@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.0.1"
 edition = "2021"
-rust-version = "1.83"
+rust-version = "1.85"
 license = "LicenseRef-Proprietary"
 repository = "https://github.com/indritkalaj/computeza"
 authors = ["Indrit Kalaj <kalaj.indrit@gmail.com>"]
@@ -35,7 +35,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 
 # --- i18n (Fluent / .ftl bundles) ---
-fluent-templates = "0.9"
+fluent-templates = "0.14"
 unic-langid = { version = "0.9", features = ["macros"] }
 
 # --- Crypto (audit signing, license verification, integrity) ---

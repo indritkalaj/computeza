@@ -44,6 +44,4 @@ mod resource;
 
 pub use plan::{DatabaseChange, PostgresPlan};
 pub use reconciler::PostgresReconciler;
-pub use resource::{
-    DatabaseSpec, PostgresInstance, PostgresSpec, PostgresStatus, ServerEndpoint,
-};
+pub use resource::{DatabaseSpec, PostgresInstance, PostgresSpec, PostgresStatus, ServerEndpoint};

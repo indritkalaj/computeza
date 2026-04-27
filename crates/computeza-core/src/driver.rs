@@ -138,7 +138,10 @@ impl Driver for NoOpDriver {
 
 impl NoOpDriver {
     fn refuse<T>(op: &str) -> Result<T> {
-        debug_assert!(false, "NoOpDriver::{op} called — reconciler should not invoke driver");
+        debug_assert!(
+            false,
+            "NoOpDriver::{op} called — reconciler should not invoke driver"
+        );
         Err(crate::Error::Driver(format!(
             "NoOpDriver does not support {op}"
         )))

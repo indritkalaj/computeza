@@ -33,10 +33,7 @@ jobs:
       - name: Install Rust toolchain
         run: rustup show
       - uses: Swatinem/rust-cache@v2
-      # --locked omitted intentionally until Cargo.lock is committed.
-      # Re-add it (and commit the lockfile CI generates) after the first
-      # green build so subsequent CI runs are reproducible.
-      - run: cargo clippy --workspace --all-targets
+      - run: cargo clippy --workspace --all-targets --locked
 
   test:
     name: test (${{ matrix.os }})
@@ -50,6 +47,5 @@ jobs:
       - name: Install Rust toolchain
         run: rustup show
       - uses: Swatinem/rust-cache@v2
-      # --locked omitted intentionally — see clippy job comment above.
-      - run: cargo build --workspace
-      - run: cargo test --workspace
+      - run: cargo build --workspace --locked
+      - run: cargo test --workspace --locked

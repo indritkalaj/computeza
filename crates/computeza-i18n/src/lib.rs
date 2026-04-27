@@ -37,9 +37,11 @@
 use fluent_templates::{static_loader, Loader};
 use unic_langid::{langid, LanguageIdentifier};
 
+// `LOCALES` is a compile-time-loaded bundle of every shipped locale. The
+// macro builds it by walking `./locales/<lang>/*.ftl` at build time, so
+// lookups against it never touch the file system at runtime — air-gapped
+// binaries carry every locale they shipped with.
 static_loader! {
-    /// Compile-time-loaded bundle of every shipped locale. Lookups against
-    /// this loader never touch the file system at runtime.
     static LOCALES = {
         locales: "./locales",
         fallback_language: "en",
@@ -95,13 +97,24 @@ impl Localizer {
 
     /// Resolve a Fluent message key with arguments.
     ///
-    /// Arguments come from a `HashMap<String, FluentValue>` per the
-    /// `fluent-templates` API.
+    /// `fluent-templates` 0.14 requires the args map keyed by
+    /// `Cow<'static, str>`. Callers typically construct it like:
+    ///
+    /// ```ignore
+    /// use std::borrow::Cow;
+    /// use fluent_templates::fluent_bundle::FluentValue;
+    /// let mut args = std::collections::HashMap::new();
+    /// args.insert(Cow::Borrowed("name"), FluentValue::from("Indrit"));
+    /// l.t_args("greeting", &args);
+    /// ```
     #[must_use]
     pub fn t_args(
         &self,
         key: &str,
-        args: &std::collections::HashMap<String, fluent_templates::fluent_bundle::FluentValue<'_>>,
+        args: &std::collections::HashMap<
+            std::borrow::Cow<'static, str>,
+            fluent_templates::fluent_bundle::FluentValue<'_>,
+        >,
     ) -> String {
         match LOCALES.try_lookup_with_args(&self.lang, key, args) {
             Some(s) => s,
@@ -127,8 +140,14 @@ mod tests {
     fn english_resolves_welcome_banner() {
         let l = Localizer::english();
         let msg = l.t("welcome-banner");
-        assert!(!msg.is_empty(), "welcome-banner should resolve to non-empty string");
-        assert!(!msg.starts_with('?'), "welcome-banner should not be marked missing: {msg}");
+        assert!(
+            !msg.is_empty(),
+            "welcome-banner should resolve to non-empty string"
+        );
+        assert!(
+            !msg.starts_with('?'),
+            "welcome-banner should not be marked missing: {msg}"
+        );
     }
 
     #[test]

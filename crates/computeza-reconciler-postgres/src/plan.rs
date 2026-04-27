@@ -51,11 +51,7 @@ pub(crate) const SYSTEM_DATABASES: &[&str] = &["template0", "template1", "postgr
 /// returned by [`crate::PostgresStatus::databases`]). `desired` is the
 /// list from [`crate::PostgresSpec::databases`]. `prune` controls whether
 /// extras in `actual` are dropped.
-pub fn compute_plan(
-    desired: &[DatabaseSpec],
-    actual: &[String],
-    prune: bool,
-) -> PostgresPlan {
+pub fn compute_plan(desired: &[DatabaseSpec], actual: &[String], prune: bool) -> PostgresPlan {
     let mut changes = Vec::new();
 
     // Creates: anything in `desired` not present in `actual`.
@@ -164,18 +160,12 @@ mod tests {
 
     #[test]
     fn creates_come_before_drops() {
-        let plan = compute_plan(
-            &[db("new")],
-            &["old".into()],
-            true,
-        );
+        let plan = compute_plan(&[db("new")], &["old".into()], true);
         assert_eq!(
             plan.changes,
             vec![
                 DatabaseChange::Create(db("new")),
-                DatabaseChange::Drop {
-                    name: "old".into()
-                },
+                DatabaseChange::Drop { name: "old".into() },
             ],
             "creates should precede drops so partial apply leaves system more-converged"
         );

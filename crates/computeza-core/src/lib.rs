@@ -8,11 +8,11 @@
 
 #![warn(missing_docs)]
 
-pub mod resource;
-pub mod reconciler;
 pub mod driver;
-pub mod health;
 pub mod error;
+pub mod health;
+pub mod reconciler;
+pub mod resource;
 
 pub use driver::{Driver, NoOpDriver};
 pub use error::{Error, Result};
