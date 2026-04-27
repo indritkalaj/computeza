@@ -20,9 +20,11 @@
 //! derive macros require `&'static str` for help text, which is a known
 //! limitation; the `Cli` struct below uses `command_help_*` keys as
 //! placeholders that will be replaced by builder-pattern construction
-//! reading from the localizer once the command surface stabilises.
+//! reading from the localizer once the command surface stabilizes.
 
 #![warn(missing_docs)]
+
+use std::net::SocketAddr;
 
 use clap::{Parser, Subcommand};
 use computeza_i18n::Localizer;
@@ -49,7 +51,12 @@ enum Command {
     /// First-run installer wizard.
     Install,
     /// Start the operator console (web UI + reconciler loop).
-    Serve,
+    Serve {
+        /// Address to bind the HTTP server to. Default `127.0.0.1:8400`
+        /// per the port allocation in spec §10.6.
+        #[arg(long, default_value = "127.0.0.1:8400")]
+        addr: SocketAddr,
+    },
     /// Show cluster status and reconciliation drift.
     Status,
     /// Show license tier, seat usage, activation health, expiry.
@@ -62,18 +69,21 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let l = Localizer::english();
 
-    let key = match cli.command {
+    match cli.command {
         None => {
             println!("{}", l.t("welcome-banner"));
             println!("{}", l.t("welcome-help"));
-            return Ok(());
         }
-        Some(Command::Install) => "cmd-install-todo",
-        Some(Command::Serve) => "cmd-serve-todo",
-        Some(Command::Status) => "cmd-status-todo",
-        Some(Command::License) => "cmd-license-todo",
-    };
-    println!("{}", l.t(key));
+        Some(Command::Serve { addr }) => {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(computeza_ui_server::serve(addr))?;
+        }
+        Some(Command::Install) => println!("{}", l.t("cmd-install-todo")),
+        Some(Command::Status) => println!("{}", l.t("cmd-status-todo")),
+        Some(Command::License) => println!("{}", l.t("cmd-license-todo")),
+    }
     Ok(())
 }
 
