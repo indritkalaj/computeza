@@ -1,0 +1,39 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# IDE / editor
+/.idea
+/.vscode/*
+!/.vscode/settings.json.example
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Local environment
+.env
+.env.local
+*.local
+
+# Build artifacts (cross-platform packaging — see spec §10)
+/dist
+/release
+*.deb
+*.rpm
+*.pkg
+*.msi
+*.msix
+*.AppImage
+*.tar.zst
+
+# Bundled data (generated, not source-controlled)
+/var/
+/data/
+
+# Misc
+*.log
+*.pid
+.cache/

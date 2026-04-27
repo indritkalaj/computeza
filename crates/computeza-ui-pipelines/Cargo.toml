@@ -1,0 +1,17 @@
+[package]
+name = "computeza-ui-pipelines"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Computeza UI pipelines — drag-and-drop pipeline canvas (spec §5)"
+
+[lints]
+workspace = true
+
+[dependencies]
+computeza-i18n = { workspace = true }
+computeza-pipelines = { workspace = true }
+computeza-ui-components = { workspace = true }

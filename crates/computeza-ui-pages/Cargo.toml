@@ -1,0 +1,16 @@
+[package]
+name = "computeza-ui-pages"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Computeza UI pages — page modules for each console section (Identity, Catalogs, Pipelines, …)"
+
+[lints]
+workspace = true
+
+[dependencies]
+computeza-i18n = { workspace = true }
+computeza-ui-components = { workspace = true }

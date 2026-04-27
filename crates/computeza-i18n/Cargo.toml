@@ -1,0 +1,17 @@
+[package]
+name = "computeza-i18n"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Computeza i18n — externalized strings via Fluent (.ftl) bundles"
+
+[lints]
+workspace = true
+
+[dependencies]
+fluent-templates = { workspace = true }
+unic-langid = { workspace = true }
+once_cell = "1"

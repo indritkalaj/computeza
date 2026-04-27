@@ -1,0 +1,17 @@
+[package]
+name = "computeza-reconciler-postgres"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "PostgreSQL reconciler — manages database creation, migration sequencing, backup orchestration"
+
+[lints]
+workspace = true
+
+[dependencies]
+computeza-core = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }

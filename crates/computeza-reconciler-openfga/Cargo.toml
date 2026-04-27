@@ -1,0 +1,17 @@
+[package]
+name = "computeza-reconciler-openfga"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "OpenFGA reconciler — manages authorization model, tuples, namespace assignment"
+
+[lints]
+workspace = true
+
+[dependencies]
+computeza-core = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }

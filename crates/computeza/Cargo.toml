@@ -1,0 +1,27 @@
+[package]
+name = "computeza"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Computeza — single-binary installer, operator console, and configurator for the all-Rust open lakehouse"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "computeza"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+
+# Internal
+computeza-core = { workspace = true }
+computeza-i18n = { workspace = true }
