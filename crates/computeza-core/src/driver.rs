@@ -101,3 +101,46 @@ pub trait Driver: Send + Sync {
     /// Snapshot metrics.
     async fn metrics(&self, dep: &Deployment) -> Result<MetricsSnapshot>;
 }
+
+/// A driver that refuses every operation. Useful for reconcilers whose
+/// `apply` step works purely against a managed component's API (typically
+/// SQL or REST) and never needs OS-level deployment operations. Pairing
+/// such a reconciler with `NoOpDriver` satisfies the [`crate::Reconciler`]
+/// trait's `Driver` bound without conjuring a real driver.
+///
+/// Calling any method panics in debug builds and returns
+/// [`crate::Error::Driver`] in release builds — the bug is "this reconciler
+/// expected to never call the driver but did", and we want it loud.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoOpDriver;
+
+#[async_trait]
+impl Driver for NoOpDriver {
+    async fn deploy(&self, _spec: ComponentSpec) -> Result<Deployment> {
+        Self::refuse("deploy")
+    }
+    async fn update(&self, _dep: &Deployment, _spec: ComponentSpec) -> Result<()> {
+        Self::refuse("update")
+    }
+    async fn destroy(&self, _dep: &Deployment) -> Result<()> {
+        Self::refuse("destroy")
+    }
+    async fn exec(&self, _dep: &Deployment, _cmd: ExecRequest) -> Result<ExecResponse> {
+        Self::refuse("exec")
+    }
+    async fn logs(&self, _dep: &Deployment, _opts: LogOptions) -> Result<LogStream> {
+        Self::refuse("logs")
+    }
+    async fn metrics(&self, _dep: &Deployment) -> Result<MetricsSnapshot> {
+        Self::refuse("metrics")
+    }
+}
+
+impl NoOpDriver {
+    fn refuse<T>(op: &str) -> Result<T> {
+        debug_assert!(false, "NoOpDriver::{op} called — reconciler should not invoke driver");
+        Err(crate::Error::Driver(format!(
+            "NoOpDriver does not support {op}"
+        )))
+    }
+}

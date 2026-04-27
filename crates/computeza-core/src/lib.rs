@@ -14,8 +14,8 @@ pub mod driver;
 pub mod health;
 pub mod error;
 
+pub use driver::{Driver, NoOpDriver};
 pub use error::{Error, Result};
 pub use health::Health;
 pub use reconciler::Reconciler;
-pub use driver::Driver;
 pub use resource::Resource;
