@@ -1,0 +1,15 @@
+[package]
+name = "computeza-ui-components"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Computeza UI components — 47-component design system library (Leptos)"
+
+[lints]
+workspace = true
+
+[dependencies]
+computeza-i18n = { workspace = true }

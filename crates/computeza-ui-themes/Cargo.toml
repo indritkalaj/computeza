@@ -1,0 +1,15 @@
+[package]
+name = "computeza-ui-themes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Computeza UI themes — brand themes, white-label support for Provider channel partners"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }

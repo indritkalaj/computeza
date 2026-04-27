@@ -1,0 +1,18 @@
+[package]
+name = "computeza-ui-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Computeza UI server — Leptos SSR application; entry point for the operator console"
+
+[lints]
+workspace = true
+
+[dependencies]
+computeza-core = { workspace = true }
+computeza-i18n = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

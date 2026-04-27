@@ -1,0 +1,87 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.83"
+license = "LicenseRef-Proprietary"
+repository = "https://github.com/indritkalaj/computeza"
+authors = ["Indrit Kalaj <kalaj.indrit@gmail.com>"]
+homepage = "https://github.com/indritkalaj/computeza"
+description = "Computeza — all-Rust open lakehouse control plane"
+
+[workspace.dependencies]
+# --- Async runtime ---
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# --- Errors ---
+anyhow = "1"
+thiserror = "2"
+
+# --- Serialization ---
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# --- Tracing / logs ---
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# --- CLI (binary only) ---
+clap = { version = "4", features = ["derive"] }
+
+# --- i18n (Fluent / .ftl bundles) ---
+fluent-templates = "0.9"
+unic-langid = { version = "0.9", features = ["macros"] }
+
+# --- Crypto (audit signing, license verification, integrity) ---
+ed25519-dalek = "2"
+blake3 = "1"
+sha2 = "0.10"
+
+# --- Time ---
+chrono = { version = "0.4", features = ["serde"] }
+
+# --- IDs ---
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+
+# --- Internal crates ---
+# Tier 1 — Core Engine
+computeza-core      = { path = "crates/computeza-core",      version = "0.0.1" }
+computeza-state     = { path = "crates/computeza-state",     version = "0.0.1" }
+computeza-audit     = { path = "crates/computeza-audit",     version = "0.0.1" }
+computeza-secrets   = { path = "crates/computeza-secrets",   version = "0.0.1" }
+computeza-driver    = { path = "crates/computeza-driver",    version = "0.0.1" }
+computeza-tenancy   = { path = "crates/computeza-tenancy",   version = "0.0.1" }
+computeza-pipelines = { path = "crates/computeza-pipelines", version = "0.0.1" }
+
+# Tier 2 — Drivers
+computeza-driver-native = { path = "crates/computeza-driver-native", version = "0.0.1" }
+
+# Tier 4 — Web Console (i18n is shared, so placed at workspace level)
+computeza-i18n          = { path = "crates/computeza-i18n",          version = "0.0.1" }
+computeza-ui-server     = { path = "crates/computeza-ui-server",     version = "0.0.1" }
+computeza-ui-components = { path = "crates/computeza-ui-components", version = "0.0.1" }
+computeza-ui-pages      = { path = "crates/computeza-ui-pages",      version = "0.0.1" }
+computeza-ui-pipelines  = { path = "crates/computeza-ui-pipelines",  version = "0.0.1" }
+computeza-ui-themes     = { path = "crates/computeza-ui-themes",     version = "0.0.1" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+[profile.dev]
+debug = "line-tables-only"
