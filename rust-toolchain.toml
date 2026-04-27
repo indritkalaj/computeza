@@ -1,4 +1,7 @@
 [toolchain]
-channel = "1.83.0"
+# Always-latest-stable. rust-version in Cargo.toml declares the MSRV
+# floor; this channel is the working ceiling. Pin to a specific x.y.z
+# closer to a release cut for reproducibility.
+channel = "stable"
 components = ["rustfmt", "clippy", "rust-src"]
 profile = "default"

@@ -176,7 +176,11 @@ impl<D: Driver + 'static> Reconciler for PostgresReconciler<D> {
                 Self::validate_identifier(owner).map_err(CoreError::from)?;
             }
         }
-        Ok(compute_plan(&desired.databases, &actual.databases, desired.prune))
+        Ok(compute_plan(
+            &desired.databases,
+            &actual.databases,
+            desired.prune,
+        ))
     }
 
     async fn apply(

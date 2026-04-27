@@ -23,15 +23,33 @@ impl Resource for PostgresInstance {
 
 /// User-declared desired state for a PostgreSQL instance.
 ///
-/// `endpoint` and `superuser_password` together identify how to reach the
-/// running server; `databases` is the desired set of databases on it.
-/// Anything else (users, schemas, migrations) is out of scope for v0.0.2.
+/// `endpoint` identifies how to reach the running server; `databases` is the
+/// desired set of databases on it. Anything else (users, schemas,
+/// migrations) is out of scope for v0.0.2.
+///
+/// # Why the password isn't a serde field
+///
+/// `superuser_password` is `#[serde(skip)]`. The platform never round-trips
+/// a plaintext password through YAML. The flow is:
+///
+/// 1. The YAML spec carries an opaque `secret_ref` (a path into the secrets
+///    store like `vault://kv/postgres/superuser` — wired up when
+///    `computeza-secrets` lands).
+/// 2. The platform's runtime layer reads that ref, asks `computeza-secrets`
+///    for the value, and constructs the in-memory `PostgresSpec` with the
+///    password populated.
+/// 3. The reconciler holds the populated spec and never serializes it back.
+///
+/// For v0.0.2 the secret_ref step is a TODO; callers populate the password
+/// directly via `Default` / programmatic construction.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PostgresSpec {
     /// How to reach the running server.
     pub endpoint: ServerEndpoint,
     /// Superuser credentials. Wrapped in `SecretString` so it doesn't leak
-    /// via `Debug` / `Display` / serde JSON output.
+    /// via `Debug` / `Display`. Skipped in (de)serialization — see the
+    /// docs above for the secrets-store flow that hydrates this.
+    #[serde(skip, default = "default_secret")]
     pub superuser_password: SecretString,
     /// Databases that should exist on the server. Reconciler creates any
     /// missing entries and (when `prune` is true) drops any extras.
@@ -41,6 +59,10 @@ pub struct PostgresSpec {
     /// opt-in.
     #[serde(default)]
     pub prune: bool,
+}
+
+fn default_secret() -> SecretString {
+    SecretString::from(String::new())
 }
 
 /// Where to reach a running PostgreSQL server.
@@ -114,7 +136,7 @@ pub struct DatabaseSpec {
 }
 
 /// System-observed actual state.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PostgresStatus {
     /// Server version as reported by `version()`. None if observe has
     /// never succeeded.
@@ -126,15 +148,4 @@ pub struct PostgresStatus {
     pub last_observed_at: Option<DateTime<Utc>>,
     /// Whether the most recent observe attempt failed.
     pub last_observe_failed: bool,
-}
-
-impl Default for PostgresStatus {
-    fn default() -> Self {
-        Self {
-            server_version: None,
-            databases: Vec::new(),
-            last_observed_at: None,
-            last_observe_failed: false,
-        }
-    }
 }

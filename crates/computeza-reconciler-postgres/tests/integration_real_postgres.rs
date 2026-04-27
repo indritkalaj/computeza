@@ -44,8 +44,8 @@ fn endpoint_and_password_from_env() -> Option<(ServerEndpoint, SecretString)> {
 #[tokio::test]
 #[ignore = "requires COMPUTEZA_POSTGRES_TEST_URL pointing at a running PostgreSQL"]
 async fn end_to_end_create_then_drop() {
-    let (endpoint, password) = endpoint_and_password_from_env()
-        .expect("set COMPUTEZA_POSTGRES_TEST_URL to run this test");
+    let (endpoint, password) =
+        endpoint_and_password_from_env().expect("set COMPUTEZA_POSTGRES_TEST_URL to run this test");
 
     // The spec and the reconciler both carry the endpoint+password today;
     // the reconciler ignores the spec's copy in observe/apply, but a future
@@ -53,8 +53,7 @@ async fn end_to_end_create_then_drop() {
     let spec_endpoint = endpoint.clone();
     let spec_password = SecretString::from(password.expose_secret().to_string());
 
-    let reconciler: PostgresReconciler<NoOpDriver> =
-        PostgresReconciler::new(endpoint, password);
+    let reconciler: PostgresReconciler<NoOpDriver> = PostgresReconciler::new(endpoint, password);
     let ctx = Context::default();
     let driver = NoOpDriver;
 
