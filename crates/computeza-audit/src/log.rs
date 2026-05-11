@@ -5,10 +5,7 @@ use std::{io, path::PathBuf};
 use chrono::Utc;
 use serde::Serialize;
 use thiserror::Error;
-use tokio::{
-    io::AsyncWriteExt,
-    sync::Mutex,
-};
+use tokio::{io::AsyncWriteExt, sync::Mutex};
 use uuid::Uuid;
 
 use crate::{

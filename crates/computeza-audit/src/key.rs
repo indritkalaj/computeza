@@ -6,7 +6,7 @@
 
 use base64ct::{Base64, Encoding};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use rand::rngs::OsRng;
+use rand::{rngs::OsRng, RngCore};
 
 /// Audit signing key.
 ///
@@ -18,11 +18,16 @@ pub struct AuditKey {
 
 impl AuditKey {
     /// Generate a fresh random keypair from the OS CSPRNG.
+    ///
+    /// We fill 32 bytes from `OsRng` and pass them to `SigningKey::from_bytes`
+    /// rather than the now-removed `SigningKey::generate(&mut rng)`
+    /// associated function from earlier dalek versions.
     #[must_use]
     pub fn generate() -> Self {
-        let mut csprng = OsRng;
+        let mut secret = [0u8; 32];
+        OsRng.fill_bytes(&mut secret);
         Self {
-            signing: SigningKey::generate(&mut csprng),
+            signing: SigningKey::from_bytes(&secret),
         }
     }
 

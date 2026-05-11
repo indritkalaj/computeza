@@ -178,21 +178,12 @@ impl<D: Driver + 'static> Reconciler for KanidmReconciler<D> {
         }
     }
 
-    async fn plan(
-        &self,
-        _desired: &KanidmSpec,
-        _actual: &KanidmStatus,
-    ) -> Result<(), CoreError> {
+    async fn plan(&self, _desired: &KanidmSpec, _actual: &KanidmStatus) -> Result<(), CoreError> {
         // No managed state yet — plan is always empty.
         Ok(())
     }
 
-    async fn apply(
-        &self,
-        _ctx: &Context,
-        _plan: (),
-        _driver: &D,
-    ) -> Result<Outcome, CoreError> {
+    async fn apply(&self, _ctx: &Context, _plan: (), _driver: &D) -> Result<Outcome, CoreError> {
         debug!("kanidm apply: no-op (read-only at v0.0.x)");
         Ok(Outcome {
             changed: false,

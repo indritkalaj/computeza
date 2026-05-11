@@ -75,16 +75,18 @@ pub async fn verify_log(
     verifying: &VerifyingKey,
 ) -> Result<VerifyOutcome, VerifyError> {
     let bytes = fs::read(path).await?;
-    let mut expected_seq: u64 = 0;
     let mut prev_head = String::new();
-    let mut events_verified: u64 = 0;
     let mut final_head_bytes = [0u8; 32];
+    let mut events_verified: u64 = 0;
 
-    for (i, line) in bytes
+    // `expected_seq` and `i` advance in lockstep starting at 0; using
+    // .zip(0_u64..) lets clippy stop worrying about an explicit counter.
+    let lines = bytes
         .split(|b| *b == b'\n')
         .filter(|l| !l.is_empty())
         .enumerate()
-    {
+        .zip(0_u64..);
+    for ((i, line), expected_seq) in lines {
         let line_no = i + 1;
         let event: AuditEvent =
             serde_json::from_slice(line).map_err(|e| VerifyError::MalformedJson {
@@ -105,12 +107,13 @@ pub async fn verify_log(
                 actual: event.body.prev_digest,
             });
         }
-        let body_bytes = event.body.canonical_bytes().map_err(|e| {
-            VerifyError::MalformedJson {
+        let body_bytes = event
+            .body
+            .canonical_bytes()
+            .map_err(|e| VerifyError::MalformedJson {
                 line: line_no,
                 detail: e.to_string(),
-            }
-        })?;
+            })?;
         if !AuditKey::verify(verifying, &body_bytes, &event.signature) {
             return Err(VerifyError::BadSignature {
                 seq: event.body.seq,
@@ -122,8 +125,10 @@ pub async fn verify_log(
         let h = hasher.finalize();
         prev_head = h.to_hex().to_string();
         final_head_bytes = *h.as_bytes();
-        expected_seq += 1;
-        events_verified += 1;
+        // `expected_seq` advances automatically as the loop iterates the
+        // 0_u64.. zip; the count of verified events is `expected_seq + 1`
+        // at the end of the body. We capture that via `events_verified`.
+        events_verified = expected_seq + 1;
     }
     Ok(VerifyOutcome {
         events_verified,
@@ -164,12 +169,22 @@ mod tests {
             let log = AuditLog::open(&path, AuditKey::from_secret([7u8; 32]))
                 .await
                 .unwrap();
-            log.append("system", Action::Reconciled, Some("postgres-instance/x".into()), json!({"changed": true}))
-                .await
-                .unwrap();
-            log.append("user:indrit", Action::UserAction, None, json!({"clicked": "Save"}))
-                .await
-                .unwrap();
+            log.append(
+                "system",
+                Action::Reconciled,
+                Some("postgres-instance/x".into()),
+                json!({"changed": true}),
+            )
+            .await
+            .unwrap();
+            log.append(
+                "user:indrit",
+                Action::UserAction,
+                None,
+                json!({"clicked": "Save"}),
+            )
+            .await
+            .unwrap();
             log.append("system", Action::Authn, None, json!({"ok": true}))
                 .await
                 .unwrap();
@@ -233,7 +248,10 @@ mod tests {
         let verifying = AuditKey::verifying_key_from_b64(&key.verifying_key_b64()).unwrap();
         let err = verify_log(&path, &verifying).await.unwrap_err();
         assert!(
-            matches!(err, VerifyError::OutOfOrder { .. } | VerifyError::ChainBroken { .. }),
+            matches!(
+                err,
+                VerifyError::OutOfOrder { .. } | VerifyError::ChainBroken { .. }
+            ),
             "expected OutOfOrder or ChainBroken, got {err:?}"
         );
     }

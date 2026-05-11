@@ -212,7 +212,11 @@ async fn create_data_dir(data_dir: &Path, user: &str) -> Result<(), InstallError
         ))));
     }
     // Postgres refuses to run on a data dir with permissive permissions.
-    let _ = Command::new("chmod").arg("0700").arg(data_dir).status().await;
+    let _ = Command::new("chmod")
+        .arg("0700")
+        .arg(data_dir)
+        .status()
+        .await;
     Ok(())
 }
 
