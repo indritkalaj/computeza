@@ -1,225 +1,201 @@
 /*!
- * Computeza UI -- modern dark-theme stylesheet.
+ * Computeza UI -- design system stylesheet.
  *
- * Spec section 4.3 mandates the indigo+orange palette. Beyond that
- * baseline, this stylesheet adds a hand-tuned layer of cards, badges,
- * glass surfaces, hover states, and typography refinements that brings
- * the operator console up to the visual quality of comparable SaaS
- * control planes (Stripe, Linear, Vercel, Supabase).
+ * Implements the brand pack shipped as `brand/index.html` (navy +
+ * lavender/pink/peach palette, Geist typography, 14px-rounded cards,
+ * grid/dot/aurora backgrounds, mono caps for eyebrows/meta).
  *
- * Class names still mirror Tailwind utilities where they overlap, so
- * the eventual swap to the tailwindcss CLI remains mechanical.
+ * Class names follow `.cz-*` for components defined here; we keep a
+ * small Tailwind-compat tail at the bottom for any leftover utility
+ * classes still in legacy templates.
  */
 
-@import url('https://rsms.me/inter/inter.css');
+@import url('https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap');
 
 :root {
-  /* Spec section 4.3 palette, refined for contrast on a near-black backdrop. */
-  --bg-0: #07081A;          /* page background */
-  --bg-1: #0E1029;          /* elevated surface */
-  --bg-2: #161A3A;          /* hover surface */
-  --bg-card: rgba(20, 22, 56, 0.7);
-  --bg-glass: rgba(255, 255, 255, 0.02);
-  --border: rgba(255, 255, 255, 0.08);
-  --border-strong: rgba(255, 255, 255, 0.14);
+  /* Brand palette (brand/index.html). */
+  --navy:     #0A0A1A;  /* page background */
+  --navy-2:   #13132A;  /* elevated surface (cards) */
+  --navy-3:   #1A1A35;  /* hover, deeper inset */
+  --line:     #1F1F3A;  /* borders, dividers */
 
-  --text-100: #F2F3FB;
-  --text-300: #B7BAD6;
-  --text-500: #7C83A8;
-  --text-700: #4C527A;
+  --lavender: #C4B8E8;  /* primary accent (links, CTAs) */
+  --pink:     #E8B8C8;  /* secondary accent */
+  --peach:    #E8C4A8;  /* tertiary accent */
 
-  --accent: #E07A4F;        /* orange, primary CTAs */
-  --accent-hover: #EB8C63;
-  --accent-faint: rgba(224, 122, 79, 0.12);
+  --ink:      #F4F1FF;  /* primary text */
+  --muted:    #6B6A85;  /* secondary text */
 
-  --indigo-500: #6D6CF8;    /* secondary accent, hover, links */
-  --indigo-700: #4F46E5;
-  --indigo-faint: rgba(109, 108, 248, 0.14);
-
-  --ok: #3DD68C;
-  --ok-faint: rgba(61, 214, 140, 0.14);
-  --warn: #F5B544;
-  --warn-faint: rgba(245, 181, 68, 0.14);
-  --fail: #FF6F6F;
-  --fail-faint: rgba(255, 111, 111, 0.14);
+  /* Status colors -- derived from the palette to stay on-brand. */
+  --ok:        #9FE8C4;
+  --ok-faint:  rgba(159, 232, 196, 0.14);
+  --warn:      var(--peach);
+  --warn-faint: rgba(232, 196, 168, 0.14);
+  --fail:      #FF9DA6;
+  --fail-faint: rgba(255, 157, 166, 0.14);
+  --info:      var(--lavender);
+  --info-faint: rgba(196, 184, 232, 0.14);
 
   --radius-sm: 6px;
-  --radius: 10px;
-  --radius-lg: 16px;
+  --radius:    14px;
+  --radius-lg: 24px;
   --shadow-card: 0 1px 0 rgba(255,255,255,0.04) inset, 0 12px 32px -16px rgba(0,0,0,0.6);
 }
 
 *, *::before, *::after { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; }
-
-html {
-  background: var(--bg-0);
-  color: var(--text-100);
-}
+html { background: var(--navy); color: var(--ink); }
 
 body {
-  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
-  font-feature-settings: 'cv11', 'ss03', 'ss01';
+  font-family: 'Geist', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-feature-settings: 'ss01' on;
   line-height: 1.55;
   min-height: 100vh;
+  color: var(--ink);
   background:
-    radial-gradient(1200px 600px at 80% -10%, rgba(109, 108, 248, 0.20), transparent 60%),
-    radial-gradient(900px 600px at -10% 110%, rgba(224, 122, 79, 0.12), transparent 60%),
-    var(--bg-0);
+    radial-gradient(900px 500px at 85% -10%, rgba(196, 184, 232, 0.10), transparent 60%),
+    radial-gradient(800px 600px at -10% 110%, rgba(232, 184, 200, 0.06), transparent 60%),
+    var(--navy);
   background-attachment: fixed;
-  color: var(--text-100);
 }
 
-a { color: var(--indigo-500); text-decoration: none; }
-a:hover { color: var(--text-100); }
+a { color: var(--lavender); text-decoration: none; }
+a:hover { color: var(--ink); }
 
-code, pre, .mono {
-  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+code, pre, .cz-mono {
+  font-family: 'Geist Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-feature-settings: 'liga' 0;
 }
 
 /* ---------- Top navigation ---------- */
 .cz-nav {
-  position: sticky;
-  top: 0;
-  z-index: 10;
-  display: flex;
-  align-items: center;
-  gap: 2rem;
+  position: sticky; top: 0; z-index: 10;
+  display: flex; align-items: center; gap: 2rem;
   padding: 1rem 2rem;
-  border-bottom: 1px solid var(--border);
-  background: rgba(7, 8, 26, 0.7);
+  border-bottom: 1px solid var(--line);
+  background: rgba(10, 10, 26, 0.72);
   backdrop-filter: saturate(140%) blur(14px);
   -webkit-backdrop-filter: saturate(140%) blur(14px);
 }
-
 .cz-brand {
-  display: flex;
-  align-items: center;
-  gap: 0.7rem;
+  display: flex; align-items: center; gap: 0.75rem;
   font-weight: 600;
   letter-spacing: -0.02em;
   font-size: 1.05rem;
-  color: var(--text-100);
+  color: var(--ink);
 }
-
-.cz-brand-mark {
-  width: 28px;
-  height: 28px;
-  border-radius: 8px;
-  background: linear-gradient(135deg, var(--accent), var(--indigo-500));
-  position: relative;
-  box-shadow: 0 0 0 1px rgba(255,255,255,0.08) inset, 0 6px 18px -6px rgba(224,122,79,0.55);
-}
-.cz-brand-mark::after {
-  content: "";
-  position: absolute; inset: 6px;
-  border-radius: 4px;
-  background: var(--bg-0);
-  opacity: 0.55;
-}
+.cz-brand img { width: 28px; height: 28px; display: block; }
+.cz-brand:hover { color: var(--ink); }
 
 .cz-navlinks {
-  display: flex; gap: 1.25rem;
+  display: flex; gap: 0.5rem;
   margin-left: auto;
 }
 .cz-navlinks a {
-  color: var(--text-300);
-  font-size: 0.9rem;
-  padding: 0.4rem 0.7rem;
+  color: var(--muted);
+  font-size: 0.875rem;
+  padding: 0.4rem 0.8rem;
   border-radius: var(--radius-sm);
   transition: background-color 120ms ease, color 120ms ease;
 }
-.cz-navlinks a:hover {
-  color: var(--text-100);
-  background: var(--bg-2);
-}
-.cz-navlinks a.cz-active {
-  color: var(--text-100);
-  background: var(--indigo-faint);
-}
+.cz-navlinks a:hover { color: var(--ink); background: var(--navy-3); }
+.cz-navlinks a.cz-active { color: var(--ink); background: var(--navy-3); }
 
 /* ---------- Page shell ---------- */
 .cz-page {
   max-width: 72rem;
   margin: 0 auto;
-  padding: 3rem 2rem 6rem;
+  padding: 3.5rem 2rem 6rem;
 }
 
+/* ---------- Eyebrow / mono tag ---------- */
+.cz-tag {
+  font-family: 'Geist Mono', monospace;
+  font-size: 0.6875rem;        /* 11px */
+  letter-spacing: 0.18em;
+  color: var(--lavender);
+  opacity: 0.75;
+  text-transform: uppercase;
+}
+
+/* ---------- Hero ---------- */
 .cz-hero {
-  margin-bottom: 3rem;
+  margin-bottom: 3.5rem;
+  padding-bottom: 0;
+}
+.cz-hero .cz-tag {
+  display: block;
+  margin-bottom: 1.1rem;
 }
 .cz-hero h1 {
-  font-size: clamp(2rem, 3.4vw, 3rem);
-  letter-spacing: -0.035em;
+  font-size: clamp(2.25rem, 3.6vw, 3.5rem);
   font-weight: 700;
-  margin: 0 0 0.6rem;
+  letter-spacing: -0.035em;
   line-height: 1.05;
-  background: linear-gradient(135deg, #ffffff 30%, var(--text-300) 100%);
-  background-clip: text;
+  margin: 0 0 1rem;
+  color: var(--ink);
+}
+.cz-hero h1 em {
+  font-style: normal;
+  background: linear-gradient(90deg, var(--lavender), var(--pink));
   -webkit-background-clip: text;
+  background-clip: text;
   color: transparent;
 }
 .cz-hero p {
-  font-size: 1.05rem;
-  color: var(--text-300);
+  font-size: 1.0625rem;       /* 17px */
+  color: var(--muted);
+  line-height: 1.6;
+  max-width: 50ch;
   margin: 0;
-  max-width: 42rem;
 }
 
-.cz-section {
-  margin-bottom: 2.5rem;
+/* ---------- Sections ---------- */
+.cz-section { margin-bottom: 2.5rem; }
+.cz-section-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  margin-bottom: 1rem;
 }
-.cz-section h2 {
-  font-size: 1.35rem;
-  letter-spacing: -0.025em;
+.cz-section-head h2 {
+  font-size: 1.5rem;
   font-weight: 600;
-  margin: 0 0 1rem;
-  color: var(--text-100);
+  letter-spacing: -0.02em;
+  margin: 0;
+}
+.cz-section-head .cz-meta {
+  font-family: 'Geist Mono', monospace;
+  font-size: 0.6875rem;
+  color: var(--muted);
+  letter-spacing: 0.06em;
 }
 .cz-section h3 {
-  font-size: 0.85rem;
+  font-size: 0.8125rem;
   text-transform: uppercase;
   letter-spacing: 0.08em;
-  color: var(--text-500);
+  color: var(--muted);
   margin: 0 0 0.75rem;
   font-weight: 600;
+  font-family: 'Geist Mono', monospace;
 }
 
 /* ---------- Cards ---------- */
 .cz-card {
-  background: var(--bg-card);
-  border: 1px solid var(--border);
+  background: var(--navy-2);
+  border: 1px solid var(--line);
   border-radius: var(--radius);
   padding: 1.5rem;
   box-shadow: var(--shadow-card);
-  transition: border-color 120ms ease, transform 120ms ease;
+  transition: border-color 150ms ease, transform 150ms ease;
 }
-a.cz-card {
-  display: block;
-  color: inherit;
-}
+a.cz-card { display: block; color: inherit; text-decoration: none; }
 a.cz-card:hover {
-  border-color: var(--border-strong);
+  border-color: var(--lavender);
   transform: translateY(-1px);
   color: inherit;
 }
-.cz-card-title {
-  font-weight: 600;
-  font-size: 1rem;
-  margin: 0 0 0.5rem;
-  color: var(--text-100);
-}
-.cz-card-body {
-  color: var(--text-300);
-  font-size: 0.92rem;
-  margin: 0;
-}
-.cz-card-meta {
-  color: var(--text-500);
-  font-size: 0.85rem;
-  margin: 0.75rem 0 0;
-}
+.cz-card-title { font-weight: 600; font-size: 1rem; margin: 0 0 0.5rem; color: var(--ink); letter-spacing: -0.01em; }
+.cz-card-body { color: var(--muted); font-size: 0.92rem; margin: 0; line-height: 1.55; }
+.cz-card-meta { color: var(--lavender); font-family: 'Geist Mono', monospace; font-size: 0.75rem; letter-spacing: 0.04em; margin: 0.75rem 0 0; }
 
 .cz-card-grid {
   display: grid;
@@ -229,201 +205,231 @@ a.cz-card:hover {
 
 /* ---------- Tables ---------- */
 .cz-table-wrap {
-  background: var(--bg-card);
-  border: 1px solid var(--border);
+  background: var(--navy-2);
+  border: 1px solid var(--line);
   border-radius: var(--radius);
   overflow: hidden;
 }
-.cz-table {
-  width: 100%;
-  border-collapse: collapse;
-}
+.cz-table { width: 100%; border-collapse: collapse; }
 .cz-table thead th {
   text-align: left;
-  font-size: 0.75rem;
+  font-size: 0.6875rem;
   text-transform: uppercase;
   letter-spacing: 0.08em;
-  color: var(--text-500);
+  color: var(--muted);
   padding: 0.85rem 1.25rem;
   background: rgba(0,0,0,0.18);
-  border-bottom: 1px solid var(--border);
-  font-weight: 600;
+  border-bottom: 1px solid var(--line);
+  font-weight: 500;
+  font-family: 'Geist Mono', monospace;
 }
 .cz-table tbody td {
   padding: 0.85rem 1.25rem;
-  border-bottom: 1px solid var(--border);
-  color: var(--text-100);
+  border-bottom: 1px solid var(--line);
+  color: var(--ink);
   font-size: 0.92rem;
   vertical-align: middle;
 }
 .cz-table tbody tr:last-child td { border-bottom: none; }
 .cz-table tbody tr:hover { background: rgba(255,255,255,0.02); }
 
-.cz-cell-dim { color: var(--text-500); }
-.cz-cell-mono { font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.85rem; }
+.cz-cell-dim { color: var(--muted); }
+.cz-cell-mono { font-family: 'Geist Mono', monospace; font-size: 0.8125rem; }
 
 /* ---------- Badges ---------- */
 .cz-badge {
-  display: inline-flex; align-items: center; gap: 0.35rem;
-  padding: 0.2rem 0.6rem;
+  display: inline-flex; align-items: center; gap: 0.4rem;
+  padding: 0.2rem 0.65rem;
   border-radius: 999px;
-  font-size: 0.75rem;
+  font-size: 0.6875rem;
   font-weight: 600;
+  font-family: 'Geist Mono', monospace;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
   border: 1px solid currentColor;
 }
 .cz-badge::before {
   content: ""; width: 6px; height: 6px; border-radius: 999px; background: currentColor;
 }
-.cz-badge-ok    { color: var(--ok);    background: var(--ok-faint); }
-.cz-badge-warn  { color: var(--warn);  background: var(--warn-faint); }
-.cz-badge-fail  { color: var(--fail);  background: var(--fail-faint); }
-.cz-badge-info  { color: var(--indigo-500); background: var(--indigo-faint); }
+.cz-badge-ok   { color: var(--ok);   background: var(--ok-faint); }
+.cz-badge-warn { color: var(--warn); background: var(--warn-faint); }
+.cz-badge-fail { color: var(--fail); background: var(--fail-faint); }
+.cz-badge-info { color: var(--info); background: var(--info-faint); }
 
 /* ---------- Buttons ---------- */
 .cz-btn {
   display: inline-flex; align-items: center; gap: 0.5rem;
-  padding: 0.55rem 1rem;
+  padding: 0.55rem 1.1rem;
   border-radius: var(--radius-sm);
-  border: 1px solid var(--border-strong);
-  background: var(--bg-2);
-  color: var(--text-100);
+  border: 1px solid var(--line);
+  background: var(--navy-3);
+  color: var(--ink);
+  font-family: inherit;
   font-size: 0.92rem;
   font-weight: 500;
   cursor: pointer;
   transition: background-color 120ms ease, border-color 120ms ease, transform 120ms ease;
   text-decoration: none;
 }
-.cz-btn:hover { background: #1F234A; border-color: rgba(255,255,255,0.22); }
+.cz-btn:hover { background: #21214a; border-color: var(--lavender); color: var(--ink); }
 .cz-btn:active { transform: translateY(1px); }
 
 .cz-btn-primary {
-  background: var(--accent);
+  background: linear-gradient(135deg, var(--lavender), var(--pink));
   border-color: transparent;
-  color: #ffffff;
+  color: var(--navy);
   font-weight: 600;
-  box-shadow: 0 6px 18px -6px rgba(224, 122, 79, 0.6);
+  box-shadow: 0 6px 18px -6px rgba(196, 184, 232, 0.45);
 }
-.cz-btn-primary:hover { background: var(--accent-hover); }
+.cz-btn-primary:hover { color: var(--navy); filter: brightness(1.05); }
 
 .cz-btn-danger {
   color: var(--fail);
   background: var(--fail-faint);
-  border-color: rgba(255, 111, 111, 0.35);
+  border-color: rgba(255, 157, 166, 0.35);
 }
-.cz-btn-danger:hover { background: rgba(255, 111, 111, 0.22); }
+.cz-btn-danger:hover { background: rgba(255, 157, 166, 0.22); color: var(--fail); }
 
 /* ---------- Forms ---------- */
-.cz-form {
-  display: flex; flex-direction: column;
-  gap: 0.9rem;
-  max-width: 30rem;
-}
+.cz-form { display: flex; flex-direction: column; gap: 0.9rem; max-width: 30rem; }
 .cz-form label {
-  font-size: 0.8rem;
+  font-family: 'Geist Mono', monospace;
+  font-size: 0.6875rem;
   text-transform: uppercase;
   letter-spacing: 0.08em;
-  color: var(--text-500);
-  font-weight: 600;
+  color: var(--muted);
+  font-weight: 500;
 }
 .cz-input, .cz-select {
   width: 100%;
-  background: var(--bg-1);
-  border: 1px solid var(--border-strong);
-  color: var(--text-100);
-  padding: 0.6rem 0.8rem;
+  background: var(--navy);
+  border: 1px solid var(--line);
+  color: var(--ink);
+  padding: 0.65rem 0.85rem;
   border-radius: var(--radius-sm);
   font-size: 0.95rem;
   font-family: inherit;
 }
 .cz-input:focus, .cz-select:focus {
   outline: none;
-  border-color: var(--indigo-500);
-  box-shadow: 0 0 0 3px var(--indigo-faint);
+  border-color: var(--lavender);
+  box-shadow: 0 0 0 3px var(--info-faint);
 }
 
 /* ---------- Progress wizard ---------- */
 .cz-progress {
   margin-top: 1.5rem;
-  padding: 1.5rem;
-  background: var(--bg-card);
-  border: 1px solid var(--border);
+  padding: 1.75rem;
+  background: var(--navy-2);
+  border: 1px solid var(--line);
   border-radius: var(--radius);
 }
 .cz-progress-phase {
   display: flex; align-items: center; justify-content: space-between;
-  font-weight: 600; font-size: 1rem; color: var(--text-100);
-  margin-bottom: 0.75rem;
+  font-weight: 600; font-size: 1.05rem; color: var(--ink);
+  margin-bottom: 0.85rem;
+  letter-spacing: -0.01em;
+}
+.cz-progress-phase > span:last-child {
+  font-family: 'Geist Mono', monospace;
+  font-size: 0.85rem;
+  color: var(--lavender);
 }
 .cz-progress-bar {
   height: 8px;
-  background: rgba(255,255,255,0.06);
+  background: var(--navy);
   border-radius: 999px;
   overflow: hidden;
-  margin-bottom: 1rem;
+  margin-bottom: 1.1rem;
+  border: 1px solid var(--line);
 }
 .cz-progress-fill {
   height: 100%;
-  background: linear-gradient(90deg, var(--accent), var(--indigo-500));
+  background: linear-gradient(90deg, var(--lavender), var(--pink));
   border-radius: inherit;
   width: 0;
   transition: width 0.3s ease;
-  box-shadow: 0 0 12px rgba(224,122,79,0.35);
+  box-shadow: 0 0 14px rgba(196,184,232,0.35);
 }
-.cz-progress-msg {
-  color: var(--text-300);
-  font-size: 0.92rem;
-}
+.cz-progress-msg { color: var(--muted); font-size: 0.92rem; }
 .cz-progress-bytes {
-  color: var(--text-500);
-  font-size: 0.85rem;
+  color: var(--lavender);
+  font-size: 0.8rem;
   margin-top: 0.5rem;
-  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-family: 'Geist Mono', monospace;
+  letter-spacing: 0.04em;
 }
 
 /* ---------- Pre / code ---------- */
 .cz-pre {
   background: rgba(0,0,0,0.35);
-  border: 1px solid var(--border);
+  border: 1px solid var(--line);
   border-radius: var(--radius-sm);
   padding: 1rem 1.25rem;
   overflow-x: auto;
   white-space: pre-wrap;
   word-break: break-word;
-  font-size: 0.86rem;
-  line-height: 1.55;
-  color: var(--text-100);
+  font-size: 0.8125rem;
+  line-height: 1.6;
+  color: var(--ink);
+  font-family: 'Geist Mono', monospace;
 }
 
-/* ---------- Definition list (resource metadata) ---------- */
+/* ---------- Definition list ---------- */
 .cz-dl {
   display: grid;
   grid-template-columns: max-content 1fr;
-  row-gap: 0.4rem;
+  row-gap: 0.45rem;
   column-gap: 2rem;
   margin: 0 0 1.5rem;
 }
 .cz-dl dt {
-  color: var(--text-500);
-  font-size: 0.78rem;
+  color: var(--muted);
+  font-size: 0.6875rem;
   text-transform: uppercase;
   letter-spacing: 0.08em;
-  font-weight: 600;
+  font-weight: 500;
+  font-family: 'Geist Mono', monospace;
   align-self: center;
 }
 .cz-dl dd {
-  color: var(--text-100);
-  font-size: 0.92rem;
+  color: var(--ink);
+  font-size: 0.875rem;
   margin: 0;
-  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-family: 'Geist Mono', monospace;
 }
+
+/* ---------- Hero stage (optional grid-bg illustration block) ---------- */
+.cz-stage {
+  aspect-ratio: 1;
+  background: radial-gradient(circle at 30% 30%, var(--navy-3) 0%, var(--navy) 70%);
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--line);
+  display: flex; align-items: center; justify-content: center;
+  position: relative;
+  overflow: hidden;
+}
+.cz-stage::before {
+  content: "";
+  position: absolute; inset: 0;
+  background-image:
+    linear-gradient(var(--line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--line) 1px, transparent 1px);
+  background-size: 32px 32px;
+  opacity: 0.4;
+  mask-image: radial-gradient(circle at center, black 30%, transparent 80%);
+}
+.cz-stage img { width: 64%; height: auto; position: relative; z-index: 2; }
 
 /* ---------- Footer ---------- */
 .cz-footer {
   margin-top: 5rem;
   padding-top: 1.5rem;
-  border-top: 1px solid var(--border);
-  color: var(--text-500);
-  font-size: 0.8rem;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 0.6875rem;
+  font-family: 'Geist Mono', monospace;
+  letter-spacing: 0.06em;
   display: flex; justify-content: space-between; align-items: center;
 }
 
@@ -431,15 +437,15 @@ a.cz-card:hover {
 .cz-stack { display: flex; flex-direction: column; gap: 1rem; }
 .cz-row   { display: flex; align-items: center; gap: 0.75rem; }
 .cz-spacer { flex: 1; }
-.cz-muted { color: var(--text-500); }
-.cz-strong { color: var(--text-100); font-weight: 600; }
+.cz-muted { color: var(--muted); }
+.cz-strong { color: var(--ink); font-weight: 600; }
 
-/* ---------- Tailwind-compat utilities (kept for places not migrated yet) ---------- */
+/* ---------- Tailwind-compat fallback (legacy class names still in templates) ---------- */
 .bg-indigo-900 { background-color: transparent; }
-.text-slate-100 { color: var(--text-100); }
-.text-slate-500 { color: var(--text-500); }
-.text-indigo-300 { color: var(--text-300); }
-.text-orange-500 { color: var(--accent); }
+.text-slate-100 { color: var(--ink); }
+.text-slate-500 { color: var(--muted); }
+.text-indigo-300 { color: var(--lavender); }
+.text-orange-500 { color: var(--peach); }
 .mx-auto { margin-left: auto; margin-right: auto; }
 .max-w-4xl { max-width: 64rem; }
 .p-12 { padding: 3rem; }
@@ -458,5 +464,5 @@ a.cz-card:hover {
 .text-xs { font-size: 0.75rem; line-height: 1rem; }
 .font-semibold { font-weight: 600; }
 .tracking-tight { letter-spacing: -0.02em; }
-.border-b { border-bottom: 1px solid var(--border); }
-.border-t { border-top: 1px solid var(--border); }
+.border-b { border-bottom: 1px solid var(--line); }
+.border-t { border-top: 1px solid var(--line); }

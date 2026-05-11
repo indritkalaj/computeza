@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200">
+  <g id="pins">
+    <rect id="pin-t-0" data-side="t" data-i="0" x="47" y="20" width="6" height="20" rx="1" fill="#f4f1ff" opacity="0.55"></rect>
+    <rect id="pin-b-0" data-side="b" data-i="0" x="47" y="160" width="6" height="20" rx="1" fill="#f4f1ff" opacity="0.55"></rect>
+    <rect id="pin-l-0" data-side="l" data-i="0" x="20" y="47" width="20" height="6" rx="1" fill="#f4f1ff" opacity="0.55"></rect>
+    <rect id="pin-r-0" data-side="r" data-i="0" x="160" y="47" width="20" height="6" rx="1" fill="#f4f1ff" opacity="0.55"></rect>
+    <rect id="pin-t-1" data-side="t" data-i="1" x="67" y="20" width="6" height="20" rx="1" fill="#f4f1ff" opacity="0.55"></rect>
+    <rect id="pin-b-1" data-side="b" data-i="1" x="67" y="160" width="6" height="20" rx="1" fill="#f4f1ff" opacity="0.55"></rect>
+    <rect id="pin-l-1" data-side="l" data-i="1" x="20" y="67" width="20" height="6" rx="1" fill="#f4f1ff" opacity="0.55"></rect>
+    <rect id="pin-r-1" data-side="r" data-i="1" x="160" y="67" width="20" height="6" rx="1" fill="#f4f1ff" opacity="0.55"></rect>
+    <rect id="pin-t-2" data-side="t" data-i="2" x="87" y="20" width="6" height="20" rx="1" fill="#f4f1ff" opacity="0.55"></rect>
+    <rect id="pin-b-2" data-side="b" data-i="2" x="87" y="160" width="6" height="20" rx="1" fill="#f4f1ff" opacity="0.55"></rect>
+    <rect id="pin-l-2" data-side="l" data-i="2" x="20" y="87" width="20" height="6" rx="1" fill="#f4f1ff" opacity="0.55"></rect>
+    <rect id="pin-r-2" data-side="r" data-i="2" x="160" y="87" width="20" height="6" rx="1" fill="#f4f1ff" opacity="0.55"></rect>
+    <rect id="pin-t-3" data-side="t" data-i="3" x="107" y="20" width="6" height="20" rx="1" fill="#f4f1ff" opacity="0.55"></rect>
+    <rect id="pin-b-3" data-side="b" data-i="3" x="107" y="160" width="6" height="20" rx="1" fill="#f4f1ff" opacity="0.55"></rect>
+    <rect id="pin-l-3" data-side="l" data-i="3" x="20" y="107" width="20" height="6" rx="1" fill="#f4f1ff" opacity="0.55"></rect>
+    <rect id="pin-r-3" data-side="r" data-i="3" x="160" y="107" width="20" height="6" rx="1" fill="#f4f1ff" opacity="0.55"></rect>
+    <rect id="pin-t-4" data-side="t" data-i="4" x="127" y="20" width="6" height="20" rx="1" fill="#f4f1ff" opacity="0.55"></rect>
+    <rect id="pin-b-4" data-side="b" data-i="4" x="127" y="160" width="6" height="20" rx="1" fill="#f4f1ff" opacity="0.55"></rect>
+    <rect id="pin-l-4" data-side="l" data-i="4" x="20" y="127" width="20" height="6" rx="1" fill="#f4f1ff" opacity="0.55"></rect>
+    <rect id="pin-r-4" data-side="r" data-i="4" x="160" y="127" width="20" height="6" rx="1" fill="#f4f1ff" opacity="0.55"></rect>
+    <rect id="pin-t-5" data-side="t" data-i="5" x="147" y="20" width="6" height="20" rx="1" fill="#f4f1ff" opacity="0.55"></rect>
+    <rect id="pin-b-5" data-side="b" data-i="5" x="147" y="160" width="6" height="20" rx="1" fill="#f4f1ff" opacity="0.55"></rect>
+    <rect id="pin-l-5" data-side="l" data-i="5" x="20" y="147" width="20" height="6" rx="1" fill="#f4f1ff" opacity="0.55"></rect>
+    <rect id="pin-r-5" data-side="r" data-i="5" x="160" y="147" width="20" height="6" rx="1" fill="#f4f1ff" opacity="0.55"></rect>
+  </g>
+  <g id="body">
+    <rect x="40" y="40" width="120" height="120" rx="8" fill="#f4f1ff"></rect>
+    <circle cx="52" cy="52" r="4" fill="#000"></circle>
+  </g>
+  <g id="etching">
+    <rect x="60" y="60" width="80" height="80" rx="2" fill="none" stroke="#000" stroke-opacity="0.5" stroke-width="1.5"></rect>
+    <line x1="60" y1="60" x2="84" y2="84" stroke="#000" stroke-opacity="0.35" stroke-width="1"></line>
+    <line x1="140" y1="60" x2="116" y2="84" stroke="#000" stroke-opacity="0.35" stroke-width="1"></line>
+    <line x1="60" y1="140" x2="84" y2="116" stroke="#000" stroke-opacity="0.35" stroke-width="1"></line>
+    <line x1="140" y1="140" x2="116" y2="116" stroke="#000" stroke-opacity="0.35" stroke-width="1"></line>
+  </g>
+  <g id="core">
+    <rect x="84" y="84" width="32" height="32" rx="2" fill="#000"></rect>
+    <rect x="92" y="92" width="16" height="16" rx="1" fill="#f4f1ff" opacity="0.35"></rect>
+  </g>
+</svg>

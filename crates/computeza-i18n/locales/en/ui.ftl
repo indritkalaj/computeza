@@ -12,7 +12,10 @@ ui-app-tagline        = Open lakehouse control plane
 # --- Index page (the "Hello, GUI" placeholder) ---
 
 ui-welcome-title      = Welcome to Computeza
+ui-welcome-lead       = Welcome to
 ui-welcome-subtitle   = Your operator console is online.
+ui-home-surfaces      = Operator surfaces
+ui-home-pre-alpha     = pre-alpha
 ui-welcome-status     = Pre-alpha -- the operator console is a placeholder while the rest of the platform is being built.
 ui-welcome-spec       = See the Architecture & Product Specification v1.5 for the full feature plan.
 

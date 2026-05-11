@@ -45,9 +45,20 @@ use std::{
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
-/// Tailwind-compatible utility CSS, embedded at compile time. Served at
-/// `/static/computeza.css` and referenced from the home page.
+/// Hand-maintained design-system stylesheet, embedded at compile time.
+/// Served at `/static/computeza.css` and referenced from every page.
 const COMPUTEZA_CSS: &str = include_str!("../assets/computeza.css");
+
+/// Brand assets, embedded at compile time so the binary has no
+/// runtime dependency on a filesystem layout. Sourced from the brand
+/// pack at `assets/brand/`. The favicon SVG is the small chip-die
+/// mark with the lavender->pink gradient; the full logo is the same
+/// mark refined for navigation use.
+const COMPUTEZA_LOGO_SVG: &str = include_str!("../assets/brand/logo/computeza-logo.svg");
+const COMPUTEZA_LOGO_MONO_LIGHT_SVG: &str =
+    include_str!("../assets/brand/logo/computeza-logo-mono-light.svg");
+const COMPUTEZA_FAVICON_SVG: &str = include_str!("../assets/brand/logo/computeza-favicon.svg");
+const COMPUTEZA_LOTTIE_PULSE: &str = include_str!("../assets/brand/lottie/computeza-pulse.json");
 
 /// In-process registry of background install jobs. Each entry maps a
 /// freshly-minted UUID to the shared progress state the driver writes
@@ -131,6 +142,14 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/healthz", get(healthz_handler))
         .route("/api/state/info", get(state_info_handler))
         .route("/static/computeza.css", get(css_handler))
+        .route("/static/brand/computeza-logo.svg", get(logo_handler))
+        .route(
+            "/static/brand/computeza-logo-mono-light.svg",
+            get(logo_mono_light_handler),
+        )
+        .route("/static/brand/computeza-favicon.svg", get(favicon_handler))
+        .route("/static/brand/computeza-pulse.json", get(lottie_handler))
+        .route("/favicon.ico", get(favicon_handler))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -702,6 +721,37 @@ async fn css_handler() -> Response {
         .into_response()
 }
 
+async fn logo_handler() -> Response {
+    serve_svg(COMPUTEZA_LOGO_SVG)
+}
+
+async fn logo_mono_light_handler() -> Response {
+    serve_svg(COMPUTEZA_LOGO_MONO_LIGHT_SVG)
+}
+
+async fn favicon_handler() -> Response {
+    serve_svg(COMPUTEZA_FAVICON_SVG)
+}
+
+async fn lottie_handler() -> Response {
+    (
+        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+        COMPUTEZA_LOTTIE_PULSE,
+    )
+        .into_response()
+}
+
+fn serve_svg(body: &'static str) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "image/svg+xml; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
 /// Identifies which top-nav link should be highlighted for the
 /// currently rendered page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -751,12 +801,13 @@ pub fn render_shell(
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>{page_title} -- {app_title}</title>
+<link rel="icon" type="image/svg+xml" href="/static/brand/computeza-favicon.svg" />
 <link rel="stylesheet" href="/static/computeza.css" />
 </head>
 <body>
 <nav class="cz-nav">
   <a href="/" class="cz-brand">
-    <span class="cz-brand-mark" aria-hidden="true"></span>
+    <img src="/static/brand/computeza-logo.svg" alt="" />
     <span>{app_title}</span>
   </a>
   <div class="cz-navlinks">
@@ -850,14 +901,26 @@ pub fn render_home(localizer: &Localizer, store_summary: StoreSummary) -> String
         ),
     );
 
+    let welcome_lead = localizer.t("ui-welcome-lead");
+    let app_title = localizer.t("ui-app-title");
+    let surfaces_heading = localizer.t("ui-home-surfaces");
+    let pre_alpha = localizer.t("ui-home-pre-alpha");
     let body = format!(
-        r#"<section class="cz-hero">
-<p class="cz-muted" style="margin: 0 0 0.75rem; text-transform: uppercase; letter-spacing: 0.12em; font-size: 0.75rem;">{tagline}</p>
-<h1>{title}</h1>
+        r#"<section class="cz-hero" style="display: grid; grid-template-columns: 1.1fr 0.9fr; gap: 3rem; align-items: center;">
+<div>
+<span class="cz-tag">{tagline}</span>
+<h1>{welcome_lead} <em>{app_title}</em></h1>
 <p>{subtitle}</p>
+</div>
+<div class="cz-stage">
+<img src="/static/brand/computeza-logo.svg" alt="" />
+</div>
 </section>
 <section class="cz-section">
-<h3>Operator surfaces</h3>
+<div class="cz-section-head">
+<h2>{surfaces_heading}</h2>
+<span class="cz-meta">{pre_alpha}</span>
+</div>
 {cards_html}
 </section>
 <section class="cz-section">
@@ -866,9 +929,12 @@ pub fn render_home(localizer: &Localizer, store_summary: StoreSummary) -> String
 <p class="cz-card-meta" style="margin: 0;">{spec_note}</p>
 </div>
 </section>"#,
-        title = html_escape(&title),
+        welcome_lead = html_escape(&welcome_lead),
+        app_title = html_escape(&app_title),
         subtitle = html_escape(&subtitle),
         tagline = html_escape(&tagline),
+        surfaces_heading = html_escape(&surfaces_heading),
+        pre_alpha = html_escape(&pre_alpha),
         status = html_escape(&status),
         spec_note = html_escape(&spec_note),
     );
