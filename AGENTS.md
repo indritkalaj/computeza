@@ -118,6 +118,156 @@ v0.0.x ships single-tenant direct-use. The constraints above belong
 in the design when these surfaces are first built; do not paint into
 a single-tier corner.
 
+## Component installer playbook (postgres lessons applied)
+
+The PostgreSQL native installer was the first end-to-end install path
+to land. It hit nearly every pitfall an autonomous installer can hit,
+and the fixes are now infrastructure other components MUST reuse
+rather than rediscover. When adding a new component reconciler +
+driver pair, check this playbook before pretending any step is simple.
+
+### Binary acquisition
+
+- **Three-tier resolution.** The driver must try, in order:
+  1. Caller-supplied `bin_dir` (operator override).
+  2. Host-installed location (`/Program Files/<Vendor>/<v>/bin` on
+     Windows, `apt`/`brew` paths on Linux/macOS).
+  3. Computeza-managed cache under `<root_dir>/binaries/<version>/`.
+  4. Download from vendor + extract into the cache.
+- **Stream the download to disk** (not `bytes().await`), report
+  `bytes_downloaded` / `total_bytes` through `ProgressHandle` so the
+  wizard's bar moves.
+- **Pin a SHA-256 per bundle.** TLS protects in-transit; the pin
+  protects against a vendor-side incident. Audit-trail entries go in
+  AGENTS.md when checksums change.
+- **`.computeza-extracted` sentinel** marks a fully-extracted cache
+  dir so re-runs hit the cache without re-downloading.
+
+### Service registration
+
+- **Never `sc.exe create` against a bare binary on Windows.**
+  Component binaries (`postgres.exe`, etc.) are console apps that
+  don't speak the SCM control protocol; SCM gives up after 30s with
+  error 1053. Use the component's own service-registration tool
+  (`pg_ctl register`) or write a service-aware wrapper.
+- **SCM has DELETE_PENDING.** After `sc delete` the service stays in
+  the SCM until every handle closes (Services snap-in, sc.exe query
+  loops). Always run `wait_for_service_absent` before re-registering;
+  the pg_ctl equivalent will fail with `service "..." already
+  registered` otherwise.
+- **Layer the teardown.** Tear a service down through every path
+  available: `sc::stop`, the component's own unregister, `sc::delete`,
+  then poll until SCM evicts.
+
+### Config files
+
+- **Many config files are first-match-wins.** `pg_hba.conf`,
+  `nginx.conf` `location` blocks, etc. Computeza-managed rules MUST
+  be **prepended** with sentinel comments (`# === computeza-managed
+  ... (start) ===` / `(end) ===`), never appended.
+- **Idempotent rewrites.** Strip the previous managed block by
+  sentinel before writing the new one. Also strip *unmarked* legacy
+  lines from earlier driver versions so re-installs converge to a
+  clean file.
+- **Pure-string transforms unit-test.** Factor `rewrite_pg_hba(s) ->
+  String` out of `ensure_loopback_trust(data_dir)` so the rewrite
+  logic is testable without touching the disk.
+
+### OS-user gotchas
+
+- **Always pass `-U <expected-superuser>`** (or equivalent) to
+  bootstrap commands. Tools default to `%USERNAME%` on Windows /
+  `$USER` on Unix, which on an admin-elevated session is the wrong
+  identity. `initdb -U postgres` is the canonical example.
+- **For existing installs without the explicit user**, ship an
+  `ensure_<role>` post-install step that runs `IF NOT EXISTS ...
+  CREATE ROLE ...` against the running service via the OS user that
+  bootstrapped it. Idempotent. Bridges old data dirs without
+  forcing the operator to re-initialise.
+
+### Auth bootstrap
+
+- **Trust on loopback** (`127.0.0.1/32 trust` + `::1/128 trust`) is
+  the v0.0.x default. It enables the in-process reconciler to
+  observe without a secret store. Loopback-only binding makes this
+  safe; remote connections still require scram-sha-256.
+- **Defer password input** until `computeza-secrets` lands. The
+  install wizard's `<details>` advanced section can grow a password
+  field that writes through the secret store rather than into the
+  spec JSON directly.
+
+### Cross-platform PATH
+
+- **Windows PowerShell does NOT use `\` for line continuation.** Use
+  backtick (`` ` ``), but really: write single-line `-Command`
+  invocations with `;` separators. Multi-line scripts via `-Command`
+  are fragile.
+- **Use `Split(';') -contains` for PATH membership tests**, not
+  `-notlike "*<dir>*"` -- the wildcard match false-positives on
+  paths containing the candidate as a substring.
+- **Always test the actual permission**, not just "command succeeded
+  silently". Surface the registration error in `Installed.<thing>_error`
+  so the result page shows the verbatim diagnostic instead of
+  "(not created)".
+
+### Reconciler integration
+
+- **Spec + Status separation.** The install wizard writes only the
+  spec (endpoint config) to the store. The reconciler is responsible
+  for the Status (observed state). Don't muddle the two.
+- **Upsert on re-install.** `store.save(.., None)` is *create-only*
+  -- a second install hits "revision conflict". Load first to
+  discover the current revision, then save with `expected_revision =
+  Some(rev)`.
+- **Kick an immediate observe after install completes.** The 30s
+  periodic tick is too coarse for "did my install actually wire up?"
+  feedback. The handler calls the reconciler's `observe()` once
+  before redirecting to the result page so /status is current by
+  the time the operator clicks through.
+- **Loopback trust auth + empty password in the spec.** Until the
+  secret store ships, `superuser_password: SecretString::from("")`
+  is fine -- pg_hba.conf's trust rule wins on 127.0.0.1.
+
+### Wizard UX
+
+- **POST-redirect-GET with a job ID.** Install runs in a tokio task;
+  the POST returns 303 to `/install/job/{id}`. The job page polls
+  `/api/install/job/{id}` every 500ms for live progress. Avoids the
+  browser-timeout problem on large downloads.
+- **`<details>` for advanced options.** Default-everything stays
+  one click; per-component overrides (port, data dir, service
+  name) tuck into a disclosure.
+- **Uninstall is a first-class flow.** Every component install MUST
+  ship a counterpart teardown with a confirmation page, a danger-
+  styled button, and a step-by-step result page. The teardown
+  preserves the binary cache by default (re-install stays fast)
+  but exposes a `purge_binaries: true` opt-in for full rollback.
+
+### Per-component checklist
+
+When adding a new component (kanidm, garage, lakekeeper, ...):
+
+- [ ] `crates/computeza-driver-native/src/<os>/<component>.rs`
+      with `install_with_progress(opts, &ProgressHandle)` and
+      `uninstall(opts) -> Uninstalled` -- mirror the postgres shape.
+- [ ] At least two pinned `Bundle`s (latest + previous-major) per
+      OS. UI exposes a version dropdown.
+- [ ] `ensure_loopback_trust`-equivalent for whatever auth this
+      component uses (admin token bootstrap, trust on loopback, ...).
+- [ ] `ensure_<role>` post-install step for cross-platform user-name
+      drift if relevant.
+- [ ] Reconciler reads the spec, calls `with_state`, runs `observe()`.
+      Already shipped for all 10 HTTP reconcilers in `28057eb`.
+- [ ] Wizard form on `/install/<component>` collects port + data dir
+      + service name; defaults are blank fields with placeholders.
+- [ ] Uninstall route + confirmation page wired into the wizard
+      footer card.
+- [ ] Smoke test that the install handler writes the
+      `<component>-instance/local` row in the metadata store with
+      the correct shape.
+- [ ] End-to-end test: open in-memory SqliteStore, persist a fake
+      observation, hit /status, assert the row renders.
+
 ## Working agreement (current preferences)
 
 - **Auto-accept.** The user has explicitly stated: "consider my answers
