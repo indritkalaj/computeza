@@ -27,14 +27,14 @@
 use std::net::SocketAddr;
 
 use axum::{
-    extract::{Form, State},
-    http::header,
+    extract::{Form, Path, State},
+    http::{header, StatusCode},
     response::{Html, IntoResponse, Json, Response},
     routing::{get, post},
     Router,
 };
 use computeza_i18n::Localizer;
-use computeza_state::{SqliteStore, Store};
+use computeza_state::{ResourceKey, SqliteStore, Store};
 use leptos::prelude::*;
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;
@@ -101,6 +101,7 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/install", get(install_handler))
         .route("/install/postgres", post(install_postgres_handler))
         .route("/status", get(status_handler))
+        .route("/resource/{kind}/{name}", get(resource_handler))
         .route("/healthz", get(healthz_handler))
         .route("/api/state/info", get(state_info_handler))
         .route("/static/computeza.css", get(css_handler))
@@ -321,6 +322,44 @@ async fn status_handler(State(state): State<AppState>) -> Html<String> {
     Html(render_status(&l, Some(&rows)))
 }
 
+async fn resource_handler(
+    State(state): State<AppState>,
+    Path((kind, name)): Path<(String, String)>,
+) -> (StatusCode, Html<String>) {
+    let l = Localizer::english();
+    let Some(store) = &state.store else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Html(render_resource(&l, &kind, &name, None, true)),
+        );
+    };
+    let key = ResourceKey::cluster_scoped(&kind, &name);
+    match store.load(&key).await {
+        Ok(Some(stored)) => (
+            StatusCode::OK,
+            Html(render_resource(&l, &kind, &name, Some(&stored), false)),
+        ),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Html(render_resource(&l, &kind, &name, None, false)),
+        ),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                kind = %kind,
+                name = %name,
+                "resource_handler: store.load failed; surfacing not-found page. \
+                 Likely causes: (1) SQLite file unreadable, (2) schema mismatch \
+                 from a prior version. Check the server logs and the state.db path."
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Html(render_resource(&l, &kind, &name, None, false)),
+            )
+        }
+    }
+}
+
 async fn home_handler() -> Html<String> {
     let l = Localizer::english();
     Html(render_home(&l))
@@ -473,6 +512,23 @@ pub fn render_components(localizer: &Localizer) -> String {
 </body>
 </html>"#
     )
+}
+
+/// Minimal percent-encoder for a single URL path segment. Encodes
+/// everything except unreserved chars + `-._~`. Not a full RFC 3986
+/// implementation; built for resource kinds and names, which are
+/// kebab-case ASCII per the workspace conventions.
+fn urlencoding_min(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        let is_unreserved = b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~');
+        if is_unreserved {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// Minimal HTML escape for embedding plain text inside element content.
@@ -633,15 +689,21 @@ pub fn render_status(localizer: &Localizer, rows: Option<&[StatusRow]>) -> Strin
                         .last_observed_at
                         .clone()
                         .unwrap_or_else(|| "-".to_string());
+                    let href = format!(
+                        "/resource/{}/{}",
+                        urlencoding_min(&r.kind),
+                        urlencoding_min(&r.instance_name)
+                    );
                     format!(
                         "<tr>\
                          <td class=\"text-indigo-300 text-sm\" style=\"padding: 0.5rem 1rem 0.5rem 0;\">{kind}</td>\
-                         <td class=\"text-slate-100\" style=\"padding: 0.5rem 1rem;\">{label} / {name}</td>\
+                         <td style=\"padding: 0.5rem 1rem;\"><a class=\"text-slate-100\" href=\"{href}\">{label} / {name}</a></td>\
                          <td class=\"text-slate-500 text-sm\" style=\"padding: 0.5rem 1rem;\">{version}</td>\
                          <td class=\"text-slate-500 text-sm\" style=\"padding: 0.5rem 1rem;\">{observed}</td>\
                          <td class=\"{state_class}\" style=\"padding: 0.5rem 0;\">{state_label}</td>\
                          </tr>",
                         kind = html_escape(&r.kind),
+                        href = href,
                         label = html_escape(&r.component_label),
                         name = html_escape(&r.instance_name),
                         version = html_escape(&version),
@@ -684,6 +746,117 @@ pub fn render_status(localizer: &Localizer, rows: Option<&[StatusRow]>) -> Strin
 <section>
 <h2 class="text-2xl font-semibold text-slate-100 m-0 mb-3">{title}</h2>
 <p class="text-slate-500 text-sm m-0 mb-6">{intro}</p>
+{body}
+</section>
+</main>
+</body>
+</html>"#
+    )
+}
+
+/// Render the `/resource/{kind}/{name}` page. `stored = Some(_)` means
+/// the resource exists and we render the full metadata + spec + status
+/// JSON; `stored = None` with `store_missing = false` means a clean 404
+/// (resource not in the store); `store_missing = true` means no store is
+/// attached to this server at all.
+#[must_use]
+pub fn render_resource(
+    localizer: &Localizer,
+    kind: &str,
+    name: &str,
+    stored: Option<&computeza_state::StoredResource>,
+    store_missing: bool,
+) -> String {
+    let app_title = localizer.t("ui-app-title");
+    let title = localizer.t("ui-resource-title");
+    let back = localizer.t("ui-resource-back");
+
+    let heading = format!("{} / {}", html_escape(kind), html_escape(name));
+
+    let body = if store_missing {
+        format!(
+            r#"<p class="text-orange-500 text-sm m-0">{}</p>"#,
+            html_escape(&localizer.t("ui-resource-store-missing"))
+        )
+    } else if let Some(sr) = stored {
+        let uuid_label = localizer.t("ui-resource-uuid");
+        let rev_label = localizer.t("ui-resource-revision");
+        let created_label = localizer.t("ui-resource-created-at");
+        let updated_label = localizer.t("ui-resource-updated-at");
+        let ws_label = localizer.t("ui-resource-workspace");
+        let spec_heading = localizer.t("ui-resource-spec-heading");
+        let status_heading = localizer.t("ui-resource-status-heading");
+        let no_status = localizer.t("ui-resource-no-status");
+
+        let spec_pretty = serde_json::to_string_pretty(&sr.spec).unwrap_or_else(|_| "{}".into());
+        let status_block = match &sr.status {
+            Some(s) => {
+                let pretty = serde_json::to_string_pretty(s).unwrap_or_else(|_| "{}".into());
+                format!(
+                    r#"<pre class="text-slate-100 text-sm" style="background: rgba(0,0,0,0.25); padding: 1rem; overflow-x: auto; white-space: pre-wrap; word-break: break-word;">{}</pre>"#,
+                    html_escape(&pretty)
+                )
+            }
+            None => format!(
+                r#"<p class="text-slate-500 text-sm m-0">{}</p>"#,
+                html_escape(&no_status)
+            ),
+        };
+        let workspace = sr
+            .key
+            .workspace
+            .as_deref()
+            .map(html_escape)
+            .unwrap_or_else(|| "-".to_string());
+
+        format!(
+            r#"<dl style="display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 1.5rem; margin-bottom: 2rem;">
+<dt class="text-indigo-300 text-sm">{uuid_label}</dt>
+<dd class="text-slate-100 text-sm" style="margin: 0;">{uuid}</dd>
+<dt class="text-indigo-300 text-sm">{rev_label}</dt>
+<dd class="text-slate-100 text-sm" style="margin: 0;">{revision}</dd>
+<dt class="text-indigo-300 text-sm">{created_label}</dt>
+<dd class="text-slate-100 text-sm" style="margin: 0;">{created_at}</dd>
+<dt class="text-indigo-300 text-sm">{updated_label}</dt>
+<dd class="text-slate-100 text-sm" style="margin: 0;">{updated_at}</dd>
+<dt class="text-indigo-300 text-sm">{ws_label}</dt>
+<dd class="text-slate-100 text-sm" style="margin: 0;">{workspace}</dd>
+</dl>
+<h3 class="text-indigo-300 text-sm" style="margin-bottom: 0.5rem;">{spec_heading}</h3>
+<pre class="text-slate-100 text-sm" style="background: rgba(0,0,0,0.25); padding: 1rem; overflow-x: auto; white-space: pre-wrap; word-break: break-word; margin-bottom: 1.5rem;">{spec_html}</pre>
+<h3 class="text-indigo-300 text-sm" style="margin-bottom: 0.5rem;">{status_heading}</h3>
+{status_block}"#,
+            uuid = html_escape(&sr.uuid.to_string()),
+            revision = sr.revision,
+            created_at = html_escape(&sr.created_at.to_rfc3339()),
+            updated_at = html_escape(&sr.updated_at.to_rfc3339()),
+            spec_html = html_escape(&spec_pretty),
+        )
+    } else {
+        format!(
+            r#"<p class="text-orange-500 text-sm m-0">{}</p>"#,
+            html_escape(&localizer.t("ui-resource-not-found"))
+        )
+    };
+
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>{title} -- {app_title}</title>
+<link rel="stylesheet" href="/static/computeza.css" />
+</head>
+<body class="bg-indigo-900 text-slate-100">
+<main class="mx-auto max-w-4xl p-12">
+<header class="border-b pb-6 mb-10">
+<h1 class="text-orange-500 text-2xl font-semibold tracking-tight m-0 mb-1">{app_title}</h1>
+<nav><a class="text-indigo-300 text-sm" href="/status">&lt;-&nbsp;{back}</a></nav>
+</header>
+<section>
+<h2 class="text-2xl font-semibold text-slate-100 m-0 mb-3">{heading}</h2>
+<p class="text-slate-500 text-sm m-0 mb-6">{title}</p>
 {body}
 </section>
 </main>
@@ -794,6 +967,49 @@ mod tests {
         assert!(html.contains("PostgreSQL 17.2"));
         assert!(html.contains("2026-05-11T08:00:00Z"));
         assert!(html.contains("Observing"));
+    }
+
+    #[test]
+    fn render_status_row_links_to_resource_detail() {
+        let l = Localizer::english();
+        let rows = vec![StatusRow {
+            kind: "postgres-instance".into(),
+            component_label: "PostgreSQL".into(),
+            instance_name: "primary".into(),
+            server_version: None,
+            last_observed_at: None,
+            last_observe_failed: false,
+            has_status: true,
+        }];
+        let html = render_status(&l, Some(&rows));
+        assert!(
+            html.contains(r#"href="/resource/postgres-instance/primary""#),
+            "/status row should link to the resource detail page; got: {html}"
+        );
+    }
+
+    #[test]
+    fn render_resource_store_missing_path() {
+        let l = Localizer::english();
+        let html = render_resource(&l, "postgres-instance", "primary", None, true);
+        assert!(html.contains("postgres-instance / primary"));
+        assert!(html.contains("needs a metadata store"));
+    }
+
+    #[test]
+    fn render_resource_not_found_path() {
+        let l = Localizer::english();
+        let html = render_resource(&l, "kanidm-instance", "missing", None, false);
+        assert!(html.contains("kanidm-instance / missing"));
+        assert!(html.contains("not in the metadata store"));
+    }
+
+    #[test]
+    fn urlencoding_passes_unreserved_chars_through() {
+        assert_eq!(urlencoding_min("postgres-instance"), "postgres-instance");
+        assert_eq!(urlencoding_min("primary"), "primary");
+        assert_eq!(urlencoding_min("a b"), "a%20b");
+        assert_eq!(urlencoding_min("a/b"), "a%2Fb");
     }
 
     #[test]

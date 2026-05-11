@@ -45,6 +45,21 @@ ui-status-state-unknown = Unknown
 ui-status-empty         = No resources have been observed yet. Bind a reconciler with `.with_state(store, instance_name)` and run it to populate this view.
 ui-status-store-missing = No metadata store is attached to this server. Start it with `computeza serve` (the binary wires a SqliteStore automatically) to see live reconciler state here.
 
+# --- Resource detail page ---
+
+ui-resource-title         = Resource detail
+ui-resource-not-found     = This resource is not in the metadata store. It may have been deleted, or the reconciler that owns it hasn't run yet.
+ui-resource-back          = Back to status
+ui-resource-uuid          = UUID
+ui-resource-revision      = Revision
+ui-resource-created-at    = Created at
+ui-resource-updated-at    = Updated at
+ui-resource-workspace     = Workspace
+ui-resource-spec-heading  = Desired spec
+ui-resource-status-heading = Observed status
+ui-resource-no-status     = No status snapshot recorded yet.
+ui-resource-store-missing = This page needs a metadata store. Start the server with `computeza serve` to attach one.
+
 # --- Install wizard ---
 
 ui-install-title         = Install a component
