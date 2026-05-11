@@ -26,3 +26,4 @@ anyhow = { workspace = true }
 computeza-core = { workspace = true }
 computeza-i18n = { workspace = true }
 computeza-ui-server = { workspace = true }
+computeza-driver-native = { workspace = true }

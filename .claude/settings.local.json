@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(git -C c:/computeza add CLAUDE.md)",
-      "Bash(git -C c:/computeza commit -m ' *)",
-      "Bash(git -C c:/computeza push)"
-    ]
-  }
-}

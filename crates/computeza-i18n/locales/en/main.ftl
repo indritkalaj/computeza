@@ -18,10 +18,14 @@ welcome-help   = Run `computeza --help` to see available commands.
 
 # --- Subcommand placeholders (will be replaced as commands are implemented) ---
 
-cmd-install-todo = `computeza install` — first-run installer wizard. Not yet implemented in this scaffold.
+cmd-install-todo = `computeza install <component>` — installs a managed component natively. v0.0.x supports `postgres` on Linux only.
 cmd-serve-todo   = `computeza serve` — start the operator console (web UI + reconciler). Not yet implemented in this scaffold.
 cmd-status-todo  = `computeza status` — report cluster health and reconciliation drift. Not yet implemented in this scaffold.
 cmd-license-todo = `computeza license` — show license tier, seat usage, activation health, expiry. Not yet implemented in this scaffold.
+
+# --- Install errors / platform gates ---
+
+install-postgres-linux-only = `computeza install postgres` is only supported on Linux in v0.0.x. macOS (launchd) and Windows (Services) variants ship in a follow-up release.
 
 # --- Generic ---
 

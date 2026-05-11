@@ -25,6 +25,21 @@ Instructions for Claude (and any other AI assistant) working in this repo.
    component itself. (Build-time deps like the Rust toolchain are a
    different story and are managed via `rust-toolchain.toml`.)
 
+   The installer is also responsible for **cross-platform PATH
+   registration** for any managed binary that exposes a CLI users may
+   invoke directly (`psql`, `kanidm`, `garage`, etc.):
+
+   - **Linux:** drop a script into `/etc/profile.d/` and a symlink into
+     `/usr/local/bin/`
+   - **macOS:** drop a file into `/etc/paths.d/` (system-wide) and a
+     symlink into `/usr/local/bin/`
+   - **Windows:** append to the machine `Path` via the registry
+     (`HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment`,
+     then broadcast `WM_SETTINGCHANGE`)
+
+   Per-user PATH variants when the install runs without privilege.
+   Uninstall reverses every PATH change it made.
+
 5. **The spec wins.** The canonical source of architectural and product
    truth is `docs/Architecture-and-Product-Specification-v1.5.pdf`
    (referenced in source comments as `spec §X.Y`). When the spec and the

@@ -1,25 +1,23 @@
 //! Computeza native driver — installs and manages components as native OS services.
 //!
-//! This is the v1.0 driver per spec §3.2 Tier 2. It implements the
-//! [`computeza_core::Driver`] trait against three host service managers:
+//! v1.0 driver per spec §3.2 Tier 2. Implements [`computeza_core::Driver`]
+//! against the host's service manager:
 //!
 //! - **Linux** — systemd unit lifecycle (spec §10.3)
 //! - **macOS** — launchd plist lifecycle (spec §10.3)
 //! - **Windows** — Windows Services via SCM (spec §10.3)
 //!
-//! Resource limits, hardening directives (NoNewPrivileges, PrivateTmp,
-//! sandboxing, Job Objects), per-component virtual service accounts, and
-//! firewall rule management all live here. Multi-node HA without
-//! Kubernetes (certificate distribution, peer discovery, Raft membership,
-//! rolling upgrades — spec §10.5) is also implemented in this crate.
+//! From the operator's perspective the experience is identical on all
+//! three platforms; only the lowest layer diverges. Cross-platform PATH
+//! registration for any managed binary that exposes a CLI users may
+//! invoke directly is also this crate's responsibility (see CLAUDE.md
+//! rule §4).
 //!
-//! Internally, the crate has three platform modules — `linux`, `macos`,
-//! `windows` — selected via cfg gates. From the operator's perspective
-//! the experience is identical on all three platforms; only the lowest
-//! layer diverges.
-//!
-//! Scaffold stub. Implementation is pending; the platform sub-modules
-//! (`linux` / `macos` / `windows`) will be added under cfg gates when the
-//! native service-manager integration starts.
+//! v0.0.x ships the Linux Postgres install path as the first end-to-end
+//! demonstration of the autonomous-installer mandate (spec §2.1). macOS
+//! and Windows implementations of the same surface follow.
 
 #![warn(missing_docs)]
+
+#[cfg(target_os = "linux")]
+pub mod linux;

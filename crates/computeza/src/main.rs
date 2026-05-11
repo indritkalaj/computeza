@@ -48,8 +48,11 @@ struct Cli {
 /// web console (spec §4.2).
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// First-run installer wizard.
-    Install,
+    /// First-run installer.
+    Install {
+        /// Component to install. v0.0.x ships only `postgres`.
+        component: InstallComponent,
+    },
     /// Start the operator console (web UI + reconciler loop).
     Serve {
         /// Address to bind the HTTP server to. Default `127.0.0.1:8400`
@@ -61,6 +64,13 @@ enum Command {
     Status,
     /// Show license tier, seat usage, activation health, expiry.
     License,
+}
+
+/// Components recognised by `computeza install`.
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum InstallComponent {
+    /// PostgreSQL (Linux-only in v0.0.x).
+    Postgres,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -80,10 +90,47 @@ fn main() -> anyhow::Result<()> {
                 .build()?;
             runtime.block_on(computeza_ui_server::serve(addr))?;
         }
-        Some(Command::Install) => println!("{}", l.t("cmd-install-todo")),
+        Some(Command::Install { component }) => {
+            install_component(component, &l)?;
+        }
         Some(Command::Status) => println!("{}", l.t("cmd-status-todo")),
         Some(Command::License) => println!("{}", l.t("cmd-license-todo")),
     }
+    Ok(())
+}
+
+/// Dispatch `computeza install <component>` to the appropriate platform
+/// install path. v0.0.x is Linux-only; macOS / Windows print a localized
+/// "not yet supported" message.
+fn install_component(component: InstallComponent, l: &Localizer) -> anyhow::Result<()> {
+    match component {
+        InstallComponent::Postgres => install_postgres(l),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn install_postgres(_l: &Localizer) -> anyhow::Result<()> {
+    use computeza_driver_native::linux::postgres;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(postgres::install(postgres::InstallOptions::default()))?;
+    println!(
+        "PostgreSQL installed.\n  bin_dir: {}\n  data_dir: {}\n  unit: {}\n  port: {}",
+        result.bin_dir.display(),
+        result.data_dir.display(),
+        result.unit_path.display(),
+        result.port,
+    );
+    if let Some(link) = result.psql_symlink {
+        println!("  psql:    {}", link.display());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn install_postgres(l: &Localizer) -> anyhow::Result<()> {
+    println!("{}", l.t("install-postgres-linux-only"));
     Ok(())
 }
 
