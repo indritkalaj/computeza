@@ -102,6 +102,10 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/install/postgres", post(install_postgres_handler))
         .route("/status", get(status_handler))
         .route("/resource/{kind}/{name}", get(resource_handler))
+        .route(
+            "/resource/{kind}/{name}/delete",
+            post(resource_delete_handler),
+        )
         .route("/healthz", get(healthz_handler))
         .route("/api/state/info", get(state_info_handler))
         .route("/static/computeza.css", get(css_handler))
@@ -405,6 +409,47 @@ async fn resource_handler(
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Html(render_resource(&l, &kind, &name, None, false)),
+            )
+        }
+    }
+}
+
+async fn resource_delete_handler(
+    State(state): State<AppState>,
+    Path((kind, name)): Path<(String, String)>,
+) -> (StatusCode, Html<String>) {
+    let l = Localizer::english();
+    let Some(store) = &state.store else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Html(render_install_result(
+                &l,
+                false,
+                &l.t("ui-resource-store-missing"),
+            )),
+        );
+    };
+    let key = ResourceKey::cluster_scoped(&kind, &name);
+    match store.delete(&key, None).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Html(render_resource_deleted(&l, &kind, &name)),
+        ),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                kind = %kind,
+                name = %name,
+                "resource_delete_handler: store.delete failed; likely cause: resource no longer exists. \
+                 The page surfaces the error so the operator can investigate via /status."
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Html(render_install_result(
+                    &l,
+                    false,
+                    &format!("{}: {e}", l.t("ui-resource-delete-failed")),
+                )),
             )
         }
     }
@@ -875,12 +920,21 @@ pub fn render_resource(
 <h3 class="text-indigo-300 text-sm" style="margin-bottom: 0.5rem;">{spec_heading}</h3>
 <pre class="text-slate-100 text-sm" style="background: rgba(0,0,0,0.25); padding: 1rem; overflow-x: auto; white-space: pre-wrap; word-break: break-word; margin-bottom: 1.5rem;">{spec_html}</pre>
 <h3 class="text-indigo-300 text-sm" style="margin-bottom: 0.5rem;">{status_heading}</h3>
-{status_block}"#,
+{status_block}
+<form method="post" action="/resource/{kind_enc}/{name_enc}/delete" style="margin-top: 2rem;" onsubmit="return confirm('{confirm}');">
+<button type="submit" class="text-orange-500" style="background: transparent; border: 1px solid currentColor; padding: 0.5rem 1rem; cursor: pointer;">{delete_button}</button>
+<p class="text-slate-500 text-sm" style="margin-top: 0.5rem;">{confirm_note}</p>
+</form>"#,
             uuid = html_escape(&sr.uuid.to_string()),
             revision = sr.revision,
             created_at = html_escape(&sr.created_at.to_rfc3339()),
             updated_at = html_escape(&sr.updated_at.to_rfc3339()),
             spec_html = html_escape(&spec_pretty),
+            kind_enc = urlencoding_min(kind),
+            name_enc = urlencoding_min(name),
+            confirm = html_escape(&localizer.t("ui-resource-delete-confirm")),
+            delete_button = html_escape(&localizer.t("ui-resource-delete-button")),
+            confirm_note = html_escape(&localizer.t("ui-resource-delete-confirm")),
         )
     } else {
         format!(
@@ -908,6 +962,40 @@ pub fn render_resource(
 <h2 class="text-2xl font-semibold text-slate-100 m-0 mb-3">{heading}</h2>
 <p class="text-slate-500 text-sm m-0 mb-6">{title}</p>
 {body}
+</section>
+</main>
+</body>
+</html>"#
+    )
+}
+
+/// Render the success page after a delete. Shows a small confirmation
+/// and links back to /status.
+#[must_use]
+pub fn render_resource_deleted(localizer: &Localizer, kind: &str, name: &str) -> String {
+    let app_title = localizer.t("ui-app-title");
+    let title = localizer.t("ui-resource-deleted");
+    let back = localizer.t("ui-resource-back");
+    let heading = format!("{} / {}", html_escape(kind), html_escape(name));
+
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>{title} -- {app_title}</title>
+<link rel="stylesheet" href="/static/computeza.css" />
+</head>
+<body class="bg-indigo-900 text-slate-100">
+<main class="mx-auto max-w-4xl p-12">
+<header class="border-b pb-6 mb-10">
+<h1 class="text-orange-500 text-2xl font-semibold tracking-tight m-0 mb-1">{app_title}</h1>
+<nav><a class="text-indigo-300 text-sm" href="/status">&lt;-&nbsp;{back}</a></nav>
+</header>
+<section>
+<h2 class="text-2xl font-semibold text-slate-100 m-0 mb-3">{heading}</h2>
+<p class="text-slate-100 m-0">{title}</p>
 </section>
 </main>
 </body>

@@ -125,5 +125,44 @@ async fn status_and_resource_pages_surface_persisted_state() {
     let body = resp.text().await.expect("body text");
     assert!(body.contains("not in the metadata store"));
 
+    // The detail page should expose a delete form pointing at the right URL.
+    let body = client
+        .get(format!("http://{addr}/resource/postgres-instance/primary"))
+        .send()
+        .await
+        .expect("GET /resource/postgres-instance/primary")
+        .text()
+        .await
+        .expect("body text");
+    assert!(
+        body.contains(r#"action="/resource/postgres-instance/primary/delete""#),
+        "detail page should host a delete form pointing at the right URL"
+    );
+    assert!(body.contains("Delete resource"));
+
+    // POST the delete and confirm the row is gone afterwards.
+    let resp = client
+        .post(format!(
+            "http://{addr}/resource/postgres-instance/primary/delete"
+        ))
+        .send()
+        .await
+        .expect("POST delete");
+    assert!(
+        resp.status().is_success(),
+        "delete should succeed; got {}",
+        resp.status()
+    );
+    let body = resp.text().await.expect("body text");
+    assert!(body.contains("Resource removed from the metadata store."));
+
+    // Subsequent GET should now 404.
+    let resp = client
+        .get(format!("http://{addr}/resource/postgres-instance/primary"))
+        .send()
+        .await
+        .expect("GET after delete");
+    assert_eq!(resp.status().as_u16(), 404);
+
     server.abort();
 }

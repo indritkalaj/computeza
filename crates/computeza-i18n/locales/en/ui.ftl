@@ -59,6 +59,10 @@ ui-resource-spec-heading  = Desired spec
 ui-resource-status-heading = Observed status
 ui-resource-no-status     = No status snapshot recorded yet.
 ui-resource-store-missing = This page needs a metadata store. Start the server with `computeza serve` to attach one.
+ui-resource-delete-button = Delete resource
+ui-resource-delete-confirm = This drops the resource from the metadata store. The on-disk service (if any) is not touched.
+ui-resource-deleted       = Resource removed from the metadata store.
+ui-resource-delete-failed = Could not delete resource:
 
 # --- Install wizard ---
 
