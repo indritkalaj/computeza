@@ -69,6 +69,10 @@ uuid = { version = "1", features = ["v4", "v7", "serde"] }
 
 # --- Secrets (never leak via Debug/Display) ---
 secrecy = { version = "0.10", features = ["serde"] }
+# aes-gcm 0.11 and argon2 0.6 are RC-only as of April 2026; stay on 0.10 / 0.5.
+aes-gcm = "0.10"
+argon2 = "0.5"
+zeroize = { version = "1", features = ["derive"] }
 
 # --- SQL drivers ---
 sqlx = { version = "0.8", default-features = false, features = [

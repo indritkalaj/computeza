@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Computeza secrets — AES-256-GCM encrypted secret storage with age key wrapping"
+description = "Computeza secrets — AES-256-GCM encrypted secret storage with argon2-derived KEK; HSM / Vault / KMIP integrations behind feature flags (forthcoming)"
 
 [lints]
 workspace = true
@@ -15,4 +15,16 @@ workspace = true
 computeza-core = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+secrecy = { workspace = true }
+aes-gcm = { workspace = true }
+argon2 = { workspace = true }
+zeroize = { workspace = true }
+base64ct = { version = "1", features = ["std"] }
+rand = "0.8"
 thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
