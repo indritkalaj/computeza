@@ -60,10 +60,11 @@ impl AuditLog {
         opts.create(true).append(true).read(false);
         // On Unix create the file with restrictive mode so it's not
         // world-readable. Audit logs contain every administrative action
-        // on the cluster; treat them as sensitive.
+        // on the cluster; treat them as sensitive. tokio's OpenOptions
+        // exposes `.mode()` as an inherent method on Unix; no trait
+        // import needed.
         #[cfg(unix)]
         {
-            use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
         let file = opts.open(&path).await?;
