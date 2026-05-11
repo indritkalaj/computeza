@@ -318,21 +318,33 @@ async fn create_data_dir(data_dir: &Path) -> Result<(), InstallError> {
 /// pg_ctl start/stop calls.
 ///
 /// Idempotency: if a service of the same name exists (from a prior
-/// failed run), we stop + delete it first so the register call gets a
-/// clean slate.
+/// run), we stop + unregister via every available mechanism and wait
+/// for SCM to fully evict the entry before calling `pg_ctl register`.
+/// Without the wait, the new register call sees the old service in
+/// `DELETE_PENDING` state and fails with `service "..." already
+/// registered`.
 async fn register_service(
     bin_dir: &Path,
     data_dir: &Path,
     service_name: &str,
     port: u16,
 ) -> Result<(), InstallError> {
-    // Wipe any leftover broken service from a previous attempt. Both
-    // sc::stop and sc::delete are idempotent (they swallow "service
-    // does not exist" / "service not running").
+    let pg_ctl = bin_dir.join("pg_ctl.exe");
+
+    // Tear down any prior registration. Each step is idempotent;
+    // we swallow non-zero exits because the service may not exist
+    // (first-ever install) or may already be in DELETE_PENDING.
     let _ = sc::stop(service_name).await;
+    let _ = pg_ctl_unregister(&pg_ctl, service_name).await;
     let _ = sc::delete(service_name).await;
 
-    let pg_ctl = bin_dir.join("pg_ctl.exe");
+    // SCM marks a deleted service as `DELETE_PENDING` until every
+    // handle to it is closed (Services snap-in, sc.exe query loops,
+    // etc.). `pg_ctl register` sees DELETE_PENDING as "exists" and
+    // fails with `service "..." already registered`. Wait briefly
+    // for SCM to actually evict the entry.
+    wait_for_service_absent(service_name, Duration::from_secs(15)).await;
+
     info!(pg_ctl = %pg_ctl.display(), service = %service_name, "registering service via pg_ctl");
     let out = Command::new(&pg_ctl)
         .arg("register")
@@ -356,6 +368,65 @@ async fn register_service(
         });
     }
     Ok(())
+}
+
+/// `pg_ctl unregister -N <name>` -- pg_ctl's own service-removal
+/// path. Mirrors `pg_ctl register` so the two stay symmetric.
+/// Non-zero exits are swallowed (the service may not exist).
+async fn pg_ctl_unregister(pg_ctl: &Path, service_name: &str) -> Result<(), InstallError> {
+    let out = Command::new(pg_ctl)
+        .arg("unregister")
+        .arg("-N")
+        .arg(service_name)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await?;
+    if !out.status.success() {
+        debug!(
+            stderr = %String::from_utf8_lossy(&out.stderr),
+            "pg_ctl unregister returned non-zero -- assuming service is absent and continuing"
+        );
+    }
+    Ok(())
+}
+
+/// Poll `sc.exe query <name>` until it returns 1060
+/// (ERROR_SERVICE_DOES_NOT_EXIST) or the deadline expires. Used to
+/// wait out the SCM `DELETE_PENDING` window between `sc delete` and
+/// the next `pg_ctl register`.
+async fn wait_for_service_absent(service_name: &str, timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let out = Command::new("sc.exe")
+            .args(["query", service_name])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await;
+        match out {
+            Ok(o) if o.status.code() == Some(1060) => {
+                debug!(service = %service_name, "service confirmed absent in SCM");
+                return;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                debug!(error = %e, "sc.exe query failed; aborting absence wait");
+                return;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            warn!(
+                service = %service_name,
+                "service did not leave DELETE_PENDING within timeout; \
+                 pg_ctl register may still fail. \
+                 Workaround: close the Services snap-in (services.msc) and any other \
+                 tool holding a handle to the service, then retry."
+            );
+            return;
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
 }
 
 async fn run_initdb_if_needed(bin_dir: &Path, data_dir: &Path) -> Result<(), InstallError> {
