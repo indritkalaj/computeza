@@ -29,6 +29,16 @@ ui-home-card-state-body       = Resource counts per kind, JSON-shaped for progra
 ui-home-store-empty           = No resources registered.
 ui-home-store-missing         = No metadata store attached on this server.
 
+# --- Metadata store page ---
+
+ui-state-title         = Metadata store
+ui-state-intro         = The raw shape of the SQLite-backed metadata graph that drives the operator console. Each row is one resource kind and how many instances of it are registered.
+ui-state-col-kind      = Kind
+ui-state-col-count     = Instances
+ui-state-store-missing = No metadata store is attached to this server. Start it with `computeza serve` to populate this view.
+ui-state-store-empty   = The store is attached but nothing has been registered yet. Run the install wizard or apply a spec to populate it.
+ui-state-view-json     = View raw JSON
+
 # --- Health check ---
 
 ui-healthz-ok         = ok

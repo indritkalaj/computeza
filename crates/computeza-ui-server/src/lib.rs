@@ -122,6 +122,7 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/install/job/{id}", get(install_job_handler))
         .route("/api/install/job/{id}", get(install_job_api_handler))
         .route("/status", get(status_handler))
+        .route("/state", get(state_page_handler))
         .route("/resource/{kind}/{name}", get(resource_handler))
         .route(
             "/resource/{kind}/{name}/delete",
@@ -442,6 +443,52 @@ async fn state_info_handler(State(state): State<AppState>) -> Json<serde_json::V
 async fn components_handler() -> Html<String> {
     let l = Localizer::english();
     Html(render_components(&l))
+}
+
+async fn state_page_handler(State(state): State<AppState>) -> Html<String> {
+    let l = Localizer::english();
+    let Some(store) = &state.store else {
+        return Html(render_state_page(&l, None));
+    };
+    // Pairs with the `/api/state/info` JSON endpoint -- same kinds,
+    // same per-kind list() calls. Any errors are surfaced inline in
+    // the row rather than crashing the page.
+    let kinds: &[(&str, &str)] = &[
+        ("postgres-instance", "postgres"),
+        ("kanidm-instance", "kanidm"),
+        ("garage-instance", "garage"),
+        ("lakekeeper-instance", "lakekeeper"),
+        ("databend-instance", "databend"),
+        ("qdrant-instance", "qdrant"),
+        ("restate-instance", "restate"),
+        ("greptime-instance", "greptime"),
+        ("grafana-instance", "grafana"),
+        ("openfga-instance", "openfga"),
+    ];
+    let mut rows: Vec<StateRow> = Vec::with_capacity(kinds.len());
+    for (kind, slug) in kinds {
+        let count = match store.list(kind, None).await {
+            Ok(v) => Ok(v.len()),
+            Err(e) => Err(e.to_string()),
+        };
+        rows.push(StateRow {
+            kind: (*kind).into(),
+            component_label: l.t(&format!("component-{slug}-name")),
+            count,
+        });
+    }
+    Html(render_state_page(&l, Some(&rows)))
+}
+
+/// One row in the `/state` table.
+#[derive(Clone, Debug)]
+pub struct StateRow {
+    /// Resource kind, e.g. `postgres-instance`.
+    pub kind: String,
+    /// Localized component name, e.g. "PostgreSQL".
+    pub component_label: String,
+    /// Instance count, or the error string from the store if listing failed.
+    pub count: Result<usize, String>,
 }
 
 /// One row in the `/status` table -- a single resource instance and its
@@ -792,7 +839,7 @@ pub fn render_home(localizer: &Localizer, store_summary: StoreSummary) -> String
         c2 = render_home_card("/install", &card_install_title, &card_install_body, None),
         c3 = render_home_card("/status", &card_status_title, &card_status_body, None),
         c4 = render_home_card(
-            "/api/state/info",
+            "/state",
             &card_state_title,
             &card_state_body,
             Some(&store_line),
@@ -1207,6 +1254,99 @@ pub fn render_status(localizer: &Localizer, rows: Option<&[StatusRow]>) -> Strin
     render_shell(localizer, &title, NavLink::Status, &body)
 }
 
+/// Render the `/state` page: per-kind resource counts pulled live from
+/// the SqliteStore. `rows = None` means no store is attached; `Some(&[])`
+/// shouldn't happen because the handler always seeds the kind list, but
+/// is handled gracefully if it does. The bottom of the page links to
+/// the `/api/state/info` JSON endpoint for programmatic callers.
+#[must_use]
+pub fn render_state_page(localizer: &Localizer, rows: Option<&[StateRow]>) -> String {
+    let title = localizer.t("ui-state-title");
+    let intro = localizer.t("ui-state-intro");
+    let col_kind = localizer.t("ui-state-col-kind");
+    let col_count = localizer.t("ui-state-col-count");
+    let view_json = localizer.t("ui-state-view-json");
+
+    let table_or_hint = match rows {
+        None => format!(
+            r#"<div class="cz-card"><p class="cz-card-body" style="margin: 0; color: var(--warn);">{}</p></div>"#,
+            html_escape(&localizer.t("ui-state-store-missing"))
+        ),
+        Some(rs) if rs.iter().all(|r| matches!(&r.count, Ok(0))) => {
+            // Store attached, every kind queried fine, but every count
+            // is zero -- we surface a "store is empty" hint rather
+            // than a wall of zeros.
+            format!(
+                r#"<div class="cz-card"><p class="cz-card-body" style="margin: 0;">{}</p></div>"#,
+                html_escape(&localizer.t("ui-state-store-empty"))
+            )
+        }
+        Some(rs) => {
+            let body_rows: String = rs
+                .iter()
+                .map(|r| {
+                    let count_cell = match &r.count {
+                        Ok(n) => {
+                            let badge = if *n > 0 {
+                                "cz-badge cz-badge-ok"
+                            } else {
+                                "cz-badge cz-badge-info"
+                            };
+                            format!(r#"<span class="{badge}">{n}</span>"#)
+                        }
+                        Err(e) => format!(
+                            r#"<span class="cz-badge cz-badge-fail">error</span> <span class="cz-cell-dim">{}</span>"#,
+                            html_escape(e)
+                        ),
+                    };
+                    format!(
+                        "<tr>\
+                         <td class=\"cz-cell-mono cz-cell-dim\">{kind}</td>\
+                         <td class=\"cz-strong\">{label}</td>\
+                         <td>{count_cell}</td>\
+                         </tr>",
+                        kind = html_escape(&r.kind),
+                        label = html_escape(&r.component_label),
+                        count_cell = count_cell,
+                    )
+                })
+                .collect();
+            format!(
+                r#"<div class="cz-table-wrap">
+<table class="cz-table">
+<thead><tr>
+<th>{col_kind}</th>
+<th>Component</th>
+<th>{col_count}</th>
+</tr></thead>
+<tbody>{body_rows}</tbody>
+</table>
+</div>"#,
+                col_kind = html_escape(&col_kind),
+                col_count = html_escape(&col_count),
+            )
+        }
+    };
+
+    let body = format!(
+        r#"<section class="cz-hero">
+<h1>{title}</h1>
+<p>{intro}</p>
+</section>
+<section class="cz-section">
+{table_or_hint}
+</section>
+<section class="cz-section">
+<a class="cz-btn" href="/api/state/info">{view_json}</a>
+</section>"#,
+        title = html_escape(&title),
+        intro = html_escape(&intro),
+        view_json = html_escape(&view_json),
+    );
+
+    render_shell(localizer, &title, NavLink::None, &body)
+}
+
 /// Render the `/resource/{kind}/{name}` page. `stored = Some(_)` means
 /// the resource exists and we render the full metadata + spec + status
 /// JSON; `stored = None` with `store_missing = false` means a clean 404
@@ -1518,7 +1658,7 @@ mod tests {
             r#"href="/components""#,
             r#"href="/install""#,
             r#"href="/status""#,
-            r#"href="/api/state/info""#,
+            r#"href="/state""#,
         ] {
             assert!(
                 html.contains(href),
