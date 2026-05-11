@@ -8,6 +8,7 @@ use computeza_core::{
     reconciler::{Context, Outcome},
     Driver, Error as CoreError, Health, NoOpDriver, Reconciler,
 };
+use computeza_state::{ResourceKey, SqliteStore, Store};
 use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
 use tokio::sync::{Mutex, OnceCell};
@@ -49,7 +50,15 @@ pub struct OpenFgaReconciler<D: Driver = NoOpDriver> {
     admin_token: SecretString,
     client: OnceCell<reqwest::Client>,
     last_observed: Mutex<Option<chrono::DateTime<Utc>>>,
+    /// Optional state-store handle. See `KanidmReconciler`.
+    state: Option<StateBinding>,
     _driver: std::marker::PhantomData<Arc<D>>,
+}
+
+/// Pair of (store, instance name) used to persist status.
+struct StateBinding {
+    store: Arc<SqliteStore>,
+    instance_name: String,
 }
 
 impl<D: Driver> OpenFgaReconciler<D> {
@@ -60,7 +69,40 @@ impl<D: Driver> OpenFgaReconciler<D> {
             admin_token,
             client: OnceCell::new(),
             last_observed: Mutex::new(None),
+            state: None,
             _driver: std::marker::PhantomData,
+        }
+    }
+
+    /// Attach a state store. See `KanidmReconciler::with_state`.
+    #[must_use]
+    pub fn with_state(mut self, store: Arc<SqliteStore>, instance_name: impl Into<String>) -> Self {
+        self.state = Some(StateBinding {
+            store,
+            instance_name: instance_name.into(),
+        });
+        self
+    }
+
+    /// Persist the latest status under `openfga-instance/<instance_name>`
+    /// if a state store is attached. Best-effort.
+    async fn persist_status(&self, status: &OpenFgaStatus) {
+        let Some(binding) = &self.state else { return };
+        let key = ResourceKey::cluster_scoped("openfga-instance", &binding.instance_name);
+        let status_json = match serde_json::to_value(status) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "failed to serialize OpenFgaStatus for state persistence");
+                return;
+            }
+        };
+        if let Err(e) = binding.store.put_status(&key, &status_json).await {
+            warn!(
+                error = %e,
+                instance = %binding.instance_name,
+                "failed to put_status; status survives in-memory only this cycle \
+                 (check disk + SQLite file permissions; reconciler will retry on next observe)"
+            );
         }
     }
 
@@ -147,16 +189,23 @@ impl<D: Driver + 'static> Reconciler for OpenFgaReconciler<D> {
     type Plan = ();
 
     async fn observe(&self, _ctx: &Context) -> Result<OpenFgaStatus, CoreError> {
-        match self.snapshot().await {
-            Ok(s) => Ok(s),
+        let status = match self.snapshot().await {
+            Ok(s) => s,
             Err(e) => {
-                warn!(error = %e, "openfga observe failed");
-                Ok(OpenFgaStatus {
+                warn!(
+                    error = %e,
+                    "openfga observe failed; returning sentinel status with last_observe_failed=true. \
+                     Reconciler will retry on next tick. Check: (1) HTTP port reachable, \
+                     (2) admin token / preshared key valid, (3) OpenFGA has finished startup."
+                );
+                OpenFgaStatus {
                     last_observe_failed: true,
                     ..OpenFgaStatus::default()
-                })
+                }
             }
-        }
+        };
+        self.persist_status(&status).await;
+        Ok(status)
     }
 
     async fn plan(&self, _desired: &OpenFgaSpec, _actual: &OpenFgaStatus) -> Result<(), CoreError> {
