@@ -36,6 +36,8 @@ use tokio::{
 };
 use tracing::{info, warn};
 
+use crate::progress::{InstallPhase, ProgressHandle};
+
 /// One pinned upstream bundle: where to download it from, what version
 /// it represents, and the SHA-256 checksum we verify after download.
 #[derive(Clone, Debug)]
@@ -108,7 +110,11 @@ pub enum FetchError {
 ///       <bin_subpath>/
 ///         postgres.exe, initdb.exe, psql.exe, ...
 /// ```
-pub async fn fetch_and_extract(cache_root: &Path, bundle: &Bundle) -> Result<PathBuf, FetchError> {
+pub async fn fetch_and_extract(
+    cache_root: &Path,
+    bundle: &Bundle,
+    progress: &ProgressHandle,
+) -> Result<PathBuf, FetchError> {
     let extracted_root = cache_root.join(bundle.version);
     let bin_dir = extracted_root.join(bundle.bin_subpath);
     let sentinel = extracted_root.join(".computeza-extracted");
@@ -119,6 +125,10 @@ pub async fn fetch_and_extract(cache_root: &Path, bundle: &Bundle) -> Result<Pat
             cache = %extracted_root.display(),
             "binary bundle already extracted; skipping download"
         );
+        progress.set_message(format!(
+            "Using cached binaries at {}",
+            extracted_root.display()
+        ));
         return Ok(bin_dir);
     }
 
@@ -131,9 +141,13 @@ pub async fn fetch_and_extract(cache_root: &Path, bundle: &Bundle) -> Result<Pat
         target = %extracted_root.display(),
         "downloading binary bundle"
     );
-    download_stream(bundle.url, &zip_path).await?;
+    progress.set_phase(InstallPhase::Downloading);
+    progress.set_message(format!("Downloading {}", bundle.url));
+    download_stream(bundle.url, &zip_path, progress).await?;
 
     if let Some(expected) = bundle.sha256 {
+        progress.set_phase(InstallPhase::Verifying);
+        progress.set_message("Verifying SHA-256");
         let actual = sha256_file(&zip_path).await?;
         if !actual.eq_ignore_ascii_case(expected) {
             // Don't leave a half-trusted file on disk.
@@ -158,6 +172,8 @@ pub async fn fetch_and_extract(cache_root: &Path, bundle: &Bundle) -> Result<Pat
         target = %extracted_root.display(),
         "extracting binary bundle"
     );
+    progress.set_phase(InstallPhase::Extracting);
+    progress.set_message(format!("Extracting to {}", extracted_root.display()));
     let zip_clone = zip_path.clone();
     let target_clone = extracted_root.clone();
     tokio::task::spawn_blocking(move || extract_zip(&zip_clone, &target_clone))
@@ -173,7 +189,11 @@ pub async fn fetch_and_extract(cache_root: &Path, bundle: &Bundle) -> Result<Pat
     Ok(bin_dir)
 }
 
-async fn download_stream(url: &str, dest: &Path) -> Result<(), FetchError> {
+async fn download_stream(
+    url: &str,
+    dest: &Path,
+    progress: &ProgressHandle,
+) -> Result<(), FetchError> {
     let resp = reqwest::Client::builder()
         // PostgreSQL bundles take a while; don't fail mid-stream on a
         // slow link. Per-chunk reads have their own timeouts inside
@@ -198,14 +218,20 @@ async fn download_stream(url: &str, dest: &Path) -> Result<(), FetchError> {
         });
     }
 
+    let total = resp.content_length();
+    progress.set_bytes(0, total);
+
     let mut file = fs::File::create(dest).await?;
     let mut stream = resp.bytes_stream();
+    let mut downloaded: u64 = 0;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|source| FetchError::Download {
             url: url.into(),
             source,
         })?;
         file.write_all(&chunk).await?;
+        downloaded += chunk.len() as u64;
+        progress.set_bytes(downloaded, total);
     }
     file.flush().await?;
     Ok(())

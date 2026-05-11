@@ -23,6 +23,7 @@ tokio = { workspace = true }
 anyhow = { workspace = true }
 sha2 = { workspace = true }
 hex = "0.4"
+chrono = { workspace = true }
 
 # Used on every target so the crate still compiles for tests / type-check
 # even where the download path is not wired in. The non-Windows installers

@@ -20,6 +20,7 @@
 #![warn(missing_docs)]
 
 pub mod fetch;
+pub mod progress;
 
 #[cfg(target_os = "linux")]
 pub mod linux;

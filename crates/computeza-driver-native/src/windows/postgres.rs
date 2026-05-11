@@ -27,17 +27,25 @@ use tokio::{fs, net::TcpStream, process::Command, time::sleep};
 use tracing::{debug, info, warn};
 
 use super::{path, sc};
-use crate::fetch::{self, Bundle, FetchError};
+use crate::{
+    fetch::{self, Bundle, FetchError},
+    progress::{InstallPhase, ProgressHandle},
+};
 
 /// Pinned PostgreSQL Windows bundle. EDB publishes the same artifact
 /// for every Computeza release; we update both the URL and the SHA-256
 /// in lockstep when bumping versions.
 ///
+/// Currently tracking PostgreSQL 18.3 (the latest major as of May
+/// 2026). The CI script under `scripts/check-pg-bundle.py` should be
+/// run before any release to confirm the URL still resolves and to
+/// refresh the pinned SHA-256.
+///
 /// SHA-256 is `None` for v0.0.x -- pin it before any stable release.
 /// AGENTS.md tracks the audit trail when checksums change.
 const PG_WINDOWS_BUNDLE: Bundle = Bundle {
-    version: "17.2-3",
-    url: "https://get.enterprisedb.com/postgresql/postgresql-17.2-3-windows-x64-binaries.zip",
+    version: "18.3-1",
+    url: "https://get.enterprisedb.com/postgresql/postgresql-18.3-1-windows-x64-binaries.zip",
     sha256: None,
     bin_subpath: "pgsql/bin",
 };
@@ -136,6 +144,7 @@ pub enum InstallError {
 /// We also check our own cache root (populated by `fetch::fetch_and_extract`)
 /// as the last fallback, before deciding to download.
 const CANDIDATE_BIN_DIRS: &[&str] = &[
+    "C:\\Program Files\\PostgreSQL\\18\\bin",
     "C:\\Program Files\\PostgreSQL\\17\\bin",
     "C:\\Program Files\\PostgreSQL\\16\\bin",
     "C:\\Program Files\\PostgreSQL\\15\\bin",
@@ -167,14 +176,21 @@ async fn detect_bin_dir() -> Result<PathBuf, Vec<PathBuf>> {
 /// The last leg implements the user mandate that the installer "should
 /// install the components automatically". If `opts.bin_dir` is set or
 /// a Program Files install is found, we never touch the network.
-async fn ensure_bin_dir(opts: &InstallOptions) -> Result<PathBuf, InstallError> {
+async fn ensure_bin_dir(
+    opts: &InstallOptions,
+    progress: &ProgressHandle,
+) -> Result<PathBuf, InstallError> {
+    progress.set_phase(InstallPhase::DetectingBinaries);
+    progress.set_message("Looking for an existing PostgreSQL install");
     if let Some(d) = &opts.bin_dir {
         info!(bin_dir = %d.display(), "using caller-supplied bin_dir");
+        progress.set_message(format!("Using {}", d.display()));
         return Ok(d.clone());
     }
     match detect_bin_dir().await {
         Ok(d) => {
             info!(bin_dir = %d.display(), "detected existing host PostgreSQL install");
+            progress.set_message(format!("Found {}", d.display()));
             Ok(d)
         }
         Err(tried) => {
@@ -183,8 +199,11 @@ async fn ensure_bin_dir(opts: &InstallOptions) -> Result<PathBuf, InstallError> 
                 "no host PostgreSQL install found; falling through to managed bundle download. \
                  To skip this step pre-install PostgreSQL or pass InstallOptions::bin_dir."
             );
+            progress.set_message(
+                "No host PostgreSQL detected; downloading bundled PostgreSQL from EDB",
+            );
             let cache_root = opts.root_dir.join("binaries");
-            let bin = fetch::fetch_and_extract(&cache_root, &PG_WINDOWS_BUNDLE).await?;
+            let bin = fetch::fetch_and_extract(&cache_root, &PG_WINDOWS_BUNDLE, progress).await?;
             // Sanity-check: the binary we expect must actually exist
             // after extraction. If not, the bundle layout has changed
             // and we need to update `bin_subpath`.
@@ -199,13 +218,25 @@ async fn ensure_bin_dir(opts: &InstallOptions) -> Result<PathBuf, InstallError> 
     }
 }
 
-/// Install Postgres natively on Windows.
+/// Install Postgres natively on Windows without progress reporting.
 pub async fn install(opts: InstallOptions) -> Result<Installed, InstallError> {
-    let bin_dir = ensure_bin_dir(&opts).await?;
+    install_with_progress(opts, &ProgressHandle::noop()).await
+}
+
+/// Install Postgres natively on Windows while reporting progress
+/// through `progress`. The CLI uses `install` (no progress); the UI
+/// server uses this entry point so the wizard can render a live bar.
+pub async fn install_with_progress(
+    opts: InstallOptions,
+    progress: &ProgressHandle,
+) -> Result<Installed, InstallError> {
+    let bin_dir = ensure_bin_dir(&opts, progress).await?;
     info!(bin_dir = %bin_dir.display(), "resolved postgres binaries");
 
     let data_dir = opts.root_dir.join("data");
 
+    progress.set_phase(InstallPhase::Initdb);
+    progress.set_message(format!("Initializing data dir at {}", data_dir.display()));
     create_data_dir(&data_dir).await?;
     run_initdb_if_needed(&bin_dir, &data_dir).await?;
 
@@ -217,6 +248,8 @@ pub async fn install(opts: InstallOptions) -> Result<Installed, InstallError> {
         data_dir.display(),
         opts.port
     );
+    progress.set_phase(InstallPhase::RegisteringService);
+    progress.set_message(format!("Registering Windows service {}", opts.service_name));
     sc::create(&sc::ServiceSpec {
         name: &opts.service_name,
         display_name: SERVICE_DISPLAY_NAME,
@@ -224,10 +257,19 @@ pub async fn install(opts: InstallOptions) -> Result<Installed, InstallError> {
         start: "auto",
     })
     .await?;
+    progress.set_phase(InstallPhase::StartingService);
+    progress.set_message("Starting service");
     sc::start(&opts.service_name).await?;
 
+    progress.set_phase(InstallPhase::WaitingForReady);
+    progress.set_message(format!(
+        "Waiting for port {} to accept connections",
+        opts.port
+    ));
     wait_for_ready("127.0.0.1", opts.port, Duration::from_secs(30)).await?;
 
+    progress.set_phase(InstallPhase::RegisteringPath);
+    progress.set_message("Registering psql in PATH");
     let psql_exe = bin_dir.join("psql.exe");
     let psql_shim = match path::register("psql", &psql_exe).await {
         Ok(p) => Some(p),

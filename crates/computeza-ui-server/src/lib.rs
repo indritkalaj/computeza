@@ -1,21 +1,23 @@
-//! Computeza UI server -- Leptos SSR + axum HTTP server.
+//! Computeza UI server -- axum HTTP server, server-rendered HTML.
 //!
-//! Per spec section 4.1, the operator console is a server-rendered Rust application
-//! using Leptos in SSR mode with selective hydration. This crate is the
-//! entry point: it wires the axum router, hosts the request handlers, and
-//! renders Leptos `view!` trees to HTML on the server.
+//! Per spec section 4.1, the operator console is a server-rendered
+//! Rust application. v0.0.x renders HTML directly from string
+//! templates; Leptos `view!` trees will return for v0.1 once we have
+//! interactive surfaces (the pipeline canvas) that benefit from
+//! reactive primitives.
 //!
 //! # What v0.0.x ships
 //!
-//! - `serve(addr)` boots an axum server bound to the given address
-//! - `GET /` renders a localized welcome page using Leptos's `view!` macro
-//! - `GET /healthz` returns a localized "ok" string for liveness probes
-//! - `tower-http::TraceLayer` emits structured tracing for every request
+//! - `serve(addr)` boots an axum server bound to the given address.
+//! - The pages `/`, `/components`, `/install`, `/install/job/{id}`,
+//!   `/status`, `/resource/{kind}/{name}` make up the operator surface.
+//! - `/api/install/job/{id}` and `/api/state/info` are the JSON
+//!   endpoints behind the wizard and the metadata-store card.
+//! - `tower-http::TraceLayer` emits structured tracing per request.
 //!
-//! Hydration (client-side WASM that re-attaches reactivity) is deferred --
-//! the v0.0.x console is purely server-rendered, no JavaScript. We add
-//! hydration once we have an actual interactive surface (the install
-//! wizard or the pipeline canvas) that needs it.
+//! All UI pages share the `render_shell` helper, which lays down the
+//! top navigation, page container, and footer. Individual page
+//! renderers produce the body fragment.
 //!
 //! # i18n
 //!
@@ -33,30 +35,46 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use computeza_driver_native::progress::{InstallProgress, ProgressHandle};
 use computeza_i18n::Localizer;
 use computeza_state::{ResourceKey, SqliteStore, Store};
-use leptos::prelude::*;
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex as StdMutex},
+};
 use tower_http::trace::TraceLayer;
+use uuid::Uuid;
 
 /// Tailwind-compatible utility CSS, embedded at compile time. Served at
 /// `/static/computeza.css` and referenced from the home page.
 const COMPUTEZA_CSS: &str = include_str!("../assets/computeza.css");
 
+/// In-process registry of background install jobs. Each entry maps a
+/// freshly-minted UUID to the shared progress state the driver writes
+/// into and the wizard polls. Jobs live for the lifetime of the
+/// process -- v0.0.x doesn't persist them; restarting the server
+/// forgets in-flight work.
+pub type JobRegistry = Arc<StdMutex<HashMap<String, Arc<StdMutex<InstallProgress>>>>>;
+
 /// Shared state passed to every handler. Holds the `SqliteStore` (when
-/// `computeza serve` opens one) plus future shared services. Wrapped in
-/// `Arc` so axum can clone it cheaply per request.
+/// `computeza serve` opens one) plus the background-job registry.
+/// Wrapped in `Arc` so axum can clone it cheaply per request.
 #[derive(Clone)]
 pub struct AppState {
     /// Persistent metadata store, `None` for the unit-test smoke router.
     pub store: Option<Arc<SqliteStore>>,
+    /// Background install jobs in flight or recently finished.
+    pub jobs: JobRegistry,
 }
 
 impl AppState {
     /// Construct an empty state for tests / minimal serve.
     #[must_use]
     pub fn empty() -> Self {
-        Self { store: None }
+        Self {
+            store: None,
+            jobs: Arc::new(StdMutex::new(HashMap::new())),
+        }
     }
 
     /// Construct with a backing SqliteStore.
@@ -64,6 +82,7 @@ impl AppState {
     pub fn with_store(store: SqliteStore) -> Self {
         Self {
             store: Some(Arc::new(store)),
+            jobs: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 }
@@ -100,6 +119,8 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/components", get(components_handler))
         .route("/install", get(install_handler))
         .route("/install/postgres", post(install_postgres_handler))
+        .route("/install/job/{id}", get(install_job_handler))
+        .route("/api/install/job/{id}", get(install_job_api_handler))
         .route("/status", get(status_handler))
         .route("/resource/{kind}/{name}", get(resource_handler))
         .route(
@@ -127,54 +148,164 @@ struct InstallForm {
 async fn install_postgres_handler(
     State(state): State<AppState>,
     Form(form): Form<InstallForm>,
-) -> Html<String> {
+) -> Response {
     let l = Localizer::english();
     if form.component != "postgres" {
         return Html(render_install_result(
             &l,
             false,
             &format!("unknown component: {}", form.component),
-        ));
+        ))
+        .into_response();
     }
-    match run_postgres_install().await {
-        Ok((summary, port)) => {
-            // Bootstrap a postgres-instance/local row in the store so the
-            // operator immediately sees the install on /status. The
-            // reconciler hasn't run yet, so it surfaces as "Unknown" until
-            // the first observe lands.
-            let mut summary = summary;
-            if let Some(store) = &state.store {
-                let key = ResourceKey::cluster_scoped("postgres-instance", "local");
-                let spec = serde_json::json!({
-                    "endpoint": {
-                        "host": "127.0.0.1",
-                        "port": port,
-                        "superuser": "postgres",
-                    },
-                    "databases": [],
-                    "prune": false,
-                });
-                match store.save(&key, &spec, None).await {
-                    Ok(_) => {
-                        summary.push_str(
-                            "\n\nRegistered as postgres-instance/local in the metadata store.\nVisit /status to see it.",
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "install_postgres_handler: store.save failed; install succeeded but the resource is not registered. \
-                             Likely cause: a postgres-instance/local already exists. Check /status."
-                        );
-                        summary.push_str(&format!(
-                            "\n\nNote: did not register postgres-instance/local ({e}). Visit /status to inspect current state."
-                        ));
+
+    // Mint a job id, store an empty progress object, spawn the install
+    // in the background, and redirect the browser to the wizard page
+    // that polls for updates.
+    let job_id = Uuid::new_v4().to_string();
+    let progress_state = Arc::new(StdMutex::new(InstallProgress::default()));
+    state
+        .jobs
+        .lock()
+        .unwrap()
+        .insert(job_id.clone(), progress_state.clone());
+
+    let store = state.store.clone();
+    let progress = ProgressHandle::new(progress_state);
+    tokio::spawn(async move {
+        match run_postgres_install_with_progress(&progress).await {
+            Ok((summary, port)) => {
+                let mut summary = summary;
+                if let Some(store) = &store {
+                    let key = ResourceKey::cluster_scoped("postgres-instance", "local");
+                    let spec = serde_json::json!({
+                        "endpoint": {
+                            "host": "127.0.0.1",
+                            "port": port,
+                            "superuser": "postgres",
+                        },
+                        "databases": [],
+                        "prune": false,
+                    });
+                    match store.save(&key, &spec, None).await {
+                        Ok(_) => {
+                            summary.push_str(
+                                "\n\nRegistered as postgres-instance/local in the metadata store.\nVisit /status to see it.",
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "install background task: store.save failed; install succeeded but \
+                                 the resource is not registered. Likely cause: a \
+                                 postgres-instance/local already exists. Check /status."
+                            );
+                            summary.push_str(&format!(
+                                "\n\nNote: did not register postgres-instance/local ({e}). Visit /status to inspect current state."
+                            ));
+                        }
                     }
                 }
+                progress.finish_success(summary);
             }
-            Html(render_install_result(&l, true, &summary))
+            Err(detail) => {
+                progress.finish_failure(detail);
+            }
         }
-        Err(detail) => Html(render_install_result(&l, false, &detail)),
+    });
+
+    // 303 See Other to the wizard page. Standard POST-redirect-GET so
+    // refreshing the wizard doesn't re-submit the form.
+    Redirect303(format!("/install/job/{job_id}")).into_response()
+}
+
+/// 303 See Other redirect helper. axum has `Redirect::to` but it
+/// defaults to 307 / 302 depending on version; we want the explicit
+/// POST-redirect-GET semantics of 303.
+struct Redirect303(String);
+
+impl IntoResponse for Redirect303 {
+    fn into_response(self) -> Response {
+        (StatusCode::SEE_OTHER, [(header::LOCATION, self.0)]).into_response()
+    }
+}
+
+/// GET /install/job/{id} -- the wizard page with the progress bars
+/// and the JS poller. Re-renders the final result page once the
+/// background task signals completion.
+async fn install_job_handler(
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+) -> (StatusCode, Html<String>) {
+    let l = Localizer::english();
+    let snapshot = state
+        .jobs
+        .lock()
+        .unwrap()
+        .get(&job_id)
+        .map(|s| s.lock().unwrap().clone());
+    match snapshot {
+        None => (
+            StatusCode::NOT_FOUND,
+            Html(render_install_result(
+                &l,
+                false,
+                &format!("Unknown install job: {job_id}"),
+            )),
+        ),
+        Some(p) if p.completed => {
+            // Render the final result page (success or failure) so
+            // refreshing the URL after completion keeps working.
+            if let Some(err) = &p.error {
+                (StatusCode::OK, Html(render_install_result(&l, false, err)))
+            } else {
+                let summary = p.success_summary.clone().unwrap_or_default();
+                (
+                    StatusCode::OK,
+                    Html(render_install_result(&l, true, &summary)),
+                )
+            }
+        }
+        Some(p) => (
+            StatusCode::OK,
+            Html(render_install_progress(&l, &job_id, &p)),
+        ),
+    }
+}
+
+/// GET /api/install/job/{id} -- JSON snapshot of progress, polled by
+/// the wizard's JS every ~500ms.
+async fn install_job_api_handler(
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+) -> Response {
+    let snapshot = state
+        .jobs
+        .lock()
+        .unwrap()
+        .get(&job_id)
+        .map(|s| s.lock().unwrap().clone());
+    match snapshot {
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "unknown job"})),
+        )
+            .into_response(),
+        Some(p) => {
+            let ratio = p.phase_ratio();
+            // Augment the serialized progress with the precomputed
+            // phase_ratio so the client doesn't need to know the
+            // bytes-vs-other-phases rule.
+            let mut value = serde_json::to_value(&p).unwrap_or_else(|_| serde_json::json!({}));
+            if let serde_json::Value::Object(m) = &mut value {
+                m.insert("phase_ratio".into(), serde_json::Value::from(ratio));
+                m.insert(
+                    "phase_label".into(),
+                    serde_json::Value::from(p.phase.label()),
+                );
+            }
+            Json(value).into_response()
+        }
     }
 }
 
@@ -183,8 +314,15 @@ async fn install_postgres_handler(
 /// error. The port is forwarded to `install_postgres_handler` so it can
 /// register a `postgres-instance/local` resource in the state store
 /// reflecting where the freshly-installed server is listening.
+///
+/// `_progress` is used on Windows where the install path streams a
+/// large binary bundle and benefits from a live wizard. Linux + macOS
+/// installs are fast enough that they don't need a progress bar yet
+/// (the wizard will still show the final result page).
 #[cfg(target_os = "linux")]
-async fn run_postgres_install() -> Result<(String, u16), String> {
+async fn run_postgres_install_with_progress(
+    _progress: &ProgressHandle,
+) -> Result<(String, u16), String> {
     use computeza_driver_native::linux::postgres;
     match postgres::install(postgres::InstallOptions::default()).await {
         Ok(r) => Ok((
@@ -206,7 +344,9 @@ async fn run_postgres_install() -> Result<(String, u16), String> {
 }
 
 #[cfg(target_os = "macos")]
-async fn run_postgres_install() -> Result<(String, u16), String> {
+async fn run_postgres_install_with_progress(
+    _progress: &ProgressHandle,
+) -> Result<(String, u16), String> {
     use computeza_driver_native::macos::postgres;
     match postgres::install(postgres::InstallOptions::default()).await {
         Ok(r) => Ok((
@@ -228,9 +368,11 @@ async fn run_postgres_install() -> Result<(String, u16), String> {
 }
 
 #[cfg(target_os = "windows")]
-async fn run_postgres_install() -> Result<(String, u16), String> {
+async fn run_postgres_install_with_progress(
+    progress: &ProgressHandle,
+) -> Result<(String, u16), String> {
     use computeza_driver_native::windows::postgres;
-    match postgres::install(postgres::InstallOptions::default()).await {
+    match postgres::install_with_progress(postgres::InstallOptions::default(), progress).await {
         Ok(r) => Ok((
             format!(
                 "bin_dir: {}\ndata_dir: {}\nservice: {}\nport: {}\npsql shim: {}",
@@ -250,7 +392,9 @@ async fn run_postgres_install() -> Result<(String, u16), String> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-async fn run_postgres_install() -> Result<(String, u16), String> {
+async fn run_postgres_install_with_progress(
+    _progress: &ProgressHandle,
+) -> Result<(String, u16), String> {
     Err("install is supported on Linux, macOS, and Windows only".into())
 }
 
@@ -507,21 +651,96 @@ async fn css_handler() -> Response {
         .into_response()
 }
 
+/// Identifies which top-nav link should be highlighted for the
+/// currently rendered page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NavLink {
+    /// Home dashboard.
+    Home,
+    /// Managed components reference.
+    Components,
+    /// Install wizard.
+    Install,
+    /// Live reconciler status dashboard.
+    Status,
+    /// No nav link highlighted (e.g. resource detail page).
+    None,
+}
+
+/// Render the shared shell: doctype, head, top nav bar with the brand
+/// mark, the centered page container, and the footer. `body` is HTML
+/// dropped verbatim inside the page container. `active` highlights
+/// one of the top-nav links.
+#[must_use]
+pub fn render_shell(
+    localizer: &Localizer,
+    page_title: &str,
+    active: NavLink,
+    body: &str,
+) -> String {
+    let app_title = localizer.t("ui-app-title");
+    let nav_components = localizer.t("ui-nav-components");
+    let nav_install = localizer.t("ui-nav-install");
+    let nav_status = localizer.t("ui-nav-status");
+    let version_label = localizer.t("ui-footer-version");
+    let version = env!("CARGO_PKG_VERSION");
+
+    let nav_class = |link: NavLink| -> &'static str {
+        if active == link {
+            "cz-active"
+        } else {
+            ""
+        }
+    };
+
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>{page_title} -- {app_title}</title>
+<link rel="stylesheet" href="/static/computeza.css" />
+</head>
+<body>
+<nav class="cz-nav">
+  <a href="/" class="cz-brand">
+    <span class="cz-brand-mark" aria-hidden="true"></span>
+    <span>{app_title}</span>
+  </a>
+  <div class="cz-navlinks">
+    <a href="/components" class="{nc}">{nav_components}</a>
+    <a href="/install" class="{ni}">{nav_install}</a>
+    <a href="/status" class="{ns}">{nav_status}</a>
+  </div>
+</nav>
+<main class="cz-page">
+{body}
+<footer class="cz-footer">
+  <span>{version_label} {version}</span>
+  <span>Spec v1.5 -- AGPL stack</span>
+</footer>
+</main>
+</body>
+</html>"#,
+        nc = nav_class(NavLink::Components),
+        ni = nav_class(NavLink::Install),
+        ns = nav_class(NavLink::Status),
+    )
+}
+
 /// Render one navigation card on the home dashboard. `extra` is an
 /// optional one-line context tail (e.g. resource count) shown beneath
-/// the body text in a smaller indigo font.
+/// the body text in a smaller font.
 fn render_home_card(href: &str, title: &str, body: &str, extra: Option<&str>) -> String {
     let extra_html = match extra {
-        Some(e) => format!(
-            r#"<p class="text-indigo-300 text-sm" style="margin: 0.5rem 0 0;">{}</p>"#,
-            html_escape(e)
-        ),
+        Some(e) => format!(r#"<p class="cz-card-meta">{}</p>"#, html_escape(e)),
         None => String::new(),
     };
     format!(
-        r#"<a href="{href}" class="text-slate-100" style="display: block; border: 1px solid currentColor; padding: 1rem; text-decoration: none;">
-<h3 class="text-orange-500" style="margin: 0 0 0.5rem;">{title}</h3>
-<p class="text-slate-500 text-sm" style="margin: 0;">{body}</p>
+        r#"<a href="{href}" class="cz-card">
+<h3 class="cz-card-title">{title}</h3>
+<p class="cz-card-body">{body}</p>
 {extra_html}
 </a>"#,
         href = html_escape(href),
@@ -532,19 +751,15 @@ fn render_home_card(href: &str, title: &str, body: &str, extra: Option<&str>) ->
 
 /// Render the home page to a complete HTML document.
 ///
-/// Public for testability and so future page modules can reuse the shell.
 /// `store_summary` drives the "Metadata store" card -- pass
 /// `StoreSummary::Missing` when no store is attached to this server.
 #[must_use]
 pub fn render_home(localizer: &Localizer, store_summary: StoreSummary) -> String {
-    let app_title = localizer.t("ui-app-title");
     let tagline = localizer.t("ui-app-tagline");
     let title = localizer.t("ui-welcome-title");
     let subtitle = localizer.t("ui-welcome-subtitle");
     let status = localizer.t("ui-welcome-status");
     let spec_note = localizer.t("ui-welcome-spec");
-    let version_label = localizer.t("ui-footer-version");
-    let version = env!("CARGO_PKG_VERSION");
 
     let card_components_title = localizer.t("ui-home-card-components-title");
     let card_components_body = localizer.t("ui-home-card-components-body");
@@ -560,22 +775,23 @@ pub fn render_home(localizer: &Localizer, store_summary: StoreSummary) -> String
         StoreSummary::Counted(0) => localizer.t("ui-home-store-empty"),
         StoreSummary::Counted(n) => format!("{n} resource(s) registered."),
     };
+
     let cards_html = format!(
-        r#"<section class="mb-10" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); gap: 1rem;">
-{card1}
-{card2}
-{card3}
-{card4}
-</section>"#,
-        card1 = render_home_card(
+        r#"<div class="cz-card-grid">
+{c1}
+{c2}
+{c3}
+{c4}
+</div>"#,
+        c1 = render_home_card(
             "/components",
             &card_components_title,
             &card_components_body,
-            None,
+            None
         ),
-        card2 = render_home_card("/install", &card_install_title, &card_install_body, None,),
-        card3 = render_home_card("/status", &card_status_title, &card_status_body, None,),
-        card4 = render_home_card(
+        c2 = render_home_card("/install", &card_install_title, &card_install_body, None),
+        c3 = render_home_card("/status", &card_status_title, &card_status_body, None),
+        c4 = render_home_card(
             "/api/state/info",
             &card_state_title,
             &card_state_body,
@@ -583,54 +799,30 @@ pub fn render_home(localizer: &Localizer, store_summary: StoreSummary) -> String
         ),
     );
 
-    // Body fragment via Leptos view!. Tailwind-compatible utility classes
-    // come from /static/computeza.css (see assets/computeza.css).
-    let components_link = localizer.t("ui-nav-components");
-    let install_link = localizer.t("ui-nav-install");
-    let status_link = localizer.t("ui-nav-status");
-    let body_view = view! {
-        <main class="mx-auto max-w-4xl p-12">
-            <header class="border-b pb-6 mb-10">
-                <h1 class="text-orange-500 text-2xl font-semibold tracking-tight m-0 mb-1">
-                    {app_title.clone()}
-                </h1>
-                <p class="text-indigo-300 text-sm m-0">{tagline}</p>
-            </header>
-            <nav class="mb-6">
-                <a class="text-indigo-300 text-sm" href="/components">{components_link}</a>
-                " | "
-                <a class="text-indigo-300 text-sm" href="/install">{install_link}</a>
-                " | "
-                <a class="text-indigo-300 text-sm" href="/status">{status_link}</a>
-            </nav>
-            <section class="mb-8">
-                <h2 class="text-2xl font-semibold text-slate-100 m-0 mb-3">{title.clone()}</h2>
-                <p class="text-slate-100 m-0 mb-6">{subtitle}</p>
-                <p class="text-slate-500 text-sm m-0 mb-2">{status}</p>
-                <p class="text-slate-500 text-sm m-0">{spec_note}</p>
-            </section>
-            <footer class="mt-16 pt-6 border-t text-slate-500 text-xs">
-                <span>{version_label}" "{version}</span>
-            </footer>
-        </main>
-    };
-    let body_html = body_view.to_html();
-    let body_html = body_html.replacen("<footer", &format!("{cards_html}<footer"), 1);
+    let body = format!(
+        r#"<section class="cz-hero">
+<p class="cz-muted" style="margin: 0 0 0.75rem; text-transform: uppercase; letter-spacing: 0.12em; font-size: 0.75rem;">{tagline}</p>
+<h1>{title}</h1>
+<p>{subtitle}</p>
+</section>
+<section class="cz-section">
+<h3>Operator surfaces</h3>
+{cards_html}
+</section>
+<section class="cz-section">
+<div class="cz-card">
+<p class="cz-card-body" style="margin: 0 0 0.5rem;">{status}</p>
+<p class="cz-card-meta" style="margin: 0;">{spec_note}</p>
+</div>
+</section>"#,
+        title = html_escape(&title),
+        subtitle = html_escape(&subtitle),
+        tagline = html_escape(&tagline),
+        status = html_escape(&status),
+        spec_note = html_escape(&spec_note),
+    );
 
-    format!(
-        r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>{title} -- {app_title}</title>
-<link rel="stylesheet" href="/static/computeza.css" />
-</head>
-<body class="bg-indigo-900 text-slate-100">
-{body_html}
-</body>
-</html>"#
-    )
+    render_shell(localizer, &title, NavLink::Home, &body)
 }
 
 /// Render the `/components` page: a table of every component the
@@ -639,7 +831,6 @@ pub fn render_home(localizer: &Localizer, store_summary: StoreSummary) -> String
 /// reconciler status (drift indicators per spec section 4.4).
 #[must_use]
 pub fn render_components(localizer: &Localizer) -> String {
-    let app_title = localizer.t("ui-app-title");
     let title = localizer.t("ui-components-title");
     let intro = localizer.t("ui-components-intro");
     let col_name = localizer.t("ui-components-col-name");
@@ -666,44 +857,41 @@ pub fn render_components(localizer: &Localizer) -> String {
             let name = localizer.t(&format!("component-{slug}-name"));
             let role = localizer.t(&format!("component-{slug}-role"));
             format!(
-                "<tr><td class=\"text-slate-100\" style=\"padding: 0.5rem 1rem 0.5rem 0;\">{name}</td>\
-                 <td class=\"text-indigo-300 text-sm\" style=\"padding: 0.5rem 1rem;\">{kind}</td>\
-                 <td class=\"text-slate-500 text-sm\" style=\"padding: 0.5rem 0;\">{role}</td></tr>"
+                "<tr><td class=\"cz-strong\">{name}</td>\
+                 <td><span class=\"cz-badge cz-badge-info\">{kind}</span></td>\
+                 <td class=\"cz-cell-dim\">{role}</td></tr>",
+                name = html_escape(&name),
+                kind = html_escape(kind),
+                role = html_escape(&role),
             )
         })
         .collect();
 
-    format!(
-        r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>{title} -- {app_title}</title>
-<link rel="stylesheet" href="/static/computeza.css" />
-</head>
-<body class="bg-indigo-900 text-slate-100">
-<main class="mx-auto max-w-4xl p-12">
-<header class="border-b pb-6 mb-10">
-<h1 class="text-orange-500 text-2xl font-semibold tracking-tight m-0 mb-1">{app_title}</h1>
-<nav><a class="text-indigo-300 text-sm" href="/"><-&nbsp;Home</a></nav>
-</header>
-<section>
-<h2 class="text-2xl font-semibold text-slate-100 m-0 mb-3">{title}</h2>
-<p class="text-slate-500 text-sm m-0 mb-6">{intro}</p>
-<table style="width: 100%; border-collapse: collapse;">
-<thead><tr class="text-indigo-300 text-sm" style="text-align: left;">
-<th style="padding: 0.5rem 1rem 0.5rem 0;">{col_name}</th>
-<th style="padding: 0.5rem 1rem;">{col_kind}</th>
-<th style="padding: 0.5rem 0;">{col_role}</th>
+    let body = format!(
+        r#"<section class="cz-hero">
+<h1>{title}</h1>
+<p>{intro}</p>
+</section>
+<section class="cz-section">
+<div class="cz-table-wrap">
+<table class="cz-table">
+<thead><tr>
+<th>{col_name}</th>
+<th>{col_kind}</th>
+<th>{col_role}</th>
 </tr></thead>
 <tbody>{rows}</tbody>
 </table>
-</section>
-</main>
-</body>
-</html>"#
-    )
+</div>
+</section>"#,
+        title = html_escape(&title),
+        intro = html_escape(&intro),
+        col_name = html_escape(&col_name),
+        col_kind = html_escape(&col_kind),
+        col_role = html_escape(&col_role),
+    );
+
+    render_shell(localizer, &title, NavLink::Components, &body)
 }
 
 /// Minimal percent-encoder for a single URL path segment. Encodes
@@ -747,7 +935,6 @@ fn html_escape(s: &str) -> String {
 /// to the CLI's `computeza install postgres`.
 #[must_use]
 pub fn render_install(localizer: &Localizer) -> String {
-    let app_title = localizer.t("ui-app-title");
     let title = localizer.t("ui-install-title");
     let intro = localizer.t("ui-install-intro");
     let target_label = localizer.t("ui-install-target-label");
@@ -755,37 +942,127 @@ pub fn render_install(localizer: &Localizer) -> String {
     let button = localizer.t("ui-install-button");
     let requires_root = localizer.t("ui-install-requires-root");
 
-    format!(
-        r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>{title} -- {app_title}</title>
-<link rel="stylesheet" href="/static/computeza.css" />
-</head>
-<body class="bg-indigo-900 text-slate-100">
-<main class="mx-auto max-w-4xl p-12">
-<header class="border-b pb-6 mb-10">
-<h1 class="text-orange-500 text-2xl font-semibold tracking-tight m-0 mb-1">{app_title}</h1>
-<nav><a class="text-indigo-300 text-sm" href="/">&lt;-&nbsp;Home</a></nav>
-</header>
-<section>
-<h2 class="text-2xl font-semibold text-slate-100 m-0 mb-3">{title}</h2>
-<p class="text-slate-500 text-sm m-0 mb-6">{intro}</p>
-<form method="post" action="/install/postgres" style="display: flex; flex-direction: column; gap: 1rem; max-width: 28rem;">
-<label class="text-indigo-300 text-sm" for="component">{target_label}</label>
-<select id="component" name="component" class="text-slate-100" style="background: transparent; border: 1px solid currentColor; padding: 0.5rem;">
+    let body = format!(
+        r#"<section class="cz-hero">
+<h1>{title}</h1>
+<p>{intro}</p>
+</section>
+<section class="cz-section" style="max-width: 32rem;">
+<div class="cz-card">
+<form method="post" action="/install/postgres" class="cz-form">
+<label for="component">{target_label}</label>
+<select id="component" name="component" class="cz-select">
 <option value="postgres">{option_postgres}</option>
 </select>
-<button type="submit" class="text-orange-500" style="background: transparent; border: 1px solid currentColor; padding: 0.5rem 1rem; cursor: pointer; align-self: flex-start;">{button}</button>
+<button type="submit" class="cz-btn cz-btn-primary" style="align-self: flex-start;">{button}</button>
 </form>
-<p class="text-slate-500 text-sm" style="margin-top: 1.5rem;">{requires_root}</p>
+</div>
+<p class="cz-muted" style="margin-top: 1rem; font-size: 0.85rem;">{requires_root}</p>
+</section>"#,
+        title = html_escape(&title),
+        intro = html_escape(&intro),
+        target_label = html_escape(&target_label),
+        option_postgres = html_escape(&option_postgres),
+        button = html_escape(&button),
+        requires_root = html_escape(&requires_root),
+    );
+
+    render_shell(localizer, &title, NavLink::Install, &body)
+}
+
+/// Render the in-flight wizard page. The page polls
+/// `/api/install/job/{id}` every 500ms via inline JS and redirects to
+/// the result page once `completed: true` lands in the snapshot.
+#[must_use]
+pub fn render_install_progress(localizer: &Localizer, job_id: &str, p: &InstallProgress) -> String {
+    let title = localizer.t("ui-install-title");
+    let phase_label = p.phase.label();
+    let ratio_pct = format!("{:.1}", p.phase_ratio() * 100.0);
+    let message = html_escape(&p.message);
+    let bytes_line = match (p.total_bytes, p.bytes_downloaded) {
+        (Some(t), d) => format!("{} / {}", human_bytes(d), human_bytes(t)),
+        (None, 0) => String::new(),
+        (None, d) => human_bytes(d),
+    };
+    let job_id_js = html_escape(job_id);
+
+    let body = format!(
+        r#"<section class="cz-hero">
+<h1>Installing PostgreSQL</h1>
+<p>Computeza is preparing your local PostgreSQL service. You can leave this page open; it polls the server every half second.</p>
 </section>
-</main>
-</body>
-</html>"#
-    )
+<section class="cz-section" style="max-width: 42rem;">
+<div class="cz-progress">
+  <div class="cz-progress-phase">
+    <span id="phase">{phase_label}</span>
+    <span class="cz-muted" id="phase-pct">{ratio_pct}%</span>
+  </div>
+  <div class="cz-progress-bar"><div class="cz-progress-fill" id="bar" style="width: {ratio_pct}%;"></div></div>
+  <div class="cz-progress-msg" id="message">{message}</div>
+  <div class="cz-progress-bytes" id="bytes">{bytes_line}</div>
+</div>
+</section>
+<script>
+const jobId = "{job_id_js}";
+function fmt(n) {{
+  if (n === 0) return "0 B";
+  const u = ["B","KB","MB","GB","TB"];
+  let i = 0; let v = n;
+  while (v >= 1024 && i < u.length - 1) {{ v /= 1024; i++; }}
+  return v.toFixed(i === 0 ? 0 : 1) + " " + u[i];
+}}
+async function poll() {{
+  try {{
+    const r = await fetch(`/api/install/job/${{jobId}}`, {{cache: "no-store"}});
+    if (!r.ok) {{ setTimeout(poll, 1500); return; }}
+    const p = await r.json();
+    document.getElementById("phase").textContent = p.phase_label || p.phase;
+    document.getElementById("message").textContent = p.message || "";
+    const pct = (p.phase_ratio * 100).toFixed(1);
+    document.getElementById("bar").style.width = pct + "%";
+    document.getElementById("phase-pct").textContent = pct + "%";
+    let bytes = "";
+    if (p.total_bytes) {{
+      bytes = fmt(p.bytes_downloaded) + " / " + fmt(p.total_bytes);
+    }} else if (p.bytes_downloaded > 0) {{
+      bytes = fmt(p.bytes_downloaded);
+    }}
+    document.getElementById("bytes").textContent = bytes;
+    if (p.completed) {{
+      window.location.href = `/install/job/${{jobId}}`;
+    }} else {{
+      setTimeout(poll, 500);
+    }}
+  }} catch (e) {{
+    setTimeout(poll, 1500);
+  }}
+}}
+poll();
+</script>"#
+    );
+
+    render_shell(localizer, &title, NavLink::Install, &body)
+}
+
+/// Format a byte count with a binary-prefix unit. Mirrors the JS
+/// `fmt` function used by the wizard so the first render (server-side)
+/// matches the live updates.
+fn human_bytes(n: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    if n == 0 {
+        return "0 B".into();
+    }
+    let mut v = n as f64;
+    let mut i = 0usize;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", UNITS[i])
+    }
 }
 
 /// Render the `/install/postgres` result page. `success` switches the
@@ -794,7 +1071,6 @@ pub fn render_install(localizer: &Localizer) -> String {
 /// `<pre>` block after HTML-escaping.
 #[must_use]
 pub fn render_install_result(localizer: &Localizer, success: bool, detail: &str) -> String {
-    let app_title = localizer.t("ui-app-title");
     let title = localizer.t("ui-install-result-title");
     let outcome = if success {
         localizer.t("ui-install-result-success")
@@ -803,36 +1079,29 @@ pub fn render_install_result(localizer: &Localizer, success: bool, detail: &str)
     };
     let back = localizer.t("ui-install-result-back");
     let detail_html = html_escape(detail);
-    let outcome_class = if success {
-        "text-slate-100"
+    let badge_class = if success {
+        "cz-badge cz-badge-ok"
     } else {
-        "text-orange-500"
+        "cz-badge cz-badge-fail"
     };
 
-    format!(
-        r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>{title} -- {app_title}</title>
-<link rel="stylesheet" href="/static/computeza.css" />
-</head>
-<body class="bg-indigo-900 text-slate-100">
-<main class="mx-auto max-w-4xl p-12">
-<header class="border-b pb-6 mb-10">
-<h1 class="text-orange-500 text-2xl font-semibold tracking-tight m-0 mb-1">{app_title}</h1>
-<nav><a class="text-indigo-300 text-sm" href="/install">&lt;-&nbsp;{back}</a></nav>
-</header>
-<section>
-<h2 class="text-2xl font-semibold {outcome_class} m-0 mb-3">{outcome}</h2>
-<p class="text-indigo-300 text-sm m-0 mb-3">{title}</p>
-<pre class="text-slate-100 text-sm" style="background: rgba(0,0,0,0.25); padding: 1rem; overflow-x: auto; white-space: pre-wrap; word-break: break-word;">{detail_html}</pre>
+    let body = format!(
+        r#"<section class="cz-hero">
+<h1>{title}</h1>
+<p><span class="{badge_class}">{outcome}</span></p>
 </section>
-</main>
-</body>
-</html>"#
-    )
+<section class="cz-section">
+<pre class="cz-pre">{detail_html}</pre>
+</section>
+<section class="cz-section">
+<a class="cz-btn" href="/install">{back}</a>
+</section>"#,
+        title = html_escape(&title),
+        outcome = html_escape(&outcome),
+        back = html_escape(&back),
+    );
+
+    render_shell(localizer, &title, NavLink::Install, &body)
 }
 
 /// Render the `/status` page: one row per persisted reconciler
@@ -841,7 +1110,6 @@ pub fn render_install_result(localizer: &Localizer, success: bool, detail: &str)
 /// `ui-status-store-missing` hint instead of an empty table.
 #[must_use]
 pub fn render_status(localizer: &Localizer, rows: Option<&[StatusRow]>) -> String {
-    let app_title = localizer.t("ui-app-title");
     let title = localizer.t("ui-status-title");
     let intro = localizer.t("ui-status-intro");
     let col_kind = localizer.t("ui-status-col-kind");
@@ -850,13 +1118,13 @@ pub fn render_status(localizer: &Localizer, rows: Option<&[StatusRow]>) -> Strin
     let col_observed = localizer.t("ui-status-col-observed");
     let col_state = localizer.t("ui-status-col-state");
 
-    let body = match rows {
+    let table_or_hint = match rows {
         None => format!(
-            r#"<p class="text-orange-500 text-sm m-0">{}</p>"#,
+            r#"<div class="cz-card"><p class="cz-card-body" style="margin: 0; color: var(--warn);">{}</p></div>"#,
             html_escape(&localizer.t("ui-status-store-missing"))
         ),
         Some([]) => format!(
-            r#"<p class="text-slate-500 text-sm m-0">{}</p>"#,
+            r#"<div class="cz-card"><p class="cz-card-body" style="margin: 0;">{}</p></div>"#,
             html_escape(&localizer.t("ui-status-empty"))
         ),
         Some(rs) => {
@@ -866,17 +1134,14 @@ pub fn render_status(localizer: &Localizer, rows: Option<&[StatusRow]>) -> Strin
             let body_rows: String = rs
                 .iter()
                 .map(|r| {
-                    let (state_label, state_class) = if !r.has_status {
-                        (state_unknown.clone(), "text-indigo-300")
+                    let (state_label, badge_cls) = if !r.has_status {
+                        (state_unknown.clone(), "cz-badge cz-badge-info")
                     } else if r.last_observe_failed {
-                        (state_failed.clone(), "text-orange-500")
+                        (state_failed.clone(), "cz-badge cz-badge-fail")
                     } else {
-                        (state_ok.clone(), "text-slate-100")
+                        (state_ok.clone(), "cz-badge cz-badge-ok")
                     };
-                    let version = r
-                        .server_version
-                        .clone()
-                        .unwrap_or_else(|| "-".to_string());
+                    let version = r.server_version.clone().unwrap_or_else(|| "-".to_string());
                     let observed = r
                         .last_observed_at
                         .clone()
@@ -888,11 +1153,11 @@ pub fn render_status(localizer: &Localizer, rows: Option<&[StatusRow]>) -> Strin
                     );
                     format!(
                         "<tr>\
-                         <td class=\"text-indigo-300 text-sm\" style=\"padding: 0.5rem 1rem 0.5rem 0;\">{kind}</td>\
-                         <td style=\"padding: 0.5rem 1rem;\"><a class=\"text-slate-100\" href=\"{href}\">{label} / {name}</a></td>\
-                         <td class=\"text-slate-500 text-sm\" style=\"padding: 0.5rem 1rem;\">{version}</td>\
-                         <td class=\"text-slate-500 text-sm\" style=\"padding: 0.5rem 1rem;\">{observed}</td>\
-                         <td class=\"{state_class}\" style=\"padding: 0.5rem 0;\">{state_label}</td>\
+                         <td class=\"cz-cell-mono cz-cell-dim\">{kind}</td>\
+                         <td><a href=\"{href}\" class=\"cz-strong\">{label} / {name}</a></td>\
+                         <td class=\"cz-cell-dim\">{version}</td>\
+                         <td class=\"cz-cell-mono cz-cell-dim\">{observed}</td>\
+                         <td><span class=\"{badge_cls}\">{state_label}</span></td>\
                          </tr>",
                         kind = html_escape(&r.kind),
                         href = href,
@@ -900,50 +1165,46 @@ pub fn render_status(localizer: &Localizer, rows: Option<&[StatusRow]>) -> Strin
                         name = html_escape(&r.instance_name),
                         version = html_escape(&version),
                         observed = html_escape(&observed),
-                        state_class = state_class,
+                        badge_cls = badge_cls,
                         state_label = html_escape(&state_label),
                     )
                 })
                 .collect();
             format!(
-                r#"<table style="width: 100%; border-collapse: collapse;">
-<thead><tr class="text-indigo-300 text-sm" style="text-align: left;">
-<th style="padding: 0.5rem 1rem 0.5rem 0;">{col_kind}</th>
-<th style="padding: 0.5rem 1rem;">{col_name}</th>
-<th style="padding: 0.5rem 1rem;">{col_version}</th>
-<th style="padding: 0.5rem 1rem;">{col_observed}</th>
-<th style="padding: 0.5rem 0;">{col_state}</th>
+                r#"<div class="cz-table-wrap">
+<table class="cz-table">
+<thead><tr>
+<th>{col_kind}</th>
+<th>{col_name}</th>
+<th>{col_version}</th>
+<th>{col_observed}</th>
+<th>{col_state}</th>
 </tr></thead>
 <tbody>{body_rows}</tbody>
-</table>"#
+</table>
+</div>"#,
+                col_kind = html_escape(&col_kind),
+                col_name = html_escape(&col_name),
+                col_version = html_escape(&col_version),
+                col_observed = html_escape(&col_observed),
+                col_state = html_escape(&col_state),
             )
         }
     };
 
-    format!(
-        r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>{title} -- {app_title}</title>
-<link rel="stylesheet" href="/static/computeza.css" />
-</head>
-<body class="bg-indigo-900 text-slate-100">
-<main class="mx-auto max-w-4xl p-12">
-<header class="border-b pb-6 mb-10">
-<h1 class="text-orange-500 text-2xl font-semibold tracking-tight m-0 mb-1">{app_title}</h1>
-<nav><a class="text-indigo-300 text-sm" href="/">&lt;-&nbsp;Home</a></nav>
-</header>
-<section>
-<h2 class="text-2xl font-semibold text-slate-100 m-0 mb-3">{title}</h2>
-<p class="text-slate-500 text-sm m-0 mb-6">{intro}</p>
-{body}
+    let body = format!(
+        r#"<section class="cz-hero">
+<h1>{title}</h1>
+<p>{intro}</p>
 </section>
-</main>
-</body>
-</html>"#
-    )
+<section class="cz-section">
+{table_or_hint}
+</section>"#,
+        title = html_escape(&title),
+        intro = html_escape(&intro),
+    );
+
+    render_shell(localizer, &title, NavLink::Status, &body)
 }
 
 /// Render the `/resource/{kind}/{name}` page. `stored = Some(_)` means
@@ -959,15 +1220,12 @@ pub fn render_resource(
     stored: Option<&computeza_state::StoredResource>,
     store_missing: bool,
 ) -> String {
-    let app_title = localizer.t("ui-app-title");
     let title = localizer.t("ui-resource-title");
-    let back = localizer.t("ui-resource-back");
-
     let heading = format!("{} / {}", html_escape(kind), html_escape(name));
 
-    let body = if store_missing {
+    let content = if store_missing {
         format!(
-            r#"<p class="text-orange-500 text-sm m-0">{}</p>"#,
+            r#"<div class="cz-card"><p class="cz-card-body" style="margin: 0; color: var(--warn);">{}</p></div>"#,
             html_escape(&localizer.t("ui-resource-store-missing"))
         )
     } else if let Some(sr) = stored {
@@ -984,15 +1242,9 @@ pub fn render_resource(
         let status_block = match &sr.status {
             Some(s) => {
                 let pretty = serde_json::to_string_pretty(s).unwrap_or_else(|_| "{}".into());
-                format!(
-                    r#"<pre class="text-slate-100 text-sm" style="background: rgba(0,0,0,0.25); padding: 1rem; overflow-x: auto; white-space: pre-wrap; word-break: break-word;">{}</pre>"#,
-                    html_escape(&pretty)
-                )
+                format!(r#"<pre class="cz-pre">{}</pre>"#, html_escape(&pretty))
             }
-            None => format!(
-                r#"<p class="text-slate-500 text-sm m-0">{}</p>"#,
-                html_escape(&no_status)
-            ),
+            None => format!(r#"<p class="cz-muted">{}</p>"#, html_escape(&no_status)),
         };
         let workspace = sr
             .key
@@ -1002,26 +1254,36 @@ pub fn render_resource(
             .unwrap_or_else(|| "-".to_string());
 
         format!(
-            r#"<dl style="display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 1.5rem; margin-bottom: 2rem;">
-<dt class="text-indigo-300 text-sm">{uuid_label}</dt>
-<dd class="text-slate-100 text-sm" style="margin: 0;">{uuid}</dd>
-<dt class="text-indigo-300 text-sm">{rev_label}</dt>
-<dd class="text-slate-100 text-sm" style="margin: 0;">{revision}</dd>
-<dt class="text-indigo-300 text-sm">{created_label}</dt>
-<dd class="text-slate-100 text-sm" style="margin: 0;">{created_at}</dd>
-<dt class="text-indigo-300 text-sm">{updated_label}</dt>
-<dd class="text-slate-100 text-sm" style="margin: 0;">{updated_at}</dd>
-<dt class="text-indigo-300 text-sm">{ws_label}</dt>
-<dd class="text-slate-100 text-sm" style="margin: 0;">{workspace}</dd>
+            r#"<div class="cz-card">
+<dl class="cz-dl">
+<dt>{uuid_label}</dt><dd>{uuid}</dd>
+<dt>{rev_label}</dt><dd>{revision}</dd>
+<dt>{created_label}</dt><dd>{created_at}</dd>
+<dt>{updated_label}</dt><dd>{updated_at}</dd>
+<dt>{ws_label}</dt><dd>{workspace}</dd>
 </dl>
-<h3 class="text-indigo-300 text-sm" style="margin-bottom: 0.5rem;">{spec_heading}</h3>
-<pre class="text-slate-100 text-sm" style="background: rgba(0,0,0,0.25); padding: 1rem; overflow-x: auto; white-space: pre-wrap; word-break: break-word; margin-bottom: 1.5rem;">{spec_html}</pre>
-<h3 class="text-indigo-300 text-sm" style="margin-bottom: 0.5rem;">{status_heading}</h3>
+</div>
+<section class="cz-section">
+<h3>{spec_heading}</h3>
+<pre class="cz-pre">{spec_html}</pre>
+</section>
+<section class="cz-section">
+<h3>{status_heading}</h3>
 {status_block}
-<form method="post" action="/resource/{kind_enc}/{name_enc}/delete" style="margin-top: 2rem;" onsubmit="return confirm('{confirm}');">
-<button type="submit" class="text-orange-500" style="background: transparent; border: 1px solid currentColor; padding: 0.5rem 1rem; cursor: pointer;">{delete_button}</button>
-<p class="text-slate-500 text-sm" style="margin-top: 0.5rem;">{confirm_note}</p>
-</form>"#,
+</section>
+<section class="cz-section">
+<form method="post" action="/resource/{kind_enc}/{name_enc}/delete" onsubmit="return confirm('{confirm}');">
+<button type="submit" class="cz-btn cz-btn-danger">{delete_button}</button>
+<p class="cz-muted" style="margin-top: 0.5rem; font-size: 0.85rem;">{confirm_note}</p>
+</form>
+</section>"#,
+            uuid_label = html_escape(&uuid_label),
+            rev_label = html_escape(&rev_label),
+            created_label = html_escape(&created_label),
+            updated_label = html_escape(&updated_label),
+            ws_label = html_escape(&ws_label),
+            spec_heading = html_escape(&spec_heading),
+            status_heading = html_escape(&status_heading),
             uuid = html_escape(&sr.uuid.to_string()),
             revision = sr.revision,
             created_at = html_escape(&sr.created_at.to_rfc3339()),
@@ -1035,69 +1297,44 @@ pub fn render_resource(
         )
     } else {
         format!(
-            r#"<p class="text-orange-500 text-sm m-0">{}</p>"#,
+            r#"<div class="cz-card"><p class="cz-card-body" style="margin: 0; color: var(--warn);">{}</p></div>"#,
             html_escape(&localizer.t("ui-resource-not-found"))
         )
     };
 
-    format!(
-        r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>{title} -- {app_title}</title>
-<link rel="stylesheet" href="/static/computeza.css" />
-</head>
-<body class="bg-indigo-900 text-slate-100">
-<main class="mx-auto max-w-4xl p-12">
-<header class="border-b pb-6 mb-10">
-<h1 class="text-orange-500 text-2xl font-semibold tracking-tight m-0 mb-1">{app_title}</h1>
-<nav><a class="text-indigo-300 text-sm" href="/status">&lt;-&nbsp;{back}</a></nav>
-</header>
-<section>
-<h2 class="text-2xl font-semibold text-slate-100 m-0 mb-3">{heading}</h2>
-<p class="text-slate-500 text-sm m-0 mb-6">{title}</p>
-{body}
+    let body = format!(
+        r#"<section class="cz-hero">
+<p class="cz-muted" style="margin: 0 0 0.5rem; text-transform: uppercase; letter-spacing: 0.12em; font-size: 0.75rem;">{title}</p>
+<h1>{heading}</h1>
 </section>
-</main>
-</body>
-</html>"#
-    )
+{content}"#,
+        title = html_escape(&title),
+    );
+
+    render_shell(localizer, &title, NavLink::Status, &body)
 }
 
 /// Render the success page after a delete. Shows a small confirmation
 /// and links back to /status.
 #[must_use]
 pub fn render_resource_deleted(localizer: &Localizer, kind: &str, name: &str) -> String {
-    let app_title = localizer.t("ui-app-title");
     let title = localizer.t("ui-resource-deleted");
     let back = localizer.t("ui-resource-back");
     let heading = format!("{} / {}", html_escape(kind), html_escape(name));
 
-    format!(
-        r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>{title} -- {app_title}</title>
-<link rel="stylesheet" href="/static/computeza.css" />
-</head>
-<body class="bg-indigo-900 text-slate-100">
-<main class="mx-auto max-w-4xl p-12">
-<header class="border-b pb-6 mb-10">
-<h1 class="text-orange-500 text-2xl font-semibold tracking-tight m-0 mb-1">{app_title}</h1>
-<nav><a class="text-indigo-300 text-sm" href="/status">&lt;-&nbsp;{back}</a></nav>
-</header>
-<section>
-<h2 class="text-2xl font-semibold text-slate-100 m-0 mb-3">{heading}</h2>
-<p class="text-slate-100 m-0">{title}</p>
+    let body = format!(
+        r#"<section class="cz-hero">
+<h1>{heading}</h1>
+<p><span class="cz-badge cz-badge-ok">{title}</span></p>
 </section>
-</main>
-</body>
-</html>"#
-    )
+<section class="cz-section">
+<a class="cz-btn" href="/status">{back}</a>
+</section>"#,
+        title = html_escape(&title),
+        back = html_escape(&back),
+    );
+
+    render_shell(localizer, &title, NavLink::Status, &body)
 }
 
 #[cfg(test)]
@@ -1248,7 +1485,7 @@ mod tests {
     }
 
     #[test]
-    fn render_status_row_marks_failed_observation_in_orange() {
+    fn render_status_row_marks_failed_observation_with_fail_badge() {
         let l = Localizer::english();
         let rows = vec![StatusRow {
             kind: "kanidm-instance".into(),
@@ -1261,7 +1498,7 @@ mod tests {
         }];
         let html = render_status(&l, Some(&rows));
         assert!(html.contains("Failed"));
-        assert!(html.contains("text-orange-500"));
+        assert!(html.contains("cz-badge-fail"));
     }
 
     #[test]
