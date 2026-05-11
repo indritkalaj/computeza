@@ -32,23 +32,48 @@ use crate::{
     progress::{InstallPhase, ProgressHandle},
 };
 
-/// Pinned PostgreSQL Windows bundle. EDB publishes the same artifact
-/// for every Computeza release; we update both the URL and the SHA-256
-/// in lockstep when bumping versions.
+/// Pinned PostgreSQL Windows bundles. EDB publishes one zip per
+/// version; we ship the latest stable major plus the previous-major
+/// so operators can pin to a tested version without falling off the
+/// supported window.
 ///
-/// Currently tracking PostgreSQL 18.3 (the latest major as of May
-/// 2026). The CI script under `scripts/check-pg-bundle.py` should be
-/// run before any release to confirm the URL still resolves and to
-/// refresh the pinned SHA-256.
+/// The first entry is the default ("latest"). The UI exposes a
+/// dropdown of these versions on `/install`.
 ///
-/// SHA-256 is `None` for v0.0.x -- pin it before any stable release.
+/// SHA-256 is `None` for v0.0.x -- pin before any stable release.
 /// AGENTS.md tracks the audit trail when checksums change.
-const PG_WINDOWS_BUNDLE: Bundle = Bundle {
-    version: "18.3-1",
-    url: "https://get.enterprisedb.com/postgresql/postgresql-18.3-1-windows-x64-binaries.zip",
-    sha256: None,
-    bin_subpath: "pgsql/bin",
-};
+const PG_WINDOWS_BUNDLES: &[Bundle] = &[
+    Bundle {
+        version: "18.3-1",
+        url: "https://get.enterprisedb.com/postgresql/postgresql-18.3-1-windows-x64-binaries.zip",
+        sha256: None,
+        bin_subpath: "pgsql/bin",
+    },
+    Bundle {
+        version: "17.9-1",
+        url: "https://get.enterprisedb.com/postgresql/postgresql-17.9-1-windows-x64-binaries.zip",
+        sha256: None,
+        bin_subpath: "pgsql/bin",
+    },
+];
+
+/// Look up a bundle by its `version` string. Falls back to the first
+/// (latest) entry when `requested` is `None` or doesn't match.
+fn bundle_for_version(requested: Option<&str>) -> &'static Bundle {
+    match requested {
+        Some(v) => PG_WINDOWS_BUNDLES
+            .iter()
+            .find(|b| b.version == v)
+            .unwrap_or(&PG_WINDOWS_BUNDLES[0]),
+        None => &PG_WINDOWS_BUNDLES[0],
+    }
+}
+
+/// All bundles we ship. The UI iterates this to populate the version
+/// dropdown.
+pub fn available_versions() -> &'static [Bundle] {
+    PG_WINDOWS_BUNDLES
+}
 
 /// Internal service name.
 pub const SERVICE_NAME: &str = "computeza-postgres";
@@ -67,6 +92,10 @@ pub struct InstallOptions {
     pub port: u16,
     /// Service name to register with SCM.
     pub service_name: String,
+    /// Which pinned bundle version to install when no host postgres
+    /// is found. `None` means use the latest (`PG_WINDOWS_BUNDLES[0]`).
+    /// Pass a version string like `"17.9-1"` to pin an older line.
+    pub version: Option<String>,
 }
 
 impl Default for InstallOptions {
@@ -80,6 +109,7 @@ impl Default for InstallOptions {
             bin_dir: None,
             port: 5432,
             service_name: SERVICE_NAME.into(),
+            version: None,
         }
     }
 }
@@ -220,7 +250,8 @@ async fn ensure_bin_dir(
                 "No host PostgreSQL detected; downloading bundled PostgreSQL from EDB",
             );
             let cache_root = opts.root_dir.join("binaries");
-            let bin = fetch::fetch_and_extract(&cache_root, &PG_WINDOWS_BUNDLE, progress).await?;
+            let bundle = bundle_for_version(opts.version.as_deref());
+            let bin = fetch::fetch_and_extract(&cache_root, bundle, progress).await?;
             // Sanity-check: the binary we expect must actually exist
             // after extraction. If not, the bundle layout has changed
             // and we need to update `bin_subpath`.

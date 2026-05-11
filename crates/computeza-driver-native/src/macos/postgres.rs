@@ -135,6 +135,102 @@ async fn detect_bin_dir() -> Result<PathBuf, InstallError> {
     Err(InstallError::BinaryNotFound(tried))
 }
 
+/// Configuration for [`uninstall`].
+#[derive(Clone, Debug)]
+pub struct UninstallOptions {
+    /// Root the install used.
+    pub root_dir: PathBuf,
+    /// launchd label (matches `Installed.plist_path`'s stem). Default
+    /// `com.computeza.postgres`.
+    pub label: String,
+    /// Filename of the plist under `/Library/LaunchDaemons/`.
+    pub plist_name: String,
+}
+
+impl Default for UninstallOptions {
+    fn default() -> Self {
+        Self {
+            root_dir: PathBuf::from("/Library/Application Support/Computeza/postgres"),
+            label: SERVICE_LABEL.into(),
+            plist_name: format!("{SERVICE_LABEL}.plist"),
+        }
+    }
+}
+
+/// Summary returned by [`uninstall`]. Same shape as the Linux and
+/// Windows variants.
+#[derive(Clone, Debug, Default)]
+pub struct Uninstalled {
+    /// Steps that completed successfully.
+    pub steps: Vec<String>,
+    /// Steps that failed (non-fatal -- the uninstall keeps going).
+    pub warnings: Vec<String>,
+}
+
+impl Uninstalled {
+    fn ok(&mut self, msg: impl Into<String>) {
+        self.steps.push(msg.into());
+    }
+    fn warn(&mut self, msg: impl Into<String>) {
+        self.warnings.push(msg.into());
+    }
+}
+
+/// Tear down a macOS PostgreSQL install written by [`install`].
+///
+/// Best-effort and idempotent. Mirrors the Linux/Windows shape so the
+/// UI handler is OS-agnostic.
+///
+/// What gets removed:
+/// - launchd service (bootout from system domain).
+/// - `/Library/LaunchDaemons/<plist>.plist`.
+/// - Data directory at `root_dir/data`.
+/// - `computeza-psql` PATH symlink.
+///
+/// Homebrew / MacPorts-installed binaries are left alone -- v0.0.x
+/// uses whatever PostgreSQL the host package manager provides.
+pub async fn uninstall(opts: UninstallOptions) -> Result<Uninstalled, InstallError> {
+    let mut out = Uninstalled::default();
+
+    // 1. Service teardown via launchctl bootout (idempotent).
+    if let Err(e) = launchctl::bootout(&opts.label).await {
+        out.warn(format!("launchctl bootout system/{}: {e}", opts.label));
+    } else {
+        out.ok(format!("bootout system/{}", opts.label));
+    }
+
+    // 2. Remove the plist.
+    let plist_path = PathBuf::from("/Library/LaunchDaemons").join(&opts.plist_name);
+    if fs::try_exists(&plist_path).await.unwrap_or(false) {
+        match fs::remove_file(&plist_path).await {
+            Ok(()) => out.ok(format!("removed plist {}", plist_path.display())),
+            Err(e) => out.warn(format!("removing plist {}: {e}", plist_path.display())),
+        }
+    } else {
+        out.ok(format!("plist absent ({})", plist_path.display()));
+    }
+
+    // 3. Data directory.
+    let data_dir = opts.root_dir.join("data");
+    if fs::try_exists(&data_dir).await.unwrap_or(false) {
+        match fs::remove_dir_all(&data_dir).await {
+            Ok(()) => out.ok(format!("removed data dir {}", data_dir.display())),
+            Err(e) => out.warn(format!("removing data dir {}: {e}", data_dir.display())),
+        }
+    } else {
+        out.ok(format!("data dir absent ({})", data_dir.display()));
+    }
+
+    // 4. PATH symlink.
+    if let Err(e) = path::unregister("psql").await {
+        out.warn(format!("removing psql symlink: {e}"));
+    } else {
+        out.ok("removed computeza-psql symlink");
+    }
+
+    Ok(out)
+}
+
 /// Install Postgres natively on macOS.
 pub async fn install(opts: InstallOptions) -> Result<Installed, InstallError> {
     let bin_dir = match opts.bin_dir.clone() {

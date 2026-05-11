@@ -99,6 +99,10 @@ ui-install-postgres      = PostgreSQL (spec section 7.13)
 ui-install-button        = Install
 ui-install-requires-root = Note: native install needs root / Administrator privileges (writes /etc/systemd/system, /Library/LaunchDaemons, or HKLM Services). If you started the operator console without elevation the install POST will fail with a clear permission error -- re-run `computeza serve` as root / via UAC and retry.
 
+ui-install-version-label     = Version
+ui-install-version-help      = Latest stable is recommended. The previous-major line is offered for operators who need to pin against an older release.
+ui-install-version-latest    = (latest)
+ui-install-version-host      = (host-installed)
 ui-install-port-label        = TCP port
 ui-install-port-help         = The address PostgreSQL listens on. Default 5432. Pick another if you already have a PostgreSQL on 5432.
 ui-install-data-dir-label    = Data directory

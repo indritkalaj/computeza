@@ -167,6 +167,11 @@ async fn install_handler() -> Html<String> {
 struct InstallForm {
     /// Component slug. v0.0.x recognises only "postgres".
     component: String,
+    /// Version string from the per-component dropdown (e.g. "18.3-1",
+    /// "17.9-1"). Empty / unknown values resolve to the driver's
+    /// "latest" default.
+    #[serde(default)]
+    version: String,
     /// TCP port to listen on. Empty string means "use the driver default".
     #[serde(default)]
     port: String,
@@ -184,6 +189,7 @@ struct InstallForm {
 /// the driver default when the corresponding form field was blank.
 #[derive(Clone, Debug, Default)]
 struct InstallConfig {
+    version: Option<String>,
     port: Option<u16>,
     root_dir: Option<String>,
     service_name: Option<String>,
@@ -191,6 +197,10 @@ struct InstallConfig {
 
 impl InstallForm {
     fn into_config(self) -> Result<InstallConfig, String> {
+        let version = match self.version.trim() {
+            "" => None,
+            s => Some(s.to_string()),
+        };
         let port =
             match self.port.trim() {
                 "" => None,
@@ -217,6 +227,7 @@ impl InstallForm {
             }
         };
         Ok(InstallConfig {
+            version,
             port,
             root_dir,
             service_name,
@@ -356,36 +367,94 @@ async fn uninstall_postgres_handler(State(state): State<AppState>) -> Response {
     Html(body).into_response()
 }
 
+/// One entry in the version dropdown. `value` is the string the form
+/// posts back; `label` is the display string. Sorted latest-first.
+#[derive(Clone, Debug)]
+struct VersionOption {
+    value: String,
+    label: String,
+}
+
+/// Available pinned bundle versions for the postgres install path.
+/// Windows has the autonomous-download bundles; Linux/macOS still rely
+/// on the host package manager, so we offer a single "(host-installed)"
+/// option that maps to `version = None` in the spec.
+fn postgres_version_options() -> Vec<VersionOption> {
+    #[cfg(target_os = "windows")]
+    {
+        use computeza_driver_native::windows::postgres;
+        let mut out = Vec::new();
+        for (i, b) in postgres::available_versions().iter().enumerate() {
+            let suffix = if i == 0 { " (latest)" } else { "" };
+            out.push(VersionOption {
+                value: b.version.to_string(),
+                label: format!("PostgreSQL {}{}", b.version, suffix),
+            });
+        }
+        out
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        vec![VersionOption {
+            value: String::new(),
+            label: "host-installed PostgreSQL".into(),
+        }]
+    }
+}
+
+/// Format an `Uninstalled`-shaped result (steps + warnings vecs) into
+/// the text block shown on the install-result page. Per-OS variants
+/// all converge on this format so the UI is OS-agnostic.
+fn format_uninstall_summary(steps: &[String], warnings: &[String]) -> String {
+    let mut out = String::new();
+    for s in steps {
+        out.push_str(&format!("OK    {s}\n"));
+    }
+    for w in warnings {
+        out.push_str(&format!("warn  {w}\n"));
+    }
+    if warnings.is_empty() {
+        out.push_str("\nAll teardown steps completed cleanly.");
+    } else {
+        out.push_str(
+            "\nSome teardown steps reported warnings (see above). \
+             They are non-fatal -- re-run the uninstall to retry any \
+             step that left state behind.",
+        );
+    }
+    out
+}
+
 #[cfg(target_os = "windows")]
 async fn run_postgres_uninstall() -> Result<String, String> {
     use computeza_driver_native::windows::postgres;
     match postgres::uninstall(postgres::UninstallOptions::default()).await {
-        Ok(r) => {
-            let mut out = String::new();
-            for s in &r.steps {
-                out.push_str(&format!("OK  {s}\n"));
-            }
-            for w in &r.warnings {
-                out.push_str(&format!("warn  {w}\n"));
-            }
-            if r.warnings.is_empty() {
-                out.push_str("\nAll teardown steps completed cleanly.");
-            } else {
-                out.push_str(
-                    "\nSome teardown steps reported warnings (see above). \
-                     They are non-fatal -- re-run the uninstall to retry any \
-                     step that left state behind.",
-                );
-            }
-            Ok(out)
-        }
+        Ok(r) => Ok(format_uninstall_summary(&r.steps, &r.warnings)),
         Err(e) => Err(format!("{e}")),
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
 async fn run_postgres_uninstall() -> Result<String, String> {
-    Err("uninstall is currently implemented for Windows only".into())
+    use computeza_driver_native::linux::postgres;
+    match postgres::uninstall(postgres::UninstallOptions::default()).await {
+        Ok(r) => Ok(format_uninstall_summary(&r.steps, &r.warnings)),
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn run_postgres_uninstall() -> Result<String, String> {
+    use computeza_driver_native::macos::postgres;
+    match postgres::uninstall(postgres::UninstallOptions::default()).await {
+        Ok(r) => Ok(format_uninstall_summary(&r.steps, &r.warnings)),
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+async fn run_postgres_uninstall() -> Result<String, String> {
+    Err("uninstall is supported on Linux, macOS, and Windows only".into())
 }
 
 /// Construct a postgres reconciler for the freshly-installed instance
@@ -563,7 +632,7 @@ async fn run_postgres_install_with_progress(
         opts.root_dir = std::path::PathBuf::from(d);
     }
     if let Some(s) = &config.service_name {
-        opts.label = s.clone();
+        opts.plist_name = format!("{s}.plist");
     }
     match postgres::install(opts).await {
         Ok(r) => Ok((
@@ -599,6 +668,9 @@ async fn run_postgres_install_with_progress(
     }
     if let Some(s) = &config.service_name {
         opts.service_name = s.clone();
+    }
+    if let Some(v) = &config.version {
+        opts.version = Some(v.clone());
     }
     match postgres::install_with_progress(opts, progress).await {
         Ok(r) => {
@@ -1267,6 +1339,8 @@ pub fn render_install(localizer: &Localizer) -> String {
     let option_postgres = localizer.t("ui-install-postgres");
     let button = localizer.t("ui-install-button");
     let requires_root = localizer.t("ui-install-requires-root");
+    let version_label = localizer.t("ui-install-version-label");
+    let version_help = localizer.t("ui-install-version-help");
     let port_label = localizer.t("ui-install-port-label");
     let port_help = localizer.t("ui-install-port-help");
     let data_dir_label = localizer.t("ui-install-data-dir-label");
@@ -1276,6 +1350,21 @@ pub fn render_install(localizer: &Localizer) -> String {
     let advanced_label = localizer.t("ui-install-advanced");
     let already_installed = localizer.t("ui-install-already-installed");
     let uninstall_button = localizer.t("ui-uninstall-button");
+
+    // Per-OS pinned versions. Linux + macOS still use whatever the
+    // host package manager provides; only Windows has the
+    // download-from-EDB path with multiple pinned versions today.
+    let version_options = postgres_version_options();
+    let version_options_html: String = version_options
+        .iter()
+        .map(|v| {
+            format!(
+                r#"<option value="{value}">{label}</option>"#,
+                value = html_escape(&v.value),
+                label = html_escape(&v.label),
+            )
+        })
+        .collect();
 
     let body = format!(
         r#"<section class="cz-hero">
@@ -1289,6 +1378,12 @@ pub fn render_install(localizer: &Localizer) -> String {
 <select id="component" name="component" class="cz-select">
 <option value="postgres">{option_postgres}</option>
 </select>
+
+<label for="version">{version_label}</label>
+<select id="version" name="version" class="cz-select">
+{version_options_html}
+</select>
+<p class="cz-muted" style="margin: -0.5rem 0 0; font-size: 0.8rem;">{version_help}</p>
 
 <label for="port">{port_label}</label>
 <input id="port" name="port" class="cz-input" type="number" min="1" max="65535" placeholder="5432" />
@@ -1328,6 +1423,9 @@ pub fn render_install(localizer: &Localizer) -> String {
         option_postgres = html_escape(&option_postgres),
         button = html_escape(&button),
         requires_root = html_escape(&requires_root),
+        version_label = html_escape(&version_label),
+        version_help = html_escape(&version_help),
+        version_options_html = version_options_html,
         port_label = html_escape(&port_label),
         port_help = html_escape(&port_help),
         data_dir_label = html_escape(&data_dir_label),

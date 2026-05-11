@@ -129,6 +129,111 @@ const CANDIDATE_BIN_DIRS: &[&str] = &[
     "/usr/local/bin",
 ];
 
+/// Configuration for [`uninstall`]. Mirrors the Windows variant so
+/// per-OS install paths converge on a single uninstall contract from
+/// the UI's point of view.
+#[derive(Clone, Debug)]
+pub struct UninstallOptions {
+    /// Root the install used. Same default as [`InstallOptions::root_dir`].
+    pub root_dir: PathBuf,
+    /// Systemd unit name. Default `computeza-postgres.service`.
+    pub unit_name: String,
+}
+
+impl Default for UninstallOptions {
+    fn default() -> Self {
+        Self {
+            root_dir: PathBuf::from("/var/lib/computeza/postgres"),
+            unit_name: "computeza-postgres.service".into(),
+        }
+    }
+}
+
+/// Summary returned by [`uninstall`]. Same shape as the Windows
+/// variant so the UI handler is OS-agnostic.
+#[derive(Clone, Debug, Default)]
+pub struct Uninstalled {
+    /// Steps that completed successfully.
+    pub steps: Vec<String>,
+    /// Steps that failed (non-fatal -- the uninstall keeps going).
+    pub warnings: Vec<String>,
+}
+
+impl Uninstalled {
+    fn ok(&mut self, msg: impl Into<String>) {
+        self.steps.push(msg.into());
+    }
+    fn warn(&mut self, msg: impl Into<String>) {
+        self.warnings.push(msg.into());
+    }
+}
+
+/// Tear down a Linux PostgreSQL install written by [`install`].
+///
+/// Best-effort and idempotent: each step swallows "already gone"
+/// errors so the caller gets a coherent summary regardless of what
+/// state the prior install left behind.
+///
+/// What gets removed:
+/// - systemd unit (stop, disable, file removal, daemon-reload).
+/// - Data directory at `root_dir/data`.
+/// - `/usr/local/bin/computeza-psql` symlink.
+///
+/// What is preserved:
+/// - The host's PostgreSQL package (we never installed it -- v0.0.x
+///   uses the distro-shipped binaries).
+/// - The metadata-store row -- the caller deletes that separately.
+pub async fn uninstall(opts: UninstallOptions) -> Result<Uninstalled, InstallError> {
+    let mut out = Uninstalled::default();
+
+    // 1. Service teardown via systemctl.
+    if let Err(e) = systemctl::stop(&opts.unit_name).await {
+        out.warn(format!("systemctl stop {}: {e}", opts.unit_name));
+    } else {
+        out.ok(format!("stopped {}", opts.unit_name));
+    }
+    if let Err(e) = systemctl::run(&["disable", &opts.unit_name]).await {
+        out.warn(format!("systemctl disable {}: {e}", opts.unit_name));
+    } else {
+        out.ok(format!("disabled {}", opts.unit_name));
+    }
+
+    // 2. Remove the unit file and reload the manager so systemctl
+    //    forgets about it.
+    let unit_path = PathBuf::from("/etc/systemd/system").join(&opts.unit_name);
+    if fs::try_exists(&unit_path).await.unwrap_or(false) {
+        match fs::remove_file(&unit_path).await {
+            Ok(()) => out.ok(format!("removed unit file {}", unit_path.display())),
+            Err(e) => out.warn(format!("removing unit file {}: {e}", unit_path.display())),
+        }
+        if let Err(e) = systemctl::daemon_reload().await {
+            out.warn(format!("systemctl daemon-reload: {e}"));
+        } else {
+            out.ok("systemctl daemon-reload");
+        }
+    }
+
+    // 3. Data directory.
+    let data_dir = opts.root_dir.join("data");
+    if fs::try_exists(&data_dir).await.unwrap_or(false) {
+        match fs::remove_dir_all(&data_dir).await {
+            Ok(()) => out.ok(format!("removed data dir {}", data_dir.display())),
+            Err(e) => out.warn(format!("removing data dir {}: {e}", data_dir.display())),
+        }
+    } else {
+        out.ok(format!("data dir absent ({})", data_dir.display()));
+    }
+
+    // 4. PATH symlink.
+    if let Err(e) = path::unregister("psql").await {
+        out.warn(format!("removing psql symlink: {e}"));
+    } else {
+        out.ok("removed /usr/local/bin/computeza-psql");
+    }
+
+    Ok(out)
+}
+
 /// Auto-detect a binary directory that contains both `postgres` and `initdb`.
 async fn detect_bin_dir() -> Result<PathBuf, InstallError> {
     let mut tried = Vec::new();
