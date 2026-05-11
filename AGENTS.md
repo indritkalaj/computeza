@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-Instructions for Claude (and any other AI assistant) working in this repo.
+Instructions for any AI coding assistant working in this repo.
 
 ## Hard rules (do not negotiate)
 

@@ -17,7 +17,7 @@
 //! 4. `systemctl enable --now computeza-postgres.service`.
 //! 5. Waits until Postgres accepts TCP connections on the configured port.
 //! 6. Registers a `computeza-psql` symlink under `/usr/local/bin/` per
-//!    CLAUDE.md rule section 4 (cross-platform PATH registration).
+//!    AGENTS.md rule section 4 (cross-platform PATH registration).
 //!
 //! Privileged operations (writing under `/var/lib`, `/etc/systemd/system`,
 //! `/usr/local/bin`, running `initdb` as the postgres user, `systemctl`)

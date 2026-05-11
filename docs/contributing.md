@@ -1,7 +1,7 @@
 # Contributing to Computeza
 
 This document captures the bits of the contributor experience that
-aren't already in [`README.md`](../README.md) or [`CLAUDE.md`](../CLAUDE.md).
+aren't already in [`README.md`](../README.md) or [`AGENTS.md`](../AGENTS.md).
 
 ## Local development loop
 
@@ -21,7 +21,7 @@ how to fix it. Common failures:
   see the non-ASCII characters present. Most can be auto-fixed with
   `python3 scripts/audit-fix-nonascii.py`; anything unusual needs a
   manual decision (em-dash to `--`, section sign to `section `, etc.).
-  See CLAUDE.md hard rule 6.
+  See AGENTS.md hard rule 6.
 - **clippy warnings** -- the workspace runs with `clippy::all = "warn"`
   and `RUSTFLAGS=-D warnings`, so any clippy lint fails CI. Apply the
   fix clippy suggests, or document an `#[allow]` with a comment if the
@@ -29,7 +29,7 @@ how to fix it. Common failures:
 
 ## House rules
 
-The non-negotiable rules live in [`CLAUDE.md`](../CLAUDE.md). They are:
+The non-negotiable rules live in [`AGENTS.md`](../AGENTS.md). They are:
 
 1. No hardcoded user-facing strings -- everything through `computeza-i18n`.
 2. GUI-first -- every admin operation reachable from the web console.

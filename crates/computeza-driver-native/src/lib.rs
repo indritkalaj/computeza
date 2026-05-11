@@ -10,7 +10,7 @@
 //! From the operator's perspective the experience is identical on all
 //! three platforms; only the lowest layer diverges. Cross-platform PATH
 //! registration for any managed binary that exposes a CLI users may
-//! invoke directly is also this crate's responsibility (see CLAUDE.md
+//! invoke directly is also this crate's responsibility (see AGENTS.md
 //! rule section 4).
 //!
 //! v0.0.x ships the Linux Postgres install path as the first end-to-end

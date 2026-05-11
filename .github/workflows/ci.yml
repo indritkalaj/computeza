@@ -45,7 +45,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Reject non-ASCII bytes in tracked source files
-        # CLAUDE.md rule (the audit on 2026-04-27): source files use only
+        # AGENTS.md rule (the audit on 2026-04-27): source files use only
         # US-ASCII printable + standard whitespace. Em-dashes, section
         # signs, smart quotes, arrows, etc. must be substituted at write
         # time. This guard is a regression net.
