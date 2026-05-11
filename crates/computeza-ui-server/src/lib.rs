@@ -27,41 +27,123 @@
 use std::net::SocketAddr;
 
 use axum::{
+    extract::State,
     http::header,
-    response::{Html, IntoResponse, Response},
+    response::{Html, IntoResponse, Json, Response},
     routing::get,
     Router,
 };
 use computeza_i18n::Localizer;
+use computeza_state::{SqliteStore, Store};
 use leptos::prelude::*;
+use std::sync::Arc;
 use tower_http::trace::TraceLayer;
 
 /// Tailwind-compatible utility CSS, embedded at compile time. Served at
 /// `/static/computeza.css` and referenced from the home page.
 const COMPUTEZA_CSS: &str = include_str!("../assets/computeza.css");
 
-/// Boot the operator console on the given address. Awaits forever
-/// (until the process is signalled to terminate).
-///
-/// Errors are returned as `anyhow::Error` so the binary can format and
-/// log them uniformly.
+/// Shared state passed to every handler. Holds the `SqliteStore` (when
+/// `computeza serve` opens one) plus future shared services. Wrapped in
+/// `Arc` so axum can clone it cheaply per request.
+#[derive(Clone)]
+pub struct AppState {
+    /// Persistent metadata store, `None` for the unit-test smoke router.
+    pub store: Option<Arc<SqliteStore>>,
+}
+
+impl AppState {
+    /// Construct an empty state for tests / minimal serve.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self { store: None }
+    }
+
+    /// Construct with a backing SqliteStore.
+    #[must_use]
+    pub fn with_store(store: SqliteStore) -> Self {
+        Self {
+            store: Some(Arc::new(store)),
+        }
+    }
+}
+
+/// Boot the operator console on the given address with no backing store.
+/// `serve_with_state` is the version `computeza serve` actually calls;
+/// this entry point exists so smoke tests and ad-hoc invocations don't
+/// need to wire a database up.
 pub async fn serve(addr: SocketAddr) -> anyhow::Result<()> {
-    let app = router();
+    serve_with_state(addr, AppState::empty()).await
+}
+
+/// Boot the operator console with a fully-populated `AppState`. Awaits
+/// forever (until the process is signalled to terminate).
+pub async fn serve_with_state(addr: SocketAddr, state: AppState) -> anyhow::Result<()> {
+    let app = router_with_state(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(%addr, "computeza ui-server listening");
+    tracing::info!(%addr, "computeza ui-server listening; visit / for the operator console, /healthz for liveness, /api/state/info for the metadata-store summary");
     axum::serve(listener, app).await?;
     Ok(())
 }
 
-/// Build the axum router. Public so integration tests can instantiate it
-/// without going through `serve` (and choose their own bind port).
+/// Build the axum router with no backing state. Convenience for smoke
+/// tests; the binary uses `router_with_state`.
 pub fn router() -> Router {
+    router_with_state(AppState::empty())
+}
+
+/// Build the axum router with an `AppState` attached. Every handler that
+/// needs the store extracts it via `State<AppState>`.
+pub fn router_with_state(state: AppState) -> Router {
     Router::new()
         .route("/", get(home_handler))
         .route("/components", get(components_handler))
         .route("/healthz", get(healthz_handler))
+        .route("/api/state/info", get(state_info_handler))
         .route("/static/computeza.css", get(css_handler))
         .layer(TraceLayer::new_for_http())
+        .with_state(state)
+}
+
+async fn state_info_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let Some(store) = &state.store else {
+        return Json(serde_json::json!({
+            "store_attached": false,
+            "message": "no backing SqliteStore configured for this server",
+        }));
+    };
+    // Best-effort survey: count resources per known kind. Failures are
+    // reported in the response rather than crashing the request -- /api/
+    // routes must be resilient to a partially-broken backend.
+    let kinds = [
+        "postgres-instance",
+        "kanidm-instance",
+        "garage-instance",
+        "lakekeeper-instance",
+        "databend-instance",
+        "qdrant-instance",
+        "restate-instance",
+        "greptime-instance",
+        "grafana-instance",
+        "openfga-instance",
+    ];
+    let mut counts = serde_json::Map::new();
+    let mut errors = serde_json::Map::new();
+    for k in kinds {
+        match store.list(k, None).await {
+            Ok(v) => {
+                counts.insert(k.into(), serde_json::Value::from(v.len()));
+            }
+            Err(e) => {
+                errors.insert(k.into(), serde_json::Value::from(e.to_string()));
+            }
+        }
+    }
+    Json(serde_json::json!({
+        "store_attached": true,
+        "resource_counts": counts,
+        "errors": errors,
+    }))
 }
 
 async fn components_handler() -> Html<String> {

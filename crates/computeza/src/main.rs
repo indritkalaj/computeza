@@ -59,6 +59,15 @@ enum Command {
         /// per the port allocation in spec section 10.6.
         #[arg(long, default_value = "127.0.0.1:8400")]
         addr: SocketAddr,
+
+        /// Path to the SQLite metadata store file. Default
+        /// `./computeza-state.db` (relative to CWD). In production the
+        /// installer drops this under /var/lib/computeza on Linux,
+        /// /Library/Application Support/Computeza on macOS, and
+        /// %PROGRAMDATA%\Computeza on Windows; the flag lets dev / test
+        /// invocations point at a writable path without root.
+        #[arg(long, default_value = "computeza-state.db")]
+        state_db: String,
     },
     /// Show cluster status and reconciliation drift.
     Status {
@@ -88,11 +97,24 @@ fn main() -> anyhow::Result<()> {
             println!("{}", l.t("welcome-banner"));
             println!("{}", l.t("welcome-help"));
         }
-        Some(Command::Serve { addr }) => {
+        Some(Command::Serve { addr, state_db }) => {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            runtime.block_on(computeza_ui_server::serve(addr))?;
+            runtime.block_on(async move {
+                let store = computeza_state::SqliteStore::open(&state_db)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "opening SqliteStore at {state_db}: {e}; \
+                         pass --state-db <writable-path> to relocate (the default \
+                         `./computeza-state.db` requires write permission in the CWD)"
+                        )
+                    })?;
+                tracing::info!(state_db = %state_db, "metadata store ready");
+                let state = computeza_ui_server::AppState::with_store(store);
+                computeza_ui_server::serve_with_state(addr, state).await
+            })?;
         }
         Some(Command::Install { component }) => {
             install_component(component, &l)?;

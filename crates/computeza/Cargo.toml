@@ -26,5 +26,6 @@ reqwest = { workspace = true }
 # Internal
 computeza-core = { workspace = true }
 computeza-i18n = { workspace = true }
+computeza-state = { workspace = true }
 computeza-ui-server = { workspace = true }
 computeza-driver-native = { workspace = true }

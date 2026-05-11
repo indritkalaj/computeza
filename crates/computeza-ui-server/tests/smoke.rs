@@ -8,6 +8,8 @@ use std::net::{Ipv4Addr, SocketAddr};
 
 use tokio::net::TcpListener;
 
+// `serde_json` is brought in transitively by the ui-server crate.
+
 #[tokio::test]
 async fn server_serves_localized_home_and_healthz() {
     // Bind to an OS-chosen free port.
@@ -92,6 +94,20 @@ async fn server_serves_localized_home_and_healthz() {
         css.contains(".bg-indigo-900"),
         "embedded CSS should define spec section 4.3 palette utilities"
     );
+
+    // /api/state/info -- with no store attached, reports store_attached=false
+    let resp = client
+        .get(format!("http://{addr}/api/state/info"))
+        .send()
+        .await
+        .expect("GET /api/state/info");
+    assert!(
+        resp.status().is_success(),
+        "/api/state/info status: {}",
+        resp.status()
+    );
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert_eq!(body["store_attached"], false);
 
     // /components -- every spec section 2.2 component should be listed
     let resp = client
