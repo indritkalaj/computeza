@@ -300,6 +300,151 @@ pub async fn install_with_progress(
     })
 }
 
+/// Configuration for [`uninstall`].
+#[derive(Clone, Debug)]
+pub struct UninstallOptions {
+    /// Root the install used. Same default as [`InstallOptions::root_dir`].
+    pub root_dir: PathBuf,
+    /// Service name to tear down.
+    pub service_name: String,
+    /// When true, also delete the cached binary bundle under
+    /// `root_dir/binaries/`. Default `false` -- a fresh re-install
+    /// can reuse the cache and skip the ~270MB download.
+    pub purge_binaries: bool,
+}
+
+impl Default for UninstallOptions {
+    fn default() -> Self {
+        let programdata =
+            std::env::var("PROGRAMDATA").unwrap_or_else(|_| String::from("C:\\ProgramData"));
+        Self {
+            root_dir: PathBuf::from(programdata)
+                .join("Computeza")
+                .join("postgres"),
+            service_name: SERVICE_NAME.into(),
+            purge_binaries: false,
+        }
+    }
+}
+
+/// Summary returned by [`uninstall`].
+#[derive(Clone, Debug, Default)]
+pub struct Uninstalled {
+    /// Steps that completed successfully.
+    pub steps: Vec<String>,
+    /// Steps that failed (non-fatal -- the uninstall keeps going).
+    pub warnings: Vec<String>,
+}
+
+impl Uninstalled {
+    fn ok(&mut self, msg: impl Into<String>) {
+        self.steps.push(msg.into());
+    }
+    fn warn(&mut self, msg: impl Into<String>) {
+        self.warnings.push(msg.into());
+    }
+}
+
+/// Tear down a Windows PostgreSQL install written by [`install`].
+///
+/// Best-effort and idempotent: each step swallows "already gone"
+/// errors so the caller gets a coherent summary regardless of what
+/// state the prior install left behind. Returns the list of completed
+/// steps and any non-fatal warnings.
+///
+/// What gets removed:
+/// - Windows service (`sc stop`, `pg_ctl unregister`, `sc delete`).
+/// - Data directory (the cluster files at `root_dir/data`).
+/// - PATH shim and machine-PATH entry created by [`path::register`].
+///
+/// What is preserved:
+/// - The cached binary bundle under `root_dir/binaries/` -- a
+///   re-install reuses it and skips the download. Pass
+///   `purge_binaries: true` to delete the cache too.
+/// - The metadata-store row -- the caller deletes that separately
+///   so the UI can fold "metadata + on-disk" into a single
+///   confirmation step.
+pub async fn uninstall(opts: UninstallOptions) -> Result<Uninstalled, InstallError> {
+    let mut out = Uninstalled::default();
+
+    // 1. Service teardown -- match the layering in `register_service`.
+    let bin_dir_for_pg_ctl = locate_existing_bin_dir(&opts.root_dir).await;
+    if let Err(e) = sc::stop(&opts.service_name).await {
+        out.warn(format!("sc stop {}: {e}", opts.service_name));
+    } else {
+        out.ok(format!("stopped service {}", opts.service_name));
+    }
+    if let Some(bin) = &bin_dir_for_pg_ctl {
+        if let Err(e) = pg_ctl_unregister(&bin.join("pg_ctl.exe"), &opts.service_name).await {
+            out.warn(format!("pg_ctl unregister: {e}"));
+        } else {
+            out.ok(format!(
+                "pg_ctl unregister of {} completed",
+                opts.service_name
+            ));
+        }
+    }
+    if let Err(e) = sc::delete(&opts.service_name).await {
+        out.warn(format!("sc delete {}: {e}", opts.service_name));
+    } else {
+        out.ok(format!("deleted service {}", opts.service_name));
+    }
+    wait_for_service_absent(&opts.service_name, Duration::from_secs(10)).await;
+
+    // 2. Data directory -- destructive; the wizard surfaces a
+    //    confirmation page before reaching here.
+    let data_dir = opts.root_dir.join("data");
+    if fs::try_exists(&data_dir).await.unwrap_or(false) {
+        match fs::remove_dir_all(&data_dir).await {
+            Ok(()) => out.ok(format!("removed data dir {}", data_dir.display())),
+            Err(e) => out.warn(format!("removing data dir {}: {e}", data_dir.display())),
+        }
+    } else {
+        out.ok(format!("data dir absent ({})", data_dir.display()));
+    }
+
+    // 3. PATH shim. The shim lives under %PROGRAMFILES%\Computeza\bin.
+    if let Err(e) = path::unregister("psql").await {
+        out.warn(format!("removing psql shim: {e}"));
+    } else {
+        out.ok("removed psql shim from PATH");
+    }
+
+    // 4. Optional binary cache.
+    if opts.purge_binaries {
+        let cache = opts.root_dir.join("binaries");
+        if fs::try_exists(&cache).await.unwrap_or(false) {
+            match fs::remove_dir_all(&cache).await {
+                Ok(()) => out.ok(format!("removed binary cache {}", cache.display())),
+                Err(e) => out.warn(format!("removing binary cache: {e}")),
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+/// Locate an already-extracted bin dir under `root/binaries/<version>/<bin_subpath>`.
+/// Used by `uninstall` so we can run `pg_ctl unregister` against the
+/// binaries that registered the service in the first place.
+async fn locate_existing_bin_dir(root_dir: &Path) -> Option<PathBuf> {
+    let cache = root_dir.join("binaries");
+    let mut entries = match fs::read_dir(&cache).await {
+        Ok(e) => e,
+        Err(_) => return None,
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let candidate = entry.path().join("pgsql").join("bin");
+        if fs::try_exists(candidate.join("pg_ctl.exe"))
+            .await
+            .unwrap_or(false)
+        {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 async fn create_data_dir(data_dir: &Path) -> Result<(), InstallError> {
     if let Some(parent) = data_dir.parent() {
         fs::create_dir_all(parent).await?;

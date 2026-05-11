@@ -130,6 +130,10 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/components", get(components_handler))
         .route("/install", get(install_handler))
         .route("/install/postgres", post(install_postgres_handler))
+        .route(
+            "/install/postgres/uninstall",
+            get(uninstall_confirm_handler).post(uninstall_postgres_handler),
+        )
         .route("/install/job/{id}", get(install_job_handler))
         .route("/api/install/job/{id}", get(install_job_api_handler))
         .route("/status", get(status_handler))
@@ -163,6 +167,61 @@ async fn install_handler() -> Html<String> {
 struct InstallForm {
     /// Component slug. v0.0.x recognises only "postgres".
     component: String,
+    /// TCP port to listen on. Empty string means "use the driver default".
+    #[serde(default)]
+    port: String,
+    /// Override the data + cluster root. Empty string means use the
+    /// platform default under %PROGRAMDATA% / /var/lib / Application Support.
+    #[serde(default)]
+    root_dir: String,
+    /// Service name registered with the OS service manager. Empty
+    /// string means use the driver default (`computeza-postgres`).
+    #[serde(default)]
+    service_name: String,
+}
+
+/// Parsed user-facing install configuration. Each field defaults to
+/// the driver default when the corresponding form field was blank.
+#[derive(Clone, Debug, Default)]
+struct InstallConfig {
+    port: Option<u16>,
+    root_dir: Option<String>,
+    service_name: Option<String>,
+}
+
+impl InstallForm {
+    fn into_config(self) -> Result<InstallConfig, String> {
+        let port =
+            match self.port.trim() {
+                "" => None,
+                s => Some(s.parse::<u16>().map_err(|_| {
+                    format!("port must be an integer between 1 and 65535; got {s:?}")
+                })?),
+            };
+        let root_dir = match self.root_dir.trim() {
+            "" => None,
+            s => Some(s.to_string()),
+        };
+        let service_name = match self.service_name.trim() {
+            "" => None,
+            s if s
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') =>
+            {
+                Some(s.to_string())
+            }
+            s => {
+                return Err(format!(
+                    "service name {s:?} must be ASCII alphanumeric / hyphen / underscore only"
+                ))
+            }
+        };
+        Ok(InstallConfig {
+            port,
+            root_dir,
+            service_name,
+        })
+    }
 }
 
 async fn install_postgres_handler(
@@ -178,6 +237,12 @@ async fn install_postgres_handler(
         ))
         .into_response();
     }
+    let config = match form.into_config() {
+        Ok(c) => c,
+        Err(msg) => {
+            return Html(render_install_result(&l, false, &msg)).into_response();
+        }
+    };
 
     // Mint a job id, store an empty progress object, spawn the install
     // in the background, and redirect the browser to the wizard page
@@ -193,7 +258,7 @@ async fn install_postgres_handler(
     let store = state.store.clone();
     let progress = ProgressHandle::new(progress_state);
     tokio::spawn(async move {
-        match run_postgres_install_with_progress(&progress).await {
+        match run_postgres_install_with_progress(&progress, &config).await {
             Ok((summary, port)) => {
                 let mut summary = summary;
                 if let Some(store) = &store {
@@ -258,6 +323,69 @@ async fn install_postgres_handler(
     // 303 See Other to the wizard page. Standard POST-redirect-GET so
     // refreshing the wizard doesn't re-submit the form.
     Redirect303(format!("/install/job/{job_id}")).into_response()
+}
+
+async fn uninstall_confirm_handler() -> Html<String> {
+    let l = Localizer::english();
+    Html(render_uninstall_confirm(&l))
+}
+
+async fn uninstall_postgres_handler(State(state): State<AppState>) -> Response {
+    let l = Localizer::english();
+    let result = run_postgres_uninstall().await;
+
+    // Best-effort: also drop the metadata row so /status doesn't
+    // keep reporting a now-deleted instance. We do this regardless
+    // of whether the driver-side uninstall succeeded -- the operator
+    // explicitly asked for a rollback.
+    if let Some(store) = &state.store {
+        let key = ResourceKey::cluster_scoped("postgres-instance", "local");
+        if let Err(e) = store.delete(&key, None).await {
+            tracing::warn!(
+                error = %e,
+                "uninstall: store.delete(postgres-instance/local) failed; \
+                 manually delete the row via the /resource page if it lingers"
+            );
+        }
+    }
+
+    let body = match result {
+        Ok(summary) => render_install_result(&l, true, &summary),
+        Err(detail) => render_install_result(&l, false, &detail),
+    };
+    Html(body).into_response()
+}
+
+#[cfg(target_os = "windows")]
+async fn run_postgres_uninstall() -> Result<String, String> {
+    use computeza_driver_native::windows::postgres;
+    match postgres::uninstall(postgres::UninstallOptions::default()).await {
+        Ok(r) => {
+            let mut out = String::new();
+            for s in &r.steps {
+                out.push_str(&format!("OK  {s}\n"));
+            }
+            for w in &r.warnings {
+                out.push_str(&format!("warn  {w}\n"));
+            }
+            if r.warnings.is_empty() {
+                out.push_str("\nAll teardown steps completed cleanly.");
+            } else {
+                out.push_str(
+                    "\nSome teardown steps reported warnings (see above). \
+                     They are non-fatal -- re-run the uninstall to retry any \
+                     step that left state behind.",
+                );
+            }
+            Ok(out)
+        }
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn run_postgres_uninstall() -> Result<String, String> {
+    Err("uninstall is currently implemented for Windows only".into())
 }
 
 /// Construct a postgres reconciler for the freshly-installed instance
@@ -389,9 +517,20 @@ async fn install_job_api_handler(
 #[cfg(target_os = "linux")]
 async fn run_postgres_install_with_progress(
     _progress: &ProgressHandle,
+    config: &InstallConfig,
 ) -> Result<(String, u16), String> {
     use computeza_driver_native::linux::postgres;
-    match postgres::install(postgres::InstallOptions::default()).await {
+    let mut opts = postgres::InstallOptions::default();
+    if let Some(p) = config.port {
+        opts.port = p;
+    }
+    if let Some(d) = &config.root_dir {
+        opts.root_dir = std::path::PathBuf::from(d);
+    }
+    if let Some(s) = &config.service_name {
+        opts.unit_name = format!("{s}.service");
+    }
+    match postgres::install(opts).await {
         Ok(r) => Ok((
             format!(
                 "bin_dir: {}\ndata_dir: {}\nsystemd unit: {}\nport: {}\npsql symlink: {}",
@@ -413,9 +552,20 @@ async fn run_postgres_install_with_progress(
 #[cfg(target_os = "macos")]
 async fn run_postgres_install_with_progress(
     _progress: &ProgressHandle,
+    config: &InstallConfig,
 ) -> Result<(String, u16), String> {
     use computeza_driver_native::macos::postgres;
-    match postgres::install(postgres::InstallOptions::default()).await {
+    let mut opts = postgres::InstallOptions::default();
+    if let Some(p) = config.port {
+        opts.port = p;
+    }
+    if let Some(d) = &config.root_dir {
+        opts.root_dir = std::path::PathBuf::from(d);
+    }
+    if let Some(s) = &config.service_name {
+        opts.label = s.clone();
+    }
+    match postgres::install(opts).await {
         Ok(r) => Ok((
             format!(
                 "bin_dir: {}\ndata_dir: {}\nlaunchd plist: {}\nport: {}\npsql symlink: {}",
@@ -437,9 +587,20 @@ async fn run_postgres_install_with_progress(
 #[cfg(target_os = "windows")]
 async fn run_postgres_install_with_progress(
     progress: &ProgressHandle,
+    config: &InstallConfig,
 ) -> Result<(String, u16), String> {
     use computeza_driver_native::windows::postgres;
-    match postgres::install_with_progress(postgres::InstallOptions::default(), progress).await {
+    let mut opts = postgres::InstallOptions::default();
+    if let Some(p) = config.port {
+        opts.port = p;
+    }
+    if let Some(d) = &config.root_dir {
+        opts.root_dir = std::path::PathBuf::from(d);
+    }
+    if let Some(s) = &config.service_name {
+        opts.service_name = s.clone();
+    }
+    match postgres::install_with_progress(opts, progress).await {
         Ok(r) => {
             let shim_line = match (&r.psql_shim, &r.psql_shim_error) {
                 (Some(p), _) => p.display().to_string(),
@@ -465,6 +626,7 @@ async fn run_postgres_install_with_progress(
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 async fn run_postgres_install_with_progress(
     _progress: &ProgressHandle,
+    _config: &InstallConfig,
 ) -> Result<(String, u16), String> {
     Err("install is supported on Linux, macOS, and Windows only".into())
 }
@@ -1093,7 +1255,7 @@ fn html_escape(s: &str) -> String {
     out
 }
 
-/// Render the `/install` page: a small form that POSTs to
+/// Render the `/install` page: a wizard form that POSTs to
 /// `/install/postgres` and lays down a native PostgreSQL service on the
 /// host. Per spec section 2.1 / 4.2 the install path is GUI-equivalent
 /// to the CLI's `computeza install postgres`.
@@ -1105,23 +1267,60 @@ pub fn render_install(localizer: &Localizer) -> String {
     let option_postgres = localizer.t("ui-install-postgres");
     let button = localizer.t("ui-install-button");
     let requires_root = localizer.t("ui-install-requires-root");
+    let port_label = localizer.t("ui-install-port-label");
+    let port_help = localizer.t("ui-install-port-help");
+    let data_dir_label = localizer.t("ui-install-data-dir-label");
+    let data_dir_help = localizer.t("ui-install-data-dir-help");
+    let service_name_label = localizer.t("ui-install-service-name-label");
+    let service_name_help = localizer.t("ui-install-service-name-help");
+    let advanced_label = localizer.t("ui-install-advanced");
+    let already_installed = localizer.t("ui-install-already-installed");
+    let uninstall_button = localizer.t("ui-uninstall-button");
 
     let body = format!(
         r#"<section class="cz-hero">
 <h1>{title}</h1>
 <p>{intro}</p>
 </section>
-<section class="cz-section" style="max-width: 32rem;">
+<section class="cz-section" style="max-width: 36rem;">
 <div class="cz-card">
-<form method="post" action="/install/postgres" class="cz-form">
+<form method="post" action="/install/postgres" class="cz-form" style="max-width: none;">
 <label for="component">{target_label}</label>
 <select id="component" name="component" class="cz-select">
 <option value="postgres">{option_postgres}</option>
 </select>
-<button type="submit" class="cz-btn cz-btn-primary" style="align-self: flex-start;">{button}</button>
+
+<label for="port">{port_label}</label>
+<input id="port" name="port" class="cz-input" type="number" min="1" max="65535" placeholder="5432" />
+<p class="cz-muted" style="margin: -0.5rem 0 0; font-size: 0.8rem;">{port_help}</p>
+
+<details style="margin-top: 0.5rem;">
+<summary class="cz-tag" style="cursor: pointer;">{advanced_label}</summary>
+<div style="display: flex; flex-direction: column; gap: 0.9rem; margin-top: 1rem;">
+<div>
+<label for="root_dir" style="display: block; margin-bottom: 0.4rem;">{data_dir_label}</label>
+<input id="root_dir" name="root_dir" class="cz-input" type="text" placeholder="(default)" />
+<p class="cz-muted" style="margin: 0.35rem 0 0; font-size: 0.8rem;">{data_dir_help}</p>
+</div>
+<div>
+<label for="service_name" style="display: block; margin-bottom: 0.4rem;">{service_name_label}</label>
+<input id="service_name" name="service_name" class="cz-input" type="text" placeholder="computeza-postgres" pattern="[A-Za-z0-9_-]+" />
+<p class="cz-muted" style="margin: 0.35rem 0 0; font-size: 0.8rem;">{service_name_help}</p>
+</div>
+</div>
+</details>
+
+<button type="submit" class="cz-btn cz-btn-primary" style="align-self: flex-start; margin-top: 0.5rem;">{button}</button>
 </form>
 </div>
 <p class="cz-muted" style="margin-top: 1rem; font-size: 0.85rem;">{requires_root}</p>
+
+<div class="cz-card" style="margin-top: 1.5rem;">
+<p class="cz-card-body" style="margin: 0 0 1rem;">{already_installed}</p>
+<form method="get" action="/install/postgres/uninstall">
+<button type="submit" class="cz-btn cz-btn-danger">{uninstall_button}</button>
+</form>
+</div>
 </section>"#,
         title = html_escape(&title),
         intro = html_escape(&intro),
@@ -1129,6 +1328,50 @@ pub fn render_install(localizer: &Localizer) -> String {
         option_postgres = html_escape(&option_postgres),
         button = html_escape(&button),
         requires_root = html_escape(&requires_root),
+        port_label = html_escape(&port_label),
+        port_help = html_escape(&port_help),
+        data_dir_label = html_escape(&data_dir_label),
+        data_dir_help = html_escape(&data_dir_help),
+        service_name_label = html_escape(&service_name_label),
+        service_name_help = html_escape(&service_name_help),
+        advanced_label = html_escape(&advanced_label),
+        already_installed = html_escape(&already_installed),
+        uninstall_button = html_escape(&uninstall_button),
+    );
+
+    render_shell(localizer, &title, NavLink::Install, &body)
+}
+
+/// Render the `/install/postgres/uninstall` confirmation page. The
+/// operator clicks the destructive button here to roll back the
+/// install. POSTing back to the same URL runs the teardown.
+#[must_use]
+pub fn render_uninstall_confirm(localizer: &Localizer) -> String {
+    let title = localizer.t("ui-uninstall-title");
+    let intro = localizer.t("ui-uninstall-intro");
+    let confirm = localizer.t("ui-uninstall-confirm");
+    let button = localizer.t("ui-uninstall-button");
+    let cancel = localizer.t("ui-uninstall-cancel");
+
+    let body = format!(
+        r#"<section class="cz-hero">
+<h1>{title}</h1>
+<p>{intro}</p>
+</section>
+<section class="cz-section" style="max-width: 36rem;">
+<div class="cz-card" style="border-color: rgba(255, 157, 166, 0.45);">
+<p class="cz-card-body" style="margin: 0 0 1.25rem; color: var(--fail);">{confirm}</p>
+<form method="post" action="/install/postgres/uninstall" style="display: flex; gap: 0.75rem;">
+<button type="submit" class="cz-btn cz-btn-danger">{button}</button>
+<a class="cz-btn" href="/install">{cancel}</a>
+</form>
+</div>
+</section>"#,
+        title = html_escape(&title),
+        intro = html_escape(&intro),
+        confirm = html_escape(&confirm),
+        button = html_escape(&button),
+        cancel = html_escape(&cancel),
     );
 
     render_shell(localizer, &title, NavLink::Install, &body)

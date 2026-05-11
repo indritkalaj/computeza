@@ -99,6 +99,23 @@ ui-install-postgres      = PostgreSQL (spec section 7.13)
 ui-install-button        = Install
 ui-install-requires-root = Note: native install needs root / Administrator privileges (writes /etc/systemd/system, /Library/LaunchDaemons, or HKLM Services). If you started the operator console without elevation the install POST will fail with a clear permission error -- re-run `computeza serve` as root / via UAC and retry.
 
+ui-install-port-label        = TCP port
+ui-install-port-help         = The address PostgreSQL listens on. Default 5432. Pick another if you already have a PostgreSQL on 5432.
+ui-install-data-dir-label    = Data directory
+ui-install-data-dir-help     = Where the cluster files live. Leave blank for the default under %PROGRAMDATA%\Computeza\postgres (Windows) / /var/lib/computeza/postgres (Linux) / /Library/Application Support/Computeza/postgres (macOS).
+ui-install-service-name-label = Service name
+ui-install-service-name-help  = Identifier registered with the OS service manager. Override only if `computeza-postgres` collides with another service you already have.
+ui-install-advanced          = Advanced options
+ui-install-already-installed = Already installed? Uninstall first to start fresh.
+
+ui-uninstall-title    = Uninstall PostgreSQL
+ui-uninstall-intro    = This rolls back the install: stops the Windows service, deletes the data directory, removes the psql shim from PATH, and drops postgres-instance/local from the metadata store. The cached binary bundle is preserved so re-install is fast.
+ui-uninstall-confirm  = This deletes the cluster's data directory. Any databases inside will be permanently lost. Make a backup first if you care about the data.
+ui-uninstall-button   = Confirm uninstall
+ui-uninstall-cancel   = Cancel
+ui-uninstall-success  = Uninstall completed.
+ui-uninstall-failed   = Uninstall failed.
+
 ui-install-result-title     = Install result
 ui-install-result-success   = Install completed.
 ui-install-result-failed    = Install failed.
