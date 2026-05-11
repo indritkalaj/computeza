@@ -33,6 +33,16 @@ Thumbs.db
 /var/
 /data/
 
+# Runtime metadata stores created by `computeza serve --state-db`.
+# Default file lives next to wherever the user ran the server from;
+# don't track any of them.
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
 # Misc
 *.log
 *.pid

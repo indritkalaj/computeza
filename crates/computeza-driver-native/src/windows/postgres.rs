@@ -27,6 +27,20 @@ use tokio::{fs, net::TcpStream, process::Command, time::sleep};
 use tracing::{debug, info, warn};
 
 use super::{path, sc};
+use crate::fetch::{self, Bundle, FetchError};
+
+/// Pinned PostgreSQL Windows bundle. EDB publishes the same artifact
+/// for every Computeza release; we update both the URL and the SHA-256
+/// in lockstep when bumping versions.
+///
+/// SHA-256 is `None` for v0.0.x -- pin it before any stable release.
+/// AGENTS.md tracks the audit trail when checksums change.
+const PG_WINDOWS_BUNDLE: Bundle = Bundle {
+    version: "17.2-3",
+    url: "https://get.enterprisedb.com/postgresql/postgresql-17.2-3-windows-x64-binaries.zip",
+    sha256: None,
+    bin_subpath: "pgsql/bin",
+};
 
 /// Internal service name.
 pub const SERVICE_NAME: &str = "computeza-postgres";
@@ -100,6 +114,14 @@ pub enum InstallError {
     /// PATH registration failed.
     #[error(transparent)]
     Path(#[from] path::PathError),
+    /// Autonomous download / extraction of the binary bundle failed.
+    /// The error chain points at the EDB URL, expected vs. actual
+    /// checksum, or zip-corruption details. Recovery: re-run when the
+    /// network is reachable, or pre-install PostgreSQL manually and
+    /// pass `--bin_dir` (CLI) / set `InstallOptions::bin_dir` so the
+    /// installer skips the download path.
+    #[error(transparent)]
+    Fetch(#[from] FetchError),
     /// Server never started accepting connections.
     #[error("postgres did not become ready on port {port} within {timeout_secs}s")]
     NotReady {
@@ -111,14 +133,17 @@ pub enum InstallError {
 }
 
 /// Common locations a Windows Postgres install might leave its binaries.
+/// We also check our own cache root (populated by `fetch::fetch_and_extract`)
+/// as the last fallback, before deciding to download.
 const CANDIDATE_BIN_DIRS: &[&str] = &[
+    "C:\\Program Files\\PostgreSQL\\17\\bin",
     "C:\\Program Files\\PostgreSQL\\16\\bin",
     "C:\\Program Files\\PostgreSQL\\15\\bin",
     "C:\\Program Files\\PostgreSQL\\14\\bin",
     "C:\\Program Files\\PostgreSQL\\13\\bin",
 ];
 
-async fn detect_bin_dir() -> Result<PathBuf, InstallError> {
+async fn detect_bin_dir() -> Result<PathBuf, Vec<PathBuf>> {
     let mut tried = Vec::new();
     for c in CANDIDATE_BIN_DIRS {
         let dir = PathBuf::from(c);
@@ -133,15 +158,50 @@ async fn detect_bin_dir() -> Result<PathBuf, InstallError> {
             return Ok(dir);
         }
     }
-    Err(InstallError::BinaryNotFound(tried))
+    Err(tried)
+}
+
+/// Resolve the binary directory: caller override > host-installed EDB
+/// release > Computeza-managed cache > autonomous download from EDB.
+///
+/// The last leg implements the user mandate that the installer "should
+/// install the components automatically". If `opts.bin_dir` is set or
+/// a Program Files install is found, we never touch the network.
+async fn ensure_bin_dir(opts: &InstallOptions) -> Result<PathBuf, InstallError> {
+    if let Some(d) = &opts.bin_dir {
+        info!(bin_dir = %d.display(), "using caller-supplied bin_dir");
+        return Ok(d.clone());
+    }
+    match detect_bin_dir().await {
+        Ok(d) => {
+            info!(bin_dir = %d.display(), "detected existing host PostgreSQL install");
+            Ok(d)
+        }
+        Err(tried) => {
+            info!(
+                tried = ?tried,
+                "no host PostgreSQL install found; falling through to managed bundle download. \
+                 To skip this step pre-install PostgreSQL or pass InstallOptions::bin_dir."
+            );
+            let cache_root = opts.root_dir.join("binaries");
+            let bin = fetch::fetch_and_extract(&cache_root, &PG_WINDOWS_BUNDLE).await?;
+            // Sanity-check: the binary we expect must actually exist
+            // after extraction. If not, the bundle layout has changed
+            // and we need to update `bin_subpath`.
+            if !fs::try_exists(bin.join("postgres.exe"))
+                .await
+                .unwrap_or(false)
+            {
+                return Err(InstallError::BinaryNotFound(vec![bin]));
+            }
+            Ok(bin)
+        }
+    }
 }
 
 /// Install Postgres natively on Windows.
 pub async fn install(opts: InstallOptions) -> Result<Installed, InstallError> {
-    let bin_dir = match opts.bin_dir.clone() {
-        Some(d) => d,
-        None => detect_bin_dir().await?,
-    };
+    let bin_dir = ensure_bin_dir(&opts).await?;
     info!(bin_dir = %bin_dir.display(), "resolved postgres binaries");
 
     let data_dir = opts.root_dir.join("data");

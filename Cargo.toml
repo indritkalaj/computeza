@@ -46,7 +46,11 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
 
 # --- HTTP client (for reconcilers that talk to managed components over REST) ---
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
+
+# --- Zip extraction (driver-native uses this to unpack downloaded binary bundles) ---
+zip = { version = "2", default-features = false, features = ["deflate"] }
+futures-util = "0.3"
 
 # --- UI framework (Leptos SSR) ---
 # Spec section 4.1 mandates Leptos 0.7+. We use the latest 0.8 line.
