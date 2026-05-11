@@ -13,8 +13,10 @@ workspace = true
 
 [dependencies]
 computeza-core = { workspace = true }
+computeza-audit = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 sqlx = { workspace = true }
 secrecy = { workspace = true }
 chrono = { workspace = true }

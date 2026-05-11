@@ -5,11 +5,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
+use computeza_audit::{Action, AuditLog};
 use computeza_core::{
     reconciler::{Context, Outcome},
     Driver, Error as CoreError, Health, NoOpDriver, Reconciler,
 };
 use secrecy::{ExposeSecret, SecretString};
+use serde_json::json;
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use thiserror::Error;
 use tokio::sync::{Mutex, OnceCell};
@@ -60,6 +62,9 @@ pub struct PostgresReconciler<D: Driver = NoOpDriver> {
     /// they cannot run inside the database being dropped.
     pool: OnceCell<PgPool>,
     last_observed: Mutex<Option<chrono::DateTime<Utc>>>,
+    /// Optional audit log; every successful DB change is appended here
+    /// as a signed event. None means no audit (typical in tests).
+    audit: Option<Arc<AuditLog>>,
     _driver: std::marker::PhantomData<Arc<D>>,
 }
 
@@ -72,6 +77,24 @@ impl<D: Driver> PostgresReconciler<D> {
             superuser_password,
             pool: OnceCell::new(),
             last_observed: Mutex::new(None),
+            audit: None,
+            _driver: std::marker::PhantomData,
+        }
+    }
+
+    /// Same as [`new`](Self::new), but attaches an audit log. Every
+    /// successful DB change in `apply` becomes a signed event in `audit`.
+    pub fn new_with_audit(
+        endpoint: ServerEndpoint,
+        superuser_password: SecretString,
+        audit: Arc<AuditLog>,
+    ) -> Self {
+        Self {
+            endpoint,
+            superuser_password,
+            pool: OnceCell::new(),
+            last_observed: Mutex::new(None),
+            audit: Some(audit),
             _driver: std::marker::PhantomData,
         }
     }
@@ -126,6 +149,22 @@ impl<D: Driver> PostgresReconciler<D> {
             last_observed_at: Some(now),
             last_observe_failed: false,
         })
+    }
+
+    /// Emit a signed audit event if an audit log is attached. Best-effort:
+    /// failure to append is logged but does not fail the reconcile (the
+    /// reconcile already committed to the database; rolling it back over
+    /// an audit error would be more dangerous than carrying on).
+    async fn audit_event(
+        &self,
+        action: Action,
+        resource: Option<String>,
+        detail: serde_json::Value,
+    ) {
+        let Some(log) = &self.audit else { return };
+        if let Err(e) = log.append("system", action, resource, detail).await {
+            warn!(error = %e, "failed to append audit event");
+        }
     }
 
     /// Validate a database identifier before we quote it into SQL. Strict
@@ -219,6 +258,12 @@ impl<D: Driver + 'static> Reconciler for PostgresReconciler<D> {
                         .await
                         .map_err(PostgresError::from)
                         .map_err(CoreError::from)?;
+                    self.audit_event(
+                        Action::ResourceCreated,
+                        Some(format!("postgres-instance/{}", db.name)),
+                        json!({"operation": "CREATE DATABASE", "owner": db.owner, "encoding": db.encoding}),
+                    )
+                    .await;
                     applied += 1;
                 }
                 DatabaseChange::Drop { name } => {
@@ -234,10 +279,24 @@ impl<D: Driver + 'static> Reconciler for PostgresReconciler<D> {
                         .await
                         .map_err(PostgresError::from)
                         .map_err(CoreError::from)?;
+                    self.audit_event(
+                        Action::ResourceDeleted,
+                        Some(format!("postgres-instance/{name}")),
+                        json!({"operation": "DROP DATABASE"}),
+                    )
+                    .await;
                     applied += 1;
                 }
             }
         }
+
+        // One overall Reconciled event with the summary.
+        self.audit_event(
+            Action::Reconciled,
+            None,
+            json!({"applied": applied, "changed": applied > 0}),
+        )
+        .await;
 
         info!(applied, "postgres reconcile applied");
         Ok(Outcome {
