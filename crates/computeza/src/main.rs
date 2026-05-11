@@ -61,7 +61,11 @@ enum Command {
         addr: SocketAddr,
     },
     /// Show cluster status and reconciliation drift.
-    Status,
+    Status {
+        /// Address of the running operator console to probe.
+        #[arg(long, default_value = "http://127.0.0.1:8400")]
+        url: String,
+    },
     /// Show license tier, seat usage, activation health, expiry.
     License,
 }
@@ -93,10 +97,42 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Install { component }) => {
             install_component(component, &l)?;
         }
-        Some(Command::Status) => println!("{}", l.t("cmd-status-todo")),
+        Some(Command::Status { url }) => {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(status(&url, &l))?;
+        }
         Some(Command::License) => println!("{}", l.t("cmd-license-todo")),
     }
     Ok(())
+}
+
+/// Probe the operator console at `url` and print a localized status
+/// summary. v0.0.x just hits `/healthz`; future versions surface drift
+/// per resource (spec §4.4 drift indicators).
+async fn status(url: &str, l: &Localizer) -> anyhow::Result<()> {
+    let healthz = format!("{}/healthz", url.trim_end_matches('/'));
+    let resp = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?
+        .get(&healthz)
+        .send()
+        .await;
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            println!("{} ({url})", l.t("status-healthy"));
+            Ok(())
+        }
+        Ok(r) => {
+            println!("{}: HTTP {} ({url})", l.t("status-unhealthy"), r.status());
+            std::process::exit(1);
+        }
+        Err(e) => {
+            println!("{}: {e} ({url})", l.t("status-unreachable"));
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Dispatch `computeza install <component>` to the appropriate platform

@@ -27,6 +27,12 @@ cmd-license-todo = `computeza license` — show license tier, seat usage, activa
 
 install-postgres-linux-only = `computeza install postgres` is only supported on Linux in v0.0.x. macOS (launchd) and Windows (Services) variants ship in a follow-up release.
 
+# --- Status command ---
+
+status-healthy     = ✓ operator console is healthy
+status-unhealthy   = ✗ operator console returned an error
+status-unreachable = ✗ operator console is unreachable
+
 # --- Generic ---
 
 err-unknown    = An unexpected error occurred. See logs for details.
