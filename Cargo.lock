@@ -757,6 +757,7 @@ dependencies = [
  "chrono",
  "computeza-audit",
  "computeza-core",
+ "computeza-state",
  "secrecy",
  "serde",
  "serde_json",

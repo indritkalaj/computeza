@@ -10,6 +10,7 @@ use computeza_core::{
     reconciler::{Context, Outcome},
     Driver, Error as CoreError, Health, NoOpDriver, Reconciler,
 };
+use computeza_state::{ResourceKey, SqliteStore, Store};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::json;
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
@@ -65,12 +66,25 @@ pub struct PostgresReconciler<D: Driver = NoOpDriver> {
     /// Optional audit log; every successful DB change is appended here
     /// as a signed event. None means no audit (typical in tests).
     audit: Option<Arc<AuditLog>>,
+    /// Optional state-store handle. When attached, every `observe()`
+    /// success calls `Store::put_status` so the snapshot is durable.
+    state: Option<StateBinding>,
     _driver: std::marker::PhantomData<Arc<D>>,
+}
+
+/// Pair of (store, instance name) used to persist status. The instance
+/// name is the `Resource::name` half of the key under which this
+/// reconciler's `PostgresStatus` lands in the state store.
+struct StateBinding {
+    store: Arc<SqliteStore>,
+    instance_name: String,
 }
 
 impl<D: Driver> PostgresReconciler<D> {
     /// Construct a reconciler bound to the given endpoint and superuser
     /// password. The connection pool is opened lazily on first use.
+    /// Builder methods [`with_audit`](Self::with_audit) and
+    /// [`with_state`](Self::with_state) attach optional integrations.
     pub fn new(endpoint: ServerEndpoint, superuser_password: SecretString) -> Self {
         Self {
             endpoint,
@@ -78,25 +92,41 @@ impl<D: Driver> PostgresReconciler<D> {
             pool: OnceCell::new(),
             last_observed: Mutex::new(None),
             audit: None,
+            state: None,
             _driver: std::marker::PhantomData,
         }
     }
 
-    /// Same as [`new`](Self::new), but attaches an audit log. Every
-    /// successful DB change in `apply` becomes a signed event in `audit`.
+    /// Attach an audit log. Every successful DB change in `apply` becomes
+    /// a signed event in `audit`. Idempotent: re-calling replaces any
+    /// previously-attached log.
+    #[must_use]
+    pub fn with_audit(mut self, audit: Arc<AuditLog>) -> Self {
+        self.audit = Some(audit);
+        self
+    }
+
+    /// Attach a state store + the instance name under which to persist
+    /// the snapshot. Every successful `observe()` then calls
+    /// `Store::put_status` so the snapshot survives a process restart
+    /// and shows up in `GET /api/state/info`.
+    #[must_use]
+    pub fn with_state(mut self, store: Arc<SqliteStore>, instance_name: impl Into<String>) -> Self {
+        self.state = Some(StateBinding {
+            store,
+            instance_name: instance_name.into(),
+        });
+        self
+    }
+
+    /// Back-compat shim. Prefer `new(..).with_audit(audit)` going forward.
+    #[deprecated(note = "use PostgresReconciler::new(..).with_audit(..) instead")]
     pub fn new_with_audit(
         endpoint: ServerEndpoint,
         superuser_password: SecretString,
         audit: Arc<AuditLog>,
     ) -> Self {
-        Self {
-            endpoint,
-            superuser_password,
-            pool: OnceCell::new(),
-            last_observed: Mutex::new(None),
-            audit: Some(audit),
-            _driver: std::marker::PhantomData,
-        }
+        Self::new(endpoint, superuser_password).with_audit(audit)
     }
 
     /// Get (or open) the lazy admin-database connection pool.
@@ -167,6 +197,31 @@ impl<D: Driver> PostgresReconciler<D> {
         }
     }
 
+    /// If a state store is attached, persist the latest status snapshot
+    /// under `postgres-instance/<instance_name>`. Best-effort: failure
+    /// is logged but does not fail observe() (we already have the
+    /// snapshot in memory; the persistence layer being temporarily
+    /// unreachable is a degraded mode, not a fatal one).
+    async fn persist_status(&self, status: &PostgresStatus) {
+        let Some(binding) = &self.state else { return };
+        let key = ResourceKey::cluster_scoped("postgres-instance", &binding.instance_name);
+        let status_json = match serde_json::to_value(status) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "failed to serialize PostgresStatus for state persistence");
+                return;
+            }
+        };
+        if let Err(e) = binding.store.put_status(&key, &status_json).await {
+            warn!(
+                error = %e,
+                instance = %binding.instance_name,
+                "failed to put_status; status survives in-memory only this cycle \
+                 (check disk + SQLite file permissions; reconciler will retry on next observe)"
+            );
+        }
+    }
+
     /// Validate a database identifier before we quote it into SQL. Strict
     /// allowlist: letters, digits, underscores, hyphens. PostgreSQL allows
     /// more, but the reconciler doesn't -- anything stranger should be a
@@ -191,16 +246,26 @@ impl<D: Driver + 'static> Reconciler for PostgresReconciler<D> {
     type Plan = PostgresPlan;
 
     async fn observe(&self, _ctx: &Context) -> Result<PostgresStatus, CoreError> {
-        match self.snapshot().await {
-            Ok(status) => Ok(status),
+        let status = match self.snapshot().await {
+            Ok(s) => s,
             Err(e) => {
-                warn!(error = %e, "postgres observe failed");
-                Ok(PostgresStatus {
+                warn!(
+                    error = %e,
+                    "postgres observe failed; returning sentinel status with last_observe_failed=true. \
+                     Reconciler will retry on next tick. Check: (1) network reachability to the \
+                     endpoint, (2) credentials in the spec, (3) pg_isready on the target host."
+                );
+                PostgresStatus {
                     last_observe_failed: true,
                     ..PostgresStatus::default()
-                })
+                }
             }
-        }
+        };
+        // Persist regardless of success/failure -- the failed-observe
+        // sentinel is useful state too (it tells the UI to surface a drift
+        // indicator). `persist_status` is best-effort; see its docs.
+        self.persist_status(&status).await;
+        Ok(status)
     }
 
     async fn plan(
