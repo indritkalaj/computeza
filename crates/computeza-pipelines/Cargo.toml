@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Computeza pipelines — pipeline definition + compilation to Restate workflows"
+description = "Computeza pipelines -- pipeline definition + compilation to Restate workflows"
 
 [lints]
 workspace = true

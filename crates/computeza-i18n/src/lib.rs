@@ -1,4 +1,4 @@
-//! Computeza i18n — externalized strings via Fluent (`.ftl`) resource bundles.
+//! Computeza i18n -- externalized strings via Fluent (`.ftl`) resource bundles.
 //!
 //! # The rule
 //!
@@ -10,7 +10,7 @@
 //! This rule is enforced socially in code review and (eventually) by a
 //! `cargo xtask check-i18n` lint that scans for string literals reaching
 //! user-facing sinks (`println!`, Leptos view text, `tracing::*` event
-//! messages that are user-visible, clap help text, …).
+//! messages that are user-visible, clap help text, ...).
 //!
 //! # Usage
 //!
@@ -28,18 +28,18 @@
 //!
 //! # Why Fluent
 //!
-//! Spec §4.1 mandates `fluent-rs + Noto Sans`. Fluent is Mozilla's
+//! Spec section 4.1 mandates `fluent-rs + Noto Sans`. Fluent is Mozilla's
 //! production l10n format used by Firefox; it handles plurals, gender,
 //! arguments, and message references natively, which CSV / JSON / gettext
 //! variants do not. The Rust binding is mature and cross-platform, which
-//! is what the all-Rust mandate (§1) calls for.
+//! is what the all-Rust mandate (section 1) calls for.
 
 use fluent_templates::{static_loader, Loader};
 use unic_langid::{langid, LanguageIdentifier};
 
 // `LOCALES` is a compile-time-loaded bundle of every shipped locale. The
 // macro builds it by walking `./locales/<lang>/*.ftl` at build time, so
-// lookups against it never touch the file system at runtime — air-gapped
+// lookups against it never touch the file system at runtime -- air-gapped
 // binaries carry every locale they shipped with.
 static_loader! {
     static LOCALES = {
@@ -48,7 +48,7 @@ static_loader! {
     };
 }
 
-/// English (US) language identifier — the only locale shipped today.
+/// English (US) language identifier -- the only locale shipped today.
 pub const EN: LanguageIdentifier = langid!("en");
 
 /// Resolves Fluent message keys against a bound language.
@@ -82,7 +82,7 @@ impl Localizer {
 
     /// Resolve a Fluent message key.
     ///
-    /// On a missing key this returns `?key?` and (in debug builds) panics —
+    /// On a missing key this returns `?key?` and (in debug builds) panics --
     /// missing keys are a build-time bug class and should be loud.
     #[must_use]
     pub fn t(&self, key: &str) -> String {

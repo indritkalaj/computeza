@@ -1,8 +1,8 @@
-//! `LakekeeperReconciler` — implements [`computeza_core::Reconciler`].
+//! `LakekeeperReconciler` -- implements [`computeza_core::Reconciler`].
 //!
 //! v0.0.x is read-only and follows the same HTTP-reconciler shape as
 //! `KanidmReconciler` and `GarageReconciler`. Write operations (warehouse
-//! create, project create, vended-creds issuance per spec §7.4) ship in
+//! create, project create, vended-creds issuance per spec section 7.4) ship in
 //! follow-ups.
 
 use std::sync::Arc;
@@ -70,6 +70,9 @@ impl<D: Driver> LakekeeperReconciler<D> {
     }
 
     fn build_client(insecure: bool) -> Result<reqwest::Client, LakekeeperError> {
+        if insecure {
+            warn!("lakekeeper: insecure_skip_tls_verify=true; TLS validation disabled");
+        }
         Ok(reqwest::Client::builder()
             .danger_accept_invalid_certs(insecure)
             .user_agent(concat!(

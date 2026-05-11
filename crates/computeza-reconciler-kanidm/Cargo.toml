@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Kanidm reconciler — manages realms, OIDC clients, users, groups, passkey policies, federation"
+description = "Kanidm reconciler -- manages realms, OIDC clients, users, groups, passkey policies, federation"
 
 [lints]
 workspace = true

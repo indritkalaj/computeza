@@ -1,6 +1,6 @@
 //! PostgreSQL reconciler.
 //!
-//! Per spec §7.13, this reconciler manages database creation, migration
+//! Per spec section 7.13, this reconciler manages database creation, migration
 //! sequencing, and (eventually) backup orchestration against a running
 //! PostgreSQL instance. It communicates over libpq via SQLx.
 //!
@@ -10,7 +10,7 @@
 //! and *running* the PostgreSQL server: laying down the binary, writing the
 //! systemd unit / launchd plist / Windows Service registration, starting
 //! the process, exposing the port. This reconciler assumes the server is
-//! already running and focuses on the *configuration* layer above it —
+//! already running and focuses on the *configuration* layer above it --
 //! creating databases, managing users, applying schema migrations, and
 //! observing replication health.
 //!
@@ -33,7 +33,7 @@
 //!
 //! - User and role management (next iteration)
 //! - Schema migrations (depends on a chosen migration runner)
-//! - Streaming replication / Patroni HA (spec §7.13)
+//! - Streaming replication / Patroni HA (spec section 7.13)
 //! - Backup orchestration
 
 #![warn(missing_docs)]

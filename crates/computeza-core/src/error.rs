@@ -20,7 +20,7 @@ pub enum Error {
     Drift {
         /// The drifted resource's identifier.
         resource: String,
-        /// Human-readable detail (NOT user-facing — i18n happens at the UI layer).
+        /// Human-readable detail (NOT user-facing -- i18n happens at the UI layer).
         detail: String,
     },
 

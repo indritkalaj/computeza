@@ -10,7 +10,7 @@
 //! ```
 //!
 //! The URL is parsed into the same `ServerEndpoint` + password that the
-//! reconciler takes in production — the test is end-to-end realistic.
+//! reconciler takes in production -- the test is end-to-end realistic.
 
 use computeza_core::{reconciler::Context, NoOpDriver, Reconciler};
 use computeza_reconciler_postgres::{

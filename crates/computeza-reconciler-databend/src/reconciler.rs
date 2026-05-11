@@ -65,6 +65,9 @@ impl<D: Driver> DatabendReconciler<D> {
     }
 
     fn build_client(insecure: bool) -> Result<reqwest::Client, DatabendError> {
+        if insecure {
+            warn!("databend: insecure_skip_tls_verify=true; TLS validation disabled");
+        }
         Ok(reqwest::Client::builder()
             .danger_accept_invalid_certs(insecure)
             .user_agent(concat!(

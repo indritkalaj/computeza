@@ -1,10 +1,10 @@
-//! Driver trait — abstracts the deployment target.
+//! Driver trait -- abstracts the deployment target.
 //!
-//! Per spec §3.4, the same reconciler logic produces a Garage cluster on
+//! Per spec section 3.4, the same reconciler logic produces a Garage cluster on
 //! native Linux, native macOS, native Windows, on Kubernetes, or on AWS EC2;
-//! only the driver differs. v1.0 ships a single driver — `driver-native` —
+//! only the driver differs. v1.0 ships a single driver -- `driver-native` --
 //! covering all three OS families. Kubernetes and cloud drivers are
-//! deferred to v1.2 (spec §3.2 Tier 2 table).
+//! deferred to v1.2 (spec section 3.2 Tier 2 table).
 //!
 //! New drivers can be added by partners without modifying core by
 //! implementing this trait in a dynamically-loaded library.
@@ -79,7 +79,7 @@ pub struct MetricsSnapshot {
     pub data: serde_json::Value,
 }
 
-/// The driver contract from spec §3.4. Native, K8s, and cloud drivers all
+/// The driver contract from spec section 3.4. Native, K8s, and cloud drivers all
 /// implement this against their respective runtimes.
 #[async_trait]
 pub trait Driver: Send + Sync {
@@ -109,7 +109,7 @@ pub trait Driver: Send + Sync {
 /// trait's `Driver` bound without conjuring a real driver.
 ///
 /// Calling any method panics in debug builds and returns
-/// [`crate::Error::Driver`] in release builds — the bug is "this reconciler
+/// [`crate::Error::Driver`] in release builds -- the bug is "this reconciler
 /// expected to never call the driver but did", and we want it loud.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoOpDriver;
@@ -140,7 +140,7 @@ impl NoOpDriver {
     fn refuse<T>(op: &str) -> Result<T> {
         debug_assert!(
             false,
-            "NoOpDriver::{op} called — reconciler should not invoke driver"
+            "NoOpDriver::{op} called -- reconciler should not invoke driver"
         );
         Err(crate::Error::Driver(format!(
             "NoOpDriver does not support {op}"

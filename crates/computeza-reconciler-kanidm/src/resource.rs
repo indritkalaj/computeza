@@ -27,7 +27,7 @@ pub struct KanidmSpec {
     /// How to reach the running Kanidm server.
     pub endpoint: KanidmEndpoint,
     /// Bearer token for the admin/idm_admin account. Skipped from
-    /// (de)serialization — see the same secrets-store pattern documented
+    /// (de)serialization -- see the same secrets-store pattern documented
     /// in the Postgres reconciler.
     #[serde(skip, default = "default_secret")]
     pub admin_token: SecretString,
@@ -40,7 +40,7 @@ fn default_secret() -> SecretString {
 /// How to reach a Kanidm server.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KanidmEndpoint {
-    /// Base URL — typically `https://idm.example.com`.
+    /// Base URL -- typically `https://idm.example.com`.
     pub base_url: String,
     /// Whether to skip TLS verification. Default false. Set true only for
     /// development against a self-signed cert.

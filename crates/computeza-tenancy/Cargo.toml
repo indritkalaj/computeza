@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Computeza tenancy — workspace isolation, quotas, billing metering"
+description = "Computeza tenancy -- workspace isolation, quotas, billing metering"
 
 [lints]
 workspace = true

@@ -1,4 +1,4 @@
-//! The [`Store`] trait — backend-agnostic persistence of the platform's
+//! The [`Store`] trait -- backend-agnostic persistence of the platform's
 //! desired-state metadata graph.
 
 use async_trait::async_trait;
@@ -11,7 +11,7 @@ use crate::error::Result;
 /// Unique key for a resource within the state store.
 ///
 /// `workspace == None` means a cluster-scoped resource (the typical case
-/// in single-tenant deployments per spec §3.6). Multi-tenant deployments
+/// in single-tenant deployments per spec section 3.6). Multi-tenant deployments
 /// scope every resource to a workspace name.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ResourceKey {
@@ -107,7 +107,7 @@ pub trait Store: Send + Sync {
     /// specific workspace for workspace-scoped lookup.
     async fn list(&self, kind: &str, workspace: Option<&str>) -> Result<Vec<StoredResource>>;
 
-    /// Replace a resource's status. Does NOT bump the revision —
+    /// Replace a resource's status. Does NOT bump the revision --
     /// reconciler-driven status updates are not user-initiated changes
     /// and shouldn't trigger spec-conflict errors elsewhere.
     async fn put_status(&self, key: &ResourceKey, status: &serde_json::Value) -> Result<()>;

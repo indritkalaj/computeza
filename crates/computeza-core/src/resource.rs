@@ -1,20 +1,20 @@
-//! Resource — the unit of declarative state.
+//! Resource -- the unit of declarative state.
 //!
-//! Per spec §3.5, every managed thing in Computeza is a Resource: it has
+//! Per spec section 3.5, every managed thing in Computeza is a Resource: it has
 //! an identity (UUID + scoped name), a spec (user-declared desired state),
 //! a status (system-observed actual state), a history (the audit log
 //! projection), and a lineage (upstream dependencies and downstream
 //! dependents).
 //!
 //! The `Resource` trait below captures the structural contract; concrete
-//! resource types (`Warehouse`, `User`, `Pipeline`, `Bucket`, …) live in
+//! resource types (`Warehouse`, `User`, `Pipeline`, `Bucket`, ...) live in
 //! the crates that own them.
 
 use chrono::{DateTime, Utc};
 use serde::{de::DeserializeOwned, Serialize};
 use uuid::Uuid;
 
-/// Identity of a resource — stable UUID plus a human-readable name unique
+/// Identity of a resource -- stable UUID plus a human-readable name unique
 /// within the resource's parent scope.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, serde::Deserialize)]
 pub struct ResourceId {
@@ -30,7 +30,7 @@ pub struct ResourceId {
 ///
 /// Edits supply the `revision` they read; the state store rejects writes
 /// where the persisted revision has advanced. The UI surfaces the resulting
-/// `Conflict` error as a three-way merge dialog (spec §3.5).
+/// `Conflict` error as a three-way merge dialog (spec section 3.5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, serde::Deserialize)]
 pub struct Revision(pub u64);
 
@@ -45,7 +45,7 @@ pub struct Metadata {
     pub created_at: DateTime<Utc>,
     /// When the spec was last updated.
     pub updated_at: DateTime<Utc>,
-    /// Workspace scope (relevant for multi-tenant deployments — spec §3.6).
+    /// Workspace scope (relevant for multi-tenant deployments -- spec section 3.6).
     pub workspace: Option<String>,
 }
 

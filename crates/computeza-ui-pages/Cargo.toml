@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Computeza UI pages — page modules for each console section (Identity, Catalogs, Pipelines, …)"
+description = "Computeza UI pages -- page modules for each console section (Identity, Catalogs, Pipelines, ...)"
 
 [lints]
 workspace = true

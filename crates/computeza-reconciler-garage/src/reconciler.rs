@@ -1,9 +1,9 @@
-//! `GarageReconciler` — implements [`computeza_core::Reconciler`] against
+//! `GarageReconciler` -- implements [`computeza_core::Reconciler`] against
 //! a running Garage cluster.
 //!
 //! v0.0.x is read-only and structurally mirrors `KanidmReconciler` in
 //! `computeza-reconciler-kanidm`. The HTTP-reconciler pattern is enforced
-//! by repetition — every reconciler that talks to an HTTP admin API
+//! by repetition -- every reconciler that talks to an HTTP admin API
 //! follows the same shape so reading one is reading them all.
 
 use std::sync::Arc;
@@ -71,6 +71,9 @@ impl<D: Driver> GarageReconciler<D> {
     }
 
     fn build_client(insecure: bool) -> Result<reqwest::Client, GarageError> {
+        if insecure {
+            warn!("garage: insecure_skip_tls_verify=true; TLS validation disabled");
+        }
         Ok(reqwest::Client::builder()
             .danger_accept_invalid_certs(insecure)
             .user_agent(concat!(

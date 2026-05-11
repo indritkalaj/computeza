@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Computeza UI themes — brand themes, white-label support for Provider channel partners"
+description = "Computeza UI themes -- brand themes, white-label support for Provider channel partners"
 
 [lints]
 workspace = true

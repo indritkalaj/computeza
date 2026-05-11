@@ -1,4 +1,4 @@
-//! `PostgresReconciler` — implements [`computeza_core::Reconciler`] against
+//! `PostgresReconciler` -- implements [`computeza_core::Reconciler`] against
 //! a running PostgreSQL server.
 
 use std::sync::Arc;
@@ -24,7 +24,7 @@ use crate::{
 
 /// Errors specific to the PostgreSQL reconciler.
 ///
-/// Internal — converted to [`computeza_core::Error`] before crossing the
+/// Internal -- converted to [`computeza_core::Error`] before crossing the
 /// trait boundary so the workspace's error API stays uniform.
 #[derive(Debug, Error)]
 pub enum PostgresError {
@@ -169,7 +169,7 @@ impl<D: Driver> PostgresReconciler<D> {
 
     /// Validate a database identifier before we quote it into SQL. Strict
     /// allowlist: letters, digits, underscores, hyphens. PostgreSQL allows
-    /// more, but the reconciler doesn't — anything stranger should be a
+    /// more, but the reconciler doesn't -- anything stranger should be a
     /// deliberate decision documented in the spec for that database, not
     /// something a YAML edit can accidentally introduce.
     fn validate_identifier(name: &str) -> Result<(), PostgresError> {
@@ -237,6 +237,12 @@ impl<D: Driver + 'static> Reconciler for PostgresReconciler<D> {
         let pool = self.admin_pool().await.map_err(CoreError::from)?;
 
         let mut applied = 0usize;
+        // SQL-injection note: PostgreSQL does not allow parameter binding
+        // for DDL identifiers, so CREATE / DROP DATABASE must interpolate
+        // the name as a string. The defense is the validate_identifier()
+        // allowlist (`[A-Za-z0-9_-]+` only) called immediately before
+        // every interpolation site. Any identifier reaching this loop
+        // has already been checked twice: once in plan() and again here.
         for change in &plan.changes {
             match change {
                 DatabaseChange::Create(db) => {
@@ -269,7 +275,7 @@ impl<D: Driver + 'static> Reconciler for PostgresReconciler<D> {
                 DatabaseChange::Drop { name } => {
                     Self::validate_identifier(name).map_err(CoreError::from)?;
                     if SYSTEM_DATABASES.contains(&name.as_str()) {
-                        // Defence in depth — compute_plan already filters these.
+                        // Defence in depth -- compute_plan already filters these.
                         continue;
                     }
                     let sql = format!("DROP DATABASE \"{name}\"");
@@ -307,7 +313,7 @@ impl<D: Driver + 'static> Reconciler for PostgresReconciler<D> {
 
     async fn health(&self, _ctx: &Context) -> Result<Health, CoreError> {
         // Healthy when we have observed successfully within the last 90s.
-        // Otherwise Unknown — actual unhealthiness is reported via the
+        // Otherwise Unknown -- actual unhealthiness is reported via the
         // status's `last_observe_failed` flag, which the UI surfaces as
         // amber until a fresh observe lands.
         let last = *self.last_observed.lock().await;
@@ -354,7 +360,7 @@ mod tests {
     #[test]
     fn rejects_unicode_database_name() {
         assert!(matches!(
-            PostgresReconciler::<NoOpDriver>::validate_identifier("naïve"),
+            PostgresReconciler::<NoOpDriver>::validate_identifier("na\u{00ef}ve"),
             Err(PostgresError::InvalidDatabaseName(_))
         ));
     }

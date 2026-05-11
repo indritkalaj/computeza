@@ -1,6 +1,6 @@
-//! Computeza UI server — Leptos SSR + axum HTTP server.
+//! Computeza UI server -- Leptos SSR + axum HTTP server.
 //!
-//! Per spec §4.1, the operator console is a server-rendered Rust application
+//! Per spec section 4.1, the operator console is a server-rendered Rust application
 //! using Leptos in SSR mode with selective hydration. This crate is the
 //! entry point: it wires the axum router, hosts the request handlers, and
 //! renders Leptos `view!` trees to HTML on the server.
@@ -12,7 +12,7 @@
 //! - `GET /healthz` returns a localized "ok" string for liveness probes
 //! - `tower-http::TraceLayer` emits structured tracing for every request
 //!
-//! Hydration (client-side WASM that re-attaches reactivity) is deferred —
+//! Hydration (client-side WASM that re-attaches reactivity) is deferred --
 //! the v0.0.x console is purely server-rendered, no JavaScript. We add
 //! hydration once we have an actual interactive surface (the install
 //! wizard or the pipeline canvas) that needs it.
@@ -134,7 +134,7 @@ pub fn render_home(localizer: &Localizer) -> String {
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>{title} — {app_title}</title>
+<title>{title} -- {app_title}</title>
 <link rel="stylesheet" href="/static/computeza.css" />
 </head>
 <body class="bg-indigo-900 text-slate-100">
@@ -145,9 +145,9 @@ pub fn render_home(localizer: &Localizer) -> String {
 }
 
 /// Render the `/components` page: a table of every component the
-/// platform manages, sourced from spec §2.2 + per-component i18n
+/// platform manages, sourced from spec section 2.2 + per-component i18n
 /// keys. Static for v0.0.x; future versions will surface live
-/// reconciler status (drift indicators per spec §4.4).
+/// reconciler status (drift indicators per spec section 4.4).
 #[must_use]
 pub fn render_components(localizer: &Localizer) -> String {
     let app_title = localizer.t("ui-app-title");
@@ -190,14 +190,14 @@ pub fn render_components(localizer: &Localizer) -> String {
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>{title} — {app_title}</title>
+<title>{title} -- {app_title}</title>
 <link rel="stylesheet" href="/static/computeza.css" />
 </head>
 <body class="bg-indigo-900 text-slate-100">
 <main class="mx-auto max-w-4xl p-12">
 <header class="border-b pb-6 mb-10">
 <h1 class="text-orange-500 text-2xl font-semibold tracking-tight m-0 mb-1">{app_title}</h1>
-<nav><a class="text-indigo-300 text-sm" href="/">←&nbsp;Home</a></nav>
+<nav><a class="text-indigo-300 text-sm" href="/"><-&nbsp;Home</a></nav>
 </header>
 <section>
 <h2 class="text-2xl font-semibold text-slate-100 m-0 mb-3">{title}</h2>

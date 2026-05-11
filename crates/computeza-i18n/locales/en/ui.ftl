@@ -1,4 +1,4 @@
-# Computeza — English (en) UI message bundle.
+# Computeza -- English (en) UI message bundle.
 #
 # Strings rendered by the operator console (Leptos SSR). Subsystem-specific
 # bundles will appear alongside this one (e.g. ui-pipelines.ftl, ui-audit.ftl)
@@ -13,7 +13,7 @@ ui-app-tagline        = Open lakehouse control plane
 
 ui-welcome-title      = Welcome to Computeza
 ui-welcome-subtitle   = Your operator console is online.
-ui-welcome-status     = Pre-alpha — the operator console is a placeholder while the rest of the platform is being built.
+ui-welcome-status     = Pre-alpha -- the operator console is a placeholder while the rest of the platform is being built.
 ui-welcome-spec       = See the Architecture & Product Specification v1.5 for the full feature plan.
 
 # --- Health check ---
@@ -47,7 +47,7 @@ component-lakekeeper-name = Lakekeeper
 component-lakekeeper-role = Iceberg REST catalog with Generic Tables
 
 component-xtable-name     = Apache XTable
-component-xtable-role     = Iceberg ↔ Delta ↔ Hudi metadata sync (Java sidecar)
+component-xtable-role     = Iceberg <-> Delta <-> Hudi metadata sync (Java sidecar)
 
 component-databend-name   = Databend
 component-databend-role   = Columnar SQL, vector, full-text search, geospatial

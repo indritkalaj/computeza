@@ -56,12 +56,29 @@ impl AuditLog {
         }
         // Recover state from any existing file.
         let (next_seq, chain_head) = recover_state(&path).await?;
-        let file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(false)
-            .open(&path)
-            .await?;
+        let mut opts = tokio::fs::OpenOptions::new();
+        opts.create(true).append(true).read(false);
+        // On Unix create the file with restrictive mode so it's not
+        // world-readable. Audit logs contain every administrative action
+        // on the cluster; treat them as sensitive.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts.open(&path).await?;
+        // If the file pre-existed, the mode= above had no effect; tighten
+        // it now. Best-effort: ignore errors if we can't chmod (e.g. file
+        // owned by another user).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = tokio::fs::metadata(&path).await {
+                let mut perms = meta.permissions();
+                perms.set_mode(0o600);
+                let _ = tokio::fs::set_permissions(&path, perms).await;
+            }
+        }
         Ok(Self {
             inner: Mutex::new(Inner {
                 file,

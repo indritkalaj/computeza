@@ -1,7 +1,7 @@
-//! Computeza UI design system — reusable Leptos components.
+//! Computeza UI design system -- reusable Leptos components.
 //!
-//! Per spec §3.2, the design system is a 47-component library; per spec
-//! §4.3 every component must conform to the dark-by-default, indigo +
+//! Per spec section 3.2, the design system is a 47-component library; per spec
+//! section 4.3 every component must conform to the dark-by-default, indigo +
 //! orange accent palette. Every component takes localised text via the
 //! `computeza-i18n` localizer rather than accepting raw strings.
 //!

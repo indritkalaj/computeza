@@ -1,5 +1,5 @@
 /*!
- * Computeza UI — hand-written Tailwind-compatible utility CSS.
+ * Computeza UI -- hand-written Tailwind-compatible utility CSS.
  *
  * This file is the v0.0.x bootstrap. It defines the spec section 4.3
  * palette as CSS custom properties and exposes the small set of Tailwind
@@ -8,7 +8,7 @@
  * by the standalone tailwindcss CLI (a single ~70MB binary, no Node).
  *
  * The class names match Tailwind exactly so the eventual swap is a
- * mechanical one — every existing class keeps working.
+ * mechanical one -- every existing class keeps working.
  */
 
 :root {

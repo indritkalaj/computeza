@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "PostgreSQL reconciler — manages databases on a running PostgreSQL instance via SQLx"
+description = "PostgreSQL reconciler -- manages databases on a running PostgreSQL instance via SQLx"
 
 [lints]
 workspace = true

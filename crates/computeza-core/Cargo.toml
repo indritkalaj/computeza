@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Computeza core — domain types, declarative state schema, Reconciler/Driver/Resource traits"
+description = "Computeza core -- domain types, declarative state schema, Reconciler/Driver/Resource traits"
 
 [lints]
 workspace = true

@@ -1,5 +1,5 @@
 /*!
- * Computeza UI — Tailwind v4 source.
+ * Computeza UI -- Tailwind v4 source.
  *
  * This is the canonical source the eventual build pipeline will consume.
  * Today the hand-maintained `computeza.css` next to it is what ships;
@@ -14,7 +14,7 @@
 
 @import "tailwindcss";
 
-/* Spec section 4.3 palette — Tailwind v4 @theme block. */
+/* Spec section 4.3 palette -- Tailwind v4 @theme block. */
 @theme {
   --color-indigo-900: #1A1B3A;
   --color-indigo-700: #2E2F5C;

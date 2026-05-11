@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Qdrant reconciler — manages collections, JWT RBAC, snapshot policies, sharding"
+description = "Qdrant reconciler -- manages collections, JWT RBAC, snapshot policies, sharding"
 
 [lints]
 workspace = true

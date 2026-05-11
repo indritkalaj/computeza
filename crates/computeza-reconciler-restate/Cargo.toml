@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Restate reconciler — manages service registrations, deployment mode, pipeline runs, agent runtime"
+description = "Restate reconciler -- manages service registrations, deployment mode, pipeline runs, agent runtime"
 
 [lints]
 workspace = true

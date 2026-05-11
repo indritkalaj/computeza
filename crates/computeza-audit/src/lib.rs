@@ -1,9 +1,9 @@
-//! Computeza audit — append-only signed audit log with hash chaining.
+//! Computeza audit -- append-only signed audit log with hash chaining.
 //!
-//! Per spec §3.5 every spec change is an event in the audit log; the
-//! current spec is a projection of the event log. Per spec §4.5 the same
-//! log feeds the **Audit Evidence Pack** generator — the killer feature
-//! for regulated buyers — and spec §6.5 makes it the EU AI Act Article 12
+//! Per spec section 3.5 every spec change is an event in the audit log; the
+//! current spec is a projection of the event log. Per spec section 4.5 the same
+//! log feeds the **Audit Evidence Pack** generator -- the killer feature
+//! for regulated buyers -- and spec section 6.5 makes it the EU AI Act Article 12
 //! record-keeping store for the agent runtime.
 //!
 //! # Guarantees

@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "OpenFGA reconciler — manages authorization model, tuples, namespace assignment"
+description = "OpenFGA reconciler -- manages authorization model, tuples, namespace assignment"
 
 [lints]
 workspace = true

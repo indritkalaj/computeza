@@ -1,19 +1,19 @@
-//! Computeza — single binary entry point.
+//! Computeza -- single binary entry point.
 //!
-//! Per spec §2.1, this binary is three things:
+//! Per spec section 2.1, this binary is three things:
 //!
-//! 1. **Installer** — first-run wizard that lays down the entire data plane
+//! 1. **Installer** -- first-run wizard that lays down the entire data plane
 //!    natively on the host operating system (`computeza install`).
-//! 2. **Operator console** — long-running server hosting the Leptos web UI,
+//! 2. **Operator console** -- long-running server hosting the Leptos web UI,
 //!    REST API, gRPC API, and the reconciliation loop (`computeza serve`).
-//! 3. **Configurator** — declarative state engine with a YAML representation
+//! 3. **Configurator** -- declarative state engine with a YAML representation
 //!    suitable for git, CI, and IaC workflows (`computeza apply`, etc.).
 //!
 //! Every command surface here is GUI-equivalent: anything you can do from
 //! this CLI you can also do from the web console (and vice versa). The CLI
 //! exists for power users, scripting, and CI; the web console is the
-//! primary interface (spec §2.1, §4.2, and the user mandate that
-//! everything — instances, clusters, users, permissions — be reachable
+//! primary interface (spec section 2.1, section 4.2, and the user mandate that
+//! everything -- instances, clusters, users, permissions -- be reachable
 //! from a GUI).
 //!
 //! User-facing strings route through [`computeza_i18n::Localizer`]. Clap's
@@ -45,7 +45,7 @@ struct Cli {
 }
 
 /// Top-level command surface. Each variant maps 1:1 to a section of the
-/// web console (spec §4.2).
+/// web console (spec section 4.2).
 #[derive(Subcommand, Debug)]
 enum Command {
     /// First-run installer.
@@ -56,7 +56,7 @@ enum Command {
     /// Start the operator console (web UI + reconciler loop).
     Serve {
         /// Address to bind the HTTP server to. Default `127.0.0.1:8400`
-        /// per the port allocation in spec §10.6.
+        /// per the port allocation in spec section 10.6.
         #[arg(long, default_value = "127.0.0.1:8400")]
         addr: SocketAddr,
     },
@@ -110,7 +110,7 @@ fn main() -> anyhow::Result<()> {
 
 /// Probe the operator console at `url` and print a localized status
 /// summary. v0.0.x just hits `/healthz`; future versions surface drift
-/// per resource (spec §4.4 drift indicators).
+/// per resource (spec section 4.4 drift indicators).
 async fn status(url: &str, l: &Localizer) -> anyhow::Result<()> {
     let healthz = format!("{}/healthz", url.trim_end_matches('/'));
     let resp = reqwest::Client::builder()

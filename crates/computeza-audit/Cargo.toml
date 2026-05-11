@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Computeza audit — append-only signed audit log with Ed25519 attestation and a hash-chained tamper-evident transcript"
+description = "Computeza audit -- append-only signed audit log with Ed25519 attestation and a hash-chained tamper-evident transcript"
 
 [lints]
 workspace = true

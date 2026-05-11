@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 
 /// Health of a managed resource at a point in time.
 ///
-/// Reconcilers refresh health every 30 seconds (spec §3.3); drift indicators
+/// Reconcilers refresh health every 30 seconds (spec section 3.3); drift indicators
 /// in the UI render this directly. The `Healthy` / `Degraded` / `Unhealthy`
-/// triad maps to spec §4.4's green / amber / red drift colours.
+/// triad maps to spec section 4.4's green / amber / red drift colours.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Health {

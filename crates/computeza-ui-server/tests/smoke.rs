@@ -1,7 +1,7 @@
 //! Server-level smoke test: bind to a free port, serve, hit /healthz and /,
 //! and assert the responses contain localized strings.
 //!
-//! Runs by default — no external dependencies. The OS picks a free port via
+//! Runs by default -- no external dependencies. The OS picks a free port via
 //! port 0 binding so concurrent test runs don't collide.
 
 use std::net::{Ipv4Addr, SocketAddr};
@@ -27,7 +27,7 @@ async fn server_serves_localized_home_and_healthz() {
     // Build a client and hit the endpoints.
     let client = reqwest::Client::builder().build().expect("reqwest client");
 
-    // /healthz — localized "ok"
+    // /healthz -- localized "ok"
     let resp = client
         .get(format!("http://{addr}/healthz"))
         .send()
@@ -44,7 +44,7 @@ async fn server_serves_localized_home_and_healthz() {
         "/healthz should return the localized ui-healthz-ok value"
     );
 
-    // / — full HTML page with localized welcome strings
+    // / -- full HTML page with localized welcome strings
     let resp = client
         .get(format!("http://{addr}/"))
         .send()
@@ -69,7 +69,7 @@ async fn server_serves_localized_home_and_healthz() {
         "home should link the embedded stylesheet"
     );
 
-    // /static/computeza.css — embedded Tailwind-compatible utility CSS
+    // /static/computeza.css -- embedded Tailwind-compatible utility CSS
     let resp = client
         .get(format!("http://{addr}/static/computeza.css"))
         .send()
@@ -93,7 +93,7 @@ async fn server_serves_localized_home_and_healthz() {
         "embedded CSS should define spec section 4.3 palette utilities"
     );
 
-    // /components — every spec section 2.2 component should be listed
+    // /components -- every spec section 2.2 component should be listed
     let resp = client
         .get(format!("http://{addr}/components"))
         .send()
@@ -120,7 +120,7 @@ async fn server_serves_localized_home_and_healthz() {
         assert!(body.contains(c), "/components should mention {c}");
     }
 
-    // Tear down. We abort rather than initiate graceful shutdown — sufficient
+    // Tear down. We abort rather than initiate graceful shutdown -- sufficient
     // for a smoke test, and avoids needing a shutdown channel in the public API.
     server.abort();
 }

@@ -34,7 +34,7 @@ fn default_secret() -> SecretString {
 /// How to reach the Lakekeeper management API.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LakekeeperEndpoint {
-    /// Base URL — typically `https://catalog.example.com`.
+    /// Base URL -- typically `https://catalog.example.com`.
     pub base_url: String,
     /// Skip TLS verification (development only).
     #[serde(default)]

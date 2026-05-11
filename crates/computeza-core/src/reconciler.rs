@@ -1,7 +1,7 @@
-//! Reconciler trait — the convergence loop that powers every Computeza
+//! Reconciler trait -- the convergence loop that powers every Computeza
 //! component integration.
 //!
-//! Per spec §3.3, every reconciler observes actual state, compares it to
+//! Per spec section 3.3, every reconciler observes actual state, compares it to
 //! desired state, computes the minimum set of operations required to
 //! converge them, and applies those operations through the appropriate
 //! [`Driver`](crate::driver::Driver). This trait captures that contract.
@@ -46,7 +46,7 @@ pub struct Outcome {
 
 /// The convergence loop. One impl per managed component.
 ///
-/// This trait mirrors spec §3.3's pseudocode literally; future revisions
+/// This trait mirrors spec section 3.3's pseudocode literally; future revisions
 /// may add hooks for compensation, dry-run, and partial-failure recovery,
 /// but those are additive.
 #[async_trait]

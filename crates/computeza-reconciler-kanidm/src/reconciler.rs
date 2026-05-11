@@ -1,4 +1,4 @@
-//! `KanidmReconciler` — implements [`computeza_core::Reconciler`] against a
+//! `KanidmReconciler` -- implements [`computeza_core::Reconciler`] against a
 //! running Kanidm server.
 //!
 //! v0.0.x is read-only: `observe()` snapshots server version + group/person
@@ -77,6 +77,9 @@ impl<D: Driver> KanidmReconciler<D> {
     }
 
     fn build_client(insecure: bool) -> Result<reqwest::Client, KanidmError> {
+        if insecure {
+            warn!("kanidm: insecure_skip_tls_verify=true; TLS validation disabled");
+        }
         Ok(reqwest::Client::builder()
             .danger_accept_invalid_certs(insecure)
             .user_agent(concat!(
@@ -163,7 +166,7 @@ impl<D: Driver> KanidmReconciler<D> {
 impl<D: Driver + 'static> Reconciler for KanidmReconciler<D> {
     type Resource = KanidmInstance;
     type Driver = D;
-    type Plan = (); // Read-only at v0.0.x — no managed state to converge.
+    type Plan = (); // Read-only at v0.0.x -- no managed state to converge.
 
     async fn observe(&self, _ctx: &Context) -> Result<KanidmStatus, CoreError> {
         match self.snapshot().await {
@@ -179,7 +182,7 @@ impl<D: Driver + 'static> Reconciler for KanidmReconciler<D> {
     }
 
     async fn plan(&self, _desired: &KanidmSpec, _actual: &KanidmStatus) -> Result<(), CoreError> {
-        // No managed state yet — plan is always empty.
+        // No managed state yet -- plan is always empty.
         Ok(())
     }
 

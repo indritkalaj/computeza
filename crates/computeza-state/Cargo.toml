@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Computeza state — persistence over SQLite (single-node) and PostgreSQL (HA) via SQLx"
+description = "Computeza state -- persistence over SQLite (single-node) and PostgreSQL (HA) via SQLx"
 
 [lints]
 workspace = true

@@ -10,7 +10,7 @@ license = "LicenseRef-Proprietary"
 repository = "https://github.com/indritkalaj/computeza"
 authors = ["Indrit Kalaj <kalaj.indrit@gmail.com>"]
 homepage = "https://github.com/indritkalaj/computeza"
-description = "Computeza — all-Rust open lakehouse control plane"
+description = "Computeza -- all-Rust open lakehouse control plane"
 
 [workspace.dependencies]
 # --- Async runtime ---
@@ -27,7 +27,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # serde_yml is the maintained successor to the now-deprecated `serde_yaml`
 # crate. The 0.0.x versioning is the maintainer's convention, not an
-# instability signal — it's widely used in production as of April 2026.
+# instability signal -- it's widely used in production as of April 2026.
 serde_yml = "0.0.12"
 
 # --- Tracing / logs ---
@@ -46,7 +46,7 @@ tower-http = { version = "0.6", features = ["trace"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 
 # --- UI framework (Leptos SSR) ---
-# Spec §4.1 mandates Leptos 0.7+. We use the latest 0.8 line.
+# Spec section 4.1 mandates Leptos 0.7+. We use the latest 0.8 line.
 # `ssr` feature for server-side rendering; client hydration deferred.
 leptos = { version = "0.8", features = ["ssr"] }
 
@@ -86,7 +86,7 @@ sqlx = { version = "0.8", default-features = false, features = [
 ] }
 
 # --- Internal crates ---
-# Tier 1 — Core Engine
+# Tier 1 -- Core Engine
 computeza-core      = { path = "crates/computeza-core",      version = "0.0.1" }
 computeza-state     = { path = "crates/computeza-state",     version = "0.0.1" }
 computeza-audit     = { path = "crates/computeza-audit",     version = "0.0.1" }
@@ -95,10 +95,10 @@ computeza-driver    = { path = "crates/computeza-driver",    version = "0.0.1" }
 computeza-tenancy   = { path = "crates/computeza-tenancy",   version = "0.0.1" }
 computeza-pipelines = { path = "crates/computeza-pipelines", version = "0.0.1" }
 
-# Tier 2 — Drivers
+# Tier 2 -- Drivers
 computeza-driver-native = { path = "crates/computeza-driver-native", version = "0.0.1" }
 
-# Tier 4 — Web Console (i18n is shared, so placed at workspace level)
+# Tier 4 -- Web Console (i18n is shared, so placed at workspace level)
 computeza-i18n          = { path = "crates/computeza-i18n",          version = "0.0.1" }
 computeza-ui-server     = { path = "crates/computeza-ui-server",     version = "0.0.1" }
 computeza-ui-components = { path = "crates/computeza-ui-components", version = "0.0.1" }

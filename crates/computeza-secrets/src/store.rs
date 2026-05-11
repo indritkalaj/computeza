@@ -1,4 +1,4 @@
-//! [`SecretsStore`] — file-backed encrypted secret storage.
+//! [`SecretsStore`] -- file-backed encrypted secret storage.
 
 use std::{collections::HashMap, path::PathBuf};
 
@@ -159,6 +159,17 @@ impl SecretsStore {
         }
         f.sync_all().await?;
         drop(f);
+        // On Unix, lock the tmp file down before rename so the destination
+        // never appears world-readable (even briefly). Values are
+        // AES-GCM ciphertext, but names are clear and could leak which
+        // services are deployed; treat the file as sensitive.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&tmp).await?.permissions();
+            perms.set_mode(0o600);
+            fs::set_permissions(&tmp, perms).await?;
+        }
         fs::rename(&tmp, &self.inner.path).await?;
         Ok(())
     }

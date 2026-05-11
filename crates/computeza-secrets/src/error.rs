@@ -11,7 +11,7 @@ pub enum SecretsError {
     /// JSON (de)serialization failure.
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
-    /// AES-GCM seal / open failure — typically wrong master key (auth tag fails).
+    /// AES-GCM seal / open failure -- typically wrong master key (auth tag fails).
     #[error("aes-gcm: {0}")]
     Crypto(String),
     /// base64 decoding failure on the stored nonce or ciphertext.

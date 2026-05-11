@@ -1,4 +1,4 @@
-# Computeza — English (en) message bundle.
+# Computeza -- English (en) message bundle.
 #
 # This file holds user-facing strings for the CLI surface and any
 # cross-cutting messages that don't belong to a specific subsystem.
@@ -13,15 +13,15 @@
 
 # --- Top-level CLI banner ---
 
-welcome-banner = Computeza — open lakehouse control plane
+welcome-banner = Computeza -- open lakehouse control plane
 welcome-help   = Run `computeza --help` to see available commands.
 
 # --- Subcommand placeholders (will be replaced as commands are implemented) ---
 
-cmd-install-todo = `computeza install <component>` — installs a managed component natively. v0.0.x supports `postgres` on Linux only.
-cmd-serve-todo   = `computeza serve` — start the operator console (web UI + reconciler). Not yet implemented in this scaffold.
-cmd-status-todo  = `computeza status` — report cluster health and reconciliation drift. Not yet implemented in this scaffold.
-cmd-license-todo = `computeza license` — show license tier, seat usage, activation health, expiry. Not yet implemented in this scaffold.
+cmd-install-todo = `computeza install <component>` -- installs a managed component natively. v0.0.x supports `postgres` on Linux only.
+cmd-serve-todo   = `computeza serve` -- start the operator console (web UI + reconciler). Not yet implemented in this scaffold.
+cmd-status-todo  = `computeza status` -- report cluster health and reconciliation drift. Not yet implemented in this scaffold.
+cmd-license-todo = `computeza license` -- show license tier, seat usage, activation health, expiry. Not yet implemented in this scaffold.
 
 # --- Install errors / platform gates ---
 
@@ -29,9 +29,9 @@ install-postgres-linux-only = `computeza install postgres` is only supported on 
 
 # --- Status command ---
 
-status-healthy     = ✓ operator console is healthy
-status-unhealthy   = ✗ operator console returned an error
-status-unreachable = ✗ operator console is unreachable
+status-healthy     = OK operator console is healthy
+status-unhealthy   = FAIL operator console returned an error
+status-unreachable = FAIL operator console is unreachable
 
 # --- Generic ---
 

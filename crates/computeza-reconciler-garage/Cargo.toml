@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Garage reconciler — manages cluster layout, zones, replication, buckets, access keys, lifecycle"
+description = "Garage reconciler -- manages cluster layout, zones, replication, buckets, access keys, lifecycle"
 
 [lints]
 workspace = true

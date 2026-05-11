@@ -18,7 +18,7 @@ Thumbs.db
 .env.local
 *.local
 
-# Build artifacts (cross-platform packaging — see spec §10)
+# Build artifacts (cross-platform packaging -- see spec section 10)
 /dist
 /release
 *.deb

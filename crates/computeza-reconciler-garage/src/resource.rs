@@ -22,7 +22,7 @@ impl Resource for GarageInstance {
 pub struct GarageSpec {
     /// Garage admin endpoint (typically `http://node:3903`).
     pub endpoint: GarageEndpoint,
-    /// Admin bearer token. Skipped from (de)serialization — see the
+    /// Admin bearer token. Skipped from (de)serialization -- see the
     /// secrets-store pattern documented in `computeza-reconciler-postgres`.
     #[serde(skip, default = "default_secret")]
     pub admin_token: SecretString,
@@ -35,7 +35,7 @@ fn default_secret() -> SecretString {
 /// How to reach the Garage admin API.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GarageEndpoint {
-    /// Base URL — typically `http://garage-node:3903`.
+    /// Base URL -- typically `http://garage-node:3903`.
     pub base_url: String,
     /// Whether to skip TLS verification. Default false.
     #[serde(default)]

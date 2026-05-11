@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Lakekeeper reconciler — manages projects, warehouses, OIDC, OpenFGA model, vended creds, Generic Tables"
+description = "Lakekeeper reconciler -- manages projects, warehouses, OIDC, OpenFGA model, vended creds, Generic Tables"
 
 [lints]
 workspace = true

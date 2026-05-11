@@ -1,6 +1,6 @@
 //! SQLite implementation of [`Store`].
 //!
-//! Single-file, single-node. Per spec §3.1 this is what runs in
+//! Single-file, single-node. Per spec section 3.1 this is what runs in
 //! single-replica deployments; HA deployments use a Postgres backend
 //! implementing the same [`Store`] trait (forthcoming).
 

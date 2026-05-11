@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Apache XTable reconciler — manages Iceberg/Delta/Hudi format translation jobs (sidecar with bundled JRE)"
+description = "Apache XTable reconciler -- manages Iceberg/Delta/Hudi format translation jobs (sidecar with bundled JRE)"
 
 [lints]
 workspace = true

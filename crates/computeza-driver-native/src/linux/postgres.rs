@@ -1,11 +1,11 @@
 //! Native installation of PostgreSQL on Linux via systemd.
 //!
 //! This is the first end-to-end demonstration of the autonomous-installer
-//! mandate (spec §2.1). The installer:
+//! mandate (spec section 2.1). The installer:
 //!
 //! 1. Locates the `postgres` and `initdb` binaries shipped by the system
 //!    package (typical paths: `/usr/lib/postgresql/<v>/bin/`, `/usr/bin/`).
-//!    v0.0.x assumes the package is present — a follow-up will download,
+//!    v0.0.x assumes the package is present -- a follow-up will download,
 //!    SHA-verify, and extract a vendored binary tarball so even this
 //!    dependency goes away.
 //! 2. Creates a `postgres`-owned data directory at
@@ -17,7 +17,7 @@
 //! 4. `systemctl enable --now computeza-postgres.service`.
 //! 5. Waits until Postgres accepts TCP connections on the configured port.
 //! 6. Registers a `computeza-psql` symlink under `/usr/local/bin/` per
-//!    CLAUDE.md rule §4 (cross-platform PATH registration).
+//!    CLAUDE.md rule section 4 (cross-platform PATH registration).
 //!
 //! Privileged operations (writing under `/var/lib`, `/etc/systemd/system`,
 //! `/usr/local/bin`, running `initdb` as the postgres user, `systemctl`)
@@ -279,7 +279,7 @@ async fn write_systemd_unit(
          TimeoutSec=120\n\
          Restart=on-failure\n\
          RestartSec=5\n\
-         # Hardening (spec §10.3)\n\
+         # Hardening (spec section 10.3)\n\
          NoNewPrivileges=yes\n\
          PrivateTmp=yes\n\
          ProtectSystem=strict\n\

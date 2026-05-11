@@ -61,7 +61,7 @@ pub enum Action {
     /// A high-level user-initiated action (clicked Save in the UI,
     /// applied a YAML).
     UserAction,
-    /// AI-related action (per spec §6.5 — agent step, retrieval, LLM call).
+    /// AI-related action (per spec section 6.5 -- agent step, retrieval, LLM call).
     Ai,
     /// Catch-all for events not yet modelled.
     Other,
@@ -75,7 +75,7 @@ impl AuditEventBody {
     /// regardless of struct field order in source.
     pub(crate) fn canonical_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
         // serde_json by default preserves struct field order from the source.
-        // We don't reorder keys at run time — instead we accept that the
+        // We don't reorder keys at run time -- instead we accept that the
         // canonical form is "the JSON serde_json produces from this struct".
         // Stability across source edits is enforced by the Eq impl + tests.
         serde_json::to_vec(self)

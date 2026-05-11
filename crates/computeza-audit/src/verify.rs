@@ -64,7 +64,7 @@ pub enum VerifyError {
 pub struct VerifyOutcome {
     /// How many events were verified successfully.
     pub events_verified: u64,
-    /// The terminal chain head — pass this to evidence-pack signers as
+    /// The terminal chain head -- pass this to evidence-pack signers as
     /// the "log tip at export time" reference.
     pub final_chain_head: [u8; 32],
 }

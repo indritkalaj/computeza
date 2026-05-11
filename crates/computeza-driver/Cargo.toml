@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Computeza driver — driver registry and re-exports of the Driver trait"
+description = "Computeza driver -- driver registry and re-exports of the Driver trait"
 
 [lints]
 workspace = true

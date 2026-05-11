@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Computeza UI server — Leptos SSR application; entry point for the operator console"
+description = "Computeza UI server -- Leptos SSR application; entry point for the operator console"
 
 [lints]
 workspace = true

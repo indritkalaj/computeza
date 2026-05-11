@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Computeza secrets — AES-256-GCM encrypted secret storage with argon2-derived KEK; HSM / Vault / KMIP integrations behind feature flags (forthcoming)"
+description = "Computeza secrets -- AES-256-GCM encrypted secret storage with argon2-derived KEK; HSM / Vault / KMIP integrations behind feature flags (forthcoming)"
 
 [lints]
 workspace = true

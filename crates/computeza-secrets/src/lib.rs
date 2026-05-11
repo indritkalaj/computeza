@@ -1,6 +1,6 @@
-//! Computeza secrets — encrypted secret storage.
+//! Computeza secrets -- encrypted secret storage.
 //!
-//! Per spec §3.2 this crate provides AES-256-GCM encrypted secret storage
+//! Per spec section 3.2 this crate provides AES-256-GCM encrypted secret storage
 //! with a wrapped key envelope. v0.0.x ships:
 //!
 //! - [`SecretsStore`]: a JSON-Lines, file-backed store where each entry's
@@ -11,15 +11,15 @@
 //!   matching the conservative defaults from RFC 9106. The passphrase
 //!   typically comes from an env var the operator sets at install time;
 //!   HSM / Vault / KMIP / PKCS#11 integrations behind feature flags
-//!   (spec §8.4) ship later.
+//!   (spec section 8.4) ship later.
 //! - Zeroize-on-drop for in-memory plaintext so secrets vanish from
 //!   memory promptly after use.
 //!
 //! # Boundary
 //!
 //! - **Not for resource specs**: those live in [`computeza-state`]. The
-//!   secrets store holds only opaque secrets — passwords, API tokens,
-//!   bearer tokens — referenced by *name* from resource specs (e.g. a
+//!   secrets store holds only opaque secrets -- passwords, API tokens,
+//!   bearer tokens -- referenced by *name* from resource specs (e.g. a
 //!   `PostgresSpec` carries `superuser_password_ref: "postgres/superuser"`,
 //!   and `computeza-state` would resolve that against `SecretsStore::get`
 //!   before passing the spec into a reconciler).

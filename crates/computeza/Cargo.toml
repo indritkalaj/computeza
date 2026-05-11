@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Computeza — single-binary installer, operator console, and configurator for the all-Rust open lakehouse"
+description = "Computeza -- single-binary installer, operator console, and configurator for the all-Rust open lakehouse"
 
 [lints]
 workspace = true

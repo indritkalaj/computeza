@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Grafana reconciler — manages datasources, folders, dashboards-as-code, OIDC"
+description = "Grafana reconciler -- manages datasources, folders, dashboards-as-code, OIDC"
 
 [lints]
 workspace = true

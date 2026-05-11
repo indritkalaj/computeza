@@ -2,7 +2,7 @@
 //!
 //! `plan()` diffs desired vs actual database lists and produces a typed
 //! [`PostgresPlan`]. The plan is data; `apply()` is what executes it. This
-//! split is deliberate — it lets us unit-test the diff logic without a
+//! split is deliberate -- it lets us unit-test the diff logic without a
 //! database, and lets future "dry-run" / "what-if" UI surfaces render the
 //! plan to a user before any changes hit the wire.
 
@@ -42,7 +42,7 @@ impl PostgresPlan {
 }
 
 /// Reserved database names on every PostgreSQL server. The reconciler
-/// never touches these — including when `prune` is true.
+/// never touches these -- including when `prune` is true.
 pub(crate) const SYSTEM_DATABASES: &[&str] = &["template0", "template1", "postgres"];
 
 /// Compute the plan to converge `actual` to `desired`.

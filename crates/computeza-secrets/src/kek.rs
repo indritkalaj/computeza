@@ -10,8 +10,8 @@
 //! 4. The KEK is held in a [`MasterKey`] for the lifetime of the process
 //!    and zeroized on drop.
 //!
-//! HSM / Vault / KMIP / PKCS#11 variants (spec §8.4) plug in by
-//! implementing a small trait `KeyProvider` that returns a `MasterKey` —
+//! HSM / Vault / KMIP / PKCS#11 variants (spec section 8.4) plug in by
+//! implementing a small trait `KeyProvider` that returns a `MasterKey` --
 //! that trait + integrations land in a follow-up.
 
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -54,7 +54,7 @@ impl std::fmt::Debug for MasterKey {
 /// `salt` must be at least 8 bytes; the platform persists a 16-byte
 /// random salt alongside the encrypted secrets file.
 ///
-/// Defaults: `m=65536KiB (64 MiB), t=3, p=1` — the OWASP 2025 / RFC 9106
+/// Defaults: `m=65536KiB (64 MiB), t=3, p=1` -- the OWASP 2025 / RFC 9106
 /// "small parameter set" baseline. Adjust upward only when latency budget
 /// allows; never downward.
 pub fn derive_kek_from_passphrase(passphrase: &[u8], salt: &[u8]) -> Result<MasterKey> {

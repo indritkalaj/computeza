@@ -10,9 +10,9 @@ Instructions for Claude (and any other AI assistant) working in this repo.
    Hardcoded English in PR diffs is a release-blocking bug. See
    [`docs/i18n.md`](docs/i18n.md).
 
-2. **GUI-first.** Every administrative operation — installing components,
+2. **GUI-first.** Every administrative operation -- installing components,
    managing clusters, creating users, granting permissions, deploying
-   pipelines — must be reachable from the web console at `computeza serve`.
+   pipelines -- must be reachable from the web console at `computeza serve`.
    The CLI is a power-user / CI escape hatch, not the primary interface.
 
 3. **Latest stable for every dep.** No deprecated, no abandoned, no stuck-on-
@@ -42,18 +42,43 @@ Instructions for Claude (and any other AI assistant) working in this repo.
 
 5. **The spec wins.** The canonical source of architectural and product
    truth is `docs/Architecture-and-Product-Specification-v1.5.pdf`
-   (referenced in source comments as `spec §X.Y`). When the spec and the
+   (referenced in source comments as `spec section X.Y`). When the spec and the
    code disagree, the spec wins until the code is updated and the spec
    amended in the same change.
+
+6. **ASCII-only source.** Every tracked source file (`*.rs`, `*.toml`,
+   `*.md`, `*.ftl`, `*.yml`, `*.css`, `*.html`, etc.) must contain only
+   US-ASCII printable + standard whitespace bytes. No em-dash, no section
+   sign, no smart quotes, no arrows, no box-drawing, no `OK`-style
+   glyphs. Substitute: `--` for em-dash, `-` for en-dash, `section ` for
+   `section sign`, `->` / `<-` / `<->` for arrows, `...` for ellipsis,
+   `OK` / `FAIL` for status glyphs. When test data must hold non-ASCII
+   bytes (e.g. asserting a rejector rejects them), use Rust's
+   `"\u{00xx}"` escape so the source file itself stays ASCII. Enforced
+   in CI by the `ascii-only` job in `.github/workflows/ci.yml`.
+
+7. **Detailed actionable logs at every level.** Each `tracing::info!`,
+   `warn!`, and `error!` call (and equivalent UI / CLI output) must
+   convey three things: (a) **what** happened, (b) the **impact**, and
+   (c) **how to troubleshoot or resolve**. Examples:
+
+   - Bad:  `error!("connection failed")`
+   - Good: `error!(host=%h, port=%p, "connection to postgres failed; \
+           reconciler will retry every 30s; check `systemctl status \
+           computeza-postgres` on the target host")`
+
+   Success / info logs are equally important: when something completes
+   the operator needs to know *what* succeeded and *what state the
+   system is now in*. Silent successes are bugs.
 
 ## Working agreement (current preferences)
 
 - **Auto-accept.** The user has explicitly stated: "consider my answers
   always yes. I am auto-accepting everything you will be creating." Skip
   the "want me to do X?" prompts and just do it. Skip the "Done. What's
-  next?" lists at end of turns — pick the next move and execute.
+  next?" lists at end of turns -- pick the next move and execute.
 
-- **Concise chat output.** Stated explicitly on 2026-04-27 — "keep the
+- **Concise chat output.** Stated explicitly on 2026-04-27 -- "keep the
   output very short to limit token usage". The durable record lives in
   TodoWrite, git commits, and code-doc comments; the chat is just a thin
   "here's what's happening now" layer.
@@ -88,5 +113,5 @@ Instructions for Claude (and any other AI assistant) working in this repo.
   `computeza-i18n`, `computeza-reconciler-postgres`, `computeza-ui-server`,
   and the `computeza` binary have real implementations.
 - `cargo run --bin computeza -- serve` boots the operator console at
-  `127.0.0.1:8400` (default per spec §10.6).
-- v1.0 GA target: Q2 2027 per spec §13.
+  `127.0.0.1:8400` (default per spec section 10.6).
+- v1.0 GA target: Q2 2027 per spec section 13.

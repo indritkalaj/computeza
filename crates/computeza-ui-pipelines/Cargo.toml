@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Computeza UI pipelines — drag-and-drop pipeline canvas (spec §5)"
+description = "Computeza UI pipelines -- drag-and-drop pipeline canvas (spec section 5)"
 
 [lints]
 workspace = true

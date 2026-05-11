@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Computeza i18n — externalized strings via Fluent (.ftl) bundles"
+description = "Computeza i18n -- externalized strings via Fluent (.ftl) bundles"
 
 [lints]
 workspace = true

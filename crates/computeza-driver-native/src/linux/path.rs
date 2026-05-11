@@ -4,14 +4,14 @@
 //! CLI (`psql`, `kanidm`, `garage`), we want that CLI on `$PATH` for
 //! every login shell on the host. The two clean ways to do that:
 //!
-//! 1. Drop a script into `/etc/profile.d/` — picked up by bash/zsh/sh
+//! 1. Drop a script into `/etc/profile.d/` -- picked up by bash/zsh/sh
 //!    at next login. Doesn't affect already-open shells; doesn't work
 //!    with fish without an extra `conf.d` drop.
 //! 2. Drop a symlink into `/usr/local/bin/` (which is on every Linux
 //!    distro's default `$PATH`). Affects every shell immediately, no
 //!    re-login needed.
 //!
-//! We use option 2 — symlinks — because of the immediate-effect property.
+//! We use option 2 -- symlinks -- because of the immediate-effect property.
 //! Symlinks are prefixed with `computeza-` to avoid colliding with
 //! distro-shipped binaries of the same name (e.g. system `psql` from a
 //! package install).

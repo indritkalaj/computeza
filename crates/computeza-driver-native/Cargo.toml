@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Computeza native driver — installs and manages components as native OS services (systemd / launchd / Windows Services)"
+description = "Computeza native driver -- installs and manages components as native OS services (systemd / launchd / Windows Services)"
 
 [lints]
 workspace = true

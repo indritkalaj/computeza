@@ -33,7 +33,7 @@ impl Resource for PostgresInstance {
 /// a plaintext password through YAML. The flow is:
 ///
 /// 1. The YAML spec carries an opaque `secret_ref` (a path into the secrets
-///    store like `vault://kv/postgres/superuser` — wired up when
+///    store like `vault://kv/postgres/superuser` -- wired up when
 ///    `computeza-secrets` lands).
 /// 2. The platform's runtime layer reads that ref, asks `computeza-secrets`
 ///    for the value, and constructs the in-memory `PostgresSpec` with the
@@ -47,7 +47,7 @@ pub struct PostgresSpec {
     /// How to reach the running server.
     pub endpoint: ServerEndpoint,
     /// Superuser credentials. Wrapped in `SecretString` so it doesn't leak
-    /// via `Debug` / `Display`. Skipped in (de)serialization — see the
+    /// via `Debug` / `Display`. Skipped in (de)serialization -- see the
     /// docs above for the secrets-store flow that hydrates this.
     #[serde(skip, default = "default_secret")]
     pub superuser_password: SecretString,
@@ -55,7 +55,7 @@ pub struct PostgresSpec {
     /// missing entries and (when `prune` is true) drops any extras.
     pub databases: Vec<DatabaseSpec>,
     /// When true, drop databases that exist on the server but are not in
-    /// `databases`. Defaults to false — destructive operations should be
+    /// `databases`. Defaults to false -- destructive operations should be
     /// opt-in.
     #[serde(default)]
     pub prune: bool,
