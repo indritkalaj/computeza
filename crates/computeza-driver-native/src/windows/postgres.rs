@@ -389,21 +389,32 @@ async fn run_initdb_if_needed(bin_dir: &Path, data_dir: &Path) -> Result<(), Ins
     Ok(())
 }
 
-/// Append `host all all 127.0.0.1/32 trust` and the IPv6 equivalent to
-/// `pg_hba.conf` if they're not already there. This lets the in-process
-/// reconciler connect to the local postgres instance without a password
-/// -- the alternative would be wiring up a secret store on first
-/// install, which we defer to v0.1.
+/// Prepend `host all all 127.0.0.1/32 trust` and the IPv6 equivalent
+/// to `pg_hba.conf`. This lets the in-process reconciler connect to
+/// the local postgres instance without a password. The alternative
+/// would be wiring up a secret store on first install, which we defer
+/// to v0.1.
 ///
-/// Trust auth here is acceptable because:
+/// **Why prepend, not append.** `pg_hba.conf` is *first match wins*.
+/// `initdb --auth-host=scram-sha-256` writes a `127.0.0.1/32
+/// scram-sha-256` rule near the top of the file; if we appended our
+/// trust rule it would be shadowed and the reconciler would still
+/// fail with "password authentication failed for user postgres".
+///
+/// **Idempotency.** The managed rules are wrapped in sentinel comments
+/// so re-running the installer detects the previous block and
+/// rewrites it in place. We also strip *unmarked* legacy lines that
+/// earlier versions of this driver appended at the bottom of the
+/// file -- otherwise operators who installed before this commit
+/// would carry duplicate / stale rules forever.
+///
+/// **Security note.** Trust auth here is acceptable because:
 /// - It applies only to loopback (`127.0.0.1/32`, `::1/128`).
 /// - The Windows service binds to 127.0.0.1, so remote hosts cannot
 ///   even attempt a connection.
 /// - The threat model is "another process on this machine can
 ///   impersonate the postgres user"; on a single-tenant dev/admin
-///   box that's not a meaningful escalation, and operators worried
-///   about it can override by editing pg_hba.conf themselves (these
-///   appends are idempotent and won't reintroduce removed rules).
+///   box that's not a meaningful escalation.
 async fn ensure_loopback_trust(data_dir: &Path) -> Result<(), InstallError> {
     let hba = data_dir.join("pg_hba.conf");
     if !fs::try_exists(&hba).await? {
@@ -411,30 +422,80 @@ async fn ensure_loopback_trust(data_dir: &Path) -> Result<(), InstallError> {
         return Ok(());
     }
     let existing = fs::read_to_string(&hba).await?;
-    let want = [
-        "# computeza-managed: loopback trust so the reconciler can observe",
-        "host    all    all    127.0.0.1/32    trust",
-        "host    all    all    ::1/128         trust",
-    ];
-    if want
-        .iter()
-        .all(|line| existing.lines().any(|cur| cur.trim() == line.trim()))
-    {
+    let new_content = rewrite_pg_hba_with_loopback_trust(&existing);
+    if new_content == existing {
         return Ok(());
     }
-    info!(hba = %hba.display(), "appending loopback-trust rules to pg_hba.conf");
-    let mut appended = existing;
-    if !appended.ends_with('\n') {
-        appended.push('\n');
-    }
-    for line in want {
-        if !appended.lines().any(|cur| cur.trim() == line.trim()) {
-            appended.push_str(line);
-            appended.push('\n');
-        }
-    }
-    fs::write(&hba, appended).await?;
+    info!(hba = %hba.display(), "rewriting pg_hba.conf with computeza-managed loopback-trust block at the top");
+    fs::write(&hba, new_content).await?;
     Ok(())
+}
+
+/// Pure-string transform extracted from [`ensure_loopback_trust`] so it
+/// can be unit-tested without a real `pg_hba.conf` on disk.
+fn rewrite_pg_hba_with_loopback_trust(existing: &str) -> String {
+    const START: &str = "# === computeza-managed loopback trust block (start) ===";
+    const END: &str = "# === computeza-managed loopback trust block (end) ===";
+
+    // Strip any prior managed block (between sentinel markers).
+    let mut filtered: Vec<&str> = Vec::with_capacity(existing.lines().count());
+    let mut inside_managed = false;
+    for line in existing.lines() {
+        let trimmed = line.trim();
+        if trimmed == START {
+            inside_managed = true;
+            continue;
+        }
+        if trimmed == END {
+            inside_managed = false;
+            continue;
+        }
+        if inside_managed {
+            continue;
+        }
+        filtered.push(line);
+    }
+
+    // Strip *unmarked* legacy lines from earlier versions of this
+    // driver that appended trust rules at the bottom without
+    // sentinels. We match conservatively: only lines whose normalised
+    // tokens look exactly like "host all all 127.0.0.1/32 trust" or
+    // the ::1 equivalent.
+    fn is_legacy_loopback_trust(line: &str) -> bool {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        matches!(
+            tokens.as_slice(),
+            ["host", "all", "all", "127.0.0.1/32", "trust"]
+                | ["host", "all", "all", "::1/128", "trust"]
+        ) || line.trim() == "# computeza-managed: loopback trust so the reconciler can observe"
+    }
+    filtered.retain(|l| !is_legacy_loopback_trust(l));
+
+    let managed = format!(
+        "{START}\n\
+         # The reconciler observes the local postgres instance over 127.0.0.1\n\
+         # and ::1 without a password. These rules must appear before any\n\
+         # other rule that matches the same address; pg_hba.conf is\n\
+         # first-match-wins.\n\
+         host all all 127.0.0.1/32 trust\n\
+         host all all ::1/128      trust\n\
+         {END}\n"
+    );
+
+    // Trim leading blank lines from the surviving content so the
+    // rewrite stays idempotent: stripping a previous managed block
+    // would otherwise leave the blank line that separated it from
+    // the rest, which we'd compound on every re-run.
+    while filtered.first().is_some_and(|l| l.trim().is_empty()) {
+        filtered.remove(0);
+    }
+
+    let body = filtered.join("\n");
+    if body.is_empty() {
+        managed
+    } else {
+        format!("{managed}\n{body}\n")
+    }
 }
 
 async fn wait_for_ready(host: &str, port: u16, timeout: Duration) -> Result<(), InstallError> {
@@ -471,6 +532,60 @@ mod tests {
                 .ends_with("computeza\\postgres"),
             "unexpected root_dir: {:?}",
             o.root_dir
+        );
+    }
+
+    #[test]
+    fn pg_hba_rewrite_prepends_trust_block_before_scram_rule() {
+        let original = "\
+# IPv4 local connections:
+host    all             all             127.0.0.1/32            scram-sha-256
+# IPv6 local connections:
+host    all             all             ::1/128                 scram-sha-256
+";
+        let rewritten = rewrite_pg_hba_with_loopback_trust(original);
+        let trust_pos = rewritten
+            .find("host all all 127.0.0.1/32 trust")
+            .expect("trust rule must be in rewritten file");
+        let scram_pos = rewritten
+            .find("scram-sha-256")
+            .expect("scram rule must still be present");
+        assert!(
+            trust_pos < scram_pos,
+            "trust rule must precede scram rule so it wins under first-match semantics; got:\n{rewritten}"
+        );
+    }
+
+    #[test]
+    fn pg_hba_rewrite_is_idempotent() {
+        let original = "host all all 127.0.0.1/32 scram-sha-256\n";
+        let once = rewrite_pg_hba_with_loopback_trust(original);
+        let twice = rewrite_pg_hba_with_loopback_trust(&once);
+        assert_eq!(once, twice, "second rewrite should be a no-op");
+    }
+
+    #[test]
+    fn pg_hba_rewrite_strips_legacy_unmarked_trust_lines() {
+        // Simulates an operator who installed under an earlier version
+        // of this driver: the trust rules are at the bottom, unmarked.
+        let legacy = "\
+# IPv4 local connections:
+host    all             all             127.0.0.1/32            scram-sha-256
+# computeza-managed: loopback trust so the reconciler can observe
+host    all    all    127.0.0.1/32    trust
+host    all    all    ::1/128         trust
+";
+        let rewritten = rewrite_pg_hba_with_loopback_trust(legacy);
+        // The legacy lines should be gone; only the managed-block
+        // trust rule remains.
+        let trust_count = rewritten.matches("host all all 127.0.0.1/32 trust").count();
+        assert_eq!(
+            trust_count, 1,
+            "exactly one trust rule for 127.0.0.1 expected; got {trust_count}:\n{rewritten}"
+        );
+        assert!(
+            !rewritten.contains("computeza-managed: loopback trust so the reconciler"),
+            "legacy comment line should be stripped:\n{rewritten}"
         );
     }
 }
