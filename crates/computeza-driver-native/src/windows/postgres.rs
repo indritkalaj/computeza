@@ -331,6 +331,110 @@ pub async fn install_with_progress(
     })
 }
 
+/// Discover already-installed PostgreSQL instances on the host so
+/// the wizard can warn the operator and pre-fill non-colliding
+/// defaults. Conservative: only reports installs we are highly
+/// confident exist.
+///
+/// Sources inspected:
+/// - Standard EDB install paths: `C:\Program Files\PostgreSQL\<v>\bin`.
+/// - Computeza-managed data dirs under `%PROGRAMDATA%\Computeza\postgres*\data`.
+pub async fn detect_installed() -> Vec<crate::detect::DetectedInstall> {
+    let mut out = Vec::new();
+
+    // EDB-installer paths.
+    for major in [18u8, 17, 16, 15, 14, 13] {
+        let bin = PathBuf::from(format!("C:\\Program Files\\PostgreSQL\\{major}\\bin"));
+        if fs::try_exists(bin.join("postgres.exe"))
+            .await
+            .unwrap_or(false)
+        {
+            let data_dir = PathBuf::from(format!("C:\\Program Files\\PostgreSQL\\{major}\\data"));
+            let (version, port) = inspect_data_dir(&data_dir).await;
+            out.push(crate::detect::DetectedInstall {
+                identifier: format!("PostgreSQL {major} (EDB)"),
+                owner: "EDB installer".into(),
+                version: version.or(Some(major.to_string())),
+                port,
+                data_dir: Some(data_dir),
+                bin_dir: Some(bin),
+            });
+        }
+    }
+
+    // Computeza-managed data dirs. Look under %PROGRAMDATA%\Computeza\
+    // for any subdir named `postgres*` with a `data/` inside.
+    let programdata =
+        std::env::var("PROGRAMDATA").unwrap_or_else(|_| String::from("C:\\ProgramData"));
+    let computeza_root = PathBuf::from(&programdata).join("Computeza");
+    if let Ok(mut entries) = fs::read_dir(&computeza_root).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            if !name.starts_with("postgres") {
+                continue;
+            }
+            let data_dir = entry.path().join("data");
+            if !fs::try_exists(&data_dir).await.unwrap_or(false) {
+                continue;
+            }
+            let (version, port) = inspect_data_dir(&data_dir).await;
+            out.push(crate::detect::DetectedInstall {
+                identifier: entry
+                    .path()
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| name.clone()),
+                owner: "computeza".into(),
+                version,
+                port,
+                data_dir: Some(data_dir),
+                bin_dir: None,
+            });
+        }
+    }
+
+    out
+}
+
+/// Read `PG_VERSION` (major version) and `postgresql.conf` (port) from
+/// a data directory. Returns `(version, port)` -- either may be None.
+async fn inspect_data_dir(data_dir: &Path) -> (Option<String>, Option<u16>) {
+    let version = match fs::read_to_string(data_dir.join("PG_VERSION")).await {
+        Ok(s) => Some(s.trim().to_string()),
+        Err(_) => None,
+    };
+    let port = match fs::read_to_string(data_dir.join("postgresql.conf")).await {
+        Ok(conf) => parse_port_from_postgresql_conf(&conf),
+        Err(_) => None,
+    };
+    (version, port)
+}
+
+/// Extract the active `port = NNNN` line from a `postgresql.conf`
+/// body. Conservative: handles the common form `port = 5432` with
+/// optional whitespace; ignores commented (`#`) lines.
+pub(crate) fn parse_port_from_postgresql_conf(conf: &str) -> Option<u16> {
+    for line in conf.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("port") else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix('=') else {
+            continue;
+        };
+        let value = rest.split_whitespace().next()?;
+        let value = value.trim_matches(|c| c == '\'' || c == '"');
+        if let Ok(p) = value.parse::<u16>() {
+            return Some(p);
+        }
+    }
+    None
+}
+
 /// Configuration for [`uninstall`].
 #[derive(Clone, Debug)]
 pub struct UninstallOptions {

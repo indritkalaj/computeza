@@ -243,6 +243,69 @@ driver pair, check this playbook before pretending any step is simple.
   preserves the binary cache by default (re-install stays fast)
   but exposes a `purge_binaries: true` opt-in for full rollback.
 
+### Parallel-install safety
+
+Operators routinely want two versions of the same component side by
+side (a v17 production cluster + a v18 staging cluster). The
+collisions to design around:
+
+- **Service name collision.** SCM / systemd / launchd indexes by
+  name. Default `computeza-<component>` collides on a second
+  install. The wizard MUST suggest a version-suffixed name
+  (`computeza-postgres-17`, `computeza-postgres-18`) when a
+  Computeza-managed service of the same component already exists.
+- **Port collision.** Default ports (5432 for postgres, 8443 for
+  kanidm, etc.) won't be available for the second install. Suggest
+  the next free port at or above the canonical default.
+- **Data dir collision.** Sharing one data dir between two installs
+  would corrupt both. Suggest a version-suffixed leaf
+  (`postgres-17/`, `postgres-18/`) when colliding.
+- **Binary cache.** Already version-keyed -- two installs share a
+  cache, no collision.
+- **PATH shim.** `computeza-<tool>` shim is last-writer-wins. Acceptable
+  because the operator using the CLI directly tends to want the
+  newest version; the install wizard can warn but doesn't need to
+  prevent.
+
+The `driver-native::detect` module is the shared infrastructure:
+
+- `detect_installed()` per OS reports `DetectedInstall` records.
+- `smart_defaults(detected, requested_version_major)` produces a
+  port + service-name / data-dir suffix that won't collide.
+- The wizard renders detected installs as a card above the form and
+  feeds the defaults into the form's `placeholder` attributes.
+
+New components must implement `detect_installed()` next to their
+install path. The detection logic should be conservative: false
+positives push operators into unnecessary suffixed names; false
+negatives at worst surface as a "service already exists" error
+that the wizard's existing teardown handles.
+
+### Reseller / sub-reseller infrastructure
+
+Per the durable product constraint in the "Product constraints"
+section, every install/instance management surface needs to flow
+through the multi-tier resale chain. For each new component:
+
+- **Identifier shape.** `<component>-instance/<name>` resource keys
+  must be workspace-scoped, not cluster-scoped, once multi-tenancy
+  ships. Don't hardcode `cluster_scoped(...)` in places where
+  `workspace_scoped(...)` will need to slot in.
+- **Branding.** Render labels (component name, badges) through
+  i18n, so resellers white-labelling the console can override
+  per-tenant.
+- **Metering tap.** When a component starts handling traffic, the
+  reconciler's `observe()` is the natural place to record an
+  aggregate (counts of users, buckets, collections, etc.). Don't
+  let component-specific telemetry leak past the workspace
+  boundary -- aggregate before exposing upward.
+- **Provisioning API.** The CLI / web wizard are operator-facing;
+  reseller-facing provisioning needs the gRPC `channel-partner`
+  surface from the Product constraints section. Don't paint
+  component installs into "operator clicks through wizard" as the
+  only path -- expose the underlying `install(opts)` function so
+  the API surface can drive it later.
+
 ### Per-component checklist
 
 When adding a new component (kanidm, garage, lakekeeper, ...):

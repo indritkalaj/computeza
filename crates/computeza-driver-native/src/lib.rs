@@ -19,6 +19,7 @@
 
 #![warn(missing_docs)]
 
+pub mod detect;
 pub mod fetch;
 pub mod progress;
 

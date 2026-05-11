@@ -135,6 +135,113 @@ async fn detect_bin_dir() -> Result<PathBuf, InstallError> {
     Err(InstallError::BinaryNotFound(tried))
 }
 
+/// Discover already-installed PostgreSQL instances on the host.
+/// Conservative: reports installs we can verify on disk.
+///
+/// Sources inspected:
+/// - Homebrew (Apple Silicon): `/opt/homebrew/opt/postgresql@<v>/bin`.
+/// - Homebrew (Intel): `/usr/local/opt/postgresql@<v>/bin`.
+/// - MacPorts: `/opt/local/lib/postgresql<v>/bin`.
+/// - Computeza-managed data dirs under
+///   `/Library/Application Support/Computeza/postgres*/data`.
+pub async fn detect_installed() -> Vec<crate::detect::DetectedInstall> {
+    let mut out = Vec::new();
+
+    let prefixes = [
+        ("/opt/homebrew/opt/postgresql@", "Homebrew"),
+        ("/usr/local/opt/postgresql@", "Homebrew"),
+        ("/opt/local/lib/postgresql", "MacPorts"),
+    ];
+
+    for major in [18u8, 17, 16, 15, 14, 13] {
+        for (prefix, owner) in prefixes.iter() {
+            let base = PathBuf::from(format!("{prefix}{major}"));
+            let bin = base.join("bin");
+            if !fs::try_exists(bin.join("postgres")).await.unwrap_or(false) {
+                continue;
+            }
+            out.push(crate::detect::DetectedInstall {
+                identifier: format!("PostgreSQL {major} ({owner})"),
+                owner: (*owner).into(),
+                version: Some(major.to_string()),
+                // Homebrew defaults to `/usr/local/var/postgresql@<v>`
+                // but the operator may have moved it. We don't try to
+                // dig the exact data dir; the smart-defaults panel
+                // only needs the port to avoid collisions, and we
+                // don't reliably know that without inspecting the
+                // running service.
+                port: None,
+                data_dir: None,
+                bin_dir: Some(bin),
+            });
+        }
+    }
+
+    // Computeza-managed data dirs.
+    if let Ok(mut entries) = fs::read_dir("/Library/Application Support/Computeza").await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            if !name.starts_with("postgres") {
+                continue;
+            }
+            let data_dir = entry.path().join("data");
+            if !fs::try_exists(&data_dir).await.unwrap_or(false) {
+                continue;
+            }
+            let (version, port) = inspect_data_dir_macos(&data_dir).await;
+            out.push(crate::detect::DetectedInstall {
+                identifier: entry
+                    .path()
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| name.clone()),
+                owner: "computeza".into(),
+                version,
+                port,
+                data_dir: Some(data_dir),
+                bin_dir: None,
+            });
+        }
+    }
+
+    out
+}
+
+async fn inspect_data_dir_macos(data_dir: &Path) -> (Option<String>, Option<u16>) {
+    let version = match fs::read_to_string(data_dir.join("PG_VERSION")).await {
+        Ok(s) => Some(s.trim().to_string()),
+        Err(_) => None,
+    };
+    let port = match fs::read_to_string(data_dir.join("postgresql.conf")).await {
+        Ok(conf) => parse_port_from_postgresql_conf(&conf),
+        Err(_) => None,
+    };
+    (version, port)
+}
+
+/// Shared parser. Mirrors the Linux + Windows implementations.
+fn parse_port_from_postgresql_conf(conf: &str) -> Option<u16> {
+    for line in conf.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("port") else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix('=') else {
+            continue;
+        };
+        let value = rest.split_whitespace().next()?;
+        let value = value.trim_matches(|c| c == '\'' || c == '"');
+        if let Ok(p) = value.parse::<u16>() {
+            return Some(p);
+        }
+    }
+    None
+}
+
 /// Configuration for [`uninstall`].
 #[derive(Clone, Debug)]
 pub struct UninstallOptions {

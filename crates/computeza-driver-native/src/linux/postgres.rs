@@ -129,6 +129,100 @@ const CANDIDATE_BIN_DIRS: &[&str] = &[
     "/usr/local/bin",
 ];
 
+/// Discover already-installed PostgreSQL instances on the host.
+/// Conservative: reports installs we can verify on disk.
+///
+/// Sources inspected:
+/// - Distro package binaries: `/usr/lib/postgresql/<v>/bin/postgres`.
+/// - System data dir + version file: `/var/lib/postgresql/<v>/main/PG_VERSION`.
+/// - Computeza-managed data dirs under `/var/lib/computeza/postgres*/data`.
+pub async fn detect_installed() -> Vec<crate::detect::DetectedInstall> {
+    let mut out = Vec::new();
+
+    // Distro packages -- iterate the same majors as CANDIDATE_BIN_DIRS
+    // and report each one whose binary actually exists.
+    for major in [18u8, 17, 16, 15, 14, 13] {
+        let bin = PathBuf::from(format!("/usr/lib/postgresql/{major}/bin"));
+        if !fs::try_exists(bin.join("postgres")).await.unwrap_or(false) {
+            continue;
+        }
+        let data_dir = PathBuf::from(format!("/var/lib/postgresql/{major}/main"));
+        let (version, port) = inspect_data_dir_linux(&data_dir).await;
+        out.push(crate::detect::DetectedInstall {
+            identifier: format!("PostgreSQL {major} (apt/yum)"),
+            owner: "distro package".into(),
+            version: version.or(Some(major.to_string())),
+            port,
+            data_dir: Some(data_dir),
+            bin_dir: Some(bin),
+        });
+    }
+
+    // Computeza-managed data dirs.
+    if let Ok(mut entries) = fs::read_dir("/var/lib/computeza").await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            if !name.starts_with("postgres") {
+                continue;
+            }
+            let data_dir = entry.path().join("data");
+            if !fs::try_exists(&data_dir).await.unwrap_or(false) {
+                continue;
+            }
+            let (version, port) = inspect_data_dir_linux(&data_dir).await;
+            out.push(crate::detect::DetectedInstall {
+                identifier: entry
+                    .path()
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| name.clone()),
+                owner: "computeza".into(),
+                version,
+                port,
+                data_dir: Some(data_dir),
+                bin_dir: None,
+            });
+        }
+    }
+
+    out
+}
+
+async fn inspect_data_dir_linux(data_dir: &Path) -> (Option<String>, Option<u16>) {
+    let version = match fs::read_to_string(data_dir.join("PG_VERSION")).await {
+        Ok(s) => Some(s.trim().to_string()),
+        Err(_) => None,
+    };
+    let port = match fs::read_to_string(data_dir.join("postgresql.conf")).await {
+        Ok(conf) => parse_port_from_postgresql_conf(&conf),
+        Err(_) => None,
+    };
+    (version, port)
+}
+
+/// Shared parser. Mirrors the Windows implementation.
+fn parse_port_from_postgresql_conf(conf: &str) -> Option<u16> {
+    for line in conf.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("port") else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix('=') else {
+            continue;
+        };
+        let value = rest.split_whitespace().next()?;
+        let value = value.trim_matches(|c| c == '\'' || c == '"');
+        if let Ok(p) = value.parse::<u16>() {
+            return Some(p);
+        }
+    }
+    None
+}
+
 /// Configuration for [`uninstall`]. Mirrors the Windows variant so
 /// per-OS install paths converge on a single uninstall contract from
 /// the UI's point of view.

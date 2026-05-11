@@ -99,6 +99,9 @@ ui-install-postgres      = PostgreSQL (spec section 7.13)
 ui-install-button        = Install
 ui-install-requires-root = Note: native install needs root / Administrator privileges (writes /etc/systemd/system, /Library/LaunchDaemons, or HKLM Services). If you started the operator console without elevation the install POST will fail with a clear permission error -- re-run `computeza serve` as root / via UAC and retry.
 
+ui-install-detected-title    = Already on this host
+ui-install-detected-empty    = No PostgreSQL installs detected.
+ui-install-detected-hint     = The form below is pre-filled with values that don't collide with what's already installed. Tweak any of them if you need a different layout.
 ui-install-version-label     = Version
 ui-install-version-help      = Latest stable is recommended. The previous-major line is offered for operators who need to pin against an older release.
 ui-install-version-latest    = (latest)

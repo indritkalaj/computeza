@@ -160,7 +160,8 @@ pub fn router_with_state(state: AppState) -> Router {
 
 async fn install_handler() -> Html<String> {
     let l = Localizer::english();
-    Html(render_install(&l))
+    let detected = computeza_driver_native::detect::postgres().await;
+    Html(render_install(&l, &detected))
 }
 
 #[derive(serde::Deserialize)]
@@ -365,6 +366,29 @@ async fn uninstall_postgres_handler(State(state): State<AppState>) -> Response {
         Err(detail) => render_install_result(&l, false, &detail),
     };
     Html(body).into_response()
+}
+
+/// Build the data-dir placeholder for the form. Suffixes the leaf
+/// onto the per-OS root so the operator sees the full path they'd
+/// get from accepting the default.
+fn root_dir_placeholder_for_leaf(leaf: &str) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        let programdata = std::env::var("PROGRAMDATA").unwrap_or_else(|_| "C:\\ProgramData".into());
+        format!("{programdata}\\Computeza\\{leaf}")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        format!("/var/lib/computeza/{leaf}")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        format!("/Library/Application Support/Computeza/{leaf}")
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        format!("./{leaf}")
+    }
 }
 
 /// One entry in the version dropdown. `value` is the string the form
@@ -1331,8 +1355,18 @@ fn html_escape(s: &str) -> String {
 /// `/install/postgres` and lays down a native PostgreSQL service on the
 /// host. Per spec section 2.1 / 4.2 the install path is GUI-equivalent
 /// to the CLI's `computeza install postgres`.
+///
+/// `detected` is the host-state survey from
+/// `computeza_driver_native::detect::postgres()`. The wizard renders
+/// it as a "Detected installs" card and feeds it into
+/// `detect::smart_defaults` so the form's placeholders show
+/// non-colliding suggestions (port shifted past 5432, service name
+/// suffixed with the major version, data-dir leaf suffixed similarly).
 #[must_use]
-pub fn render_install(localizer: &Localizer) -> String {
+pub fn render_install(
+    localizer: &Localizer,
+    detected: &[computeza_driver_native::detect::DetectedInstall],
+) -> String {
     let title = localizer.t("ui-install-title");
     let intro = localizer.t("ui-install-intro");
     let target_label = localizer.t("ui-install-target-label");
@@ -1366,11 +1400,76 @@ pub fn render_install(localizer: &Localizer) -> String {
         })
         .collect();
 
+    // Smart defaults: when something is already installed, the
+    // wizard's placeholders shift to non-colliding values so the
+    // operator can install a second instance without typing.
+    let default_version_major = version_options
+        .first()
+        .map(|v| v.value.split('.').next().unwrap_or("").to_string())
+        .unwrap_or_default();
+    let defaults = computeza_driver_native::detect::smart_defaults(
+        detected,
+        if default_version_major.is_empty() {
+            None
+        } else {
+            Some(&default_version_major)
+        },
+    );
+    let port_placeholder = format!("{}", defaults.port);
+    let service_name_placeholder = defaults.service_name();
+    let root_dir_placeholder = root_dir_placeholder_for_leaf(&defaults.data_dir_leaf());
+
+    // "Detected installs" card. Empty list collapses to a single-line
+    // hint so the section doesn't dominate the page for first-time
+    // operators.
+    let detected_title = localizer.t("ui-install-detected-title");
+    let detected_empty = localizer.t("ui-install-detected-empty");
+    let detected_hint = localizer.t("ui-install-detected-hint");
+    let detected_html = if detected.is_empty() {
+        format!(
+            r#"<p class="cz-card-body" style="margin: 0;">{}</p>"#,
+            html_escape(&detected_empty)
+        )
+    } else {
+        let rows: String = detected
+            .iter()
+            .map(|d| {
+                let badge_class = if d.owner.eq_ignore_ascii_case("computeza") {
+                    "cz-badge cz-badge-info"
+                } else {
+                    "cz-badge cz-badge-warn"
+                };
+                format!(
+                    r#"<li style="margin-bottom: 0.4rem;"><span class="{badge_class}">{owner}</span> <span class="cz-cell-mono">{summary}</span></li>"#,
+                    badge_class = badge_class,
+                    owner = html_escape(&d.owner),
+                    summary = html_escape(&d.summary()),
+                )
+            })
+            .collect();
+        format!(
+            r#"<ul style="list-style: none; padding: 0; margin: 0;">{rows}</ul>
+<p class="cz-muted" style="margin: 0.75rem 0 0; font-size: 0.85rem;">{hint}</p>"#,
+            hint = html_escape(&detected_hint),
+        )
+    };
+    let detected_section = format!(
+        r#"<section class="cz-section" style="max-width: 36rem;">
+<div class="cz-card">
+<h3 style="margin: 0 0 0.75rem;">{title}</h3>
+{body}
+</div>
+</section>"#,
+        title = html_escape(&detected_title),
+        body = detected_html,
+    );
+
     let body = format!(
         r#"<section class="cz-hero">
 <h1>{title}</h1>
 <p>{intro}</p>
 </section>
+{detected_section}
 <section class="cz-section" style="max-width: 36rem;">
 <div class="cz-card">
 <form method="post" action="/install/postgres" class="cz-form" style="max-width: none;">
@@ -1386,7 +1485,7 @@ pub fn render_install(localizer: &Localizer) -> String {
 <p class="cz-muted" style="margin: -0.5rem 0 0; font-size: 0.8rem;">{version_help}</p>
 
 <label for="port">{port_label}</label>
-<input id="port" name="port" class="cz-input" type="number" min="1" max="65535" placeholder="5432" />
+<input id="port" name="port" class="cz-input" type="number" min="1" max="65535" placeholder="{port_placeholder}" />
 <p class="cz-muted" style="margin: -0.5rem 0 0; font-size: 0.8rem;">{port_help}</p>
 
 <details style="margin-top: 0.5rem;">
@@ -1394,12 +1493,12 @@ pub fn render_install(localizer: &Localizer) -> String {
 <div style="display: flex; flex-direction: column; gap: 0.9rem; margin-top: 1rem;">
 <div>
 <label for="root_dir" style="display: block; margin-bottom: 0.4rem;">{data_dir_label}</label>
-<input id="root_dir" name="root_dir" class="cz-input" type="text" placeholder="(default)" />
+<input id="root_dir" name="root_dir" class="cz-input" type="text" placeholder="{root_dir_placeholder}" />
 <p class="cz-muted" style="margin: 0.35rem 0 0; font-size: 0.8rem;">{data_dir_help}</p>
 </div>
 <div>
 <label for="service_name" style="display: block; margin-bottom: 0.4rem;">{service_name_label}</label>
-<input id="service_name" name="service_name" class="cz-input" type="text" placeholder="computeza-postgres" pattern="[A-Za-z0-9_-]+" />
+<input id="service_name" name="service_name" class="cz-input" type="text" placeholder="{service_name_placeholder}" pattern="[A-Za-z0-9_-]+" />
 <p class="cz-muted" style="margin: 0.35rem 0 0; font-size: 0.8rem;">{service_name_help}</p>
 </div>
 </div>
@@ -1428,13 +1527,17 @@ pub fn render_install(localizer: &Localizer) -> String {
         version_options_html = version_options_html,
         port_label = html_escape(&port_label),
         port_help = html_escape(&port_help),
+        port_placeholder = html_escape(&port_placeholder),
         data_dir_label = html_escape(&data_dir_label),
         data_dir_help = html_escape(&data_dir_help),
+        root_dir_placeholder = html_escape(&root_dir_placeholder),
         service_name_label = html_escape(&service_name_label),
         service_name_help = html_escape(&service_name_help),
+        service_name_placeholder = html_escape(&service_name_placeholder),
         advanced_label = html_escape(&advanced_label),
         already_installed = html_escape(&already_installed),
         uninstall_button = html_escape(&uninstall_button),
+        detected_section = detected_section,
     );
 
     render_shell(localizer, &title, NavLink::Install, &body)
@@ -1986,7 +2089,7 @@ mod tests {
     #[test]
     fn render_install_shows_form_and_postgres_option() {
         let l = Localizer::english();
-        let html = render_install(&l);
+        let html = render_install(&l, &[]);
         assert!(html.starts_with("<!DOCTYPE html>"));
         assert!(html.contains("Install a component"));
         assert!(html.contains("PostgreSQL"));
