@@ -71,6 +71,53 @@ Instructions for any AI coding assistant working in this repo.
    the operator needs to know *what* succeeded and *what state the
    system is now in*. Silent successes are bugs.
 
+## Product constraints
+
+These are durable business / go-to-market constraints that shape
+architecture across the codebase. Engineering decisions touching the
+listed surfaces must preserve them.
+
+### Multi-tier distribution channels
+
+Computeza is sellable through three channels simultaneously, and the
+codebase must not bake in any single one of them:
+
+1. **Direct** -- Computeza -> end-customer.
+2. **Reseller** -- Computeza -> reseller -> end-customer.
+3. **Sub-reseller** -- Computeza -> reseller -> sub-reseller ->
+   end-customer (modelled on the Databricks -> Microsoft -> enterprise
+   pattern).
+
+Surfaces this affects and how engineering should treat them:
+
+- **Licensing tokens** must encode the full reseller chain
+  (`issuer -> tier 1 -> tier 2 -> customer`), and activation must round-
+  trip the chain back so every upstream party can verify entitlement
+  and bill. The current ed25519-signed license model needs a "chain"
+  claim before stable.
+- **White-labeling.** Any tier in the chain may rebrand the operator
+  console (logo, brand mark, accent colors, support contact). Keep
+  `assets/computeza.css` CSS-variable-driven; the `cz-brand` element
+  needs to accept a tenant-supplied SVG once branding lands.
+- **Telemetry / metering** must flow upward for reseller billing
+  without exposing customer-private content to upstream tiers. Plan
+  a coarse "seats / components installed / query volume" pipe where
+  each tier sees only aggregates of its downstream.
+- **Multi-tenancy.** `ResourceKey::workspace_scoped` already exists;
+  v0.1 should grow workspaces into first-class objects so one
+  Computeza deployment can serve "one reseller's tenant" or "one
+  end-customer" cleanly.
+- **Channel-partner API.** Resellers will need a provisioning API
+  (likely gRPC + mTLS) separate from the operator console.
+- **Support routing.** Error reporting must route to the operator's
+  vendor-of-record, which may not be Computeza itself. Plan a
+  `support_contact` config knob shown in the footer and linked from
+  error pages.
+
+v0.0.x ships single-tenant direct-use. The constraints above belong
+in the design when these surfaces are first built; do not paint into
+a single-tier corner.
+
 ## Working agreement (current preferences)
 
 - **Auto-accept.** The user has explicitly stated: "consider my answers
