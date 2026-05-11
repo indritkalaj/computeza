@@ -93,6 +93,33 @@ async fn server_serves_localized_home_and_healthz() {
         "embedded CSS should define spec section 4.3 palette utilities"
     );
 
+    // /components — every spec section 2.2 component should be listed
+    let resp = client
+        .get(format!("http://{addr}/components"))
+        .send()
+        .await
+        .expect("GET /components");
+    assert!(
+        resp.status().is_success(),
+        "/components status: {}",
+        resp.status()
+    );
+    let body = resp.text().await.expect("body text");
+    for c in [
+        "Kanidm",
+        "Garage",
+        "Lakekeeper",
+        "Databend",
+        "Qdrant",
+        "Restate",
+        "GreptimeDB",
+        "Grafana",
+        "PostgreSQL",
+        "OpenFGA",
+    ] {
+        assert!(body.contains(c), "/components should mention {c}");
+    }
+
     // Tear down. We abort rather than initiate graceful shutdown — sufficient
     // for a smoke test, and avoids needing a shutdown channel in the public API.
     server.abort();

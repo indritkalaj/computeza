@@ -58,9 +58,15 @@ pub async fn serve(addr: SocketAddr) -> anyhow::Result<()> {
 pub fn router() -> Router {
     Router::new()
         .route("/", get(home_handler))
+        .route("/components", get(components_handler))
         .route("/healthz", get(healthz_handler))
         .route("/static/computeza.css", get(css_handler))
         .layer(TraceLayer::new_for_http())
+}
+
+async fn components_handler() -> Html<String> {
+    let l = Localizer::english();
+    Html(render_components(&l))
 }
 
 async fn home_handler() -> Html<String> {
@@ -97,6 +103,7 @@ pub fn render_home(localizer: &Localizer) -> String {
 
     // Body fragment via Leptos view!. Tailwind-compatible utility classes
     // come from /static/computeza.css (see assets/computeza.css).
+    let components_link = localizer.t("ui-nav-components");
     let body_view = view! {
         <main class="mx-auto max-w-4xl p-12">
             <header class="border-b pb-6 mb-10">
@@ -105,6 +112,9 @@ pub fn render_home(localizer: &Localizer) -> String {
                 </h1>
                 <p class="text-indigo-300 text-sm m-0">{tagline}</p>
             </header>
+            <nav class="mb-6">
+                <a class="text-indigo-300 text-sm" href="/components">{components_link}</a>
+            </nav>
             <section>
                 <h2 class="text-2xl font-semibold text-slate-100 m-0 mb-3">{title.clone()}</h2>
                 <p class="text-slate-100 m-0 mb-6">{subtitle}</p>
@@ -134,9 +144,107 @@ pub fn render_home(localizer: &Localizer) -> String {
     )
 }
 
+/// Render the `/components` page: a table of every component the
+/// platform manages, sourced from spec §2.2 + per-component i18n
+/// keys. Static for v0.0.x; future versions will surface live
+/// reconciler status (drift indicators per spec §4.4).
+#[must_use]
+pub fn render_components(localizer: &Localizer) -> String {
+    let app_title = localizer.t("ui-app-title");
+    let title = localizer.t("ui-components-title");
+    let intro = localizer.t("ui-components-intro");
+    let col_name = localizer.t("ui-components-col-name");
+    let col_kind = localizer.t("ui-components-col-kind");
+    let col_role = localizer.t("ui-components-col-role");
+
+    let components: &[(&str, &str)] = &[
+        ("kanidm", "identity"),
+        ("garage", "object-storage"),
+        ("lakekeeper", "catalog"),
+        ("xtable", "format-translation"),
+        ("databend", "sql-engine"),
+        ("qdrant", "vector"),
+        ("restate", "workflows"),
+        ("greptime", "observability"),
+        ("grafana", "dashboards"),
+        ("postgres", "metadata-rdbms"),
+        ("openfga", "authorization"),
+    ];
+
+    let rows: String = components
+        .iter()
+        .map(|(slug, kind)| {
+            let name = localizer.t(&format!("component-{slug}-name"));
+            let role = localizer.t(&format!("component-{slug}-role"));
+            format!(
+                "<tr><td class=\"text-slate-100\" style=\"padding: 0.5rem 1rem 0.5rem 0;\">{name}</td>\
+                 <td class=\"text-indigo-300 text-sm\" style=\"padding: 0.5rem 1rem;\">{kind}</td>\
+                 <td class=\"text-slate-500 text-sm\" style=\"padding: 0.5rem 0;\">{role}</td></tr>"
+            )
+        })
+        .collect();
+
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>{title} — {app_title}</title>
+<link rel="stylesheet" href="/static/computeza.css" />
+</head>
+<body class="bg-indigo-900 text-slate-100">
+<main class="mx-auto max-w-4xl p-12">
+<header class="border-b pb-6 mb-10">
+<h1 class="text-orange-500 text-2xl font-semibold tracking-tight m-0 mb-1">{app_title}</h1>
+<nav><a class="text-indigo-300 text-sm" href="/">←&nbsp;Home</a></nav>
+</header>
+<section>
+<h2 class="text-2xl font-semibold text-slate-100 m-0 mb-3">{title}</h2>
+<p class="text-slate-500 text-sm m-0 mb-6">{intro}</p>
+<table style="width: 100%; border-collapse: collapse;">
+<thead><tr class="text-indigo-300 text-sm" style="text-align: left;">
+<th style="padding: 0.5rem 1rem 0.5rem 0;">{col_name}</th>
+<th style="padding: 0.5rem 1rem;">{col_kind}</th>
+<th style="padding: 0.5rem 0;">{col_role}</th>
+</tr></thead>
+<tbody>{rows}</tbody>
+</table>
+</section>
+</main>
+</body>
+</html>"#
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_components_lists_every_spec_component() {
+        let l = Localizer::english();
+        let html = render_components(&l);
+        for component in [
+            "Kanidm",
+            "Garage",
+            "Lakekeeper",
+            "Apache XTable",
+            "Databend",
+            "Qdrant",
+            "Restate",
+            "GreptimeDB",
+            "Grafana",
+            "PostgreSQL",
+            "OpenFGA",
+        ] {
+            assert!(
+                html.contains(component),
+                "/components should mention {component}; got HTML excerpt:\n{}",
+                &html[..html.len().min(2000)]
+            );
+        }
+    }
 
     #[test]
     fn render_home_contains_localized_title() {
