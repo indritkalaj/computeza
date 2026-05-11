@@ -30,9 +30,22 @@ if ! cargo fmt --all --check; then
 fi
 
 step "ascii-only guard (no non-ASCII bytes in tracked source)"
-python3 scripts/audit-nonascii.py | tail -1 | grep -q '^TOTAL files-with-nonascii: 0$' || {
-    echo "Found non-ASCII bytes. Run python3 scripts/audit-nonascii.py" >&2
-    echo "to see offenders, then python3 scripts/audit-fix-nonascii.py" >&2
+# Prefer python3 on Linux / macOS; fall back to python on Windows where
+# `python3` is often a Microsoft-Store shim that exits non-zero. We test
+# `python3 --version` rather than just `command -v` because the shim
+# satisfies `command -v` but fails on actual invocation.
+PY=""
+if python3 --version >/dev/null 2>&1; then
+    PY=python3
+elif python --version >/dev/null 2>&1; then
+    PY=python
+else
+    echo "Python is required for the ascii audit step; install python3 (Linux/macOS) or python (Windows)" >&2
+    exit 1
+fi
+"$PY" scripts/audit-nonascii.py | tail -1 | grep -q '^TOTAL files-with-nonascii: 0$' || {
+    echo "Found non-ASCII bytes. Run $PY scripts/audit-nonascii.py" >&2
+    echo "to see offenders, then $PY scripts/audit-fix-nonascii.py" >&2
     exit 1
 }
 
