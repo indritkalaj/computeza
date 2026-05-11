@@ -116,6 +116,18 @@ pub enum InstallError {
         /// Captured stderr.
         stderr: String,
     },
+    /// `pg_ctl register` failed -- this is the official PostgreSQL way
+    /// to create a Windows service for a postgres data directory.
+    /// Using `sc.exe create` against bare `postgres.exe` instead leads
+    /// to error 1053 (service did not respond) because postgres is a
+    /// console app and does not speak the SCM control protocol.
+    #[error("pg_ctl register failed (exit {code:?}): {stderr}")]
+    PgCtlRegisterFailed {
+        /// Exit code (None means signalled).
+        code: Option<i32>,
+        /// Captured stderr.
+        stderr: String,
+    },
     /// SCM call failed.
     #[error(transparent)]
     Sc(#[from] sc::ScError),
@@ -240,23 +252,9 @@ pub async fn install_with_progress(
     create_data_dir(&data_dir).await?;
     run_initdb_if_needed(&bin_dir, &data_dir).await?;
 
-    // bin_path for the service: quote the exe path, then -D <data>, -p <port>.
-    let postgres_exe = bin_dir.join("postgres.exe");
-    let bin_path = format!(
-        "\"{}\" -D \"{}\" -p {}",
-        postgres_exe.display(),
-        data_dir.display(),
-        opts.port
-    );
     progress.set_phase(InstallPhase::RegisteringService);
     progress.set_message(format!("Registering Windows service {}", opts.service_name));
-    sc::create(&sc::ServiceSpec {
-        name: &opts.service_name,
-        display_name: SERVICE_DISPLAY_NAME,
-        bin_path: &bin_path,
-        start: "auto",
-    })
-    .await?;
+    register_service(&bin_dir, &data_dir, &opts.service_name, opts.port).await?;
     progress.set_phase(InstallPhase::StartingService);
     progress.set_message("Starting service");
     sc::start(&opts.service_name).await?;
@@ -297,6 +295,59 @@ async fn create_data_dir(data_dir: &Path) -> Result<(), InstallError> {
     // On Windows we rely on Program-Files / ProgramData ACL inheritance
     // -- no chmod equivalent. The service account (NetworkService) gains
     // read-write via the ProgramData ACL.
+    Ok(())
+}
+
+/// Register a Windows service that runs `postgres.exe` against the
+/// given data dir. Uses `pg_ctl register` -- the only Postgres-aware
+/// way to register the service.
+///
+/// `postgres.exe` itself is a console application, not a service
+/// binary. Registering it directly with `sc.exe create` (the previous
+/// approach) yields error 1053 ("service did not respond to the start
+/// or control request in a timely fashion") because postgres has no
+/// SCM handler. `pg_ctl register` writes a service entry that uses
+/// pg_ctl's own service wrapper, which translates SCM commands into
+/// pg_ctl start/stop calls.
+///
+/// Idempotency: if a service of the same name exists (from a prior
+/// failed run), we stop + delete it first so the register call gets a
+/// clean slate.
+async fn register_service(
+    bin_dir: &Path,
+    data_dir: &Path,
+    service_name: &str,
+    port: u16,
+) -> Result<(), InstallError> {
+    // Wipe any leftover broken service from a previous attempt. Both
+    // sc::stop and sc::delete are idempotent (they swallow "service
+    // does not exist" / "service not running").
+    let _ = sc::stop(service_name).await;
+    let _ = sc::delete(service_name).await;
+
+    let pg_ctl = bin_dir.join("pg_ctl.exe");
+    info!(pg_ctl = %pg_ctl.display(), service = %service_name, "registering service via pg_ctl");
+    let out = Command::new(&pg_ctl)
+        .arg("register")
+        .arg("-N")
+        .arg(service_name)
+        .arg("-D")
+        .arg(data_dir)
+        .arg("-S")
+        .arg("auto")
+        .arg("-w")
+        .arg("-o")
+        .arg(format!("-p {port}"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await?;
+    if !out.status.success() {
+        return Err(InstallError::PgCtlRegisterFailed {
+            code: out.status.code(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
+    }
     Ok(())
 }
 
