@@ -207,7 +207,16 @@ async fn install_postgres_handler(
                         "databases": [],
                         "prune": false,
                     });
-                    match store.save(&key, &spec, None).await {
+                    // Upsert: load to discover an existing revision, then
+                    // save with that revision so re-installs update in
+                    // place instead of erroring with "revision conflict
+                    // on postgres-instance/local: expected None, found
+                    // Some(1)".
+                    let expected_revision = match store.load(&key).await {
+                        Ok(Some(existing)) => Some(existing.revision),
+                        _ => None,
+                    };
+                    match store.save(&key, &spec, expected_revision).await {
                         Ok(_) => {
                             summary.push_str(
                                 "\n\nRegistered as postgres-instance/local in the metadata store.\nVisit /status to see it.",
@@ -217,13 +226,25 @@ async fn install_postgres_handler(
                             tracing::warn!(
                                 error = %e,
                                 "install background task: store.save failed; install succeeded but \
-                                 the resource is not registered. Likely cause: a \
-                                 postgres-instance/local already exists. Check /status."
+                                 the resource is not registered. Most likely another writer raced \
+                                 the upsert. Re-run the install if /status is wrong."
                             );
                             summary.push_str(&format!(
                                 "\n\nNote: did not register postgres-instance/local ({e}). Visit /status to inspect current state."
                             ));
                         }
+                    }
+
+                    // Kick a single observe() immediately so /status
+                    // doesn't sit on the previous (likely failed) tick
+                    // result for up to 30 seconds. Best-effort: the
+                    // periodic tick will retry regardless.
+                    if let Err(e) = observe_postgres_instance_now(store.clone(), &spec).await {
+                        tracing::debug!(
+                            error = %e,
+                            "post-install observe attempt did not write a fresh status; \
+                             /status will update on the next periodic tick"
+                        );
                     }
                 }
                 progress.finish_success(summary);
@@ -237,6 +258,32 @@ async fn install_postgres_handler(
     // 303 See Other to the wizard page. Standard POST-redirect-GET so
     // refreshing the wizard doesn't re-submit the form.
     Redirect303(format!("/install/job/{job_id}")).into_response()
+}
+
+/// Construct a postgres reconciler for the freshly-installed instance
+/// and run a single `observe()` so the persisted status snapshot is
+/// up to date by the time the wizard's redirect lands on `/status`.
+///
+/// Best-effort: if the spec doesn't parse or the connection fails, we
+/// log and return -- the periodic tick will retry on its next 30-second
+/// interval. Non-fatal to the install.
+async fn observe_postgres_instance_now(
+    store: Arc<SqliteStore>,
+    spec_json: &serde_json::Value,
+) -> anyhow::Result<()> {
+    use computeza_core::reconciler::Context;
+    use computeza_core::{NoOpDriver, Reconciler};
+    use computeza_reconciler_postgres::{PostgresReconciler, PostgresSpec};
+
+    let spec: PostgresSpec = serde_json::from_value(spec_json.clone())?;
+    let reconciler: PostgresReconciler<NoOpDriver> =
+        PostgresReconciler::new(spec.endpoint.clone(), spec.superuser_password)
+            .with_state(store, "local");
+    // observe() is "best effort writes a status row to the store".
+    // It returns Ok with `last_observe_failed=true` on connection
+    // failure, so the .await? here only propagates programming bugs.
+    let _ = reconciler.observe(&Context::default()).await;
+    Ok(())
 }
 
 /// 303 See Other redirect helper. axum has `Redirect::to` but it

@@ -849,6 +849,7 @@ dependencies = [
  "computeza-core",
  "computeza-driver-native",
  "computeza-i18n",
+ "computeza-reconciler-postgres",
  "computeza-state",
  "reqwest",
  "serde",
