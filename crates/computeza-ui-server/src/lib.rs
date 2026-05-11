@@ -100,6 +100,7 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/components", get(components_handler))
         .route("/install", get(install_handler))
         .route("/install/postgres", post(install_postgres_handler))
+        .route("/status", get(status_handler))
         .route("/healthz", get(healthz_handler))
         .route("/api/state/info", get(state_info_handler))
         .route("/static/computeza.css", get(css_handler))
@@ -244,6 +245,82 @@ async fn components_handler() -> Html<String> {
     Html(render_components(&l))
 }
 
+/// One row in the `/status` table -- a single resource instance and its
+/// most recent observation, projected from the store's opaque status JSON
+/// into the fields every HTTP reconciler exposes (server_version,
+/// last_observed_at, last_observe_failed).
+#[derive(Clone, Debug, Default)]
+pub struct StatusRow {
+    /// Resource kind, e.g. `postgres-instance`.
+    pub kind: String,
+    /// Localized display name for the component, e.g. "PostgreSQL".
+    pub component_label: String,
+    /// Instance name as registered with `with_state(.., instance_name)`.
+    pub instance_name: String,
+    /// `server_version` from the status JSON, if present.
+    pub server_version: Option<String>,
+    /// ISO-8601 last observation timestamp, if present.
+    pub last_observed_at: Option<String>,
+    /// `last_observe_failed` flag from the status JSON. Defaults to false
+    /// when the field is absent (e.g. the resource exists but has never
+    /// been observed -- that case is reported via `has_status` instead).
+    pub last_observe_failed: bool,
+    /// Whether a status snapshot has been recorded at all.
+    pub has_status: bool,
+}
+
+async fn status_handler(State(state): State<AppState>) -> Html<String> {
+    let l = Localizer::english();
+    let Some(store) = &state.store else {
+        return Html(render_status(&l, None));
+    };
+    // (kind, component-slug) -- the slug feeds the `component-<slug>-name`
+    // i18n key for the localized display label.
+    let entries: &[(&str, &str)] = &[
+        ("postgres-instance", "postgres"),
+        ("kanidm-instance", "kanidm"),
+        ("garage-instance", "garage"),
+        ("lakekeeper-instance", "lakekeeper"),
+        ("databend-instance", "databend"),
+        ("qdrant-instance", "qdrant"),
+        ("restate-instance", "restate"),
+        ("greptime-instance", "greptime"),
+        ("grafana-instance", "grafana"),
+        ("openfga-instance", "openfga"),
+    ];
+    let mut rows: Vec<StatusRow> = Vec::new();
+    for (kind, slug) in entries {
+        let Ok(list) = store.list(kind, None).await else {
+            continue;
+        };
+        for sr in list {
+            let status = sr.status.as_ref();
+            let server_version = status
+                .and_then(|s| s.get("server_version"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let last_observed_at = status
+                .and_then(|s| s.get("last_observed_at"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let last_observe_failed = status
+                .and_then(|s| s.get("last_observe_failed"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            rows.push(StatusRow {
+                kind: (*kind).into(),
+                component_label: l.t(&format!("component-{slug}-name")),
+                instance_name: sr.key.name.clone(),
+                server_version,
+                last_observed_at,
+                last_observe_failed,
+                has_status: status.is_some(),
+            });
+        }
+    }
+    Html(render_status(&l, Some(&rows)))
+}
+
 async fn home_handler() -> Html<String> {
     let l = Localizer::english();
     Html(render_home(&l))
@@ -280,6 +357,7 @@ pub fn render_home(localizer: &Localizer) -> String {
     // come from /static/computeza.css (see assets/computeza.css).
     let components_link = localizer.t("ui-nav-components");
     let install_link = localizer.t("ui-nav-install");
+    let status_link = localizer.t("ui-nav-status");
     let body_view = view! {
         <main class="mx-auto max-w-4xl p-12">
             <header class="border-b pb-6 mb-10">
@@ -292,6 +370,8 @@ pub fn render_home(localizer: &Localizer) -> String {
                 <a class="text-indigo-300 text-sm" href="/components">{components_link}</a>
                 " | "
                 <a class="text-indigo-300 text-sm" href="/install">{install_link}</a>
+                " | "
+                <a class="text-indigo-300 text-sm" href="/status">{status_link}</a>
             </nav>
             <section>
                 <h2 class="text-2xl font-semibold text-slate-100 m-0 mb-3">{title.clone()}</h2>
@@ -507,6 +587,111 @@ pub fn render_install_result(localizer: &Localizer, success: bool, detail: &str)
     )
 }
 
+/// Render the `/status` page: one row per persisted reconciler
+/// observation. `rows = None` means the server is running without a
+/// metadata store (no `computeza serve`), and we surface the
+/// `ui-status-store-missing` hint instead of an empty table.
+#[must_use]
+pub fn render_status(localizer: &Localizer, rows: Option<&[StatusRow]>) -> String {
+    let app_title = localizer.t("ui-app-title");
+    let title = localizer.t("ui-status-title");
+    let intro = localizer.t("ui-status-intro");
+    let col_kind = localizer.t("ui-status-col-kind");
+    let col_name = localizer.t("ui-status-col-name");
+    let col_version = localizer.t("ui-status-col-version");
+    let col_observed = localizer.t("ui-status-col-observed");
+    let col_state = localizer.t("ui-status-col-state");
+
+    let body = match rows {
+        None => format!(
+            r#"<p class="text-orange-500 text-sm m-0">{}</p>"#,
+            html_escape(&localizer.t("ui-status-store-missing"))
+        ),
+        Some([]) => format!(
+            r#"<p class="text-slate-500 text-sm m-0">{}</p>"#,
+            html_escape(&localizer.t("ui-status-empty"))
+        ),
+        Some(rs) => {
+            let state_ok = localizer.t("ui-status-state-ok");
+            let state_failed = localizer.t("ui-status-state-failed");
+            let state_unknown = localizer.t("ui-status-state-unknown");
+            let body_rows: String = rs
+                .iter()
+                .map(|r| {
+                    let (state_label, state_class) = if !r.has_status {
+                        (state_unknown.clone(), "text-indigo-300")
+                    } else if r.last_observe_failed {
+                        (state_failed.clone(), "text-orange-500")
+                    } else {
+                        (state_ok.clone(), "text-slate-100")
+                    };
+                    let version = r
+                        .server_version
+                        .clone()
+                        .unwrap_or_else(|| "-".to_string());
+                    let observed = r
+                        .last_observed_at
+                        .clone()
+                        .unwrap_or_else(|| "-".to_string());
+                    format!(
+                        "<tr>\
+                         <td class=\"text-indigo-300 text-sm\" style=\"padding: 0.5rem 1rem 0.5rem 0;\">{kind}</td>\
+                         <td class=\"text-slate-100\" style=\"padding: 0.5rem 1rem;\">{label} / {name}</td>\
+                         <td class=\"text-slate-500 text-sm\" style=\"padding: 0.5rem 1rem;\">{version}</td>\
+                         <td class=\"text-slate-500 text-sm\" style=\"padding: 0.5rem 1rem;\">{observed}</td>\
+                         <td class=\"{state_class}\" style=\"padding: 0.5rem 0;\">{state_label}</td>\
+                         </tr>",
+                        kind = html_escape(&r.kind),
+                        label = html_escape(&r.component_label),
+                        name = html_escape(&r.instance_name),
+                        version = html_escape(&version),
+                        observed = html_escape(&observed),
+                        state_class = state_class,
+                        state_label = html_escape(&state_label),
+                    )
+                })
+                .collect();
+            format!(
+                r#"<table style="width: 100%; border-collapse: collapse;">
+<thead><tr class="text-indigo-300 text-sm" style="text-align: left;">
+<th style="padding: 0.5rem 1rem 0.5rem 0;">{col_kind}</th>
+<th style="padding: 0.5rem 1rem;">{col_name}</th>
+<th style="padding: 0.5rem 1rem;">{col_version}</th>
+<th style="padding: 0.5rem 1rem;">{col_observed}</th>
+<th style="padding: 0.5rem 0;">{col_state}</th>
+</tr></thead>
+<tbody>{body_rows}</tbody>
+</table>"#
+            )
+        }
+    };
+
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>{title} -- {app_title}</title>
+<link rel="stylesheet" href="/static/computeza.css" />
+</head>
+<body class="bg-indigo-900 text-slate-100">
+<main class="mx-auto max-w-4xl p-12">
+<header class="border-b pb-6 mb-10">
+<h1 class="text-orange-500 text-2xl font-semibold tracking-tight m-0 mb-1">{app_title}</h1>
+<nav><a class="text-indigo-300 text-sm" href="/">&lt;-&nbsp;Home</a></nav>
+</header>
+<section>
+<h2 class="text-2xl font-semibold text-slate-100 m-0 mb-3">{title}</h2>
+<p class="text-slate-500 text-sm m-0 mb-6">{intro}</p>
+{body}
+</section>
+</main>
+</body>
+</html>"#
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -574,6 +759,58 @@ mod tests {
         let html = render_install_result(&l, true, "bin_dir: /opt/computeza/postgres");
         assert!(html.contains("Install completed."));
         assert!(html.contains("bin_dir: /opt/computeza/postgres"));
+    }
+
+    #[test]
+    fn render_status_no_store_shows_store_missing_hint() {
+        let l = Localizer::english();
+        let html = render_status(&l, None);
+        assert!(html.contains("Reconciler status"));
+        assert!(html.contains("No metadata store is attached"));
+    }
+
+    #[test]
+    fn render_status_empty_shows_empty_hint() {
+        let l = Localizer::english();
+        let html = render_status(&l, Some(&[]));
+        assert!(html.contains("No resources have been observed yet."));
+    }
+
+    #[test]
+    fn render_status_row_renders_kind_name_version_state() {
+        let l = Localizer::english();
+        let rows = vec![StatusRow {
+            kind: "postgres-instance".into(),
+            component_label: "PostgreSQL".into(),
+            instance_name: "primary".into(),
+            server_version: Some("PostgreSQL 17.2".into()),
+            last_observed_at: Some("2026-05-11T08:00:00Z".into()),
+            last_observe_failed: false,
+            has_status: true,
+        }];
+        let html = render_status(&l, Some(&rows));
+        assert!(html.contains("postgres-instance"));
+        assert!(html.contains("PostgreSQL / primary"));
+        assert!(html.contains("PostgreSQL 17.2"));
+        assert!(html.contains("2026-05-11T08:00:00Z"));
+        assert!(html.contains("Observing"));
+    }
+
+    #[test]
+    fn render_status_row_marks_failed_observation_in_orange() {
+        let l = Localizer::english();
+        let rows = vec![StatusRow {
+            kind: "kanidm-instance".into(),
+            component_label: "Kanidm".into(),
+            instance_name: "primary".into(),
+            server_version: None,
+            last_observed_at: None,
+            last_observe_failed: true,
+            has_status: true,
+        }];
+        let html = render_status(&l, Some(&rows));
+        assert!(html.contains("Failed"));
+        assert!(html.contains("text-orange-500"));
     }
 
     #[test]

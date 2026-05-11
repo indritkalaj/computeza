@@ -109,6 +109,37 @@ async fn server_serves_localized_home_and_healthz() {
     let body: serde_json::Value = resp.json().await.expect("json body");
     assert_eq!(body["store_attached"], false);
 
+    // /install -- wizard form page with a postgres option
+    let resp = client
+        .get(format!("http://{addr}/install"))
+        .send()
+        .await
+        .expect("GET /install");
+    assert!(
+        resp.status().is_success(),
+        "/install status: {}",
+        resp.status()
+    );
+    let body = resp.text().await.expect("body text");
+    assert!(body.contains("Install a component"));
+    assert!(body.contains("PostgreSQL"));
+    assert!(body.contains(r#"action="/install/postgres""#));
+
+    // /status -- with no store attached, surfaces the store-missing hint
+    let resp = client
+        .get(format!("http://{addr}/status"))
+        .send()
+        .await
+        .expect("GET /status");
+    assert!(
+        resp.status().is_success(),
+        "/status status: {}",
+        resp.status()
+    );
+    let body = resp.text().await.expect("body text");
+    assert!(body.contains("Reconciler status"));
+    assert!(body.contains("No metadata store is attached"));
+
     // /components -- every spec section 2.2 component should be listed
     let resp = client
         .get(format!("http://{addr}/components"))

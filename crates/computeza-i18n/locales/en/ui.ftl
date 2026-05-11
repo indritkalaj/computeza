@@ -28,6 +28,22 @@ ui-footer-version     = Version
 
 ui-nav-components     = Components
 ui-nav-install        = Install
+ui-nav-status         = Status
+
+# --- Status page ---
+
+ui-status-title         = Reconciler status
+ui-status-intro         = Live observations from every reconciler currently bound to this server. Each row is one resource instance and its most recent status snapshot (spec section 4.4 drift surface).
+ui-status-col-kind      = Kind
+ui-status-col-name      = Name
+ui-status-col-version   = Server version
+ui-status-col-observed  = Last observed
+ui-status-col-state     = State
+ui-status-state-ok      = Observing
+ui-status-state-failed  = Failed
+ui-status-state-unknown = Unknown
+ui-status-empty         = No resources have been observed yet. Bind a reconciler with `.with_state(store, instance_name)` and run it to populate this view.
+ui-status-store-missing = No metadata store is attached to this server. Start it with `computeza serve` (the binary wires a SqliteStore automatically) to see live reconciler state here.
 
 # --- Install wizard ---
 

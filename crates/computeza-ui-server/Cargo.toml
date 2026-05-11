@@ -28,4 +28,4 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 
 [dev-dependencies]
-reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
