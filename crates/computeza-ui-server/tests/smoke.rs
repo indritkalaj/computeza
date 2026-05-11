@@ -64,6 +64,34 @@ async fn server_serves_localized_home_and_healthz() {
         body.contains("Open lakehouse control plane"),
         "rendered home should contain the localized tagline"
     );
+    assert!(
+        body.contains(r#"href="/static/computeza.css""#),
+        "home should link the embedded stylesheet"
+    );
+
+    // /static/computeza.css — embedded Tailwind-compatible utility CSS
+    let resp = client
+        .get(format!("http://{addr}/static/computeza.css"))
+        .send()
+        .await
+        .expect("GET /static/computeza.css");
+    assert!(
+        resp.status().is_success(),
+        "/static/computeza.css status: {}",
+        resp.status()
+    );
+    assert_eq!(
+        resp.headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("text/css; charset=utf-8"),
+        "CSS asset should be served with text/css content-type"
+    );
+    let css = resp.text().await.expect("body text");
+    assert!(
+        css.contains(".bg-indigo-900"),
+        "embedded CSS should define spec section 4.3 palette utilities"
+    );
 
     // Tear down. We abort rather than initiate graceful shutdown — sufficient
     // for a smoke test, and avoids needing a shutdown channel in the public API.

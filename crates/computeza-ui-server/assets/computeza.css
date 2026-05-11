@@ -1,0 +1,65 @@
+/*!
+ * Computeza UI — hand-written Tailwind-compatible utility CSS.
+ *
+ * This file is the v0.0.x bootstrap. It defines the spec section 4.3
+ * palette as CSS custom properties and exposes the small set of Tailwind
+ * utility class names the current pages use. When the UI surface grows
+ * past what hand-maintenance scales to, we add a build pipeline driven
+ * by the standalone tailwindcss CLI (a single ~70MB binary, no Node).
+ *
+ * The class names match Tailwind exactly so the eventual swap is a
+ * mechanical one — every existing class keeps working.
+ */
+
+:root {
+  --indigo-900: #1A1B3A;
+  --indigo-700: #2E2F5C;
+  --indigo-500: #4F46E5;
+  --indigo-300: #8B85F0;
+  --orange-600: #C8633F;
+  --orange-500: #E07A4F;
+  --slate-900:  #0F1024;
+  --slate-500:  #5C5E84;
+  --slate-100:  #E8E9F3;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  font-family: 'Noto Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  line-height: 1.5;
+  min-height: 100vh;
+}
+
+/* --- Background / text colour utilities --- */
+.bg-indigo-900 { background-color: var(--indigo-900); }
+.bg-indigo-700 { background-color: var(--indigo-700); }
+.text-slate-100 { color: var(--slate-100); }
+.text-slate-500 { color: var(--slate-500); }
+.text-indigo-300 { color: var(--indigo-300); }
+.text-orange-500 { color: var(--orange-500); }
+
+/* --- Layout --- */
+.mx-auto { margin-left: auto; margin-right: auto; }
+.max-w-4xl { max-width: 64rem; }
+.p-12 { padding: 3rem; }
+.pb-6 { padding-bottom: 1.5rem; }
+.pt-6 { padding-top: 1.5rem; }
+.mb-10 { margin-bottom: 2.5rem; }
+.mt-16 { margin-top: 4rem; }
+.mb-1 { margin-bottom: 0.25rem; }
+.mb-3 { margin-bottom: 0.75rem; }
+.mb-6 { margin-bottom: 1.5rem; }
+.mb-2 { margin-bottom: 0.5rem; }
+.m-0 { margin: 0; }
+
+/* --- Typography --- */
+.text-2xl { font-size: 1.5rem; line-height: 2rem; }
+.text-sm { font-size: 0.875rem; line-height: 1.25rem; }
+.text-xs { font-size: 0.75rem; line-height: 1rem; }
+.font-semibold { font-weight: 600; }
+.tracking-tight { letter-spacing: -0.02em; }
+
+/* --- Borders --- */
+.border-b { border-bottom: 1px solid var(--indigo-700); }
+.border-t { border-top: 1px solid var(--indigo-700); }

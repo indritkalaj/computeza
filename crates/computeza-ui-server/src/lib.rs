@@ -26,10 +26,19 @@
 
 use std::net::SocketAddr;
 
-use axum::{response::Html, routing::get, Router};
+use axum::{
+    http::header,
+    response::{Html, IntoResponse, Response},
+    routing::get,
+    Router,
+};
 use computeza_i18n::Localizer;
 use leptos::prelude::*;
 use tower_http::trace::TraceLayer;
+
+/// Tailwind-compatible utility CSS, embedded at compile time. Served at
+/// `/static/computeza.css` and referenced from the home page.
+const COMPUTEZA_CSS: &str = include_str!("../assets/computeza.css");
 
 /// Boot the operator console on the given address. Awaits forever
 /// (until the process is signalled to terminate).
@@ -50,6 +59,7 @@ pub fn router() -> Router {
     Router::new()
         .route("/", get(home_handler))
         .route("/healthz", get(healthz_handler))
+        .route("/static/computeza.css", get(css_handler))
         .layer(TraceLayer::new_for_http())
 }
 
@@ -61,6 +71,14 @@ async fn home_handler() -> Html<String> {
 async fn healthz_handler() -> String {
     let l = Localizer::english();
     l.t("ui-healthz-ok")
+}
+
+async fn css_handler() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        COMPUTEZA_CSS,
+    )
+        .into_response()
 }
 
 /// Render the home page to a complete HTML document.
@@ -77,31 +95,29 @@ pub fn render_home(localizer: &Localizer) -> String {
     let version_label = localizer.t("ui-footer-version");
     let version = env!("CARGO_PKG_VERSION");
 
-    // Body fragment via Leptos view!. The shell (<!doctype>, <head>, palette
-    // CSS) is composed around it as a string — once we add hydration and a
-    // real <Layout> component, the whole document moves into Leptos.
+    // Body fragment via Leptos view!. Tailwind-compatible utility classes
+    // come from /static/computeza.css (see assets/computeza.css).
     let body_view = view! {
-        <main class="shell">
-            <header class="brand-header">
-                <h1 class="brand">{app_title.clone()}</h1>
-                <p class="tagline">{tagline}</p>
+        <main class="mx-auto max-w-4xl p-12">
+            <header class="border-b pb-6 mb-10">
+                <h1 class="text-orange-500 text-2xl font-semibold tracking-tight m-0 mb-1">
+                    {app_title.clone()}
+                </h1>
+                <p class="text-indigo-300 text-sm m-0">{tagline}</p>
             </header>
-            <section class="hero">
-                <h2>{title.clone()}</h2>
-                <p class="subtitle">{subtitle}</p>
-                <p class="status">{status}</p>
-                <p class="spec-note">{spec_note}</p>
+            <section>
+                <h2 class="text-2xl font-semibold text-slate-100 m-0 mb-3">{title.clone()}</h2>
+                <p class="text-slate-100 m-0 mb-6">{subtitle}</p>
+                <p class="text-slate-500 text-sm m-0 mb-2">{status}</p>
+                <p class="text-slate-500 text-sm m-0">{spec_note}</p>
             </section>
-            <footer class="meta">
+            <footer class="mt-16 pt-6 border-t text-slate-500 text-xs">
                 <span>{version_label}" "{version}</span>
             </footer>
         </main>
     };
     let body_html = body_view.to_html();
 
-    // Spec §4.3 palette: indigo-900 canvas, indigo-300 / orange-500 accents,
-    // slate-100 body text, dark theme by default. Inlined for v0.0.x; moves
-    // to Tailwind once `cargo-leptos` lands.
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -109,36 +125,9 @@ pub fn render_home(localizer: &Localizer) -> String {
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>{title} — {app_title}</title>
-<style>
-  :root {{
-    --indigo-900: #1A1B3A;
-    --indigo-700: #2E2F5C;
-    --indigo-300: #8B85F0;
-    --orange-500: #E07A4F;
-    --slate-500:  #5C5E84;
-    --slate-100:  #E8E9F3;
-  }}
-  * {{ box-sizing: border-box; }}
-  html, body {{ margin: 0; padding: 0; }}
-  body {{
-    background: var(--indigo-900);
-    color: var(--slate-100);
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    line-height: 1.5;
-    min-height: 100vh;
-  }}
-  .shell {{ max-width: 64rem; margin: 0 auto; padding: 3rem 2rem; }}
-  .brand-header {{ border-bottom: 1px solid var(--indigo-700); padding-bottom: 1.5rem; margin-bottom: 2.5rem; }}
-  .brand {{ color: var(--orange-500); font-size: 1.5rem; font-weight: 600; margin: 0 0 0.25rem 0; letter-spacing: -0.02em; }}
-  .tagline {{ color: var(--indigo-300); margin: 0; font-size: 0.875rem; }}
-  .hero h2 {{ font-size: 1.5rem; font-weight: 600; margin: 0 0 0.75rem 0; color: var(--slate-100); }}
-  .hero .subtitle {{ color: var(--slate-100); margin: 0 0 1.5rem 0; }}
-  .hero .status {{ color: var(--slate-500); font-size: 0.875rem; margin: 0 0 0.5rem 0; }}
-  .hero .spec-note {{ color: var(--slate-500); font-size: 0.875rem; margin: 0; }}
-  .meta {{ color: var(--slate-500); font-size: 0.75rem; margin-top: 4rem; padding-top: 1.5rem; border-top: 1px solid var(--indigo-700); }}
-</style>
+<link rel="stylesheet" href="/static/computeza.css" />
 </head>
-<body>
+<body class="bg-indigo-900 text-slate-100">
 {body_html}
 </body>
 </html>"#

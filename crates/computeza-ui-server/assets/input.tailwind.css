@@ -1,0 +1,30 @@
+/*!
+ * Computeza UI — Tailwind v4 source.
+ *
+ * This is the canonical source the eventual build pipeline will consume.
+ * Today the hand-maintained `computeza.css` next to it is what ships;
+ * keeping this file under version control documents the intended palette
+ * and CSS-based theming for when we wire up the standalone tailwindcss
+ * CLI (a single binary, no Node toolchain).
+ *
+ * To rebuild manually once tailwindcss is on PATH:
+ *
+ *   tailwindcss -i assets/input.tailwind.css -o assets/computeza.css --minify
+ */
+
+@import "tailwindcss";
+
+/* Spec section 4.3 palette — Tailwind v4 @theme block. */
+@theme {
+  --color-indigo-900: #1A1B3A;
+  --color-indigo-700: #2E2F5C;
+  --color-indigo-500: #4F46E5;
+  --color-indigo-300: #8B85F0;
+  --color-orange-600: #C8633F;
+  --color-orange-500: #E07A4F;
+  --color-slate-900:  #0F1024;
+  --color-slate-500:  #5C5E84;
+  --color-slate-100:  #E8E9F3;
+
+  --font-family-sans: 'Noto Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
