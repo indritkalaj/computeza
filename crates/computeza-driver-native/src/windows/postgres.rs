@@ -23,7 +23,7 @@ use std::{
 };
 
 use thiserror::Error;
-use tokio::{fs, io::AsyncWriteExt, net::TcpStream, process::Command, time::sleep};
+use tokio::{fs, net::TcpStream, process::Command, time::sleep};
 use tracing::{debug, info, warn};
 
 use super::{path, sc};
