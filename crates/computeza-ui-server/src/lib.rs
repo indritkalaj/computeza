@@ -374,20 +374,24 @@ async fn run_postgres_install_with_progress(
 ) -> Result<(String, u16), String> {
     use computeza_driver_native::windows::postgres;
     match postgres::install_with_progress(postgres::InstallOptions::default(), progress).await {
-        Ok(r) => Ok((
-            format!(
-                "bin_dir: {}\ndata_dir: {}\nservice: {}\nport: {}\npsql shim: {}",
-                r.bin_dir.display(),
-                r.data_dir.display(),
-                r.service_name,
+        Ok(r) => {
+            let shim_line = match (&r.psql_shim, &r.psql_shim_error) {
+                (Some(p), _) => p.display().to_string(),
+                (None, Some(err)) => format!("(failed: {err})"),
+                (None, None) => "(not created)".into(),
+            };
+            Ok((
+                format!(
+                    "bin_dir: {}\ndata_dir: {}\nservice: {}\nport: {}\npsql shim: {}",
+                    r.bin_dir.display(),
+                    r.data_dir.display(),
+                    r.service_name,
+                    r.port,
+                    shim_line,
+                ),
                 r.port,
-                r.psql_shim
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "(not created)".into()),
-            ),
-            r.port,
-        )),
+            ))
+        }
         Err(e) => Err(format!("{e}")),
     }
 }

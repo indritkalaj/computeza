@@ -105,6 +105,11 @@ computeza-pipelines = { path = "crates/computeza-pipelines", version = "0.0.1" }
 # Tier 2 -- Drivers
 computeza-driver-native = { path = "crates/computeza-driver-native", version = "0.0.1" }
 
+# Tier 3 -- Reconcilers (only the ones currently wired into the binary's
+# observe loop; others are members of the workspace but not depended on
+# until they're integrated).
+computeza-reconciler-postgres = { path = "crates/computeza-reconciler-postgres", version = "0.0.1" }
+
 # Tier 4 -- Web Console (i18n is shared, so placed at workspace level)
 computeza-i18n          = { path = "crates/computeza-i18n",          version = "0.0.1" }
 computeza-ui-server     = { path = "crates/computeza-ui-server",     version = "0.0.1" }

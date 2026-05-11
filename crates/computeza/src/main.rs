@@ -113,6 +113,11 @@ fn main() -> anyhow::Result<()> {
                     })?;
                 tracing::info!(state_db = %state_db, "metadata store ready");
                 let state = computeza_ui_server::AppState::with_store(store);
+                let store_for_tick = state
+                    .store
+                    .clone()
+                    .expect("AppState::with_store always populates store");
+                tokio::spawn(reconcile_tick(store_for_tick));
                 computeza_ui_server::serve_with_state(addr, state).await
             })?;
         }
@@ -230,6 +235,65 @@ fn install_postgres(_l: &Localizer) -> anyhow::Result<()> {
 fn install_postgres(l: &Localizer) -> anyhow::Result<()> {
     println!("{}", l.t("install-postgres-unsupported-os"));
     Ok(())
+}
+
+/// Periodic in-process reconcile tick. Reads every `postgres-instance`
+/// row from the metadata store and runs `observe()` against it,
+/// persisting the result back via `with_state(store, name)`. The UI's
+/// `/status` page then surfaces the live server version, last-observed
+/// timestamp, and the green "Observing" badge.
+///
+/// v0.0.x only covers postgres-instance; the HTTP reconcilers
+/// (kanidm/garage/lakekeeper/...) will join this loop once their
+/// resource types are populated through the apply flow.
+async fn reconcile_tick(store: std::sync::Arc<computeza_state::SqliteStore>) {
+    use computeza_core::reconciler::Context;
+    use computeza_core::{NoOpDriver, Reconciler};
+    use computeza_reconciler_postgres::{PostgresReconciler, PostgresSpec};
+    use computeza_state::Store;
+
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+    // Don't fire immediately on startup -- give the install path or the
+    // operator time to write the first row.
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let ctx = Context::default();
+    loop {
+        tick.tick().await;
+        let rows = match store.list("postgres-instance", None).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "reconcile_tick: failed to list postgres-instance resources; \
+                     skipping this tick. Will retry on the next 30s interval."
+                );
+                continue;
+            }
+        };
+        for sr in rows {
+            let spec: PostgresSpec = match serde_json::from_value(sr.spec.clone()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        kind = %sr.key.kind,
+                        name = %sr.key.name,
+                        "reconcile_tick: spec did not deserialize as PostgresSpec; \
+                         leaving status as Unknown. Inspect /resource/{}/{} and fix the spec.",
+                        sr.key.kind, sr.key.name,
+                    );
+                    continue;
+                }
+            };
+            let reconciler: PostgresReconciler<NoOpDriver> =
+                PostgresReconciler::new(spec.endpoint.clone(), spec.superuser_password)
+                    .with_state(store.clone(), &sr.key.name);
+            // Observe is best-effort; the reconciler itself logs failures
+            // and writes a `last_observe_failed=true` sentinel to the
+            // store so the UI can render the orange "Failed" badge.
+            let _ = reconciler.observe(&ctx).await;
+        }
+    }
 }
 
 /// Configure the global tracing subscriber. Reads `RUST_LOG` for filtering

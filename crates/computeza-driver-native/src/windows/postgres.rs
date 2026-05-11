@@ -95,8 +95,13 @@ pub struct Installed {
     pub service_name: String,
     /// Port the daemon is now listening on.
     pub port: u16,
-    /// Path to the `.cmd` shim for psql.
+    /// Path to the `.cmd` shim for psql, when PATH registration succeeded.
     pub psql_shim: Option<PathBuf>,
+    /// Diagnostic text from the PATH-registration step when it failed.
+    /// PATH registration is non-critical -- the install proceeds even
+    /// when it fails -- so we record the error here for display rather
+    /// than aborting. `None` means the step succeeded or did not run.
+    pub psql_shim_error: Option<String>,
 }
 
 /// Errors from the install pipeline.
@@ -269,11 +274,12 @@ pub async fn install_with_progress(
     progress.set_phase(InstallPhase::RegisteringPath);
     progress.set_message("Registering psql in PATH");
     let psql_exe = bin_dir.join("psql.exe");
-    let psql_shim = match path::register("psql", &psql_exe).await {
-        Ok(p) => Some(p),
+    let (psql_shim, psql_shim_error) = match path::register("psql", &psql_exe).await {
+        Ok(p) => (Some(p), None),
         Err(e) => {
-            warn!(error = %e, "registering computeza-psql.cmd shim failed");
-            None
+            let msg = format!("{e}");
+            warn!(error = %msg, "registering computeza-psql.cmd shim failed");
+            (None, Some(msg))
         }
     };
 
@@ -284,6 +290,7 @@ pub async fn install_with_progress(
         service_name: opts.service_name,
         port: opts.port,
         psql_shim,
+        psql_shim_error,
     })
 }
 
@@ -355,6 +362,11 @@ async fn run_initdb_if_needed(bin_dir: &Path, data_dir: &Path) -> Result<(), Ins
     let marker = data_dir.join("PG_VERSION");
     if fs::try_exists(&marker).await? {
         debug!(data_dir = %data_dir.display(), "data dir already initialised; skipping initdb");
+        // Still ensure the loopback-trust rule is present -- previous
+        // installs of this driver wrote `scram-sha-256` for host
+        // connections, which prevents the in-process reconciler from
+        // observing the instance (no password to pass). Idempotent.
+        ensure_loopback_trust(data_dir).await?;
         return Ok(());
     }
     info!(data_dir = %data_dir.display(), "running initdb");
@@ -373,6 +385,55 @@ async fn run_initdb_if_needed(bin_dir: &Path, data_dir: &Path) -> Result<(), Ins
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         });
     }
+    ensure_loopback_trust(data_dir).await?;
+    Ok(())
+}
+
+/// Append `host all all 127.0.0.1/32 trust` and the IPv6 equivalent to
+/// `pg_hba.conf` if they're not already there. This lets the in-process
+/// reconciler connect to the local postgres instance without a password
+/// -- the alternative would be wiring up a secret store on first
+/// install, which we defer to v0.1.
+///
+/// Trust auth here is acceptable because:
+/// - It applies only to loopback (`127.0.0.1/32`, `::1/128`).
+/// - The Windows service binds to 127.0.0.1, so remote hosts cannot
+///   even attempt a connection.
+/// - The threat model is "another process on this machine can
+///   impersonate the postgres user"; on a single-tenant dev/admin
+///   box that's not a meaningful escalation, and operators worried
+///   about it can override by editing pg_hba.conf themselves (these
+///   appends are idempotent and won't reintroduce removed rules).
+async fn ensure_loopback_trust(data_dir: &Path) -> Result<(), InstallError> {
+    let hba = data_dir.join("pg_hba.conf");
+    if !fs::try_exists(&hba).await? {
+        // No pg_hba.conf yet -- initdb hasn't run, caller will retry.
+        return Ok(());
+    }
+    let existing = fs::read_to_string(&hba).await?;
+    let want = [
+        "# computeza-managed: loopback trust so the reconciler can observe",
+        "host    all    all    127.0.0.1/32    trust",
+        "host    all    all    ::1/128         trust",
+    ];
+    if want
+        .iter()
+        .all(|line| existing.lines().any(|cur| cur.trim() == line.trim()))
+    {
+        return Ok(());
+    }
+    info!(hba = %hba.display(), "appending loopback-trust rules to pg_hba.conf");
+    let mut appended = existing;
+    if !appended.ends_with('\n') {
+        appended.push('\n');
+    }
+    for line in want {
+        if !appended.lines().any(|cur| cur.trim() == line.trim()) {
+            appended.push_str(line);
+            appended.push('\n');
+        }
+    }
+    fs::write(&hba, appended).await?;
     Ok(())
 }
 

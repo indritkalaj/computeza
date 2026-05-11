@@ -92,17 +92,26 @@ pub async fn unregister(name: &str) -> Result<(), PathError> {
 }
 
 /// Add `dir` to the machine PATH if it isn't already present.
+///
+/// The script is a single line so PowerShell parses it cleanly via
+/// `-Command`. A previous version split it across multiple lines with
+/// trailing `\` characters; that's not a PowerShell continuation
+/// (PowerShell uses backtick `` ` ``), so the script failed to parse
+/// and the shim never got onto PATH. Single-quoted strings carry the
+/// directory verbatim so backslashes in the Windows path don't need
+/// escaping; we only have to handle the rare case where the path
+/// contains a single quote.
 async fn add_to_machine_path(dir: &Path) -> Result<(), PathError> {
     let dir_str = dir.to_string_lossy().into_owned();
-    // PowerShell one-liner: read machine PATH, add if absent, write back.
-    // We use the `-Command` invocation rather than -EncodedCommand for
-    // clarity; the script is small enough that escaping is manageable.
+    let escaped = dir_str.replace('\'', "''");
     let script = format!(
-        r#"$cur = [Environment]::GetEnvironmentVariable('Path', 'Machine'); \
-           if ($cur -notlike "*{dir}*") {{ \
-             [Environment]::SetEnvironmentVariable('Path', "$cur;{dir}", 'Machine') \
-           }}"#,
-        dir = dir_str.replace('"', "`\"")
+        "$d = '{escaped}'; \
+         $cur = [Environment]::GetEnvironmentVariable('Path', 'Machine'); \
+         if (-not $cur) {{ $cur = '' }} \
+         if (-not ($cur.Split(';') -contains $d)) {{ \
+             $new = if ($cur) {{ \"$cur;$d\" }} else {{ $d }}; \
+             [Environment]::SetEnvironmentVariable('Path', $new, 'Machine') \
+         }}"
     );
     let out = Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])

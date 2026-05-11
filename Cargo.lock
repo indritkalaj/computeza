@@ -470,13 +470,17 @@ name = "computeza"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "computeza-core",
  "computeza-driver-native",
  "computeza-i18n",
+ "computeza-reconciler-postgres",
  "computeza-state",
  "computeza-ui-server",
  "reqwest",
+ "secrecy",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
