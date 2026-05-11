@@ -626,9 +626,18 @@ dependencies = [
 name = "computeza-reconciler-databend"
 version = "0.0.1"
 dependencies = [
+ "anyhow",
  "async-trait",
+ "chrono",
  "computeza-core",
+ "reqwest",
+ "secrecy",
  "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
 ]
 
 [[package]]
