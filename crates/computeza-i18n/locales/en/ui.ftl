@@ -27,6 +27,21 @@ ui-footer-version     = Version
 # --- Navigation ---
 
 ui-nav-components     = Components
+ui-nav-install        = Install
+
+# --- Install wizard ---
+
+ui-install-title         = Install a component
+ui-install-intro         = `computeza install <component>` lays down a native OS service. The same install path runs from the CLI -- this page is the GUI-equivalent per spec section 2.1 / 4.2.
+ui-install-target-label  = Component
+ui-install-postgres      = PostgreSQL (spec section 7.13)
+ui-install-button        = Install
+ui-install-requires-root = Note: native install needs root / Administrator privileges (writes /etc/systemd/system, /Library/LaunchDaemons, or HKLM Services). If you started the operator console without elevation the install POST will fail with a clear permission error -- re-run `computeza serve` as root / via UAC and retry.
+
+ui-install-result-title     = Install result
+ui-install-result-success   = Install completed.
+ui-install-result-failed    = Install failed.
+ui-install-result-back      = Back to install wizard
 
 # --- Components page ---
 

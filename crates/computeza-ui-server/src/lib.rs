@@ -27,10 +27,10 @@
 use std::net::SocketAddr;
 
 use axum::{
-    extract::State,
+    extract::{Form, State},
     http::header,
     response::{Html, IntoResponse, Json, Response},
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use computeza_i18n::Localizer;
@@ -98,11 +98,104 @@ pub fn router_with_state(state: AppState) -> Router {
     Router::new()
         .route("/", get(home_handler))
         .route("/components", get(components_handler))
+        .route("/install", get(install_handler))
+        .route("/install/postgres", post(install_postgres_handler))
         .route("/healthz", get(healthz_handler))
         .route("/api/state/info", get(state_info_handler))
         .route("/static/computeza.css", get(css_handler))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+async fn install_handler() -> Html<String> {
+    let l = Localizer::english();
+    Html(render_install(&l))
+}
+
+#[derive(serde::Deserialize)]
+struct InstallForm {
+    /// Component slug. v0.0.x recognises only "postgres".
+    component: String,
+}
+
+async fn install_postgres_handler(Form(form): Form<InstallForm>) -> Html<String> {
+    let l = Localizer::english();
+    if form.component != "postgres" {
+        return Html(render_install_result(
+            &l,
+            false,
+            &format!("unknown component: {}", form.component),
+        ));
+    }
+    let result = run_postgres_install().await;
+    match result {
+        Ok(summary) => Html(render_install_result(&l, true, &summary)),
+        Err(detail) => Html(render_install_result(&l, false, &detail)),
+    }
+}
+
+/// Run the platform-specific Postgres install and return either a
+/// success summary or a failure detail (both for human display).
+#[cfg(target_os = "linux")]
+async fn run_postgres_install() -> Result<String, String> {
+    use computeza_driver_native::linux::postgres;
+    match postgres::install(postgres::InstallOptions::default()).await {
+        Ok(r) => Ok(format!(
+            "bin_dir: {}\ndata_dir: {}\nsystemd unit: {}\nport: {}\npsql symlink: {}",
+            r.bin_dir.display(),
+            r.data_dir.display(),
+            r.unit_path.display(),
+            r.port,
+            r.psql_symlink
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(not created)".into()),
+        )),
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn run_postgres_install() -> Result<String, String> {
+    use computeza_driver_native::macos::postgres;
+    match postgres::install(postgres::InstallOptions::default()).await {
+        Ok(r) => Ok(format!(
+            "bin_dir: {}\ndata_dir: {}\nlaunchd plist: {}\nport: {}\npsql symlink: {}",
+            r.bin_dir.display(),
+            r.data_dir.display(),
+            r.plist_path.display(),
+            r.port,
+            r.psql_symlink
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(not created)".into()),
+        )),
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+#[cfg(target_os = "windows")]
+async fn run_postgres_install() -> Result<String, String> {
+    use computeza_driver_native::windows::postgres;
+    match postgres::install(postgres::InstallOptions::default()).await {
+        Ok(r) => Ok(format!(
+            "bin_dir: {}\ndata_dir: {}\nservice: {}\nport: {}\npsql shim: {}",
+            r.bin_dir.display(),
+            r.data_dir.display(),
+            r.service_name,
+            r.port,
+            r.psql_shim
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(not created)".into()),
+        )),
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+async fn run_postgres_install() -> Result<String, String> {
+    Err("install is supported on Linux, macOS, and Windows only".into())
 }
 
 async fn state_info_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -186,6 +279,7 @@ pub fn render_home(localizer: &Localizer) -> String {
     // Body fragment via Leptos view!. Tailwind-compatible utility classes
     // come from /static/computeza.css (see assets/computeza.css).
     let components_link = localizer.t("ui-nav-components");
+    let install_link = localizer.t("ui-nav-install");
     let body_view = view! {
         <main class="mx-auto max-w-4xl p-12">
             <header class="border-b pb-6 mb-10">
@@ -196,6 +290,8 @@ pub fn render_home(localizer: &Localizer) -> String {
             </header>
             <nav class="mb-6">
                 <a class="text-indigo-300 text-sm" href="/components">{components_link}</a>
+                " | "
+                <a class="text-indigo-300 text-sm" href="/install">{install_link}</a>
             </nav>
             <section>
                 <h2 class="text-2xl font-semibold text-slate-100 m-0 mb-3">{title.clone()}</h2>
@@ -299,6 +395,118 @@ pub fn render_components(localizer: &Localizer) -> String {
     )
 }
 
+/// Minimal HTML escape for embedding plain text inside element content.
+/// Not a general-purpose sanitiser -- callers must not pass user-controlled
+/// HTML through it expecting attribute-safety.
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Render the `/install` page: a small form that POSTs to
+/// `/install/postgres` and lays down a native PostgreSQL service on the
+/// host. Per spec section 2.1 / 4.2 the install path is GUI-equivalent
+/// to the CLI's `computeza install postgres`.
+#[must_use]
+pub fn render_install(localizer: &Localizer) -> String {
+    let app_title = localizer.t("ui-app-title");
+    let title = localizer.t("ui-install-title");
+    let intro = localizer.t("ui-install-intro");
+    let target_label = localizer.t("ui-install-target-label");
+    let option_postgres = localizer.t("ui-install-postgres");
+    let button = localizer.t("ui-install-button");
+    let requires_root = localizer.t("ui-install-requires-root");
+
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>{title} -- {app_title}</title>
+<link rel="stylesheet" href="/static/computeza.css" />
+</head>
+<body class="bg-indigo-900 text-slate-100">
+<main class="mx-auto max-w-4xl p-12">
+<header class="border-b pb-6 mb-10">
+<h1 class="text-orange-500 text-2xl font-semibold tracking-tight m-0 mb-1">{app_title}</h1>
+<nav><a class="text-indigo-300 text-sm" href="/">&lt;-&nbsp;Home</a></nav>
+</header>
+<section>
+<h2 class="text-2xl font-semibold text-slate-100 m-0 mb-3">{title}</h2>
+<p class="text-slate-500 text-sm m-0 mb-6">{intro}</p>
+<form method="post" action="/install/postgres" style="display: flex; flex-direction: column; gap: 1rem; max-width: 28rem;">
+<label class="text-indigo-300 text-sm" for="component">{target_label}</label>
+<select id="component" name="component" class="text-slate-100" style="background: transparent; border: 1px solid currentColor; padding: 0.5rem;">
+<option value="postgres">{option_postgres}</option>
+</select>
+<button type="submit" class="text-orange-500" style="background: transparent; border: 1px solid currentColor; padding: 0.5rem 1rem; cursor: pointer; align-self: flex-start;">{button}</button>
+</form>
+<p class="text-slate-500 text-sm" style="margin-top: 1.5rem;">{requires_root}</p>
+</section>
+</main>
+</body>
+</html>"#
+    )
+}
+
+/// Render the `/install/postgres` result page. `success` switches the
+/// heading between the success and failure i18n keys; `detail` is the
+/// raw output (success summary or error chain) shown verbatim in a
+/// `<pre>` block after HTML-escaping.
+#[must_use]
+pub fn render_install_result(localizer: &Localizer, success: bool, detail: &str) -> String {
+    let app_title = localizer.t("ui-app-title");
+    let title = localizer.t("ui-install-result-title");
+    let outcome = if success {
+        localizer.t("ui-install-result-success")
+    } else {
+        localizer.t("ui-install-result-failed")
+    };
+    let back = localizer.t("ui-install-result-back");
+    let detail_html = html_escape(detail);
+    let outcome_class = if success {
+        "text-slate-100"
+    } else {
+        "text-orange-500"
+    };
+
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>{title} -- {app_title}</title>
+<link rel="stylesheet" href="/static/computeza.css" />
+</head>
+<body class="bg-indigo-900 text-slate-100">
+<main class="mx-auto max-w-4xl p-12">
+<header class="border-b pb-6 mb-10">
+<h1 class="text-orange-500 text-2xl font-semibold tracking-tight m-0 mb-1">{app_title}</h1>
+<nav><a class="text-indigo-300 text-sm" href="/install">&lt;-&nbsp;{back}</a></nav>
+</header>
+<section>
+<h2 class="text-2xl font-semibold {outcome_class} m-0 mb-3">{outcome}</h2>
+<p class="text-indigo-300 text-sm m-0 mb-3">{title}</p>
+<pre class="text-slate-100 text-sm" style="background: rgba(0,0,0,0.25); padding: 1rem; overflow-x: auto; white-space: pre-wrap; word-break: break-word;">{detail_html}</pre>
+</section>
+</main>
+</body>
+</html>"#
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,6 +553,36 @@ mod tests {
         assert!(html.starts_with("<!DOCTYPE html>"));
         assert!(html.contains("<html lang=\"en\">"));
         assert!(html.contains("</html>"));
+    }
+
+    #[test]
+    fn render_install_shows_form_and_postgres_option() {
+        let l = Localizer::english();
+        let html = render_install(&l);
+        assert!(html.starts_with("<!DOCTYPE html>"));
+        assert!(html.contains("Install a component"));
+        assert!(html.contains("PostgreSQL"));
+        assert!(html.contains("action=\"/install/postgres\""));
+        assert!(html.contains("method=\"post\""));
+        assert!(html.contains("name=\"component\""));
+        assert!(html.contains("value=\"postgres\""));
+    }
+
+    #[test]
+    fn render_install_result_success_uses_success_string() {
+        let l = Localizer::english();
+        let html = render_install_result(&l, true, "bin_dir: /opt/computeza/postgres");
+        assert!(html.contains("Install completed."));
+        assert!(html.contains("bin_dir: /opt/computeza/postgres"));
+    }
+
+    #[test]
+    fn render_install_result_failure_uses_failure_string_and_escapes_detail() {
+        let l = Localizer::english();
+        let html = render_install_result(&l, false, "<script>alert(1)</script>");
+        assert!(html.contains("Install failed."));
+        assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+        assert!(!html.contains("<script>alert(1)</script>"));
     }
 
     #[test]

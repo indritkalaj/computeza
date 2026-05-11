@@ -891,6 +891,7 @@ dependencies = [
  "anyhow",
  "axum",
  "computeza-core",
+ "computeza-driver-native",
  "computeza-i18n",
  "computeza-state",
  "leptos",
