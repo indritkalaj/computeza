@@ -16,6 +16,19 @@ ui-welcome-subtitle   = Your operator console is online.
 ui-welcome-status     = Pre-alpha -- the operator console is a placeholder while the rest of the platform is being built.
 ui-welcome-spec       = See the Architecture & Product Specification v1.5 for the full feature plan.
 
+# --- Home dashboard cards ---
+
+ui-home-card-components-title = Managed components
+ui-home-card-components-body  = The 11 data-plane components Computeza manages. Pulled from spec section 2.2.
+ui-home-card-install-title    = Install a component
+ui-home-card-install-body     = Run the GUI-equivalent of `computeza install <component>`. v0.0.x ships PostgreSQL; the rest follow.
+ui-home-card-status-title     = Reconciler status
+ui-home-card-status-body      = Live observations from every reconciler bound to this server, with per-row drill-down.
+ui-home-card-state-title      = Metadata store
+ui-home-card-state-body       = Resource counts per kind, JSON-shaped for programmatic callers.
+ui-home-store-empty           = No resources registered.
+ui-home-store-missing         = No metadata store attached on this server.
+
 # --- Health check ---
 
 ui-healthz-ok         = ok

@@ -455,9 +455,43 @@ async fn resource_delete_handler(
     }
 }
 
-async fn home_handler() -> Html<String> {
+async fn home_handler(State(state): State<AppState>) -> Html<String> {
     let l = Localizer::english();
-    Html(render_home(&l))
+    let store_summary = match &state.store {
+        None => StoreSummary::Missing,
+        Some(store) => {
+            let kinds = [
+                "postgres-instance",
+                "kanidm-instance",
+                "garage-instance",
+                "lakekeeper-instance",
+                "databend-instance",
+                "qdrant-instance",
+                "restate-instance",
+                "greptime-instance",
+                "grafana-instance",
+                "openfga-instance",
+            ];
+            let mut total: usize = 0;
+            for k in kinds {
+                if let Ok(v) = store.list(k, None).await {
+                    total += v.len();
+                }
+            }
+            StoreSummary::Counted(total)
+        }
+    };
+    Html(render_home(&l, store_summary))
+}
+
+/// Top-level state-store summary shown in the home dashboard's
+/// `Metadata store` card.
+#[derive(Clone, Copy, Debug)]
+pub enum StoreSummary {
+    /// No store attached on this server (smoke router).
+    Missing,
+    /// Store attached; total resource count across all known kinds.
+    Counted(usize),
 }
 
 async fn healthz_handler() -> String {
@@ -473,11 +507,36 @@ async fn css_handler() -> Response {
         .into_response()
 }
 
+/// Render one navigation card on the home dashboard. `extra` is an
+/// optional one-line context tail (e.g. resource count) shown beneath
+/// the body text in a smaller indigo font.
+fn render_home_card(href: &str, title: &str, body: &str, extra: Option<&str>) -> String {
+    let extra_html = match extra {
+        Some(e) => format!(
+            r#"<p class="text-indigo-300 text-sm" style="margin: 0.5rem 0 0;">{}</p>"#,
+            html_escape(e)
+        ),
+        None => String::new(),
+    };
+    format!(
+        r#"<a href="{href}" class="text-slate-100" style="display: block; border: 1px solid currentColor; padding: 1rem; text-decoration: none;">
+<h3 class="text-orange-500" style="margin: 0 0 0.5rem;">{title}</h3>
+<p class="text-slate-500 text-sm" style="margin: 0;">{body}</p>
+{extra_html}
+</a>"#,
+        href = html_escape(href),
+        title = html_escape(title),
+        body = html_escape(body),
+    )
+}
+
 /// Render the home page to a complete HTML document.
 ///
 /// Public for testability and so future page modules can reuse the shell.
+/// `store_summary` drives the "Metadata store" card -- pass
+/// `StoreSummary::Missing` when no store is attached to this server.
 #[must_use]
-pub fn render_home(localizer: &Localizer) -> String {
+pub fn render_home(localizer: &Localizer, store_summary: StoreSummary) -> String {
     let app_title = localizer.t("ui-app-title");
     let tagline = localizer.t("ui-app-tagline");
     let title = localizer.t("ui-welcome-title");
@@ -486,6 +545,43 @@ pub fn render_home(localizer: &Localizer) -> String {
     let spec_note = localizer.t("ui-welcome-spec");
     let version_label = localizer.t("ui-footer-version");
     let version = env!("CARGO_PKG_VERSION");
+
+    let card_components_title = localizer.t("ui-home-card-components-title");
+    let card_components_body = localizer.t("ui-home-card-components-body");
+    let card_install_title = localizer.t("ui-home-card-install-title");
+    let card_install_body = localizer.t("ui-home-card-install-body");
+    let card_status_title = localizer.t("ui-home-card-status-title");
+    let card_status_body = localizer.t("ui-home-card-status-body");
+    let card_state_title = localizer.t("ui-home-card-state-title");
+    let card_state_body = localizer.t("ui-home-card-state-body");
+
+    let store_line = match store_summary {
+        StoreSummary::Missing => localizer.t("ui-home-store-missing"),
+        StoreSummary::Counted(0) => localizer.t("ui-home-store-empty"),
+        StoreSummary::Counted(n) => format!("{n} resource(s) registered."),
+    };
+    let cards_html = format!(
+        r#"<section class="mb-10" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); gap: 1rem;">
+{card1}
+{card2}
+{card3}
+{card4}
+</section>"#,
+        card1 = render_home_card(
+            "/components",
+            &card_components_title,
+            &card_components_body,
+            None,
+        ),
+        card2 = render_home_card("/install", &card_install_title, &card_install_body, None,),
+        card3 = render_home_card("/status", &card_status_title, &card_status_body, None,),
+        card4 = render_home_card(
+            "/api/state/info",
+            &card_state_title,
+            &card_state_body,
+            Some(&store_line),
+        ),
+    );
 
     // Body fragment via Leptos view!. Tailwind-compatible utility classes
     // come from /static/computeza.css (see assets/computeza.css).
@@ -507,7 +603,7 @@ pub fn render_home(localizer: &Localizer) -> String {
                 " | "
                 <a class="text-indigo-300 text-sm" href="/status">{status_link}</a>
             </nav>
-            <section>
+            <section class="mb-8">
                 <h2 class="text-2xl font-semibold text-slate-100 m-0 mb-3">{title.clone()}</h2>
                 <p class="text-slate-100 m-0 mb-6">{subtitle}</p>
                 <p class="text-slate-500 text-sm m-0 mb-2">{status}</p>
@@ -519,6 +615,7 @@ pub fn render_home(localizer: &Localizer) -> String {
         </main>
     };
     let body_html = body_view.to_html();
+    let body_html = body_html.replacen("<footer", &format!("{cards_html}<footer"), 1);
 
     format!(
         r#"<!DOCTYPE html>
@@ -1035,7 +1132,7 @@ mod tests {
     #[test]
     fn render_home_contains_localized_title() {
         let l = Localizer::english();
-        let html = render_home(&l);
+        let html = render_home(&l, StoreSummary::Missing);
         assert!(
             html.contains("Welcome to Computeza"),
             "rendered HTML should contain the localized welcome title; got:\n{html}"
@@ -1045,7 +1142,7 @@ mod tests {
     #[test]
     fn render_home_is_a_complete_html_document() {
         let l = Localizer::english();
-        let html = render_home(&l);
+        let html = render_home(&l, StoreSummary::Missing);
         assert!(html.starts_with("<!DOCTYPE html>"));
         assert!(html.contains("<html lang=\"en\">"));
         assert!(html.contains("</html>"));
@@ -1177,13 +1274,45 @@ mod tests {
     }
 
     #[test]
+    fn render_home_dashboard_links_to_every_surface() {
+        let l = Localizer::english();
+        let html = render_home(&l, StoreSummary::Missing);
+        for href in [
+            r#"href="/components""#,
+            r#"href="/install""#,
+            r#"href="/status""#,
+            r#"href="/api/state/info""#,
+        ] {
+            assert!(
+                html.contains(href),
+                "home dashboard should link to {href}; got HTML excerpt:\n{}",
+                &html[..html.len().min(2000)]
+            );
+        }
+    }
+
+    #[test]
+    fn render_home_state_card_shows_missing_when_no_store() {
+        let l = Localizer::english();
+        let html = render_home(&l, StoreSummary::Missing);
+        assert!(html.contains("No metadata store attached"));
+    }
+
+    #[test]
+    fn render_home_state_card_shows_count_when_store_attached() {
+        let l = Localizer::english();
+        let html = render_home(&l, StoreSummary::Counted(3));
+        assert!(html.contains("3 resource(s) registered."));
+    }
+
+    #[test]
     fn render_home_has_no_hardcoded_english_strings_outside_attributes() {
         // Sanity check: every <p> and <h*> text node should be a value the
         // localizer produced. We assert by checking that strings the .ftl
         // bundle defines actually appear (positive check) and that some
         // common hardcoded-English smell doesn't (negative check).
         let l = Localizer::english();
-        let html = render_home(&l);
+        let html = render_home(&l, StoreSummary::Missing);
         assert!(html.contains("Computeza")); // ui-app-title
         assert!(html.contains("Open lakehouse control plane")); // ui-app-tagline
         assert!(html.contains("Pre-alpha")); // ui-welcome-status starts with this
