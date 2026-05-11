@@ -120,7 +120,10 @@ struct InstallForm {
     component: String,
 }
 
-async fn install_postgres_handler(Form(form): Form<InstallForm>) -> Html<String> {
+async fn install_postgres_handler(
+    State(state): State<AppState>,
+    Form(form): Form<InstallForm>,
+) -> Html<String> {
     let l = Localizer::english();
     if form.component != "postgres" {
         return Html(render_install_result(
@@ -129,74 +132,121 @@ async fn install_postgres_handler(Form(form): Form<InstallForm>) -> Html<String>
             &format!("unknown component: {}", form.component),
         ));
     }
-    let result = run_postgres_install().await;
-    match result {
-        Ok(summary) => Html(render_install_result(&l, true, &summary)),
+    match run_postgres_install().await {
+        Ok((summary, port)) => {
+            // Bootstrap a postgres-instance/local row in the store so the
+            // operator immediately sees the install on /status. The
+            // reconciler hasn't run yet, so it surfaces as "Unknown" until
+            // the first observe lands.
+            let mut summary = summary;
+            if let Some(store) = &state.store {
+                let key = ResourceKey::cluster_scoped("postgres-instance", "local");
+                let spec = serde_json::json!({
+                    "endpoint": {
+                        "host": "127.0.0.1",
+                        "port": port,
+                        "superuser": "postgres",
+                    },
+                    "databases": [],
+                    "prune": false,
+                });
+                match store.save(&key, &spec, None).await {
+                    Ok(_) => {
+                        summary.push_str(
+                            "\n\nRegistered as postgres-instance/local in the metadata store.\nVisit /status to see it.",
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "install_postgres_handler: store.save failed; install succeeded but the resource is not registered. \
+                             Likely cause: a postgres-instance/local already exists. Check /status."
+                        );
+                        summary.push_str(&format!(
+                            "\n\nNote: did not register postgres-instance/local ({e}). Visit /status to inspect current state."
+                        ));
+                    }
+                }
+            }
+            Html(render_install_result(&l, true, &summary))
+        }
         Err(detail) => Html(render_install_result(&l, false, &detail)),
     }
 }
 
-/// Run the platform-specific Postgres install and return either a
-/// success summary or a failure detail (both for human display).
+/// Run the platform-specific Postgres install and return either
+/// `(human_summary, listening_port)` on success or a failure detail on
+/// error. The port is forwarded to `install_postgres_handler` so it can
+/// register a `postgres-instance/local` resource in the state store
+/// reflecting where the freshly-installed server is listening.
 #[cfg(target_os = "linux")]
-async fn run_postgres_install() -> Result<String, String> {
+async fn run_postgres_install() -> Result<(String, u16), String> {
     use computeza_driver_native::linux::postgres;
     match postgres::install(postgres::InstallOptions::default()).await {
-        Ok(r) => Ok(format!(
-            "bin_dir: {}\ndata_dir: {}\nsystemd unit: {}\nport: {}\npsql symlink: {}",
-            r.bin_dir.display(),
-            r.data_dir.display(),
-            r.unit_path.display(),
+        Ok(r) => Ok((
+            format!(
+                "bin_dir: {}\ndata_dir: {}\nsystemd unit: {}\nport: {}\npsql symlink: {}",
+                r.bin_dir.display(),
+                r.data_dir.display(),
+                r.unit_path.display(),
+                r.port,
+                r.psql_symlink
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(not created)".into()),
+            ),
             r.port,
-            r.psql_symlink
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "(not created)".into()),
         )),
         Err(e) => Err(format!("{e}")),
     }
 }
 
 #[cfg(target_os = "macos")]
-async fn run_postgres_install() -> Result<String, String> {
+async fn run_postgres_install() -> Result<(String, u16), String> {
     use computeza_driver_native::macos::postgres;
     match postgres::install(postgres::InstallOptions::default()).await {
-        Ok(r) => Ok(format!(
-            "bin_dir: {}\ndata_dir: {}\nlaunchd plist: {}\nport: {}\npsql symlink: {}",
-            r.bin_dir.display(),
-            r.data_dir.display(),
-            r.plist_path.display(),
+        Ok(r) => Ok((
+            format!(
+                "bin_dir: {}\ndata_dir: {}\nlaunchd plist: {}\nport: {}\npsql symlink: {}",
+                r.bin_dir.display(),
+                r.data_dir.display(),
+                r.plist_path.display(),
+                r.port,
+                r.psql_symlink
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(not created)".into()),
+            ),
             r.port,
-            r.psql_symlink
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "(not created)".into()),
         )),
         Err(e) => Err(format!("{e}")),
     }
 }
 
 #[cfg(target_os = "windows")]
-async fn run_postgres_install() -> Result<String, String> {
+async fn run_postgres_install() -> Result<(String, u16), String> {
     use computeza_driver_native::windows::postgres;
     match postgres::install(postgres::InstallOptions::default()).await {
-        Ok(r) => Ok(format!(
-            "bin_dir: {}\ndata_dir: {}\nservice: {}\nport: {}\npsql shim: {}",
-            r.bin_dir.display(),
-            r.data_dir.display(),
-            r.service_name,
+        Ok(r) => Ok((
+            format!(
+                "bin_dir: {}\ndata_dir: {}\nservice: {}\nport: {}\npsql shim: {}",
+                r.bin_dir.display(),
+                r.data_dir.display(),
+                r.service_name,
+                r.port,
+                r.psql_shim
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(not created)".into()),
+            ),
             r.port,
-            r.psql_shim
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "(not created)".into()),
         )),
         Err(e) => Err(format!("{e}")),
     }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-async fn run_postgres_install() -> Result<String, String> {
+async fn run_postgres_install() -> Result<(String, u16), String> {
     Err("install is supported on Linux, macOS, and Windows only".into())
 }
 
