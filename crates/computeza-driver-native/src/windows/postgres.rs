@@ -271,6 +271,12 @@ pub async fn install_with_progress(
     ));
     wait_for_ready("127.0.0.1", opts.port, Duration::from_secs(30)).await?;
 
+    // Idempotent role-bootstrap: only repairs data dirs initialised
+    // by earlier driver versions that omitted `-U postgres`. Fresh
+    // installs return immediately because the bootstrap user is
+    // already `postgres`.
+    ensure_postgres_role(&bin_dir, opts.port).await?;
+
     progress.set_phase(InstallPhase::RegisteringPath);
     progress.set_message("Registering psql in PATH");
     let psql_exe = bin_dir.join("psql.exe");
@@ -442,8 +448,16 @@ async fn run_initdb_if_needed(bin_dir: &Path, data_dir: &Path) -> Result<(), Ins
     }
     info!(data_dir = %data_dir.display(), "running initdb");
     let mut cmd = Command::new(bin_dir.join("initdb.exe"));
+    // `-U postgres` forces the bootstrap superuser to be "postgres"
+    // regardless of which OS user runs the installer. Without it,
+    // initdb defaults to `%USERNAME%` on Windows -- on an admin
+    // account that produces a superuser called e.g. "Administrator"
+    // and the in-process reconciler (which connects as "postgres")
+    // fails with `role "postgres" does not exist`.
     cmd.arg("-D")
         .arg(data_dir)
+        .arg("-U")
+        .arg("postgres")
         .arg("--auth-host=scram-sha-256")
         .arg("--encoding=UTF8")
         .arg("--locale=C")
@@ -457,6 +471,66 @@ async fn run_initdb_if_needed(bin_dir: &Path, data_dir: &Path) -> Result<(), Ins
         });
     }
     ensure_loopback_trust(data_dir).await?;
+    Ok(())
+}
+
+/// Ensure a `postgres` superuser role exists in the running cluster.
+/// Idempotent. Used to repair data dirs initialised by earlier
+/// versions of this driver that did not pass `-U postgres` to initdb
+/// -- those dirs have the OS account name as the bootstrap superuser,
+/// and our reconciler can't connect as `postgres` because the role
+/// doesn't exist.
+///
+/// Uses the running server's psql.exe over loopback. The connection
+/// succeeds because `ensure_loopback_trust` writes a trust rule for
+/// 127.0.0.1; the bootstrap user is read from `%USERNAME%` (matching
+/// initdb's own default).
+async fn ensure_postgres_role(bin_dir: &Path, port: u16) -> Result<(), InstallError> {
+    let bootstrap_user = std::env::var("USERNAME").unwrap_or_else(|_| "postgres".into());
+    if bootstrap_user.eq_ignore_ascii_case("postgres") {
+        // The bootstrap user already is "postgres" (this is a fresh
+        // install written by the new `-U postgres` initdb path).
+        debug!("bootstrap user is already 'postgres'; skipping role bootstrap");
+        return Ok(());
+    }
+    info!(
+        bootstrap_user = %bootstrap_user,
+        "ensuring 'postgres' superuser role exists (data dir was bootstrapped by an earlier driver \
+         without -U postgres)"
+    );
+    // PL/pgSQL DO block makes the CREATE ROLE idempotent. We can't
+    // use `CREATE ROLE IF NOT EXISTS` because PostgreSQL doesn't
+    // ship one.
+    let sql = "DO $$ BEGIN \
+               IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'postgres') THEN \
+                 CREATE ROLE postgres LOGIN SUPERUSER; \
+               END IF; \
+               END $$;";
+    let psql = bin_dir.join("psql.exe");
+    let out = Command::new(&psql)
+        .arg("-h")
+        .arg("127.0.0.1")
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("-U")
+        .arg(&bootstrap_user)
+        .arg("-d")
+        .arg("postgres")
+        .arg("-c")
+        .arg(sql)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await?;
+    if !out.status.success() {
+        warn!(
+            stderr = %String::from_utf8_lossy(&out.stderr),
+            "ensure_postgres_role: psql exited non-zero. The reconciler may still see \
+             `role \"postgres\" does not exist`. Workaround: connect manually with \
+             `psql -h 127.0.0.1 -U {bootstrap_user} -d postgres` and run \
+             `CREATE ROLE postgres LOGIN SUPERUSER;` yourself."
+        );
+    }
     Ok(())
 }
 
