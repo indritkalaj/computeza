@@ -25,10 +25,13 @@ thiserror = "2"
 # --- Serialization ---
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# serde_yml is the maintained successor to the now-deprecated `serde_yaml`
-# crate. The 0.0.x versioning is the maintainer's convention, not an
-# instability signal -- it's widely used in production as of April 2026.
-serde_yml = "0.0.12"
+# YAML support intentionally not in the workspace deps right now:
+# - `serde_yaml` 0.9.34 was deprecated by its maintainer in late 2024.
+# - `serde_yml` 0.0.12 (the community fork) was flagged
+#   unsound/unmaintained in RUSTSEC-2025-0067 / RUSTSEC-2025-0068.
+# Pipelines (the only consumer) is still a stub. When real YAML loading
+# lands we'll evaluate `serde-norway` / `serde-yaml-bw` / `marked-yaml`
+# against current security advisories.
 
 # --- Tracing / logs ---
 tracing = "0.1"

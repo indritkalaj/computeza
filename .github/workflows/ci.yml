@@ -80,10 +80,6 @@ jobs:
     name: cargo audit
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # Advisory only: surfaces known CVEs in the dep graph without blocking
-    # the merge. Flip continue-on-error to false when the team is ready
-    # to treat advisories as release-blocking.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v5
       - name: Install Rust toolchain
@@ -91,7 +87,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-audit
         run: cargo install --locked cargo-audit
-      - run: cargo audit
+      # Documented ignores. Re-evaluate every release; if upstream ships
+      # a fix, drop the corresponding --ignore.
+      #
+      # RUSTSEC-2023-0071: `rsa` Marvin Attack. Pulled in transitively by
+      #   `sqlx-mysql` because `sqlx-macros` always depends on all backend
+      #   crates regardless of which features are enabled. We don't
+      #   connect to MySQL at runtime; the sidechannel is unreachable for
+      #   us. Upstream has no published fix as of 2026-05-11.
+      #
+      # RUSTSEC-2024-0436: `paste` unmaintained. Pulled in by every
+      #   Leptos sub-crate (tachys, reactive_graph, leptos_dom, ...);
+      #   we can't replace it without forking Leptos.
+      - run: |
+          cargo audit \
+            --ignore RUSTSEC-2023-0071 \
+            --ignore RUSTSEC-2024-0436
 
   test:
     name: test (${{ matrix.os }})
