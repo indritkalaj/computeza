@@ -4205,10 +4205,12 @@ async fn admin_operators_handler(
 struct CreateOperatorForm {
     username: String,
     password: String,
-    /// Comma-separated group names. e.g. "operators,viewers". The
-    /// handler trims + filters empties.
+    /// Group memberships. Submitted as one `groups=...` pair per
+    /// checked checkbox in the form; we accept either that
+    /// (`["admins","operators"]`) or a legacy comma-separated single
+    /// string (`["admins,operators"]`) and flatten in the handler.
     #[serde(default)]
-    groups: String,
+    groups: Vec<String>,
 }
 
 /// POST /admin/operators -- create a new operator account.
@@ -4221,9 +4223,13 @@ async fn admin_create_operator_handler(
     let Some(operators) = &state.operators else {
         return Redirect303("/admin/operators".into()).into_response();
     };
+    // Accept both shapes -- modern multi-value (one pair per
+    // checkbox) and legacy comma-separated single string. Both
+    // flatten into a clean Vec<String> here.
     let groups: Vec<String> = form
         .groups
-        .split(',')
+        .iter()
+        .flat_map(|g| g.split(','))
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
@@ -4287,7 +4293,11 @@ async fn admin_create_operator_handler(
 
 #[derive(serde::Deserialize)]
 struct UpdateGroupsForm {
-    groups: String,
+    /// Same shape as [`CreateOperatorForm::groups`] -- one entry
+    /// per checked checkbox in the form, or a single legacy comma-
+    /// separated string. Flattened in the handler.
+    #[serde(default)]
+    groups: Vec<String>,
 }
 
 /// POST /admin/operators/{name}/groups -- replace an operator's
@@ -4304,7 +4314,8 @@ async fn admin_update_operator_groups_handler(
     };
     let groups: Vec<String> = form
         .groups
-        .split(',')
+        .iter()
+        .flat_map(|g| g.split(','))
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
@@ -8538,13 +8549,18 @@ pub fn render_admin_operators(
                     delete = html_escape(&delete),
                 )
             };
+            let checkboxes = group_checkboxes_html(
+                &format!("row-{}", op.username),
+                &op.groups,
+            );
+            let _ = groups_str;
             format!(
                 r#"<tr>
 <td><code>{username}</code></td>
 <td>
-<form method="post" action="/admin/operators/{username_enc}/groups" style="display: flex; gap: 0.4rem; align-items: center;">
+<form method="post" action="/admin/operators/{username_enc}/groups" style="display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap;">
 <input type="hidden" name="csrf_token" value="" />
-<input type="text" name="groups" value="{groups}" class="cz-input" style="margin: 0; padding: 0.3rem 0.5rem; font-size: 0.82rem; min-width: 12rem;" pattern="[A-Za-z0-9_,\- ]+" />
+{checkboxes}
 <button type="submit" class="cz-btn" style="padding: 0.3rem 0.6rem; font-size: 0.78rem;">{edit_groups}</button>
 </form>
 </td>
@@ -8558,7 +8574,7 @@ pub fn render_admin_operators(
 </tr>"#,
                 username = html_escape(&op.username),
                 username_enc = urlencoding_min(&op.username),
-                groups = html_escape(&groups_str),
+                checkboxes = checkboxes,
                 edit_groups = html_escape(&edit_groups),
                 created = html_escape(&op.created_at.to_rfc3339()),
                 confirm = html_escape(&confirm),
@@ -8603,8 +8619,10 @@ pub fn render_admin_operators(
 <label for="new-password">{new_password}</label>
 <input id="new-password" name="password" class="cz-input" type="password" minlength="12" required autocomplete="new-password" />
 <p class="cz-muted" style="margin: -0.5rem 0 0; font-size: 0.8rem;">{new_password_help}</p>
-<label for="new-groups">{new_groups}</label>
-<input id="new-groups" name="groups" class="cz-input" type="text" value="operators" pattern="[A-Za-z0-9_,\- ]+" />
+<span class="cz-input-label">{new_groups}</span>
+<div style="display: flex; gap: 0.85rem; flex-wrap: wrap; padding: 0.3rem 0 0.6rem;">
+{new_group_checkboxes}
+</div>
 <button type="submit" class="cz-btn cz-btn-primary" style="margin-top: 0.5rem;">{new_submit}</button>
 </form>
 </div>
@@ -8622,9 +8640,40 @@ pub fn render_admin_operators(
         new_password = html_escape(&new_password),
         new_password_help = html_escape(&new_password_help),
         new_groups = html_escape(&new_groups),
+        new_group_checkboxes = group_checkboxes_html("new", &["operators".to_string()]),
         new_submit = html_escape(&new_submit),
     );
     render_shell(localizer, &title, NavLink::Operators, &body)
+}
+
+/// Render one checkbox per [`auth::BUILTIN_GROUPS`] entry, pre-
+/// checked when the group is in `current`. The boxes share the
+/// `name="groups"` attribute so the browser submits one
+/// `groups=<name>` pair per checked box -- our form handlers
+/// flatten the resulting `Vec<String>` into a clean group list.
+///
+/// Replacing a free-text "operators,viewers" input with checkboxes
+/// removes the entire "typo'd into a non-existent group" failure
+/// mode (operators that match no known group end up with no
+/// permissions and get locked out).
+fn group_checkboxes_html(prefix: &str, current: &[String]) -> String {
+    auth::BUILTIN_GROUPS
+        .iter()
+        .map(|(name, _perms)| {
+            let id = format!("{prefix}-group-{name}");
+            let checked = if current.iter().any(|g| g == name) {
+                " checked"
+            } else {
+                ""
+            };
+            format!(
+                r#"<label for="{id}" style="display: inline-flex; gap: 0.35rem; align-items: center; margin: 0; font-weight: normal; cursor: pointer;"><input id="{id}" type="checkbox" name="groups" value="{name}"{checked} /> <code>{name}</code></label>"#,
+                id = html_escape(&id),
+                name = html_escape(name),
+                checked = checked,
+            )
+        })
+        .collect()
 }
 
 /// Render `GET /admin/workspaces` -- v0.0.x list. Always shows the
@@ -11574,6 +11623,67 @@ mod tests {
         assert!(html.contains("Step 2"));
         assert!(html.contains("Step 3"));
         assert!(html.contains("/admin/secrets/setup/generate-passphrase"));
+    }
+
+    // ---- Operator group checkbox UI ----
+
+    #[test]
+    fn group_checkboxes_html_renders_one_box_per_builtin_group() {
+        let html = group_checkboxes_html("new", &[]);
+        // One checkbox per BUILTIN_GROUPS entry.
+        for (name, _) in auth::BUILTIN_GROUPS {
+            assert!(
+                html.contains(&format!(r#"value="{name}""#)),
+                "expected checkbox for group {name}"
+            );
+        }
+        // No checkbox starts pre-checked when `current` is empty.
+        assert!(!html.contains(" checked"));
+    }
+
+    #[test]
+    fn group_checkboxes_html_marks_current_groups_checked() {
+        let html = group_checkboxes_html("row", &["operators".into(), "viewers".into()]);
+        assert!(
+            html.contains(r#"value="operators" checked"#),
+            "operators must be pre-checked"
+        );
+        assert!(
+            html.contains(r#"value="viewers" checked"#),
+            "viewers must be pre-checked"
+        );
+        assert!(
+            !html.contains(r#"value="admins" checked"#),
+            "admins must not be pre-checked"
+        );
+    }
+
+    #[test]
+    fn render_admin_operators_emits_checkboxes_not_free_text_input() {
+        let l = Localizer::english();
+        let now = chrono::Utc::now();
+        let op = auth::OperatorRecord {
+            username: "alice".into(),
+            password_hash: "x".into(),
+            groups: vec!["admins".into()],
+            created_at: now,
+        };
+        let html = render_admin_operators(&l, std::slice::from_ref(&op), "alice", None);
+        // No free-text "groups" input anywhere.
+        assert!(
+            !html.contains(r#"<input type="text" name="groups""#),
+            "free-text groups input must be replaced with checkboxes"
+        );
+        assert!(
+            !html.contains(r#"name="groups" class="cz-input" type="text""#),
+            "create-form free-text groups input must be replaced"
+        );
+        // Three checkboxes per row + three for the create form = 6.
+        let checkbox_count = html.matches(r#"type="checkbox" name="groups""#).count();
+        assert_eq!(
+            checkbox_count, 6,
+            "expected 3 checkboxes per row + 3 in create form (one row in this test)"
+        );
     }
 
     // ---- EU AI Act compliance ----
