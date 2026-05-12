@@ -158,7 +158,8 @@ fn main() -> anyhow::Result<()> {
                     .store
                     .clone()
                     .expect("AppState::with_store always populates store");
-                tokio::spawn(reconcile_tick(store_for_tick));
+                let secrets_for_tick = state.secrets.clone();
+                tokio::spawn(reconcile_tick(store_for_tick, secrets_for_tick));
                 computeza_ui_server::serve_with_state(addr, state).await
             })?;
         }
@@ -353,7 +354,10 @@ fn install_postgres(_l: &Localizer) -> anyhow::Result<()> {
 /// v0.0.x only covers postgres-instance; the HTTP reconcilers
 /// (kanidm/garage/lakekeeper/...) will join this loop once their
 /// resource types are populated through the apply flow.
-async fn reconcile_tick(store: std::sync::Arc<computeza_state::SqliteStore>) {
+async fn reconcile_tick(
+    store: std::sync::Arc<computeza_state::SqliteStore>,
+    secrets: Option<std::sync::Arc<computeza_secrets::SecretsStore>>,
+) {
     use computeza_core::reconciler::Context;
     use computeza_core::{NoOpDriver, Reconciler};
     use computeza_reconciler_postgres::{PostgresReconciler, PostgresSpec};
@@ -378,7 +382,7 @@ async fn reconcile_tick(store: std::sync::Arc<computeza_state::SqliteStore>) {
             }
         };
         for sr in rows {
-            let spec: PostgresSpec = match serde_json::from_value(sr.spec.clone()) {
+            let mut spec: PostgresSpec = match serde_json::from_value(sr.spec.clone()) {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::warn!(
@@ -392,6 +396,11 @@ async fn reconcile_tick(store: std::sync::Arc<computeza_state::SqliteStore>) {
                     continue;
                 }
             };
+            // Resolve superuser_password_ref against the secrets store
+            // before constructing the reconciler. Mirrors the
+            // post-install observe path in ui-server so periodic and
+            // post-install observations see the same password.
+            computeza_ui_server::hydrate_postgres_password(&mut spec, secrets.as_deref()).await;
             let reconciler: PostgresReconciler<NoOpDriver> =
                 PostgresReconciler::new(spec.endpoint.clone(), spec.superuser_password)
                     .with_state(store.clone(), &sr.key.name);
