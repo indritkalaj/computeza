@@ -21,10 +21,10 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
 
-# Native cross-platform packaging is a v1.0 commitment (spec section 10),
-# so CI must validate Linux + macOS + Windows from day one. Matrix is small
-# now to keep CI cheap; expand to ARM64 and the packaging matrix in
-# section 10.1 once the packaging machinery lands.
+# v0.0.x is Linux-only for the data-plane install path (see README.md
+# "Platform support" and AGENTS.md). CI runs on ubuntu-latest only;
+# macOS + Windows runners come back when the multi-OS install path
+# lands in v0.1+ (spec section 10).
 
 jobs:
   fmt:
@@ -105,12 +105,8 @@ jobs:
             --ignore RUSTSEC-2024-0436
 
   test:
-    name: test (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+    name: test
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
