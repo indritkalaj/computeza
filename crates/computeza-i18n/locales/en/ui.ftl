@@ -140,6 +140,12 @@ ui-install-rollback-title    = Roll back this install
 ui-install-rollback-intro    = Uninstall every component this job successfully laid down, in reverse dependency order. Use this when a later component failed and you want a clean re-try, or when you want to fully tear down a successful install. Best-effort: failures during teardown are logged but do not stop the rollback.
 ui-install-rollback-button   = Roll back this install
 
+# --- Repair / re-install on the resource detail page ---
+
+ui-resource-repair-heading = Repair this component
+ui-resource-repair-intro   = Re-run the install for this component. Idempotent: existing on-disk state is preserved where possible and only out-of-date pieces are regenerated. Use this when the service is down, the systemd unit went missing, or the spec was edited externally and you want the install path to re-apply it.
+ui-resource-repair-button  = Re-install
+
 # --- Active-job resume banner on /install ---
 
 ui-install-active-title   = Install in progress

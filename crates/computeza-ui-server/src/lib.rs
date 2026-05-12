@@ -6513,6 +6513,36 @@ pub fn render_resource(
             .map(html_escape)
             .unwrap_or_else(|| "-".to_string());
 
+        // Component slug for the repair / re-install button (kind
+        // "postgres-instance" -> slug "postgres"). The button is only
+        // rendered when the slug is one we recognize in the unified
+        // install dispatcher.
+        let repair_block = kind
+            .strip_suffix("-instance")
+            .filter(|s| INSTALL_ORDER.contains(s))
+            .map(|slug| {
+                let heading = localizer.t("ui-resource-repair-heading");
+                let intro = localizer.t("ui-resource-repair-intro");
+                let button = localizer.t("ui-resource-repair-button");
+                format!(
+                    r#"<section class="cz-section">
+<div class="cz-card">
+<h3 style="margin: 0 0 0.5rem;">{heading}</h3>
+<p class="cz-muted" style="margin: 0 0 0.85rem; font-size: 0.85rem;">{intro}</p>
+<form method="post" action="/install/{slug}">
+<input type="hidden" name="component" value="{slug}" />
+<button type="submit" class="cz-btn">{button}</button>
+</form>
+</div>
+</section>"#,
+                    heading = html_escape(&heading),
+                    intro = html_escape(&intro),
+                    button = html_escape(&button),
+                    slug = html_escape(slug),
+                )
+            })
+            .unwrap_or_default();
+
         format!(
             r#"<div class="cz-card">
 <dl class="cz-dl">
@@ -6531,6 +6561,7 @@ pub fn render_resource(
 <h3>{status_heading}</h3>
 {status_block}
 </section>
+{repair_block}
 <section class="cz-section">
 <form method="post" action="/resource/{kind_enc}/{name_enc}/delete" onsubmit="return confirm('{confirm}');">
 <button type="submit" class="cz-btn cz-btn-danger">{delete_button}</button>
