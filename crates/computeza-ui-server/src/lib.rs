@@ -237,9 +237,63 @@ pub fn router_with_state(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn install_hub_handler() -> Html<String> {
+async fn install_hub_handler(State(state): State<AppState>) -> Html<String> {
     let l = Localizer::english();
-    Html(render_install_hub(&l))
+    let active = active_jobs(&state);
+    Html(render_install_hub(&l, &active))
+}
+
+/// Snapshot of an in-flight install job, surfaced on the install hub
+/// so the operator can re-attach the wizard after a browser refresh
+/// or navigation away.
+#[derive(Clone, Debug)]
+struct ActiveJob {
+    id: String,
+    running_slug: Option<String>,
+    components_done: usize,
+    components_total: usize,
+}
+
+/// Return an entry for every job whose snapshot says it hasn't
+/// completed yet. Used by the install hub to surface "Install in
+/// progress" banners that link back to the wizard.
+fn active_jobs(state: &AppState) -> Vec<ActiveJob> {
+    let map = state.jobs.lock().unwrap();
+    map.iter()
+        .filter_map(|(id, prog)| {
+            let p = prog.lock().unwrap();
+            if p.completed {
+                return None;
+            }
+            let total = p.components.len();
+            let done = p
+                .components
+                .iter()
+                .filter(|c| {
+                    matches!(
+                        c.state,
+                        computeza_driver_native::progress::ComponentState::Done
+                    )
+                })
+                .count();
+            let running = p
+                .components
+                .iter()
+                .find(|c| {
+                    matches!(
+                        c.state,
+                        computeza_driver_native::progress::ComponentState::Running
+                    )
+                })
+                .map(|c| c.slug.clone());
+            Some(ActiveJob {
+                id: id.clone(),
+                running_slug: running,
+                components_done: done,
+                components_total: total,
+            })
+        })
+        .collect()
 }
 
 /// POST /install -- the unified whole-stack install. Parses one config
@@ -3470,11 +3524,15 @@ fn render_unified_component_card(localizer: &Localizer, c: &ComponentEntry) -> S
 /// bottom that POSTs back to `/install` and runs every component in
 /// dependency order.
 ///
+/// `active` lists any install jobs currently in flight; one banner per
+/// job renders above the form linking back to `/install/job/{id}` so
+/// operators can re-attach the wizard after navigating away.
+///
 /// Per-component pages (`/install/postgres`, `/install/kanidm`, ...)
 /// remain available for power users and CI scripts but are no longer
 /// linked from the hub.
 #[must_use]
-pub fn render_install_hub(localizer: &Localizer) -> String {
+pub fn render_install_hub(localizer: &Localizer, active: &[ActiveJob]) -> String {
     let title = localizer.t("ui-install-hub-title");
     let intro = localizer.t("ui-install-hub-intro");
     let install_all_button = localizer.t("ui-install-all-button");
@@ -3486,6 +3544,7 @@ pub fn render_install_hub(localizer: &Localizer) -> String {
         .collect();
 
     let platform_banner = render_platform_banner(localizer);
+    let active_banner = render_active_jobs_banner(localizer, active);
 
     let body = format!(
         r#"<section class="cz-hero">
@@ -3493,6 +3552,7 @@ pub fn render_install_hub(localizer: &Localizer) -> String {
 <p>{intro}</p>
 </section>
 {platform_banner}
+{active_banner}
 <form method="post" action="/install" style="display: contents;">
 <section class="cz-section">
 <div class="cz-card-grid">{cards}</div>
@@ -3507,12 +3567,66 @@ pub fn render_install_hub(localizer: &Localizer) -> String {
         title = html_escape(&title),
         intro = html_escape(&intro),
         platform_banner = platform_banner,
+        active_banner = active_banner,
         cards = cards,
         install_all_helper = html_escape(&install_all_helper),
         install_all_button = html_escape(&install_all_button),
     );
 
     render_shell(localizer, &title, NavLink::Install, &body)
+}
+
+/// Render one banner per active install job. Empty string when no
+/// jobs are in flight. The banner links to `/install/job/{id}` so
+/// the operator can pick up wherever they left off after navigating
+/// away or refreshing the browser.
+fn render_active_jobs_banner(localizer: &Localizer, active: &[ActiveJob]) -> String {
+    if active.is_empty() {
+        return String::new();
+    }
+    let title = localizer.t("ui-install-active-title");
+    let resume = localizer.t("ui-install-active-resume");
+    let running_word = localizer.t("ui-install-active-running");
+
+    let rows: String = active
+        .iter()
+        .map(|j| {
+            let progress_line = if j.components_total > 0 {
+                let running = j
+                    .running_slug
+                    .as_deref()
+                    .map(|s| format!(", {s} {running_word}"))
+                    .unwrap_or_default();
+                format!(
+                    "{}/{} components{running}",
+                    j.components_done, j.components_total,
+                    running = running,
+                )
+            } else {
+                "single component".into()
+            };
+            format!(
+                r#"<div class="cz-card-body" style="display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin: 0 0 0.5rem;">
+<span class="cz-muted" style="font-size: 0.85rem;">{progress_line}</span>
+<a class="cz-btn" href="/install/job/{job_id}">{resume}</a>
+</div>"#,
+                progress_line = html_escape(&progress_line),
+                job_id = html_escape(&j.id),
+                resume = html_escape(&resume),
+            )
+        })
+        .collect();
+
+    format!(
+        r#"<section class="cz-section" style="max-width: 60rem;">
+<div class="cz-card" style="border-color: rgba(159, 232, 196, 0.45);">
+<p class="cz-card-body" style="margin: 0 0 0.75rem;"><span class="cz-badge cz-badge-warn">{title}</span></p>
+{rows}
+</div>
+</section>"#,
+        title = html_escape(&title),
+        rows = rows,
+    )
 }
 
 /// Guard helper: returns `Err(Response)` with a clean unsupported-OS
@@ -6379,8 +6493,12 @@ mod tests {
     #[test]
     fn install_hub_renders_a_card_per_component_and_one_global_submit() {
         let l = Localizer::english();
-        let html = render_install_hub(&l);
+        let html = render_install_hub(&l, &[]);
         assert!(html.contains("Install Computeza"));
+        assert!(
+            !html.contains("Install in progress"),
+            "no active-jobs banner should render when none are passed"
+        );
         assert!(
             html.contains(r#"action="/install""#),
             "unified hub form must post to /install"
@@ -6402,6 +6520,22 @@ mod tests {
         );
         assert!(html.contains("Identity and access"));
         assert!(html.contains("Configurable in v0.1+"));
+    }
+
+    #[test]
+    fn install_hub_renders_active_job_banner_with_resume_link() {
+        let l = Localizer::english();
+        let active = vec![ActiveJob {
+            id: "abc-123".into(),
+            running_slug: Some("kanidm".into()),
+            components_done: 3,
+            components_total: 10,
+        }];
+        let html = render_install_hub(&l, &active);
+        assert!(html.contains("Install in progress"));
+        assert!(html.contains(r#"href="/install/job/abc-123""#));
+        assert!(html.contains("3/10 components"));
+        assert!(html.contains("kanidm currently running"));
     }
 
     #[test]

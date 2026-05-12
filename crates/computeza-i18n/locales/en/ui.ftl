@@ -124,6 +124,12 @@ ui-install-progress-state-running = Running
 ui-install-progress-state-done    = Done
 ui-install-progress-state-failed  = Failed
 
+# --- Active-job resume banner on /install ---
+
+ui-install-active-title   = Install in progress
+ui-install-active-resume  = Resume the wizard
+ui-install-active-running = currently running
+
 ui-platform-banner-supported   = Detected:
 ui-platform-banner-unsupported = Host not supported
 ui-platform-supported-title    = Supported platforms
