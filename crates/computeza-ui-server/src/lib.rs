@@ -2238,6 +2238,15 @@ pub fn render_install_progress(localizer: &Localizer, job_id: &str, p: &InstallP
     };
     let job_id_js = html_escape(job_id);
 
+    // Render the initial log lines server-side so an operator who
+    // refreshes the page mid-install sees the existing history,
+    // not just whatever lines have arrived since the JS started.
+    let initial_log_html: String = p
+        .log
+        .iter()
+        .map(|l| format!("<div>{}</div>\n", html_escape(l)))
+        .collect();
+
     let body = format!(
         r#"<section class="cz-hero">
 <h1>Installing PostgreSQL</h1>
@@ -2252,16 +2261,32 @@ pub fn render_install_progress(localizer: &Localizer, job_id: &str, p: &InstallP
   <div class="cz-progress-bar"><div class="cz-progress-fill" id="bar" style="width: {ratio_pct}%;"></div></div>
   <div class="cz-progress-msg" id="message">{message}</div>
   <div class="cz-progress-bytes" id="bytes">{bytes_line}</div>
+  <details style="margin-top: 1rem;" id="log-details">
+    <summary class="cz-tag" style="cursor: pointer;">Show install log</summary>
+    <div id="log" class="cz-pre" style="margin-top: 0.6rem; max-height: 16rem; overflow-y: auto;">{initial_log_html}</div>
+  </details>
 </div>
 </section>
 <script>
 const jobId = "{job_id_js}";
+let lastLogLen = {initial_log_len};
 function fmt(n) {{
   if (n === 0) return "0 B";
   const u = ["B","KB","MB","GB","TB"];
   let i = 0; let v = n;
   while (v >= 1024 && i < u.length - 1) {{ v /= 1024; i++; }}
   return v.toFixed(i === 0 ? 0 : 1) + " " + u[i];
+}}
+function appendLog(lines) {{
+  if (!lines || lines.length === 0) return;
+  const el = document.getElementById("log");
+  const wasAtBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 4;
+  for (const line of lines) {{
+    const div = document.createElement("div");
+    div.textContent = line;
+    el.appendChild(div);
+  }}
+  if (wasAtBottom) {{ el.scrollTop = el.scrollHeight; }}
 }}
 async function poll() {{
   try {{
@@ -2280,6 +2305,10 @@ async function poll() {{
       bytes = fmt(p.bytes_downloaded);
     }}
     document.getElementById("bytes").textContent = bytes;
+    if (Array.isArray(p.log) && p.log.length > lastLogLen) {{
+      appendLog(p.log.slice(lastLogLen));
+      lastLogLen = p.log.length;
+    }}
     if (p.completed) {{
       window.location.href = `/install/job/${{jobId}}`;
     }} else {{
@@ -2290,7 +2319,8 @@ async function poll() {{
   }}
 }}
 poll();
-</script>"#
+</script>"#,
+        initial_log_len = p.log.len(),
     );
 
     render_shell(localizer, &title, NavLink::Install, &body)

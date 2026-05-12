@@ -86,6 +86,13 @@ pub struct InstallProgress {
     /// Latest message line from the driver, for the wizard's "what's
     /// happening" subtitle.
     pub message: String,
+    /// Full append-only log of every status line the driver produced
+    /// (each `set_message` call adds one entry). The wizard renders
+    /// this in an expandable scrollable panel below the progress bar
+    /// so the operator can see exactly what happened during a slow
+    /// step like `cargo install kanidmd` or the 270MB postgres
+    /// bundle download.
+    pub log: Vec<String>,
     /// Bytes pulled from the network so far (only meaningful during
     /// [`InstallPhase::Downloading`]).
     pub bytes_downloaded: u64,
@@ -165,10 +172,19 @@ impl ProgressHandle {
         }
     }
 
-    /// Update the "what's happening" subtitle.
+    /// Update the "what's happening" subtitle, and append the same
+    /// line to the install log so the wizard's expandable log panel
+    /// shows the full history of status messages. Skips appending
+    /// when the message exactly matches the previous one (avoids
+    /// runaway duplicates during a long download tick loop).
     pub fn set_message(&self, msg: impl Into<String>) {
         if let Some(m) = &self.inner {
-            m.lock().unwrap().message = msg.into();
+            let mut g = m.lock().unwrap();
+            let s = msg.into();
+            if g.log.last().map(|l| l.as_str()) != Some(s.as_str()) {
+                g.log.push(s.clone());
+            }
+            g.message = s;
         }
     }
 
@@ -185,7 +201,9 @@ impl ProgressHandle {
     }
 
     /// Mark the task complete with the given success summary. After
-    /// this point the wizard stops polling.
+    /// this point the wizard stops polling. Appends a terminal
+    /// "Done." line to the log so the expandable log panel always
+    /// ends with a clear closing line.
     pub fn finish_success(&self, summary: impl Into<String>) {
         if let Some(m) = &self.inner {
             let mut g = m.lock().unwrap();
@@ -193,17 +211,22 @@ impl ProgressHandle {
             g.success_summary = Some(summary.into());
             g.completed = true;
             g.finished_at = Some(Utc::now());
+            g.log.push("Done.".into());
         }
     }
 
-    /// Mark the task failed with the given error chain.
+    /// Mark the task failed with the given error chain. Appends a
+    /// terminal "Failed: <error>" line so the operator sees both the
+    /// last status message and the final reason in the log.
     pub fn finish_failure(&self, error: impl Into<String>) {
         if let Some(m) = &self.inner {
             let mut g = m.lock().unwrap();
+            let err = error.into();
             g.phase = InstallPhase::Failed;
-            g.error = Some(error.into());
+            g.error = Some(err.clone());
             g.completed = true;
             g.finished_at = Some(Utc::now());
+            g.log.push(format!("Failed: {err}"));
         }
     }
 }
