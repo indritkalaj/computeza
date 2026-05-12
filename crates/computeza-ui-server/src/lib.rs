@@ -238,6 +238,98 @@ async fn auth_middleware(
     next.run(request).await
 }
 
+/// Permission middleware -- runs after auth_middleware. Reads the
+/// session's bound username, looks up the operator's groups, computes
+/// the effective permission set, and verifies the route's required
+/// permission is in that set.
+///
+/// Bypasses public paths and unauthenticated test surfaces (no
+/// operators attached). Rejects with 403 + a clean inline page on
+/// permission denial.
+async fn permission_middleware(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    request: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    let path = request.uri().path().to_string();
+    let method = request.method().to_string();
+
+    if auth::is_public_path(&path) {
+        return next.run(request).await;
+    }
+    let Some(operators) = state.operators.clone() else {
+        // No operator store attached = smoke-test surface = no auth.
+        return next.run(request).await;
+    };
+    // The auth_middleware that ran before us already injected a
+    // Session; if it's missing here we treat it as missing auth and
+    // bounce back to /login (defensive -- this branch should not
+    // hit under normal middleware ordering).
+    let Some(session) = request.extensions().get::<auth::Session>().cloned() else {
+        return Redirect303("/login".into()).into_response();
+    };
+
+    let Some(operator) = operators.get(&session.username).await else {
+        // Session points at a non-existent operator (e.g. account
+        // deleted while their cookie was still live). Clear the
+        // cookie and bounce to /login so they can re-sign-in as
+        // someone else.
+        tracing::warn!(
+            username = %session.username,
+            "session references a deleted operator account; rejecting"
+        );
+        let mut response = Redirect303("/login".into()).into_response();
+        if let Ok(value) = axum::http::HeaderValue::from_str(&auth::clear_session_cookie_header()) {
+            response.headers_mut().append(header::SET_COOKIE, value);
+        }
+        if let Ok(value) = axum::http::HeaderValue::from_str(&auth::clear_csrf_cookie_header()) {
+            response.headers_mut().append(header::SET_COOKIE, value);
+        }
+        return response;
+    };
+
+    let perms = auth::permissions_for_groups(&operator.groups);
+    let Some(required) = auth::required_permission_for(&method, &path) else {
+        return next.run(request).await;
+    };
+    if !perms.contains(&required) {
+        tracing::warn!(
+            username = %session.username,
+            method = %method,
+            path = %path,
+            required = ?required,
+            groups = ?operator.groups,
+            "permission denied"
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            Html(render_permission_denied(&operator.groups, required)),
+        )
+            .into_response();
+    }
+
+    next.run(request).await
+}
+
+/// Tiny inline page rendered on permission denial. Not localized --
+/// operators see this when they hit a button they don't have rights
+/// for, which is rare in practice and the message just needs to be
+/// understandable enough to ask their admin.
+fn render_permission_denied(groups: &[String], required: auth::Permission) -> String {
+    format!(
+        "<!DOCTYPE html><html><head><title>Permission denied</title></head>\
+         <body style=\"font-family:sans-serif;padding:2rem;max-width:40rem;margin:0 auto;\">\
+         <h1>Permission denied</h1>\
+         <p>Your account is in groups {groups:?} and does not carry the \
+         <code>{required:?}</code> permission required for this surface. \
+         Ask an administrator to add you to a group that includes it \
+         (admins / operators / viewers).</p>\
+         <p><a href=\"/\">Back to the landing page</a> &middot; \
+         <a href=\"/account\">Your account</a></p>\
+         </body></html>"
+    )
+}
+
 /// CSRF middleware -- verifies the `csrf_token` form field on every
 /// POST request to a non-public, non-exempt path.
 ///
@@ -397,6 +489,8 @@ fn render_csrf_failure() -> String {
 /// needs the store extracts it via `State<AppState>`.
 pub fn router_with_state(state: AppState) -> Router {
     let auth_layer = axum::middleware::from_fn_with_state(state.clone(), auth_middleware);
+    let permission_layer =
+        axum::middleware::from_fn_with_state(state.clone(), permission_middleware);
     let csrf_layer = axum::middleware::from_fn_with_state(state.clone(), csrf_middleware);
     Router::new()
         .route("/", get(home_handler))
@@ -503,6 +597,19 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/logout", post(logout_handler))
         .route("/account", get(account_handler))
         .route("/audit", get(audit_handler))
+        .route(
+            "/admin/operators",
+            get(admin_operators_handler).post(admin_create_operator_handler),
+        )
+        .route(
+            "/admin/operators/{name}/groups",
+            post(admin_update_operator_groups_handler),
+        )
+        .route(
+            "/admin/operators/{name}/delete",
+            post(admin_delete_operator_handler),
+        )
+        .route("/admin/groups", get(admin_groups_handler))
         .route("/healthz", get(healthz_handler))
         .route("/api/state/info", get(state_info_handler))
         .route("/static/computeza.css", get(css_handler))
@@ -515,6 +622,7 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/static/brand/computeza-pulse.json", get(lottie_handler))
         .route("/favicon.ico", get(favicon_handler))
         .layer(csrf_layer)
+        .layer(permission_layer)
         .layer(auth_layer)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -3669,7 +3777,14 @@ async fn setup_post_handler(
         let msg = l.t("ui-setup-password-mismatch");
         return Html(render_setup(&l, Some(&msg))).into_response();
     }
-    if let Err(e) = operators.create(&form.username, &form.password).await {
+    // First-boot operator is always an admin so they have somewhere
+    // to operate from. Additional operators (and their group
+    // memberships) are managed from /admin/operators once at least
+    // one admin exists.
+    if let Err(e) = operators
+        .create(&form.username, &form.password, &["admins".to_string()])
+        .await
+    {
         return Html(render_setup(&l, Some(&e.to_string()))).into_response();
     }
     let session_id = state.sessions.create(form.username.clone()).await;
@@ -3731,6 +3846,212 @@ async fn audit_handler(State(state): State<AppState>) -> Html<String> {
     });
     let verifying_key = audit.verifying_key_b64().await;
     Html(render_audit(&l, Some(&events), Some(&verifying_key)))
+}
+
+/// GET /admin/operators -- list every operator account with their
+/// group memberships, plus a "create new operator" form. Manage-only
+/// (the permission middleware bounces non-admins with 403).
+async fn admin_operators_handler(
+    State(state): State<AppState>,
+    axum::Extension(session): axum::Extension<auth::Session>,
+) -> Html<String> {
+    let l = Localizer::english();
+    let operators = match &state.operators {
+        Some(o) => o.list().await,
+        None => Vec::new(),
+    };
+    Html(render_admin_operators(
+        &l,
+        &operators,
+        &session.username,
+        None,
+    ))
+}
+
+#[derive(serde::Deserialize)]
+struct CreateOperatorForm {
+    username: String,
+    password: String,
+    /// Comma-separated group names. e.g. "operators,viewers". The
+    /// handler trims + filters empties.
+    #[serde(default)]
+    groups: String,
+}
+
+/// POST /admin/operators -- create a new operator account.
+async fn admin_create_operator_handler(
+    State(state): State<AppState>,
+    axum::Extension(session): axum::Extension<auth::Session>,
+    Form(form): Form<CreateOperatorForm>,
+) -> Response {
+    let l = Localizer::english();
+    let Some(operators) = &state.operators else {
+        return Redirect303("/admin/operators".into()).into_response();
+    };
+    let groups: Vec<String> = form
+        .groups
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let groups = if groups.is_empty() {
+        vec!["operators".to_string()]
+    } else {
+        groups
+    };
+    if let Err(e) = operators
+        .create(&form.username, &form.password, &groups)
+        .await
+    {
+        let list = operators.list().await;
+        return Html(render_admin_operators(
+            &l,
+            &list,
+            &session.username,
+            Some(&e.to_string()),
+        ))
+        .into_response();
+    }
+    if let Some(audit) = &state.audit {
+        let _ = audit
+            .append(
+                session.username.clone(),
+                computeza_audit::Action::UserAction,
+                Some(format!("operator/{}", form.username)),
+                serde_json::json!({
+                    "action": "create_operator",
+                    "username": form.username,
+                    "groups": groups,
+                }),
+            )
+            .await;
+    }
+    Redirect303("/admin/operators".into()).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct UpdateGroupsForm {
+    groups: String,
+}
+
+/// POST /admin/operators/{name}/groups -- replace an operator's
+/// group memberships.
+async fn admin_update_operator_groups_handler(
+    State(state): State<AppState>,
+    axum::Extension(session): axum::Extension<auth::Session>,
+    Path(name): Path<String>,
+    Form(form): Form<UpdateGroupsForm>,
+) -> Response {
+    let l = Localizer::english();
+    let Some(operators) = &state.operators else {
+        return Redirect303("/admin/operators".into()).into_response();
+    };
+    let groups: Vec<String> = form
+        .groups
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if let Err(e) = operators.set_groups(&name, &groups).await {
+        let list = operators.list().await;
+        return Html(render_admin_operators(
+            &l,
+            &list,
+            &session.username,
+            Some(&format!("Updating {name}: {e}")),
+        ))
+        .into_response();
+    }
+    if let Some(audit) = &state.audit {
+        let _ = audit
+            .append(
+                session.username.clone(),
+                computeza_audit::Action::UserAction,
+                Some(format!("operator/{name}")),
+                serde_json::json!({
+                    "action": "update_groups",
+                    "username": name,
+                    "groups": groups,
+                }),
+            )
+            .await;
+    }
+    Redirect303("/admin/operators".into()).into_response()
+}
+
+/// POST /admin/operators/{name}/delete -- delete an operator
+/// account. Refuses to delete the currently-signed-in admin or the
+/// last remaining admin (the console would lose its management
+/// surface otherwise).
+async fn admin_delete_operator_handler(
+    State(state): State<AppState>,
+    axum::Extension(session): axum::Extension<auth::Session>,
+    Path(name): Path<String>,
+) -> Response {
+    let l = Localizer::english();
+    let Some(operators) = &state.operators else {
+        return Redirect303("/admin/operators".into()).into_response();
+    };
+    if name == session.username {
+        let list = operators.list().await;
+        return Html(render_admin_operators(
+            &l,
+            &list,
+            &session.username,
+            Some(&l.t("ui-admin-operators-cant-delete-self")),
+        ))
+        .into_response();
+    }
+    // Last-admin protection: if this is an admins-group member and
+    // it's the ONLY admins-group member, refuse.
+    let list = operators.list().await;
+    let target_is_admin = list
+        .iter()
+        .find(|r| r.username == name)
+        .map(|r| r.groups.iter().any(|g| g == "admins"))
+        .unwrap_or(false);
+    let admin_count = list
+        .iter()
+        .filter(|r| r.groups.iter().any(|g| g == "admins"))
+        .count();
+    if target_is_admin && admin_count <= 1 {
+        return Html(render_admin_operators(
+            &l,
+            &list,
+            &session.username,
+            Some(&l.t("ui-admin-operators-cant-delete-last-admin")),
+        ))
+        .into_response();
+    }
+    if let Err(e) = operators.delete(&name).await {
+        let list = operators.list().await;
+        return Html(render_admin_operators(
+            &l,
+            &list,
+            &session.username,
+            Some(&format!("Deleting {name}: {e}")),
+        ))
+        .into_response();
+    }
+    if let Some(audit) = &state.audit {
+        let _ = audit
+            .append(
+                session.username.clone(),
+                computeza_audit::Action::UserAction,
+                Some(format!("operator/{name}")),
+                serde_json::json!({"action": "delete_operator", "username": name}),
+            )
+            .await;
+    }
+    Redirect303("/admin/operators".into()).into_response()
+}
+
+/// GET /admin/groups -- read-only listing of built-in groups + the
+/// permissions each grants. v0.0.x ships three built-in groups;
+/// custom groups land in v0.1+.
+async fn admin_groups_handler() -> Html<String> {
+    let l = Localizer::english();
+    Html(render_admin_groups(&l))
 }
 
 async fn healthz_handler() -> String {
@@ -3797,6 +4118,10 @@ pub enum NavLink {
     Account,
     /// Audit log viewer.
     Audit,
+    /// Admin operator-management page.
+    Operators,
+    /// Admin group-listing page.
+    Groups,
     /// No nav link highlighted (e.g. resource detail page).
     None,
 }
@@ -3820,6 +4145,8 @@ pub fn render_shell(
     let nav_secrets = localizer.t("ui-admin-secrets");
     let nav_account = localizer.t("ui-nav-account");
     let nav_audit = localizer.t("ui-audit-nav");
+    let nav_admin_operators = localizer.t("ui-nav-admin-operators");
+    let nav_admin_groups = localizer.t("ui-nav-admin-groups");
     let version_label = localizer.t("ui-footer-version");
     let version = env!("CARGO_PKG_VERSION");
 
@@ -3854,6 +4181,8 @@ pub fn render_shell(
     <a href="/state" class="{nm}">{nav_state}</a>
     <a href="/admin/secrets" class="{na}">{nav_secrets}</a>
     <a href="/audit" class="{naud}">{nav_audit}</a>
+    <a href="/admin/operators" class="{nops}">{nav_admin_operators}</a>
+    <a href="/admin/groups" class="{ngrp}">{nav_admin_groups}</a>
     <a href="/account" class="{nacc}">{nav_account}</a>
   </div>
 </nav>
@@ -3895,6 +4224,8 @@ pub fn render_shell(
         nm = nav_class(NavLink::State),
         na = nav_class(NavLink::Secrets),
         naud = nav_class(NavLink::Audit),
+        nops = nav_class(NavLink::Operators),
+        ngrp = nav_class(NavLink::Groups),
         nacc = nav_class(NavLink::Account),
     )
 }
@@ -7182,6 +7513,190 @@ pub fn render_account(localizer: &Localizer, session: &auth::Session) -> String 
         created_at = html_escape(&session.created_at.to_rfc3339()),
     );
     render_shell(localizer, &title, NavLink::Account, &body)
+}
+
+/// Render `GET /admin/operators` -- the operator-management page.
+/// Lists every operator with edit + delete forms per row, plus a
+/// "create new operator" form at the bottom. `current_username`
+/// populates the disabled-state on the row for the operator who is
+/// currently signed in (prevents self-delete from the UI; the
+/// handler enforces this too).
+#[must_use]
+pub fn render_admin_operators(
+    localizer: &Localizer,
+    operators: &[auth::OperatorRecord],
+    current_username: &str,
+    error_message: Option<&str>,
+) -> String {
+    let title = localizer.t("ui-admin-operators-title");
+    let intro = localizer.t("ui-admin-operators-intro");
+    let col_user = localizer.t("ui-admin-operators-col-username");
+    let col_groups = localizer.t("ui-admin-operators-col-groups");
+    let col_created = localizer.t("ui-admin-operators-col-created");
+    let col_actions = localizer.t("ui-admin-operators-col-actions");
+    let delete = localizer.t("ui-admin-operators-delete");
+    let confirm = localizer.t("ui-admin-operators-delete-confirm");
+    let edit_groups = localizer.t("ui-admin-operators-edit-groups");
+    let new_heading = localizer.t("ui-admin-operators-new-heading");
+    let new_username = localizer.t("ui-admin-operators-new-username");
+    let new_password = localizer.t("ui-admin-operators-new-password");
+    let new_password_help = localizer.t("ui-admin-operators-new-password-help");
+    let new_groups = localizer.t("ui-admin-operators-new-groups");
+    let new_submit = localizer.t("ui-admin-operators-new-submit");
+
+    let rows: String = operators
+        .iter()
+        .map(|op| {
+            let groups_str = op.groups.join(", ");
+            let is_self = op.username == current_username;
+            let delete_button = if is_self {
+                format!(
+                    r#"<button type="submit" class="cz-btn cz-btn-danger" disabled title="self">{delete}</button>"#,
+                    delete = html_escape(&delete),
+                )
+            } else {
+                format!(
+                    r#"<button type="submit" class="cz-btn cz-btn-danger">{delete}</button>"#,
+                    delete = html_escape(&delete),
+                )
+            };
+            format!(
+                r#"<tr>
+<td><code>{username}</code></td>
+<td>
+<form method="post" action="/admin/operators/{username_enc}/groups" style="display: flex; gap: 0.4rem; align-items: center;">
+<input type="hidden" name="csrf_token" value="" />
+<input type="text" name="groups" value="{groups}" class="cz-input" style="margin: 0; padding: 0.3rem 0.5rem; font-size: 0.82rem; min-width: 12rem;" pattern="[A-Za-z0-9_,\- ]+" />
+<button type="submit" class="cz-btn" style="padding: 0.3rem 0.6rem; font-size: 0.78rem;">{edit_groups}</button>
+</form>
+</td>
+<td class="cz-cell-mono cz-cell-dim">{created}</td>
+<td>
+<form method="post" action="/admin/operators/{username_enc}/delete" onsubmit="return confirm('{confirm}');" style="margin: 0;">
+<input type="hidden" name="csrf_token" value="" />
+{delete_button}
+</form>
+</td>
+</tr>"#,
+                username = html_escape(&op.username),
+                username_enc = urlencoding_min(&op.username),
+                groups = html_escape(&groups_str),
+                edit_groups = html_escape(&edit_groups),
+                created = html_escape(&op.created_at.to_rfc3339()),
+                confirm = html_escape(&confirm),
+                delete_button = delete_button,
+            )
+        })
+        .collect();
+
+    let error_block = match error_message {
+        Some(msg) => format!(
+            r#"<div class="cz-card" style="border-color: rgba(255, 157, 166, 0.55); margin-bottom: 1rem;">
+<p class="cz-card-body" style="margin: 0; color: var(--fail);">{}</p>
+</div>"#,
+            html_escape(msg)
+        ),
+        None => String::new(),
+    };
+
+    let body = format!(
+        r#"<section class="cz-hero">
+<h1>{title}</h1>
+<p>{intro}</p>
+</section>
+<section class="cz-section">
+{error_block}
+<div class="cz-card">
+<table class="cz-table" style="width: 100%;">
+<thead><tr><th>{col_user}</th><th>{col_groups}</th><th>{col_created}</th><th>{col_actions}</th></tr></thead>
+<tbody>
+{rows}
+</tbody>
+</table>
+</div>
+</section>
+<section class="cz-section" style="max-width: 32rem;">
+<div class="cz-card">
+<h3 style="margin: 0 0 0.85rem;">{new_heading}</h3>
+<form method="post" action="/admin/operators" class="cz-form" style="max-width: none;">
+<input type="hidden" name="csrf_token" value="" />
+<label for="new-username">{new_username}</label>
+<input id="new-username" name="username" class="cz-input" type="text" required pattern="[A-Za-z0-9_.\-]+" maxlength="64" />
+<label for="new-password">{new_password}</label>
+<input id="new-password" name="password" class="cz-input" type="password" minlength="12" required autocomplete="new-password" />
+<p class="cz-muted" style="margin: -0.5rem 0 0; font-size: 0.8rem;">{new_password_help}</p>
+<label for="new-groups">{new_groups}</label>
+<input id="new-groups" name="groups" class="cz-input" type="text" value="operators" pattern="[A-Za-z0-9_,\- ]+" />
+<button type="submit" class="cz-btn cz-btn-primary" style="margin-top: 0.5rem;">{new_submit}</button>
+</form>
+</div>
+</section>"#,
+        title = html_escape(&title),
+        intro = html_escape(&intro),
+        error_block = error_block,
+        col_user = html_escape(&col_user),
+        col_groups = html_escape(&col_groups),
+        col_created = html_escape(&col_created),
+        col_actions = html_escape(&col_actions),
+        rows = rows,
+        new_heading = html_escape(&new_heading),
+        new_username = html_escape(&new_username),
+        new_password = html_escape(&new_password),
+        new_password_help = html_escape(&new_password_help),
+        new_groups = html_escape(&new_groups),
+        new_submit = html_escape(&new_submit),
+    );
+    render_shell(localizer, &title, NavLink::Operators, &body)
+}
+
+/// Render `GET /admin/groups` -- read-only listing of built-in groups
+/// and the permissions each carries. v0.0.x ships admins / operators
+/// / viewers; custom groups are v0.1+.
+#[must_use]
+pub fn render_admin_groups(localizer: &Localizer) -> String {
+    let title = localizer.t("ui-admin-groups-title");
+    let intro = localizer.t("ui-admin-groups-intro");
+    let col_name = localizer.t("ui-admin-groups-col-name");
+    let col_perms = localizer.t("ui-admin-groups-col-perms");
+
+    let rows: String = auth::BUILTIN_GROUPS
+        .iter()
+        .map(|(name, perms)| {
+            let perm_str = perms
+                .iter()
+                .map(|p| p.label())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                r#"<tr><td><code>{name}</code></td><td>{perms}</td></tr>"#,
+                name = html_escape(name),
+                perms = html_escape(&perm_str),
+            )
+        })
+        .collect();
+
+    let body = format!(
+        r#"<section class="cz-hero">
+<h1>{title}</h1>
+<p>{intro}</p>
+</section>
+<section class="cz-section">
+<div class="cz-card">
+<table class="cz-table" style="width: 100%;">
+<thead><tr><th>{col_name}</th><th>{col_perms}</th></tr></thead>
+<tbody>
+{rows}
+</tbody>
+</table>
+</div>
+</section>"#,
+        title = html_escape(&title),
+        intro = html_escape(&intro),
+        col_name = html_escape(&col_name),
+        col_perms = html_escape(&col_perms),
+        rows = rows,
+    );
+    render_shell(localizer, &title, NavLink::Groups, &body)
 }
 
 /// Render `GET /audit` -- the audit-log viewer. Passing `None` for

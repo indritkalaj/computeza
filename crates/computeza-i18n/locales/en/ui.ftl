@@ -185,6 +185,34 @@ ui-audit-col-resource    = Resource
 ui-audit-nav             = Audit
 ui-audit-verifying-key   = Verifying key
 
+# --- /admin/operators + /admin/groups ---
+
+ui-admin-operators-title    = Operators
+ui-admin-operators-intro    = Operator accounts that can sign in to this Computeza install. Each operator belongs to one or more groups; the union of group permissions determines what they can do in the console. Admins manage other operators here.
+ui-admin-operators-col-username = Username
+ui-admin-operators-col-groups   = Groups
+ui-admin-operators-col-created  = Created
+ui-admin-operators-col-actions  = Actions
+ui-admin-operators-delete       = Delete
+ui-admin-operators-delete-confirm = Permanently delete this operator? Their sessions are invalidated immediately; the action is irreversible.
+ui-admin-operators-cant-delete-last-admin = Cannot delete the last admin: at least one admins-group operator must remain so the console retains a management surface.
+ui-admin-operators-cant-delete-self = Cannot delete the account you are currently signed in as.
+ui-admin-operators-edit-groups  = Update groups
+ui-admin-operators-new-heading  = Create a new operator
+ui-admin-operators-new-username = New operator username
+ui-admin-operators-new-password = Initial password
+ui-admin-operators-new-password-help = At least 12 characters. The operator can change it themselves once they sign in.
+ui-admin-operators-new-groups   = Group memberships
+ui-admin-operators-new-submit   = Create operator
+
+ui-admin-groups-title  = Groups
+ui-admin-groups-intro  = Built-in groups. v0.0.x ships three roles -- admins, operators, viewers -- with the permission sets shown below. Custom groups land in v0.1+.
+ui-admin-groups-col-name = Group
+ui-admin-groups-col-perms = Permissions
+
+ui-nav-admin-operators = Operators
+ui-nav-admin-groups    = Groups
+
 # --- Home dashboard cards ---
 
 ui-home-card-components-title = Managed components

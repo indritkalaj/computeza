@@ -77,6 +77,110 @@ pub struct OperatorRecord {
     /// Wall-clock when the operator was created. Surfaced on the
     /// audit row eventually; not exposed via the cookie.
     pub created_at: DateTime<Utc>,
+    /// Group memberships -- references into the built-in
+    /// [`BUILTIN_GROUPS`] table. Existing operators created before
+    /// the RBAC layer landed deserialize with this defaulted to
+    /// `["admins"]` so they retain full access.
+    #[serde(default = "default_groups")]
+    pub groups: Vec<String>,
+}
+
+fn default_groups() -> Vec<String> {
+    vec!["admins".to_string()]
+}
+
+/// Coarse permission categories. Routes are gated by membership in
+/// one of these; the role-to-permission mapping lives in
+/// [`BUILTIN_GROUPS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Permission {
+    /// Read-only surfaces: status, audit, resource detail, components.
+    Read,
+    /// Operational mutations: install, uninstall, rotate, delete.
+    Write,
+    /// Administrative actions: manage operator accounts + group
+    /// memberships, view + rotate secrets at /admin/*.
+    Manage,
+}
+
+impl Permission {
+    /// Label rendered on the group-permissions read-only page. Kept
+    /// minimal so the localized i18n surface doesn't need to grow a
+    /// per-permission key set in v0.0.x.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Permission::Read => "Read",
+            Permission::Write => "Write",
+            Permission::Manage => "Manage",
+        }
+    }
+}
+
+/// Built-in group definitions. v0.0.x ships three: `admins` (full),
+/// `operators` (Read + Write, no operator management), and `viewers`
+/// (Read only). Custom groups + custom permission mixes are a v0.1+
+/// extension.
+pub const BUILTIN_GROUPS: &[(&str, &[Permission])] = &[
+    (
+        "admins",
+        &[Permission::Read, Permission::Write, Permission::Manage],
+    ),
+    ("operators", &[Permission::Read, Permission::Write]),
+    ("viewers", &[Permission::Read]),
+];
+
+/// Whether `group_name` is a built-in group recognized by the
+/// permission layer. Unknown groups deserialize cleanly but contribute
+/// no permissions -- the operator effectively has no access.
+#[must_use]
+pub fn is_known_group(group_name: &str) -> bool {
+    BUILTIN_GROUPS.iter().any(|(n, _)| *n == group_name)
+}
+
+/// Compute the union of permissions across a list of group names.
+/// Unknown group names are silently skipped (operators with only
+/// unknown groups end up with no permissions and can't access the
+/// console).
+#[must_use]
+pub fn permissions_for_groups(group_names: &[String]) -> std::collections::HashSet<Permission> {
+    let mut out = std::collections::HashSet::new();
+    for g in group_names {
+        if let Some((_, perms)) = BUILTIN_GROUPS.iter().find(|(n, _)| *n == g.as_str()) {
+            for p in *perms {
+                out.insert(*p);
+            }
+        }
+    }
+    out
+}
+
+/// Map a request `(method, path)` onto the permission the route
+/// requires. Returns `None` for paths the middleware should bypass
+/// (public surfaces are already handled by [`is_public_path`]). Every
+/// other authenticated request gets a permission requirement; the
+/// permission middleware extracts the operator's groups, computes
+/// effective permissions, and rejects with 403 when the required
+/// permission isn't in the set.
+#[must_use]
+pub fn required_permission_for(method: &str, path: &str) -> Option<Permission> {
+    // /logout is allowed for any signed-in operator regardless of
+    // their effective permissions -- otherwise a Viewer who can't
+    // even sign out would be stuck.
+    if path == "/logout" {
+        return Some(Permission::Read);
+    }
+    // /admin/* requires Manage for both reads and writes.
+    if path.starts_with("/admin/") {
+        return Some(Permission::Manage);
+    }
+    // Read methods: Read is enough.
+    if method == "GET" || method == "HEAD" {
+        return Some(Permission::Read);
+    }
+    // Everything else (POST / PUT / DELETE) mutates state.
+    Some(Permission::Write)
 }
 
 /// JSONL-backed operator account store.
@@ -157,13 +261,33 @@ impl OperatorFile {
         }
     }
 
-    /// Append a new operator. Returns `AlreadyExists` when the
-    /// username collides with an existing record.
-    pub async fn create(&self, username: &str, password: &str) -> Result<(), AuthError> {
+    /// Append a new operator with the given group memberships.
+    /// `groups` is validated against [`BUILTIN_GROUPS`]; unknown
+    /// names are rejected so a typo doesn't accidentally leave the
+    /// operator without any permissions.
+    ///
+    /// Pass `&["admins"]` as the groups argument for the first-boot
+    /// operator (`/setup`) so they retain full access.
+    pub async fn create(
+        &self,
+        username: &str,
+        password: &str,
+        groups: &[String],
+    ) -> Result<(), AuthError> {
         validate_username(username)?;
         if password.len() < 12 {
             return Err(AuthError::Argon2(
                 "password must be at least 12 characters".into(),
+            ));
+        }
+        for g in groups {
+            if !is_known_group(g) {
+                return Err(AuthError::Argon2(format!("unknown group: {g}")));
+            }
+        }
+        if groups.is_empty() {
+            return Err(AuthError::Argon2(
+                "an operator must be a member of at least one group".into(),
             ));
         }
         let mut records = self.cache.write().await;
@@ -175,13 +299,73 @@ impl OperatorFile {
             username: username.to_string(),
             password_hash: hash,
             created_at: Utc::now(),
+            groups: groups.to_vec(),
         };
         records.push(rec.clone());
         self.write_atomic(&records).await?;
         tracing::info!(
             username = %username,
-            "operator account created; sign in at /login to start using the operator console"
+            groups = ?groups,
+            "operator account created"
         );
+        Ok(())
+    }
+
+    /// List every operator. Used by the /admin/operators page.
+    pub async fn list(&self) -> Vec<OperatorRecord> {
+        self.cache.read().await.clone()
+    }
+
+    /// Look up an operator by username. Returns `None` when no
+    /// matching record exists. Used by the permission middleware on
+    /// every authenticated request to map the session's username
+    /// back onto its effective group memberships.
+    pub async fn get(&self, username: &str) -> Option<OperatorRecord> {
+        self.cache
+            .read()
+            .await
+            .iter()
+            .find(|r| r.username == username)
+            .cloned()
+    }
+
+    /// Replace the group memberships for an existing operator.
+    /// Returns `BadCredentials` (treated as a generic "not found"
+    /// for the UI) if the username doesn't exist.
+    pub async fn set_groups(&self, username: &str, groups: &[String]) -> Result<(), AuthError> {
+        for g in groups {
+            if !is_known_group(g) {
+                return Err(AuthError::Argon2(format!("unknown group: {g}")));
+            }
+        }
+        if groups.is_empty() {
+            return Err(AuthError::Argon2(
+                "an operator must be a member of at least one group".into(),
+            ));
+        }
+        let mut records = self.cache.write().await;
+        let Some(rec) = records.iter_mut().find(|r| r.username == username) else {
+            return Err(AuthError::BadCredentials);
+        };
+        rec.groups = groups.to_vec();
+        self.write_atomic(&records).await?;
+        tracing::info!(username = %username, groups = ?groups, "operator group memberships updated");
+        Ok(())
+    }
+
+    /// Delete an operator account. Returns `BadCredentials` when no
+    /// matching record exists. The caller is responsible for
+    /// preventing the last admin from being removed -- that policy
+    /// lives in the handler.
+    pub async fn delete(&self, username: &str) -> Result<(), AuthError> {
+        let mut records = self.cache.write().await;
+        let before = records.len();
+        records.retain(|r| r.username != username);
+        if records.len() == before {
+            return Err(AuthError::BadCredentials);
+        }
+        self.write_atomic(&records).await?;
+        tracing::info!(username = %username, "operator account deleted");
         Ok(())
     }
 
@@ -537,7 +721,10 @@ mod tests {
         let path = dir.join("operators.jsonl");
         let store = OperatorFile::open(&path).await.unwrap();
         assert!(store.is_empty().await);
-        store.create("admin", "hunter2hunter2").await.unwrap();
+        store
+            .create("admin", "hunter2hunter2", &["admins".to_string()])
+            .await
+            .unwrap();
         assert!(!store.is_empty().await);
 
         // verify happy path
@@ -558,7 +745,9 @@ mod tests {
 
         // duplicate create rejects
         assert!(matches!(
-            store.create("admin", "hunter2hunter2").await,
+            store
+                .create("admin", "hunter2hunter2", &["admins".to_string()])
+                .await,
             Err(AuthError::AlreadyExists(_))
         ));
 
@@ -567,6 +756,136 @@ mod tests {
         let store2 = OperatorFile::open(&path).await.unwrap();
         assert!(!store2.is_empty().await);
         store2.verify("admin", "hunter2hunter2").await.unwrap();
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[test]
+    fn permissions_for_groups_unions_across_memberships() {
+        let perms = permissions_for_groups(&["viewers".to_string(), "operators".to_string()]);
+        assert!(perms.contains(&Permission::Read));
+        assert!(perms.contains(&Permission::Write));
+        assert!(!perms.contains(&Permission::Manage));
+    }
+
+    #[test]
+    fn permissions_for_groups_skips_unknown_groups() {
+        let perms =
+            permissions_for_groups(&["not-a-real-group".to_string(), "viewers".to_string()]);
+        assert!(perms.contains(&Permission::Read));
+        assert!(!perms.contains(&Permission::Write));
+        assert!(!perms.contains(&Permission::Manage));
+    }
+
+    #[test]
+    fn permissions_for_groups_admins_has_everything() {
+        let perms = permissions_for_groups(&["admins".to_string()]);
+        assert!(perms.contains(&Permission::Read));
+        assert!(perms.contains(&Permission::Write));
+        assert!(perms.contains(&Permission::Manage));
+    }
+
+    #[test]
+    fn required_permission_routes_admin_through_manage() {
+        assert_eq!(
+            required_permission_for("GET", "/admin/operators"),
+            Some(Permission::Manage)
+        );
+        assert_eq!(
+            required_permission_for("POST", "/admin/operators"),
+            Some(Permission::Manage)
+        );
+        assert_eq!(
+            required_permission_for("POST", "/admin/secrets/postgres/admin-password/rotate"),
+            Some(Permission::Manage)
+        );
+    }
+
+    #[test]
+    fn required_permission_routes_read_for_get_write_for_post() {
+        assert_eq!(
+            required_permission_for("GET", "/status"),
+            Some(Permission::Read)
+        );
+        assert_eq!(
+            required_permission_for("GET", "/audit"),
+            Some(Permission::Read)
+        );
+        assert_eq!(
+            required_permission_for("POST", "/install"),
+            Some(Permission::Write)
+        );
+        assert_eq!(
+            required_permission_for("POST", "/install/job/abc/rollback"),
+            Some(Permission::Write)
+        );
+        // /logout always allowed for anyone signed in (even viewers).
+        assert_eq!(
+            required_permission_for("POST", "/logout"),
+            Some(Permission::Read)
+        );
+    }
+
+    #[test]
+    fn is_known_group_only_matches_builtin() {
+        assert!(is_known_group("admins"));
+        assert!(is_known_group("operators"));
+        assert!(is_known_group("viewers"));
+        assert!(!is_known_group("custom-group"));
+        assert!(!is_known_group(""));
+    }
+
+    #[tokio::test]
+    async fn operator_file_set_groups_and_delete() {
+        let dir = std::env::temp_dir().join(format!(
+            "computeza-test-rbac-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("operators.jsonl");
+        let store = OperatorFile::open(&path).await.unwrap();
+        store
+            .create("alice", "alicepassword!", &["admins".to_string()])
+            .await
+            .unwrap();
+        store
+            .create("bob", "bobpassword12", &["viewers".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(store.list().await.len(), 2);
+
+        // set_groups happy path
+        store
+            .set_groups("bob", &["operators".to_string()])
+            .await
+            .unwrap();
+        let bob = store.get("bob").await.unwrap();
+        assert_eq!(bob.groups, vec!["operators"]);
+
+        // unknown group rejected
+        assert!(matches!(
+            store.set_groups("bob", &["not-a-group".to_string()]).await,
+            Err(AuthError::Argon2(_))
+        ));
+
+        // empty groups rejected
+        assert!(matches!(
+            store.set_groups("bob", &[]).await,
+            Err(AuthError::Argon2(_))
+        ));
+
+        // delete happy path
+        store.delete("bob").await.unwrap();
+        assert_eq!(store.list().await.len(), 1);
+        assert!(store.get("bob").await.is_none());
+
+        // delete unknown returns BadCredentials
+        assert!(matches!(
+            store.delete("nobody").await,
+            Err(AuthError::BadCredentials)
+        ));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

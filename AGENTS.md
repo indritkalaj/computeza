@@ -559,6 +559,51 @@ metadata store, secrets, audit viewer, account page) requires a valid
 - Sessions live in process memory; restart = forced re-sign-in.
   Persistent sessions are a v0.1+ ask.
 
+### RBAC (groups + permissions)
+
+Every authenticated request flows through a permission middleware
+after the auth middleware. Three built-in permission categories live
+in `auth::Permission`:
+
+- `Read` -- view-only surfaces (status, audit, components, resource
+  detail).
+- `Write` -- operational mutations (install, uninstall, rotate,
+  delete).
+- `Manage` -- administrative actions (manage operator accounts and
+  group memberships, all `/admin/*` routes).
+
+Three built-in groups in `auth::BUILTIN_GROUPS` map operators onto
+permissions:
+
+- `admins` -- Read + Write + Manage. First-boot operator (created
+  via `/setup`) is always added here. Custom-group operators land
+  in v0.1+.
+- `operators` -- Read + Write. Day-to-day install / uninstall /
+  rotate without operator-management capability.
+- `viewers` -- Read only. SOC analysts, auditors, monitoring NPCs.
+
+The middleware's `required_permission_for(method, path)` rule:
+
+- `/logout` always allowed (any signed-in operator).
+- `/admin/*` requires `Manage`.
+- Any `GET` / `HEAD` requires `Read`.
+- Any other method requires `Write`.
+
+The `/admin/operators` page (also `Manage`-gated) lets admins create
+new operators, edit their group memberships, and delete accounts.
+The last admin cannot be deleted -- the console would lose its
+management surface; the handler enforces this regardless of UI state.
+The currently-signed-in admin cannot self-delete either.
+
+`/admin/groups` is a read-only listing of the built-in groups and
+the permission sets each carries. Custom groups + custom permission
+mixes are explicitly v0.1+.
+
+When an operator is in only unknown groups (e.g. operators-only
+group migrated away), their effective permission set is empty and
+every protected request lands on the permission-denied page; an
+admin must update their group memberships via `/admin/operators`.
+
 ### CSRF defense
 
 Every non-public, non-`/login`-or-`/setup` POST request is gated by
