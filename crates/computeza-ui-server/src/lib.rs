@@ -490,7 +490,7 @@ async fn save_install_config(
     slug: &str,
     config: &InstallConfig,
 ) -> anyhow::Result<()> {
-    let key = ResourceKey::cluster_scoped("install-config", &format!("{slug}-local"));
+    let key = ResourceKey::cluster_scoped("install-config", format!("{slug}-local"));
     let value = serde_json::to_value(config)
         .map_err(|e| anyhow::anyhow!("serialising InstallConfig for {slug}: {e}"))?;
     let expected_revision = match store.load(&key).await {
@@ -509,7 +509,7 @@ async fn save_install_config(
 /// the install ran before this persistence layer landed, or via the
 /// per-component pages that don't yet write install-config rows).
 async fn load_install_config(store: &SqliteStore, slug: &str) -> Option<InstallConfig> {
-    let key = ResourceKey::cluster_scoped("install-config", &format!("{slug}-local"));
+    let key = ResourceKey::cluster_scoped("install-config", format!("{slug}-local"));
     match store.load(&key).await {
         Ok(Some(stored)) => serde_json::from_value::<InstallConfig>(stored.spec)
             .map_err(|e| {
@@ -530,7 +530,7 @@ async fn load_install_config(store: &SqliteStore, slug: &str) -> Option<InstallC
 /// rollback so the metadata store doesn't keep a stale row pointing
 /// at a service that no longer exists.
 async fn delete_install_config(store: &SqliteStore, slug: &str) {
-    let key = ResourceKey::cluster_scoped("install-config", &format!("{slug}-local"));
+    let key = ResourceKey::cluster_scoped("install-config", format!("{slug}-local"));
     if let Err(e) = store.delete(&key, None).await {
         tracing::debug!(
             error = %e,
@@ -616,23 +616,131 @@ fn build_unified_config(
     })
 }
 
-/// Dispatch the uninstall path for a slug. Mirrors [`dispatch_install`]
-/// but for teardown -- used by the unified rollback flow.
-async fn dispatch_uninstall(slug: &str) -> Result<String, String> {
-    match slug {
-        "postgres" => run_postgres_uninstall().await,
-        "kanidm" => run_kanidm_uninstall().await,
-        "garage" => run_garage_uninstall().await,
-        "openfga" => run_openfga_uninstall().await,
-        "qdrant" => run_qdrant_uninstall().await,
-        "lakekeeper" => run_lakekeeper_uninstall().await,
-        "greptime" => run_greptime_uninstall().await,
-        "grafana" => run_grafana_uninstall().await,
-        "restate" => run_restate_uninstall().await,
-        "databend" => run_databend_uninstall().await,
-        other => Err(format!(
-            "dispatch_uninstall: unknown component slug {other:?}"
-        )),
+/// Apply per-slug [`InstallConfig`] overrides to the `unit_name` +
+/// `root_dir` fields shared by every component's UninstallOptions
+/// struct. No-op when individual fields are unset (operator accepted
+/// driver defaults at install time).
+#[cfg(target_os = "linux")]
+fn apply_uninstall_config_overrides(
+    config: &InstallConfig,
+    unit_name: &mut String,
+    root_dir: &mut std::path::PathBuf,
+) {
+    if let Some(s) = &config.service_name {
+        *unit_name = format!("{s}.service");
+    }
+    if let Some(d) = &config.root_dir {
+        *root_dir = std::path::PathBuf::from(d);
+    }
+}
+
+/// Custom-config variant of [`dispatch_uninstall`]. Used by the
+/// unified rollback flow so an operator who installed with custom
+/// `service_name` / `root_dir` doesn't end up with default-named
+/// services lingering after the rollback. Linux-only -- the v0.0.x
+/// install path is Linux-only anyway, so the non-Linux branch
+/// returns a clean error.
+async fn dispatch_uninstall_with_config(
+    slug: &str,
+    config: &InstallConfig,
+) -> Result<String, String> {
+    #[cfg(target_os = "linux")]
+    {
+        use computeza_driver_native::linux;
+        match slug {
+            "postgres" => {
+                let mut opts = linux::postgres::UninstallOptions::default();
+                apply_uninstall_config_overrides(config, &mut opts.unit_name, &mut opts.root_dir);
+                linux::postgres::uninstall(opts)
+                    .await
+                    .map(|r| format_uninstall_summary(&r.steps, &r.warnings))
+                    .map_err(|e| format!("{e}"))
+            }
+            "kanidm" => {
+                let mut opts = linux::kanidm::UninstallOptions::default();
+                apply_uninstall_config_overrides(config, &mut opts.unit_name, &mut opts.root_dir);
+                linux::kanidm::uninstall(opts)
+                    .await
+                    .map(|r| format_uninstall_summary(&r.steps, &r.warnings))
+                    .map_err(|e| format!("{e}"))
+            }
+            "garage" => {
+                let mut opts = linux::garage::UninstallOptions::default();
+                apply_uninstall_config_overrides(config, &mut opts.unit_name, &mut opts.root_dir);
+                linux::garage::uninstall(opts)
+                    .await
+                    .map(|r| format_uninstall_summary(&r.steps, &r.warnings))
+                    .map_err(|e| format!("{e}"))
+            }
+            "openfga" => {
+                let mut opts = linux::openfga::UninstallOptions::default();
+                apply_uninstall_config_overrides(config, &mut opts.unit_name, &mut opts.root_dir);
+                linux::openfga::uninstall(opts)
+                    .await
+                    .map(|r| format_uninstall_summary(&r.steps, &r.warnings))
+                    .map_err(|e| format!("{e}"))
+            }
+            "qdrant" => {
+                let mut opts = linux::qdrant::UninstallOptions::default();
+                apply_uninstall_config_overrides(config, &mut opts.unit_name, &mut opts.root_dir);
+                linux::qdrant::uninstall(opts)
+                    .await
+                    .map(|r| format_uninstall_summary(&r.steps, &r.warnings))
+                    .map_err(|e| format!("{e}"))
+            }
+            "lakekeeper" => {
+                let mut opts = linux::lakekeeper::UninstallOptions::default();
+                apply_uninstall_config_overrides(config, &mut opts.unit_name, &mut opts.root_dir);
+                linux::lakekeeper::uninstall(opts)
+                    .await
+                    .map(|r| format_uninstall_summary(&r.steps, &r.warnings))
+                    .map_err(|e| format!("{e}"))
+            }
+            "greptime" => {
+                let mut opts = linux::greptime::UninstallOptions::default();
+                apply_uninstall_config_overrides(config, &mut opts.unit_name, &mut opts.root_dir);
+                linux::greptime::uninstall(opts)
+                    .await
+                    .map(|r| format_uninstall_summary(&r.steps, &r.warnings))
+                    .map_err(|e| format!("{e}"))
+            }
+            "grafana" => {
+                let mut opts = linux::grafana::UninstallOptions::default();
+                apply_uninstall_config_overrides(config, &mut opts.unit_name, &mut opts.root_dir);
+                linux::grafana::uninstall(opts)
+                    .await
+                    .map(|r| format_uninstall_summary(&r.steps, &r.warnings))
+                    .map_err(|e| format!("{e}"))
+            }
+            "restate" => {
+                let mut opts = linux::restate::UninstallOptions::default();
+                apply_uninstall_config_overrides(config, &mut opts.unit_name, &mut opts.root_dir);
+                linux::restate::uninstall(opts)
+                    .await
+                    .map(|r| format_uninstall_summary(&r.steps, &r.warnings))
+                    .map_err(|e| format!("{e}"))
+            }
+            "databend" => {
+                let mut opts = linux::databend::UninstallOptions::default();
+                apply_uninstall_config_overrides(config, &mut opts.unit_name, &mut opts.root_dir);
+                linux::databend::uninstall(opts)
+                    .await
+                    .map(|r| format_uninstall_summary(&r.steps, &r.warnings))
+                    .map_err(|e| format!("{e}"))
+            }
+            other => Err(format!(
+                "dispatch_uninstall_with_config: unknown component slug {other:?}"
+            )),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (slug, config);
+        Err(
+            "dispatch_uninstall_with_config: v0.0.x install path is Linux-only; \
+             rollback with custom config is not available on this platform"
+                .into(),
+        )
     }
 }
 
@@ -2820,6 +2928,17 @@ async fn install_rollback_handler(
         .into_response();
     };
 
+    if !p.completed {
+        return Html(render_install_result(
+            &l,
+            false,
+            "Cannot roll back a job that is still running. Wait for it to complete (the wizard \
+             redirects to the result page automatically) and try again, or kill the server if \
+             the job is stuck and re-roll-back after restart.",
+        ))
+        .into_response();
+    }
+
     let installed: Vec<String> = p
         .components
         .iter()
@@ -2841,13 +2960,29 @@ async fn install_rollback_handler(
     }
 
     let store = state.store.clone();
+    let secrets = state.secrets.clone();
     let mut summary = String::new();
     let mut any_failed = false;
     // Reverse dependency order so consumers come down before their
     // dependencies (e.g. lakekeeper before postgres).
     for slug in installed.iter().rev() {
         summary.push_str(&format!("=== rollback: {slug} ===\n"));
-        match dispatch_uninstall(slug).await {
+
+        // Load the install-config the operator chose at install time
+        // (custom service_name / root_dir / etc) so the rollback
+        // targets the SAME service the install created, not the
+        // driver default. Falls back to InstallConfig::default() if
+        // no config was persisted (legacy installs or per-component
+        // install path that doesn't persist).
+        let config = if let Some(store) = &store {
+            load_install_config(store.as_ref(), slug)
+                .await
+                .unwrap_or_default()
+        } else {
+            InstallConfig::default()
+        };
+
+        match dispatch_uninstall_with_config(slug, &config).await {
             Ok(detail) => summary.push_str(&format!("{detail}\n\n")),
             Err(e) => {
                 any_failed = true;
@@ -2855,11 +2990,12 @@ async fn install_rollback_handler(
                 tracing::warn!(
                     component = %slug,
                     error = %e,
-                    "rollback: dispatch_uninstall failed; continuing with the rest of the chain"
+                    "rollback: dispatch_uninstall_with_config failed; continuing with the rest of the chain"
                 );
             }
         }
         if let Some(store) = &store {
+            // Drop the instance row.
             let kind = format!("{slug}-instance");
             let key = ResourceKey::cluster_scoped(&kind, "local");
             if let Err(e) = store.delete(&key, None).await {
@@ -2872,6 +3008,22 @@ async fn install_rollback_handler(
                 summary.push_str(&format!(
                     "Note: failed to drop {slug}-instance/local from metadata store ({e}).\n\n"
                 ));
+            }
+            // Drop the persisted install-config so the next install
+            // of this slug doesn't inherit stale overrides.
+            delete_install_config(store.as_ref(), slug).await;
+        }
+        // Drop the encrypted admin credential too -- the service is
+        // gone, the credential is meaningless.
+        if let Some(secrets) = &secrets {
+            let secret_ref = format!("{slug}/admin-password");
+            if let Err(e) = secrets.delete(&secret_ref).await {
+                tracing::debug!(
+                    error = %e,
+                    component = %slug,
+                    "rollback: secrets.delete({secret_ref}) failed; \
+                     ignoring -- the entry may not have existed"
+                );
             }
         }
     }
@@ -3221,18 +3373,36 @@ async fn resource_handler(
     let Some(store) = &state.store else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            Html(render_resource(&l, &kind, &name, None, true)),
+            Html(render_resource(&l, &kind, &name, None, None, true)),
         );
+    };
+    // If this is a managed component instance, eagerly load the
+    // persisted InstallConfig so the repair button can submit the
+    // operator's chosen service-name / root-dir / port / version as
+    // hidden inputs instead of letting the driver fall back to
+    // defaults.
+    let install_config: Option<InstallConfig> = match kind.strip_suffix("-instance") {
+        Some(slug) if INSTALL_ORDER.contains(&slug) => {
+            load_install_config(store.as_ref(), slug).await
+        }
+        _ => None,
     };
     let key = ResourceKey::cluster_scoped(&kind, &name);
     match store.load(&key).await {
         Ok(Some(stored)) => (
             StatusCode::OK,
-            Html(render_resource(&l, &kind, &name, Some(&stored), false)),
+            Html(render_resource(
+                &l,
+                &kind,
+                &name,
+                Some(&stored),
+                install_config.as_ref(),
+                false,
+            )),
         ),
         Ok(None) => (
             StatusCode::NOT_FOUND,
-            Html(render_resource(&l, &kind, &name, None, false)),
+            Html(render_resource(&l, &kind, &name, None, None, false)),
         ),
         Err(e) => {
             tracing::warn!(
@@ -3245,7 +3415,7 @@ async fn resource_handler(
             );
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Html(render_resource(&l, &kind, &name, None, false)),
+                Html(render_resource(&l, &kind, &name, None, None, false)),
             )
         }
     }
@@ -6787,6 +6957,7 @@ pub fn render_resource(
     kind: &str,
     name: &str,
     stored: Option<&computeza_state::StoredResource>,
+    install_config: Option<&InstallConfig>,
     store_missing: bool,
 ) -> String {
     let title = localizer.t("ui-resource-title");
@@ -6825,7 +6996,10 @@ pub fn render_resource(
         // Component slug for the repair / re-install button (kind
         // "postgres-instance" -> slug "postgres"). The button is only
         // rendered when the slug is one we recognize in the unified
-        // install dispatcher.
+        // install dispatcher. The form embeds the persisted
+        // InstallConfig (when available) as hidden inputs so the
+        // re-install targets the same service name / port / root dir
+        // the operator originally chose -- not driver defaults.
         let repair_block = kind
             .strip_suffix("-instance")
             .filter(|s| INSTALL_ORDER.contains(s))
@@ -6833,6 +7007,38 @@ pub fn render_resource(
                 let heading = localizer.t("ui-resource-repair-heading");
                 let intro = localizer.t("ui-resource-repair-intro");
                 let button = localizer.t("ui-resource-repair-button");
+
+                let hidden_inputs = match install_config {
+                    Some(c) => {
+                        let mut h = String::new();
+                        if let Some(v) = &c.version {
+                            h.push_str(&format!(
+                                r#"<input type="hidden" name="version" value="{}" />"#,
+                                html_escape(v)
+                            ));
+                        }
+                        if let Some(p) = c.port {
+                            h.push_str(&format!(
+                                r#"<input type="hidden" name="port" value="{p}" />"#
+                            ));
+                        }
+                        if let Some(d) = &c.root_dir {
+                            h.push_str(&format!(
+                                r#"<input type="hidden" name="root_dir" value="{}" />"#,
+                                html_escape(d)
+                            ));
+                        }
+                        if let Some(s) = &c.service_name {
+                            h.push_str(&format!(
+                                r#"<input type="hidden" name="service_name" value="{}" />"#,
+                                html_escape(s)
+                            ));
+                        }
+                        h
+                    }
+                    None => String::new(),
+                };
+
                 format!(
                     r#"<section class="cz-section">
 <div class="cz-card">
@@ -6840,6 +7046,7 @@ pub fn render_resource(
 <p class="cz-muted" style="margin: 0 0 0.85rem; font-size: 0.85rem;">{intro}</p>
 <form method="post" action="/install/{slug}">
 <input type="hidden" name="component" value="{slug}" />
+{hidden_inputs}
 <button type="submit" class="cz-btn">{button}</button>
 </form>
 </div>
@@ -6848,6 +7055,7 @@ pub fn render_resource(
                     intro = html_escape(&intro),
                     button = html_escape(&button),
                     slug = html_escape(slug),
+                    hidden_inputs = hidden_inputs,
                 )
             })
             .unwrap_or_default();
@@ -7063,7 +7271,7 @@ mod tests {
     #[test]
     fn render_resource_store_missing_path() {
         let l = Localizer::english();
-        let html = render_resource(&l, "postgres-instance", "primary", None, true);
+        let html = render_resource(&l, "postgres-instance", "primary", None, None, true);
         assert!(html.contains("postgres-instance / primary"));
         assert!(html.contains("needs a metadata store"));
     }
@@ -7071,7 +7279,7 @@ mod tests {
     #[test]
     fn render_resource_not_found_path() {
         let l = Localizer::english();
-        let html = render_resource(&l, "kanidm-instance", "missing", None, false);
+        let html = render_resource(&l, "kanidm-instance", "missing", None, None, false);
         assert!(html.contains("kanidm-instance / missing"));
         assert!(html.contains("not in the metadata store"));
     }
