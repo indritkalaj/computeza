@@ -922,6 +922,7 @@ dependencies = [
  "computeza-core",
  "computeza-driver-native",
  "computeza-i18n",
+ "computeza-identity-federation",
  "computeza-reconciler-postgres",
  "computeza-secrets",
  "computeza-state",

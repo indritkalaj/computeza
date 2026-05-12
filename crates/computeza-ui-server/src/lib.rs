@@ -1061,11 +1061,59 @@ fn build_unified_config(
             ));
         }
     };
+    // Parse optional IdP binding fields. When idp_kind is unset
+    // (operator left the dropdown on "None"), no IdpConfig is
+    // attached and federation is skipped for this component.
+    let idp_kind_raw = form
+        .get(&format!("{slug}__idp_kind"))
+        .map(String::as_str)
+        .unwrap_or("")
+        .trim();
+    let idp_config = if idp_kind_raw.is_empty() {
+        None
+    } else {
+        use computeza_identity_federation::IdpKind;
+        let kind = match idp_kind_raw {
+            "entra-id" => IdpKind::EntraId,
+            "aws-iam" => IdpKind::AwsIam,
+            "gcp-iam" => IdpKind::GcpIam,
+            "keycloak" => IdpKind::Keycloak,
+            "generic-oidc" => IdpKind::GenericOidc,
+            other => return Err(format!("{slug} unknown IdP kind: {other:?}")),
+        };
+        let get_str = |k: &str| -> String {
+            form.get(&format!("{slug}__{k}"))
+                .map(String::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        };
+        let cfg = computeza_identity_federation::IdpConfig {
+            kind,
+            discovery_url: get_str("idp_discovery_url"),
+            client_id: get_str("idp_client_id"),
+            client_secret_ref: {
+                let r = get_str("idp_secret_ref");
+                if r.is_empty() {
+                    None
+                } else {
+                    Some(r)
+                }
+            },
+            redirect_uri: get_str("idp_redirect_uri"),
+            claim_mappings: Vec::new(),
+        };
+        cfg.validate()
+            .map_err(|e| format!("{slug} IdP config: {e}"))?;
+        Some(cfg)
+    };
+
     Ok(InstallConfig {
         version,
         port,
         root_dir,
         service_name,
+        idp_config,
     })
 }
 
@@ -1320,6 +1368,12 @@ pub struct InstallConfig {
     /// uses the driver default (`computeza-<slug>`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_name: Option<String>,
+    /// Optional upstream IdP binding. Persisted alongside the spec
+    /// so the kanidm federation reconciler (v0.1+) can consume it
+    /// without an additional store lookup. `None` for components
+    /// the operator chose to leave on local-only auth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idp_config: Option<computeza_identity_federation::IdpConfig>,
 }
 
 impl InstallForm {
@@ -1358,6 +1412,12 @@ impl InstallForm {
             port,
             root_dir,
             service_name,
+            // Per-component install handlers don't yet expose the
+            // IdP form. The unified install at /install does;
+            // operators wanting federation on a per-component path
+            // can install via /install and the IdP config persists
+            // with the install-config row.
+            idp_config: None,
         })
     }
 }
@@ -4941,7 +5001,6 @@ fn render_unified_component_card(localizer: &Localizer, c: &ComponentEntry) -> S
     let role = localizer.t(c.role_key);
     let identity_label = localizer.t("ui-install-card-identity");
     let identity_help = localizer.t("ui-install-card-identity-help");
-    let identity_v01 = localizer.t("ui-install-card-identity-v01");
     let port_label = localizer.t("ui-install-port-label");
     let data_dir_label = localizer.t("ui-install-data-dir-label");
     let service_name_label = localizer.t("ui-install-service-name-label");
@@ -4997,8 +5056,28 @@ fn render_unified_component_card(localizer: &Localizer, c: &ComponentEntry) -> S
 <input id="{slug}__version" name="{slug}__version" class="cz-input" type="text" placeholder="latest"{disabled_attr} />
 </div>
 <div style="margin-top: 0.85rem; padding: 0.75rem 0.9rem; border-radius: 0.5rem; background: rgba(245, 181, 68, 0.08); border: 1px solid rgba(245, 181, 68, 0.25);">
-<p style="margin: 0 0 0.35rem; font-weight: 600; font-size: 0.85rem;">{identity_label} <span class="cz-badge cz-badge-info" style="margin-left: 0.5rem;">{identity_v01}</span></p>
-<p class="cz-muted" style="margin: 0; font-size: 0.82rem;">{identity_help}</p>
+<p style="margin: 0 0 0.35rem; font-weight: 600; font-size: 0.85rem;">{identity_label}</p>
+<p class="cz-muted" style="margin: 0 0 0.6rem; font-size: 0.82rem;">{identity_help}</p>
+<div style="display: flex; flex-direction: column; gap: 0.5rem;">
+<label for="{slug}__idp_kind" style="font-size: 0.82rem;">Upstream IdP</label>
+<select id="{slug}__idp_kind" name="{slug}__idp_kind" class="cz-select"{disabled_attr}>
+<option value="">None (local-only auth)</option>
+<option value="entra-id">Microsoft Entra ID</option>
+<option value="aws-iam">AWS IAM Identity Center</option>
+<option value="gcp-iam">GCP Identity Platform</option>
+<option value="keycloak">Keycloak</option>
+<option value="generic-oidc">Generic OIDC</option>
+</select>
+<label for="{slug}__idp_discovery_url" style="font-size: 0.82rem;">OIDC discovery URL</label>
+<input id="{slug}__idp_discovery_url" name="{slug}__idp_discovery_url" class="cz-input" type="url" placeholder="https://login.microsoftonline.com/&lt;tenant&gt;/v2.0/.well-known/openid-configuration"{disabled_attr} />
+<label for="{slug}__idp_client_id" style="font-size: 0.82rem;">Client ID</label>
+<input id="{slug}__idp_client_id" name="{slug}__idp_client_id" class="cz-input" type="text" placeholder="computeza-{slug}"{disabled_attr} />
+<label for="{slug}__idp_secret_ref" style="font-size: 0.82rem;">Client-secret ref (into the secrets store)</label>
+<input id="{slug}__idp_secret_ref" name="{slug}__idp_secret_ref" class="cz-input" type="text" placeholder="{slug}/idp-client-secret"{disabled_attr} />
+<label for="{slug}__idp_redirect_uri" style="font-size: 0.82rem;">Redirect URI</label>
+<input id="{slug}__idp_redirect_uri" name="{slug}__idp_redirect_uri" class="cz-input" type="url" placeholder="https://console.example.com/auth/callback"{disabled_attr} />
+<p class="cz-muted" style="margin: 0.35rem 0 0; font-size: 0.78rem;">Leave the IdP dropdown on "None" to skip federation for this component. Claim-to-group mappings configure on the /admin/operators page after first sign-on.</p>
+</div>
 </div>
 </div>
 </details>
@@ -5012,7 +5091,6 @@ fn render_unified_component_card(localizer: &Localizer, c: &ComponentEntry) -> S
         unavailable_block = unavailable_block,
         identity_label = html_escape(&identity_label),
         identity_help = html_escape(&identity_help),
-        identity_v01 = html_escape(&identity_v01),
         port_label = html_escape(&port_label),
         data_dir_label = html_escape(&data_dir_label),
         service_name_label = html_escape(&service_name_label),
@@ -8897,7 +8975,17 @@ mod tests {
             "there must be exactly one global Install button"
         );
         assert!(html.contains("Identity and access"));
-        assert!(html.contains("Configurable in v0.1+"));
+        // E20: identity-and-access disclosure now carries real
+        // form fields (IdP kind dropdown + discovery URL + etc.)
+        // instead of the v0.1-placeholder banner.
+        assert!(
+            html.contains(r#"name="postgres__idp_kind""#),
+            "every component card must expose an idp_kind selector"
+        );
+        assert!(
+            html.contains(r#"name="postgres__idp_discovery_url""#),
+            "every component card must expose an idp_discovery_url input"
+        );
     }
 
     #[test]
@@ -9115,6 +9203,7 @@ mod tests {
             port: Some(5433),
             root_dir: Some("/srv/pg-staging".into()),
             service_name: Some("computeza-postgres-staging".into()),
+            idp_config: None,
         };
         let html = render_resource(
             &l,
@@ -9165,6 +9254,7 @@ mod tests {
             port: Some(5433),
             root_dir: None,
             service_name: Some("computeza-postgres-staging".into()),
+            idp_config: None,
         };
         let v = serde_json::to_value(&original).expect("serialize");
         // None fields skip-serialize so blank input forms don't round-
@@ -9253,6 +9343,7 @@ mod tests {
             port: Some(5433),
             root_dir: Some("/srv/pg".into()),
             service_name: Some("computeza-postgres-staging".into()),
+            idp_config: None,
         };
         save_install_config(&store, "postgres", &config)
             .await
@@ -9320,6 +9411,7 @@ mod tests {
             port: Some(5433),
             root_dir: Some("/srv/pg".into()),
             version: None,
+            idp_config: None,
         };
         let spec = serde_json::json!({"endpoint": {"host": "127.0.0.1", "port": 5433}});
 

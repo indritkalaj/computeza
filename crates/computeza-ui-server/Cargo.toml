@@ -19,6 +19,7 @@ computeza-driver-native = { workspace = true }
 computeza-reconciler-postgres = { workspace = true }
 computeza-secrets = { workspace = true }
 computeza-audit = { workspace = true }
+computeza-identity-federation = { workspace = true }
 aes-gcm = { workspace = true }
 secrecy = { workspace = true }
 argon2 = { workspace = true }
