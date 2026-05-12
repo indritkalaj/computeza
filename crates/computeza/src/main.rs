@@ -170,6 +170,32 @@ fn main() -> anyhow::Result<()> {
                 }
                 state = state.with_operators(operators);
 
+                // Bootstrap the audit log. Key persists at
+                // <state_db_parent>/audit.key (chmod 0600); without
+                // persistence the signature chain breaks across
+                // restarts and historic events become unverifiable.
+                let parent = std::path::Path::new(&state_db)
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .map(std::path::Path::to_path_buf)
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                let audit_key_path = parent.join("audit.key");
+                let audit_log_path = parent.join("audit.jsonl");
+                let audit_key = open_or_init_audit_key(&audit_key_path).await?;
+                let audit = computeza_audit::AuditLog::open(&audit_log_path, audit_key)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "opening AuditLog at {}: {e}",
+                            audit_log_path.display()
+                        )
+                    })?;
+                tracing::info!(
+                    audit_log = %audit_log_path.display(),
+                    "audit log attached; sign-in, sign-out, and first-boot setup events are recorded here"
+                );
+                state = state.with_audit(audit);
+
                 match open_secrets_store(&state_db).await? {
                     Some(s) => {
                         tracing::info!(
@@ -537,6 +563,50 @@ async fn ensure_secrets_salt(path: &std::path::Path) -> anyhow::Result<Vec<u8>> 
          unrecoverable -- there is no master recovery path by design."
     );
     Ok(salt.to_vec())
+}
+
+/// Open the audit signing key at `path`, or generate + persist a
+/// fresh one on first run. The key persistence is what lets the
+/// signature chain survive a server restart; without it the chain
+/// would break each reboot and the audit log becomes unverifiable
+/// past the most recent process lifetime.
+///
+/// The key file is `chmod 0600` on Unix; anyone with read access to
+/// it can forge audit entries for past dates.
+async fn open_or_init_audit_key(
+    path: &std::path::Path,
+) -> anyhow::Result<computeza_audit::AuditKey> {
+    if tokio::fs::try_exists(path).await.unwrap_or(false) {
+        let bytes = tokio::fs::read(path).await?;
+        let arr: [u8; 32] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("audit key at {} is not 32 bytes", path.display()))?;
+        return Ok(computeza_audit::AuditKey::from_secret_bytes(arr));
+    }
+    let key = computeza_audit::AuditKey::generate();
+    let bytes = key.to_secret_bytes();
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(path, bytes).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = tokio::fs::metadata(path).await {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o600);
+            let _ = tokio::fs::set_permissions(path, perms).await;
+        }
+    }
+    tracing::warn!(
+        path = %path.display(),
+        "Generated a NEW ed25519 audit signing key (first-run event). \
+         Back this file up alongside the secrets salt -- losing it means the \
+         audit signature chain breaks at the next restart and historic events \
+         become unverifiable."
+    );
+    Ok(key)
 }
 
 /// Configure the global tracing subscriber. Reads `RUST_LOG` for filtering

@@ -171,6 +171,20 @@ ui-account-intro           = Details for your operator account. Signing out dest
 ui-account-username        = Username
 ui-account-session-since   = Session started
 
+# --- Audit log viewer ---
+
+ui-audit-title           = Audit log
+ui-audit-intro           = Append-only event log for every administrative action on this Computeza install. Each entry is signed with the server's ed25519 audit key and chained to the previous entry via BLAKE3, so any tampering past the latest event is detectable. Newest events appear first; the viewer caps at 200 rows.
+ui-audit-empty           = No audit events recorded yet. Sign in to the console or run any administrative action to populate the log.
+ui-audit-missing         = No audit log is attached to this server. Re-run `computeza serve` with a writable state directory; the audit file lives next to the metadata store at `<state_db_parent>/audit.jsonl`.
+ui-audit-col-seq         = #
+ui-audit-col-timestamp   = Timestamp (UTC)
+ui-audit-col-actor       = Actor
+ui-audit-col-action      = Action
+ui-audit-col-resource    = Resource
+ui-audit-nav             = Audit
+ui-audit-verifying-key   = Verifying key
+
 # --- Home dashboard cards ---
 
 ui-home-card-components-title = Managed components

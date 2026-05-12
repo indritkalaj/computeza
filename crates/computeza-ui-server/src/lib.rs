@@ -93,6 +93,10 @@ pub struct AppState {
     pub operators: Option<auth::OperatorFile>,
     /// In-process session table.
     pub sessions: auth::SessionStore,
+    /// Append-only audit log (ed25519-signed, chained). `None` for
+    /// the smoke-test harness; the binary always attaches one.
+    /// Login / logout / setup flows route through this when present.
+    pub audit: Option<Arc<computeza_audit::AuditLog>>,
 }
 
 impl AppState {
@@ -105,6 +109,7 @@ impl AppState {
             secrets: None,
             operators: None,
             sessions: auth::SessionStore::new(),
+            audit: None,
         }
     }
 
@@ -117,7 +122,15 @@ impl AppState {
             secrets: None,
             operators: None,
             sessions: auth::SessionStore::new(),
+            audit: None,
         }
+    }
+
+    /// Attach an audit log. Chainable with the other builders.
+    #[must_use]
+    pub fn with_audit(mut self, audit: computeza_audit::AuditLog) -> Self {
+        self.audit = Some(Arc::new(audit));
+        self
     }
 
     /// Attach an encrypted [`SecretsStore`] to the state. Chainable
@@ -333,6 +346,7 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/setup", get(setup_form_handler).post(setup_post_handler))
         .route("/logout", post(logout_handler))
         .route("/account", get(account_handler))
+        .route("/audit", get(audit_handler))
         .route("/healthz", get(healthz_handler))
         .route("/api/state/info", get(state_info_handler))
         .route("/static/computeza.css", get(css_handler))
@@ -3401,9 +3415,29 @@ async fn login_post_handler(
                 username = %rec.username,
                 "operator signed in; session minted and cookie set"
             );
+            if let Some(audit) = &state.audit {
+                let _ = audit
+                    .append(
+                        rec.username.clone(),
+                        computeza_audit::Action::Authn,
+                        None,
+                        serde_json::json!({"username": rec.username}),
+                    )
+                    .await;
+            }
             response
         }
         Err(_) => {
+            if let Some(audit) = &state.audit {
+                let _ = audit
+                    .append(
+                        form.username.clone(),
+                        computeza_audit::Action::Authn,
+                        None,
+                        serde_json::json!({"username": form.username}),
+                    )
+                    .await;
+            }
             let failure = l.t("ui-login-failed");
             Html(render_login(&l, &form.next, Some(&failure))).into_response()
         }
@@ -3499,6 +3533,23 @@ async fn account_handler(axum::Extension(session): axum::Extension<auth::Session
     Html(render_account(&l, &session))
 }
 
+/// GET /audit -- recent audit-log events. Auth-required (the
+/// middleware bounces unauthenticated visitors to /login). Caps at
+/// 200 rows; older events stay on disk but the viewer doesn't
+/// paginate yet (v0.1+ refinement).
+async fn audit_handler(State(state): State<AppState>) -> Html<String> {
+    let l = Localizer::english();
+    let Some(audit) = &state.audit else {
+        return Html(render_audit(&l, None, None));
+    };
+    let events = audit.list_recent(200).await.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "audit list_recent failed; rendering empty page");
+        Vec::new()
+    });
+    let verifying_key = audit.verifying_key_b64().await;
+    Html(render_audit(&l, Some(&events), Some(&verifying_key)))
+}
+
 async fn healthz_handler() -> String {
     let l = Localizer::english();
     l.t("ui-healthz-ok")
@@ -3561,6 +3612,8 @@ pub enum NavLink {
     Secrets,
     /// Operator account / sign-out page.
     Account,
+    /// Audit log viewer.
+    Audit,
     /// No nav link highlighted (e.g. resource detail page).
     None,
 }
@@ -3583,6 +3636,7 @@ pub fn render_shell(
     let nav_state = localizer.t("ui-nav-state");
     let nav_secrets = localizer.t("ui-admin-secrets");
     let nav_account = localizer.t("ui-nav-account");
+    let nav_audit = localizer.t("ui-audit-nav");
     let version_label = localizer.t("ui-footer-version");
     let version = env!("CARGO_PKG_VERSION");
 
@@ -3616,6 +3670,7 @@ pub fn render_shell(
     <a href="/status" class="{ns}">{nav_status}</a>
     <a href="/state" class="{nm}">{nav_state}</a>
     <a href="/admin/secrets" class="{na}">{nav_secrets}</a>
+    <a href="/audit" class="{naud}">{nav_audit}</a>
     <a href="/account" class="{nacc}">{nav_account}</a>
   </div>
 </nav>
@@ -3633,6 +3688,7 @@ pub fn render_shell(
         ns = nav_class(NavLink::Status),
         nm = nav_class(NavLink::State),
         na = nav_class(NavLink::Secrets),
+        naud = nav_class(NavLink::Audit),
         nacc = nav_class(NavLink::Account),
     )
 }
@@ -6900,6 +6956,116 @@ pub fn render_account(localizer: &Localizer, session: &auth::Session) -> String 
     render_shell(localizer, &title, NavLink::Account, &body)
 }
 
+/// Render `GET /audit` -- the audit-log viewer. Passing `None` for
+/// `events` indicates the audit log is not attached on this server
+/// (e.g. the smoke-test surface). Passing `Some(&[])` renders an
+/// empty-state card so the operator knows the log is wired but no
+/// events have been written yet.
+#[must_use]
+pub fn render_audit(
+    localizer: &Localizer,
+    events: Option<&[computeza_audit::AuditEvent]>,
+    verifying_key_b64: Option<&str>,
+) -> String {
+    let title = localizer.t("ui-audit-title");
+    let intro = localizer.t("ui-audit-intro");
+    let empty = localizer.t("ui-audit-empty");
+    let missing = localizer.t("ui-audit-missing");
+    let col_seq = localizer.t("ui-audit-col-seq");
+    let col_ts = localizer.t("ui-audit-col-timestamp");
+    let col_actor = localizer.t("ui-audit-col-actor");
+    let col_action = localizer.t("ui-audit-col-action");
+    let col_resource = localizer.t("ui-audit-col-resource");
+    let verifying_label = localizer.t("ui-audit-verifying-key");
+
+    let body = match events {
+        None => format!(
+            r#"<section class="cz-hero">
+<h1>{title}</h1>
+<p>{intro}</p>
+</section>
+<section class="cz-section">
+<div class="cz-card" style="border-color: rgba(245, 181, 68, 0.55);">
+<p class="cz-card-body" style="margin: 0; color: var(--warn);">{missing}</p>
+</div>
+</section>"#,
+            title = html_escape(&title),
+            intro = html_escape(&intro),
+            missing = html_escape(&missing),
+        ),
+        Some([]) => format!(
+            r#"<section class="cz-hero">
+<h1>{title}</h1>
+<p>{intro}</p>
+</section>
+<section class="cz-section">
+<div class="cz-card"><p class="cz-card-body" style="margin: 0;">{empty}</p></div>
+</section>"#,
+            title = html_escape(&title),
+            intro = html_escape(&intro),
+            empty = html_escape(&empty),
+        ),
+        Some(events) => {
+            let rows: String = events
+                .iter()
+                .map(|e| {
+                    let resource = e.body.resource.as_deref().unwrap_or("-");
+                    format!(
+                        r#"<tr>
+<td class="cz-cell-mono">{seq}</td>
+<td class="cz-cell-mono cz-cell-dim">{ts}</td>
+<td>{actor}</td>
+<td><span class="cz-badge cz-badge-info">{action}</span></td>
+<td class="cz-cell-mono">{resource}</td>
+</tr>"#,
+                        seq = e.body.seq,
+                        ts = html_escape(&e.body.timestamp.to_rfc3339()),
+                        actor = html_escape(&e.body.actor),
+                        action = html_escape(&format!("{:?}", e.body.action)),
+                        resource = html_escape(resource),
+                    )
+                })
+                .collect();
+            let key_block = match verifying_key_b64 {
+                Some(k) => format!(
+                    r#"<p class="cz-muted" style="margin-top: 1rem; font-size: 0.82rem;"><strong>{verifying_label}:</strong> <code>{k}</code></p>"#,
+                    verifying_label = html_escape(&verifying_label),
+                    k = html_escape(k),
+                ),
+                None => String::new(),
+            };
+            format!(
+                r#"<section class="cz-hero">
+<h1>{title}</h1>
+<p>{intro}</p>
+</section>
+<section class="cz-section">
+<div class="cz-card">
+<table class="cz-table" style="width: 100%;">
+<thead><tr><th>{col_seq}</th><th>{col_ts}</th><th>{col_actor}</th><th>{col_action}</th><th>{col_resource}</th></tr></thead>
+<tbody>
+{rows}
+</tbody>
+</table>
+{key_block}
+</div>
+</section>"#,
+                title = html_escape(&title),
+                intro = html_escape(&intro),
+                col_seq = html_escape(&col_seq),
+                col_ts = html_escape(&col_ts),
+                col_actor = html_escape(&col_actor),
+                col_action = html_escape(&col_action),
+                col_resource = html_escape(&col_resource),
+                rows = rows,
+                key_block = key_block,
+            )
+        }
+    };
+
+    render_shell(localizer, &title, NavLink::Audit, &body)
+}
+
 /// Render `GET /setup` when an operator account already exists.
 /// Carries a link onward to `/login` so the operator can sign in.
 #[must_use]
@@ -8502,6 +8668,48 @@ mod tests {
             load_install_config(&store, "postgres").await.is_none(),
             "teardown must drop install-config regardless of dispatch result"
         );
+    }
+
+    #[test]
+    fn render_audit_renders_store_missing_when_none() {
+        let l = Localizer::english();
+        let html = render_audit(&l, None, None);
+        assert!(html.contains("No audit log is attached"));
+        assert!(!html.contains("Verifying key"));
+    }
+
+    #[test]
+    fn render_audit_renders_empty_state() {
+        let l = Localizer::english();
+        let html = render_audit(&l, Some(&[]), None);
+        assert!(html.contains("No audit events recorded yet"));
+    }
+
+    #[test]
+    fn render_audit_renders_events_newest_first_with_columns() {
+        use computeza_audit::{Action, AuditEvent, AuditEventBody};
+        let l = Localizer::english();
+        let event_a = AuditEvent {
+            body: AuditEventBody {
+                id: uuid::Uuid::nil(),
+                seq: 1,
+                timestamp: chrono::DateTime::parse_from_rfc3339("2026-05-12T10:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+                prev_digest: String::new(),
+                actor: "admin".into(),
+                action: Action::Authn,
+                resource: None,
+                detail: serde_json::json!({"username": "admin"}),
+            },
+            signature: "sig-base64".into(),
+        };
+        let html = render_audit(&l, Some(&[event_a]), Some("pubkey-base64"));
+        assert!(html.contains("admin"));
+        assert!(html.contains("Authn"));
+        assert!(html.contains("2026-05-12T10:00:00"));
+        assert!(html.contains("Verifying key"));
+        assert!(html.contains("pubkey-base64"));
     }
 
     #[tokio::test]

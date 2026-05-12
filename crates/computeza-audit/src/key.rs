@@ -41,6 +41,30 @@ impl AuditKey {
         }
     }
 
+    /// Restore an audit key from a raw 32-byte secret. Pairs with
+    /// [`AuditKey::to_secret_bytes`] so an operator-console binary
+    /// can persist the key across restarts (without persistence the
+    /// signature chain breaks every time the server reboots, which
+    /// makes the audit log unverifiable past the most recent run).
+    ///
+    /// The caller is responsible for protecting the file on disk --
+    /// anyone with read access to the bytes can forge audit entries
+    /// for past dates.
+    #[must_use]
+    pub fn from_secret_bytes(secret: [u8; 32]) -> Self {
+        Self {
+            signing: SigningKey::from_bytes(&secret),
+        }
+    }
+
+    /// Export the 32-byte signing secret so the caller can persist
+    /// it next to the audit log. Treat the returned bytes as a
+    /// secret -- they grant the ability to forge audit entries.
+    #[must_use]
+    pub fn to_secret_bytes(&self) -> [u8; 32] {
+        self.signing.to_bytes()
+    }
+
     /// Sign `bytes` with the audit key. Returns base64 (standard, no padding).
     pub fn sign(&self, bytes: &[u8]) -> String {
         let sig = self.signing.sign(bytes);

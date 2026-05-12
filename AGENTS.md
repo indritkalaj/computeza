@@ -520,6 +520,56 @@ identity-federation crate land. v0.0.x installs against loopback
 trust auth so the reconciler can observe; the unified form does not
 yet collect any credential material.
 
+## Authentication and audit
+
+The operator console enforces session-cookie auth across every route
+that mutates state. The public surface is the marketing landing page
+at `/`, plus `/login`, `/setup`, `/components`, `/healthz`, `/static/*`,
+and `/favicon.ico`. Everything else (the install hub, status,
+metadata store, secrets, audit viewer, account page) requires a valid
+`computeza_session` cookie.
+
+### Where data lives
+
+- `<state_db_parent>/operators.jsonl` -- one operator account per
+  line. Username in clear, password as Argon2id PHC hash with a
+  16-byte salt embedded. Created by `POST /setup` on first boot;
+  subsequent operators are not yet creatable through the UI (v0.1+).
+- `<state_db_parent>/audit.key` -- ed25519 signing key, 32 bytes,
+  `chmod 0600`. Generated on first run and persisted so the audit
+  signature chain survives restarts. Treat as a secret -- anyone
+  with read access can forge past audit entries.
+- `<state_db_parent>/audit.jsonl` -- append-only audit log, one event
+  per line. Each event carries the operator's username, the action
+  category (`Authn` for login flows; reconciler crates use the other
+  variants), a resource pointer, and a BLAKE3 chain digest plus
+  ed25519 signature. The viewer at `/audit` renders the newest 200.
+- `<state_db_parent>/computeza-secrets.{salt,jsonl}` -- the encrypted
+  secrets store (already documented in the Host prerequisites
+  section). Independent of the auth artifacts above.
+
+### Threat model (v0.0.x)
+
+- Console binds 127.0.0.1 by default. Loopback-bound trust is the
+  baseline; CSRF + cross-origin attacks are mitigated by
+  `SameSite=Strict` on the session cookie.
+- HTTPS is out of scope for v0.0.x. Operators who expose the console
+  beyond loopback should terminate TLS at a reverse proxy (nginx,
+  Caddy) and set `Secure` on the cookie via a follow-up patch.
+- Sessions live in process memory; restart = forced re-sign-in.
+  Persistent sessions are a v0.1+ ask.
+- Explicit CSRF tokens on every POST are a v0.1+ defense-in-depth
+  add. SameSite=Strict is sufficient until the console is exposed
+  beyond loopback (where subdomain-based CSRF becomes a concern).
+
+### Adding a new public path
+
+`auth::PUBLIC_PATH_PREFIXES` in `crates/computeza-ui-server/src/auth.rs`
+is the canonical list. Anything not in the prefix set requires a
+valid session. Adding a new public surface (e.g. a `/pricing` page)
+means appending to that constant and adding the unit-test row in
+`is_public_path_classifies_known_routes`.
+
 ## Host prerequisites
 
 The product owner's directive: "we also need to deliver the dependencies

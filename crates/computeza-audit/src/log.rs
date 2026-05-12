@@ -146,6 +146,35 @@ impl AuditLog {
         let g = self.inner.lock().await;
         g.key.verifying_key_b64()
     }
+
+    /// Read the most recent events from the on-disk log, newest
+    /// first. Reads up to `limit` lines (or the whole file when
+    /// `limit` exceeds the line count); does not verify signatures
+    /// inline -- the caller can call [`AuditEvent::verify_with`]
+    /// against each result if a verification pass is wanted.
+    ///
+    /// Used by the operator console's `/audit` viewer.
+    pub async fn list_recent(&self, limit: usize) -> Result<Vec<AuditEvent>, AuditError> {
+        let g = self.inner.lock().await;
+        let path = g.path.clone();
+        drop(g);
+        if !tokio::fs::try_exists(&path).await? {
+            return Ok(Vec::new());
+        }
+        let raw = tokio::fs::read(&path).await?;
+        let mut out: Vec<AuditEvent> = Vec::new();
+        for line in raw.split(|b| *b == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let evt: AuditEvent = serde_json::from_slice(line)?;
+            out.push(evt);
+        }
+        // Newest first.
+        out.reverse();
+        out.truncate(limit);
+        Ok(out)
+    }
 }
 
 /// Returned by [`AuditLog::append`] for callers that want to chain
