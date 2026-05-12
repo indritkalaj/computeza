@@ -16,7 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tokio::{fs, io::AsyncWriteExt, net::TcpStream, time::sleep};
+use tokio::{fs, net::TcpStream, time::sleep};
 use tracing::{info, warn};
 
 use super::{path as pathmod, systemctl};

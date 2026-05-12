@@ -205,6 +205,7 @@ fn parse_os_release_field(body: &str, key: &str) -> Option<String> {
     None
 }
 
+#[cfg(not(target_os = "linux"))]
 fn unsupported_message(detected: &str) -> String {
     format!(
         "Detected {detected}. v0.0.x installs the data-plane components only on \
