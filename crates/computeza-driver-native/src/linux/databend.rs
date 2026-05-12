@@ -14,18 +14,20 @@ use super::service::{
 pub const UNIT_NAME: &str = "computeza-databend.service";
 pub const DEFAULT_PORT: u16 = 8000;
 
+// Repo moved from datafuselabs to databendlabs. Versions use the
+// `patch` suffix on stable; nightly tags also exist on the same repo
+// but we pin to patch releases.
 const DATABEND_BUNDLES: &[Bundle] = &[
     Bundle {
-        version: "1.2.700",
-        // TODO: verify against https://github.com/datafuselabs/databend/releases
-        url: "https://github.com/datafuselabs/databend/releases/download/v1.2.700-nightly/databend-v1.2.700-nightly-x86_64-unknown-linux-musl.tar.gz",
+        version: "1.2.888-patch-8",
+        url: "https://github.com/databendlabs/databend/releases/download/v1.2.888-patch-8/databend-v1.2.888-patch-8-x86_64-unknown-linux-gnu.tar.gz",
         kind: ArchiveKind::TarGz,
         sha256: None,
         bin_subpath: "bin",
     },
     Bundle {
-        version: "1.2.600",
-        url: "https://github.com/datafuselabs/databend/releases/download/v1.2.600-nightly/databend-v1.2.600-nightly-x86_64-unknown-linux-musl.tar.gz",
+        version: "1.2.880-patch-1",
+        url: "https://github.com/databendlabs/databend/releases/download/v1.2.880-patch-1/databend-v1.2.880-patch-1-x86_64-unknown-linux-gnu.tar.gz",
         kind: ArchiveKind::TarGz,
         sha256: None,
         bin_subpath: "bin",

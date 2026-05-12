@@ -12,21 +12,23 @@ use super::service::{self, InstalledService, ServiceError, ServiceInstall, Unins
 pub const UNIT_NAME: &str = "computeza-grafana.service";
 pub const DEFAULT_PORT: u16 = 3000;
 
+// Verified May 2026. Grafana doesn't publish on GitHub releases;
+// it has its own CDN at dl.grafana.com. The archive root directory
+// is `grafana-vX.Y.Z/` with `bin/`, `conf/`, etc. inside.
 const GRAFANA_BUNDLES: &[Bundle] = &[
     Bundle {
-        version: "11.4.0",
-        // TODO: verify against https://grafana.com/grafana/download
-        url: "https://dl.grafana.com/oss/release/grafana-11.4.0.linux-amd64.tar.gz",
+        version: "13.0.1",
+        url: "https://dl.grafana.com/oss/release/grafana-13.0.1.linux-amd64.tar.gz",
         kind: ArchiveKind::TarGz,
         sha256: None,
-        bin_subpath: "grafana-v11.4.0/bin",
+        bin_subpath: "grafana-v13.0.1/bin",
     },
     Bundle {
-        version: "11.3.0",
-        url: "https://dl.grafana.com/oss/release/grafana-11.3.0.linux-amd64.tar.gz",
+        version: "12.4.3",
+        url: "https://dl.grafana.com/oss/release/grafana-12.4.3.linux-amd64.tar.gz",
         kind: ArchiveKind::TarGz,
         sha256: None,
-        bin_subpath: "grafana-v11.3.0/bin",
+        bin_subpath: "grafana-v12.4.3/bin",
     },
 ];
 

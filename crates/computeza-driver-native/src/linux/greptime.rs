@@ -12,21 +12,21 @@ use super::service::{self, InstalledService, ServiceError, ServiceInstall, Unins
 pub const UNIT_NAME: &str = "computeza-greptime.service";
 pub const DEFAULT_HTTP_PORT: u16 = 4000;
 
+// Verified May 2026 against the GitHub Releases API.
 const GREPTIME_BUNDLES: &[Bundle] = &[
     Bundle {
-        version: "0.13.0",
-        // TODO: verify against https://github.com/GreptimeTeam/greptimedb/releases
-        url: "https://github.com/GreptimeTeam/greptimedb/releases/download/v0.13.0/greptime-linux-amd64-v0.13.0.tar.gz",
+        version: "1.0.1",
+        url: "https://github.com/GreptimeTeam/greptimedb/releases/download/v1.0.1/greptime-linux-amd64-v1.0.1.tar.gz",
         kind: ArchiveKind::TarGz,
         sha256: None,
-        bin_subpath: "greptime-linux-amd64-v0.13.0",
+        bin_subpath: "",
     },
     Bundle {
-        version: "0.12.0",
-        url: "https://github.com/GreptimeTeam/greptimedb/releases/download/v0.12.0/greptime-linux-amd64-v0.12.0.tar.gz",
+        version: "1.0.0",
+        url: "https://github.com/GreptimeTeam/greptimedb/releases/download/v1.0.0/greptime-linux-amd64-v1.0.0.tar.gz",
         kind: ArchiveKind::TarGz,
         sha256: None,
-        bin_subpath: "greptime-linux-amd64-v0.12.0",
+        bin_subpath: "",
     },
 ];
 

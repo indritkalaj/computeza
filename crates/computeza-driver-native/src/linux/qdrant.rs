@@ -14,18 +14,18 @@ use super::service::{
 pub const UNIT_NAME: &str = "computeza-qdrant.service";
 pub const DEFAULT_HTTP_PORT: u16 = 6333;
 
+// Verified May 2026 against the GitHub Releases API.
 const QDRANT_BUNDLES: &[Bundle] = &[
     Bundle {
-        version: "1.13.0",
-        // TODO: verify against https://github.com/qdrant/qdrant/releases
-        url: "https://github.com/qdrant/qdrant/releases/download/v1.13.0/qdrant-x86_64-unknown-linux-gnu.tar.gz",
+        version: "1.18.0",
+        url: "https://github.com/qdrant/qdrant/releases/download/v1.18.0/qdrant-x86_64-unknown-linux-gnu.tar.gz",
         kind: ArchiveKind::TarGz,
         sha256: None,
         bin_subpath: "",
     },
     Bundle {
-        version: "1.12.5",
-        url: "https://github.com/qdrant/qdrant/releases/download/v1.12.5/qdrant-x86_64-unknown-linux-gnu.tar.gz",
+        version: "1.17.1",
+        url: "https://github.com/qdrant/qdrant/releases/download/v1.17.1/qdrant-x86_64-unknown-linux-gnu.tar.gz",
         kind: ArchiveKind::TarGz,
         sha256: None,
         bin_subpath: "",

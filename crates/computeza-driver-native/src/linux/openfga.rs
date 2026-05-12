@@ -14,18 +14,18 @@ use super::service::{
 pub const UNIT_NAME: &str = "computeza-openfga.service";
 pub const DEFAULT_HTTP_PORT: u16 = 8080;
 
+// Verified May 2026 against the GitHub Releases API.
 const OPENFGA_BUNDLES: &[Bundle] = &[
     Bundle {
-        version: "1.11.0",
-        // TODO: verify against https://github.com/openfga/openfga/releases
-        url: "https://github.com/openfga/openfga/releases/download/v1.11.0/openfga_1.11.0_linux_amd64.tar.gz",
+        version: "1.15.1",
+        url: "https://github.com/openfga/openfga/releases/download/v1.15.1/openfga_1.15.1_linux_amd64.tar.gz",
         kind: ArchiveKind::TarGz,
         sha256: None,
         bin_subpath: "",
     },
     Bundle {
-        version: "1.10.0",
-        url: "https://github.com/openfga/openfga/releases/download/v1.10.0/openfga_1.10.0_linux_amd64.tar.gz",
+        version: "1.15.0",
+        url: "https://github.com/openfga/openfga/releases/download/v1.15.0/openfga_1.15.0_linux_amd64.tar.gz",
         kind: ArchiveKind::TarGz,
         sha256: None,
         bin_subpath: "",

@@ -123,10 +123,45 @@ ui-install-advanced          = Advanced options
 ui-install-already-installed = Already installed? Uninstall first to start fresh.
 
 ui-install-kanidm-title  = Install Kanidm
-ui-install-kanidm-intro  = Kanidm is the identity provider Computeza uses for SSO, OAuth2, passkeys, and RADIUS. The install downloads the kanidmd server binary, writes a minimal `server.toml`, and registers a native OS service. Production deployments need a real TLS certificate placed under the data dir before the daemon will start.
+ui-install-kanidm-intro  = Kanidm is the identity provider Computeza uses for SSO, OAuth2, passkeys, and RADIUS. The install compiles `kanidmd` from crates.io (10-15 min), generates a self-signed TLS cert, writes a minimal `server.toml`, and registers a systemd unit. After install run `kanidmd recover_account admin` to bootstrap the initial admin password.
 
 ui-uninstall-kanidm-title = Uninstall Kanidm
 ui-uninstall-kanidm-intro = Roll back the Kanidm install: stop the service, remove the OS service unit, delete the data directory under the install root, and drop kanidm-instance/local from the metadata store. The cached binary bundle is preserved so re-install is fast.
+
+ui-install-garage-title  = Install Garage
+ui-install-garage-intro  = Garage is the S3-compatible, geo-distributed object store. Install drops the prebuilt binary from the deuxfleurs CDN, writes a single-node `garage.toml` (replication_factor = 1, sqlite metadata), and registers a systemd unit. Adjust replication + multi-node layout via the admin API after first boot.
+ui-uninstall-garage-title = Uninstall Garage
+ui-uninstall-garage-intro = Roll back the Garage install: stop the service, remove the systemd unit, delete the data directory, drop garage-instance/local from the metadata store. The cached binary is preserved.
+
+ui-install-openfga-title  = Install OpenFGA
+ui-install-openfga-intro  = OpenFGA is the fine-grained authorization service (Zanzibar-style). Install downloads the binary from the upstream GitHub release, runs it with in-memory storage on the chosen port, and registers a systemd unit. Switch to Postgres storage by editing the unit's ExecStart args.
+ui-uninstall-openfga-title = Uninstall OpenFGA
+ui-uninstall-openfga-intro = Roll back the OpenFGA install: stop the service, remove the systemd unit, drop openfga-instance/local from the metadata store. In-memory storage means there is no data dir to delete.
+
+ui-install-qdrant-title  = Install Qdrant
+ui-install-qdrant-intro  = Qdrant is the production vector retrieval API. Install downloads the binary, writes a minimal `config.yaml`, registers a systemd unit, and binds REST on the chosen port + gRPC on port+1.
+ui-uninstall-qdrant-title = Uninstall Qdrant
+ui-uninstall-qdrant-intro = Roll back the Qdrant install: stop the service, remove the systemd unit, delete the data directory (vector storage). Drops qdrant-instance/local from the metadata store.
+
+ui-install-greptime-title  = Install GreptimeDB
+ui-install-greptime-intro  = GreptimeDB is the unified observability database (metrics, logs, traces). Install downloads the binary, registers a systemd unit running `greptime standalone start`, binds HTTP on the chosen port.
+ui-uninstall-greptime-title = Uninstall GreptimeDB
+ui-uninstall-greptime-intro = Roll back the GreptimeDB install: stop the service, remove the systemd unit, delete the data directory. Drops greptime-instance/local from the metadata store.
+
+ui-install-lakekeeper-title  = Install Lakekeeper
+ui-install-lakekeeper-intro  = Lakekeeper is the Iceberg REST catalog with Generic Tables support. Install downloads the binary, registers a systemd unit. Note: Lakekeeper needs a PostgreSQL backing store -- install postgres-instance first and configure the connection in the systemd unit's environment block.
+ui-uninstall-lakekeeper-title = Uninstall Lakekeeper
+ui-uninstall-lakekeeper-intro = Roll back the Lakekeeper install: stop the service, remove the systemd unit, drop lakekeeper-instance/local from the metadata store.
+
+ui-install-databend-title  = Install Databend
+ui-install-databend-intro  = Databend is the columnar SQL + vector + full-text + geospatial engine. Install downloads the binary from the databendlabs GitHub release, writes a minimal `databend-query.toml` (fs storage backend), and registers a systemd unit.
+ui-uninstall-databend-title = Uninstall Databend
+ui-uninstall-databend-intro = Roll back the Databend install: stop the service, remove the systemd unit, delete the data directory. Drops databend-instance/local from the metadata store.
+
+ui-install-grafana-title  = Install Grafana
+ui-install-grafana-intro  = Grafana is the BI and visualization layer. Install downloads the binary from dl.grafana.com, registers a systemd unit. Default admin login is `admin / admin` -- change it immediately after first login.
+ui-uninstall-grafana-title = Uninstall Grafana
+ui-uninstall-grafana-intro = Roll back the Grafana install: stop the service, remove the systemd unit, delete the data directory (dashboards, datasources). Drops grafana-instance/local from the metadata store.
 
 ui-uninstall-title    = Uninstall PostgreSQL
 ui-uninstall-intro    = This rolls back the install: stops the Windows service, deletes the data directory, removes the psql shim from PATH, and drops postgres-instance/local from the metadata store. The cached binary bundle is preserved so re-install is fast.

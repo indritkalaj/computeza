@@ -15,18 +15,19 @@ use super::service::{self, InstalledService, ServiceError, ServiceInstall, Unins
 pub const UNIT_NAME: &str = "computeza-lakekeeper.service";
 pub const DEFAULT_PORT: u16 = 8181;
 
+// Verified May 2026 against the GitHub Releases API. Lakekeeper
+// ships gnu rather than musl builds.
 const LAKEKEEPER_BUNDLES: &[Bundle] = &[
     Bundle {
-        version: "0.9.0",
-        // TODO: verify against https://github.com/lakekeeper/lakekeeper/releases
-        url: "https://github.com/lakekeeper/lakekeeper/releases/download/v0.9.0/lakekeeper-x86_64-unknown-linux-musl.tar.gz",
+        version: "0.12.2",
+        url: "https://github.com/lakekeeper/lakekeeper/releases/download/v0.12.2/lakekeeper-x86_64-unknown-linux-gnu.tar.gz",
         kind: ArchiveKind::TarGz,
         sha256: None,
         bin_subpath: "",
     },
     Bundle {
-        version: "0.8.0",
-        url: "https://github.com/lakekeeper/lakekeeper/releases/download/v0.8.0/lakekeeper-x86_64-unknown-linux-musl.tar.gz",
+        version: "0.11.6",
+        url: "https://github.com/lakekeeper/lakekeeper/releases/download/v0.11.6/lakekeeper-x86_64-unknown-linux-gnu.tar.gz",
         kind: ArchiveKind::TarGz,
         sha256: None,
         bin_subpath: "",

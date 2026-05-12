@@ -14,10 +14,10 @@ use super::service::{
 pub const UNIT_NAME: &str = "computeza-garage.service";
 pub const DEFAULT_S3_PORT: u16 = 3900;
 
+// Verified May 2026 -- the deuxfleurs CDN serves these URLs.
 const GARAGE_BUNDLES: &[Bundle] = &[
     Bundle {
         version: "2.0.0",
-        // TODO: verify against https://garagehq.deuxfleurs.fr/download/
         url: "https://garagehq.deuxfleurs.fr/_releases/v2.0.0/x86_64-unknown-linux-musl/garage",
         kind: ArchiveKind::Raw,
         sha256: None,
