@@ -118,12 +118,21 @@ pub enum InstallError {
 }
 
 /// Common locations a system Postgres install might leave its binaries.
+/// Keep the major-version list in sync with `detect_installed`'s scan
+/// loop -- both must agree on which majors Computeza recognises.
 const CANDIDATE_BIN_DIRS: &[&str] = &[
+    "/usr/lib/postgresql/18/bin",
+    "/usr/lib/postgresql/17/bin",
     "/usr/lib/postgresql/16/bin",
     "/usr/lib/postgresql/15/bin",
     "/usr/lib/postgresql/14/bin",
+    "/usr/lib/postgresql/13/bin",
+    "/usr/pgsql-18/bin",
+    "/usr/pgsql-17/bin",
     "/usr/pgsql-16/bin",
     "/usr/pgsql-15/bin",
+    "/usr/pgsql-14/bin",
+    "/usr/pgsql-13/bin",
     "/opt/postgresql/bin",
     "/usr/bin",
     "/usr/local/bin",
