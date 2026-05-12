@@ -26,6 +26,8 @@
 
 #![warn(missing_docs)]
 
+pub mod auth;
+
 use std::net::SocketAddr;
 
 use axum::{
@@ -70,9 +72,10 @@ pub type JobRegistry = Arc<StdMutex<HashMap<String, Arc<StdMutex<InstallProgress
 
 /// Shared state passed to every handler. Holds the `SqliteStore` (when
 /// `computeza serve` opens one), the encrypted [`SecretsStore`] (when
-/// the operator has set `COMPUTEZA_SECRETS_PASSPHRASE`), and the
-/// background-job registry. Wrapped in `Arc` so axum can clone it
-/// cheaply per request.
+/// the operator has set `COMPUTEZA_SECRETS_PASSPHRASE`), the operator
+/// account store + session table for auth, and the background-job
+/// registry. Wrapped in `Arc` so axum can clone it cheaply per
+/// request.
 #[derive(Clone)]
 pub struct AppState {
     /// Persistent metadata store, `None` for the unit-test smoke router.
@@ -84,6 +87,12 @@ pub struct AppState {
     /// credentials degrade to surfacing them in-band on the result
     /// page instead of persisting them encrypted.
     pub secrets: Option<Arc<SecretsStore>>,
+    /// Operator account store. `None` for the smoke-test harness; the
+    /// real binary always attaches one (auth is disabled wholesale
+    /// when this is None, intended only for unit-test surfaces).
+    pub operators: Option<auth::OperatorFile>,
+    /// In-process session table.
+    pub sessions: auth::SessionStore,
 }
 
 impl AppState {
@@ -94,6 +103,8 @@ impl AppState {
             store: None,
             jobs: Arc::new(StdMutex::new(HashMap::new())),
             secrets: None,
+            operators: None,
+            sessions: auth::SessionStore::new(),
         }
     }
 
@@ -104,6 +115,8 @@ impl AppState {
             store: Some(Arc::new(store)),
             jobs: Arc::new(StdMutex::new(HashMap::new())),
             secrets: None,
+            operators: None,
+            sessions: auth::SessionStore::new(),
         }
     }
 
@@ -112,6 +125,14 @@ impl AppState {
     #[must_use]
     pub fn with_secrets(mut self, secrets: SecretsStore) -> Self {
         self.secrets = Some(Arc::new(secrets));
+        self
+    }
+
+    /// Attach the operator account store. Once attached, the auth
+    /// middleware enforces login on every non-public route.
+    #[must_use]
+    pub fn with_operators(mut self, operators: auth::OperatorFile) -> Self {
+        self.operators = Some(operators);
         self
     }
 }
