@@ -136,15 +136,24 @@ async fn server_serves_localized_home_and_healthz() {
     let body = resp.text().await.expect("body text");
     assert!(body.contains(r#"action="/install/postgres""#));
 
-    // /install/<other-non-postgres> -- the CLI explainer page.
-    // Kanidm has wizard code in tree but routes are commented out
-    // because its vendor doesn't ship prebuilt binaries (see
-    // module note); it falls through to the catch-all.
+    // /install/kanidm -- kanidm has its own wizard now (Linux
+    // `cargo install` flow). Available: true on the hub.
     let resp = client
         .get(format!("http://{addr}/install/kanidm"))
         .send()
         .await
         .expect("GET /install/kanidm");
+    assert!(resp.status().is_success());
+    let body = resp.text().await.expect("body text");
+    assert!(body.contains("Install Kanidm"));
+    assert!(body.contains(r#"action="/install/kanidm""#));
+
+    // /install/<other-still-planned> -- still the CLI explainer.
+    let resp = client
+        .get(format!("http://{addr}/install/garage"))
+        .send()
+        .await
+        .expect("GET /install/garage");
     assert!(resp.status().is_success());
     let body = resp.text().await.expect("body text");
     assert!(body.contains("Install from the CLI"));

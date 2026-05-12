@@ -137,21 +137,14 @@ pub fn router_with_state(state: AppState) -> Router {
             "/install/postgres/uninstall",
             get(uninstall_confirm_handler).post(uninstall_postgres_handler),
         )
-        // Kanidm routes are intentionally NOT registered while
-        // `available: false` on the hub card. The wizard form +
-        // 3-OS drivers exist in code, but the Bundle URLs 404
-        // because kanidm doesn't ship prebuilt binaries on GitHub
-        // releases. Once the package-manager dispatch lands, flip
-        // available=true and re-enable the routes below.
-        //
-        // .route(
-        //     "/install/kanidm",
-        //     get(install_kanidm_form_handler).post(install_kanidm_handler),
-        // )
-        // .route(
-        //     "/install/kanidm/uninstall",
-        //     get(uninstall_kanidm_confirm_handler).post(uninstall_kanidm_handler),
-        // )
+        .route(
+            "/install/kanidm",
+            get(install_kanidm_form_handler).post(install_kanidm_handler),
+        )
+        .route(
+            "/install/kanidm/uninstall",
+            get(uninstall_kanidm_confirm_handler).post(uninstall_kanidm_handler),
+        )
         .route("/install/{component}", get(install_component_handler))
         .route("/install/job/{id}", get(install_job_handler))
         .route("/api/install/job/{id}", get(install_job_api_handler))
@@ -404,13 +397,11 @@ async fn uninstall_postgres_handler(State(state): State<AppState>) -> Response {
 // disabled while the hub card is `available: false`. See the
 // commented-out kanidm routes in `router_with_state`.
 // ============================================================
-#[allow(dead_code)]
 async fn install_kanidm_form_handler() -> Html<String> {
     let l = Localizer::english();
     Html(render_install_kanidm(&l))
 }
 
-#[allow(dead_code)]
 async fn install_kanidm_handler(
     State(state): State<AppState>,
     Form(form): Form<InstallForm>,
@@ -480,13 +471,11 @@ async fn install_kanidm_handler(
     Redirect303(format!("/install/job/{job_id}")).into_response()
 }
 
-#[allow(dead_code)]
 async fn uninstall_kanidm_confirm_handler() -> Html<String> {
     let l = Localizer::english();
     Html(render_uninstall_kanidm_confirm(&l))
 }
 
-#[allow(dead_code)]
 async fn uninstall_kanidm_handler(State(state): State<AppState>) -> Response {
     let l = Localizer::english();
     let result = run_kanidm_uninstall().await;
@@ -1646,13 +1635,14 @@ const COMPONENTS: &[ComponentEntry] = &[
         slug: "kanidm",
         name_key: "component-kanidm-name",
         role_key: "component-kanidm-role",
-        // Note: the wizard form + 3-OS drivers are wired, but
-        // kanidm doesn't publish prebuilt binaries on GitHub
-        // releases -- distribution is via distro package managers
-        // (zypper / dnf / apt / brew) + Docker + `cargo install`.
-        // The download-from-GitHub path will 404. Flipping to
-        // `true` once the package-manager dispatch lands.
-        available: false,
+        // Linux install path lives. Compiles kanidmd from crates.io
+        // via `cargo install --locked --version <pin> --root <path>`,
+        // generates a self-signed TLS cert via openssl, writes
+        // server.toml, registers a systemd unit, starts. Operator
+        // still needs `kanidmd recover_account admin` post-install
+        // to bootstrap the admin password (surfaced in the wizard
+        // result page).
+        available: true,
     },
     ComponentEntry {
         slug: "garage",
@@ -2190,13 +2180,9 @@ fn kanidm_version_options() -> Vec<VersionOption> {
         kanidm::available_versions()
             .iter()
             .enumerate()
-            .map(|(i, b)| VersionOption {
-                value: b.version.into(),
-                label: format!(
-                    "Kanidm {}{}",
-                    b.version,
-                    if i == 0 { " (latest)" } else { "" }
-                ),
+            .map(|(i, v)| VersionOption {
+                value: (*v).to_string(),
+                label: format!("Kanidm {v}{}", if i == 0 { " (latest)" } else { "" }),
             })
             .collect()
     }
