@@ -436,6 +436,45 @@ button at the bottom POSTs back to `/install`, which spawns one job
 that runs every available component sequentially through
 [`INSTALL_ORDER`] in `crates/computeza-ui-server/src/lib.rs`.
 
+### Per-install persistence + lifecycle
+
+Each component install in the unified flow persists **three** metadata
+rows after a successful install:
+
+1. `<slug>-instance/local` -- the spec the reconciler observes against
+   (endpoint, databases, etc.). Already required by the reconciler.
+2. `install-config/<slug>-local` -- the `InstallConfig` the operator
+   chose (version pin, port override, data dir override, service name
+   override). Persisted so rollback / repair can target the same
+   service the install created instead of falling back to driver
+   defaults.
+3. `<slug>/admin-password` in the encrypted `SecretsStore`
+   (only for components with an admin-credential concept: postgres,
+   kanidm, grafana). Generated **after** a successful install so a
+   failed install never leaves an orphan secret.
+
+The rollback flow (`POST /install/job/{id}/rollback`) reads
+`install-config/<slug>-local` for each Done component, builds an
+`UninstallOptions` with the persisted `service_name` + `root_dir`
+overrides, and tears down via `dispatch_uninstall_with_config`. After
+each component uninstall it also drops the install-config row and the
+`<slug>/admin-password` entry, so a torn-down component leaves no
+metadata or credential residue.
+
+The repair flow on `/resource/{kind}/{name}` reads the persisted
+config and embeds it as hidden inputs on the Re-install form so the
+re-run targets the same service the install created.
+
+**Known gap (per-component pages):** the legacy per-component pages
+at `/install/<slug>` and `/install/<slug>/uninstall` do NOT yet save
+or read `install-config/<slug>-local`. Operators who mix flows
+(install via `/install`, then teardown via `/install/postgres/uninstall`)
+will hit the same custom-service-name miss the rollback flow used to
+have. The fix is symmetric: each per-component install handler should
+save install-config + generate credentials, and each per-component
+uninstall handler should load install-config + dispatch through
+`dispatch_uninstall_with_config`. Tracked as a v0.0.x follow-up.
+
 Adding a new component to the unified install:
 
 1. Append the slug to `INSTALL_ORDER` in the position that respects
