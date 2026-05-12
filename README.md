@@ -17,6 +17,20 @@ are governed by `docs/Architecture-and-Product-Specification-v1.5.pdf`
 (referenced as "the spec" in source comments). v1.0 GA target: **Q2 2027**
 per spec section 13.
 
+## Platform support
+
+**v0.0.x is Linux-only for the data-plane install path.** The 11 managed
+components (PostgreSQL, Kanidm, Garage, ...) ship native install drivers
+for Linux first; macOS + Windows variants are v0.1+ work. The PostgreSQL
+driver retains incidental macOS + Windows coverage from earlier work --
+that surface is frozen, not extended; new components target Linux only.
+
+The operator console itself (`computeza serve`) runs on any OS that
+builds Rust. You can run the web UI on Windows pointing at remote Linux
+hosts that own the actual installs; install actions from the wizard
+just need a Linux host on the other end. Spec section 10 documents the
+multi-OS roadmap.
+
 ## Core principles
 
 These are non-negotiable. They drive every design decision in the codebase.

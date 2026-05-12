@@ -414,4 +414,11 @@ When adding a new component (kanidm, garage, lakekeeper, ...):
   and the `computeza` binary have real implementations.
 - `cargo run --bin computeza -- serve` boots the operator console at
   `127.0.0.1:8400` (default per spec section 10.6).
+- **v0.0.x is Linux-only for the data-plane install path.** The 11
+  managed components target Linux first. macOS + Windows native install
+  drivers ship in v0.1+. The PostgreSQL driver retains incidental macOS
+  + Windows coverage from earlier work -- treat that surface as frozen,
+  do not extend new components to other OSes until the Linux story is
+  complete for all 11. The operator console (`computeza serve`) itself
+  remains cross-platform; only install actions are Linux-gated.
 - v1.0 GA target: Q2 2027 per spec section 13.
