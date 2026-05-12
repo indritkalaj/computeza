@@ -720,6 +720,10 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/install/job/{id}/rollback", post(install_rollback_handler))
         .route("/api/install/job/{id}", get(install_job_api_handler))
         .route("/admin/secrets", get(secrets_index_handler))
+        .route(
+            "/admin/secrets/setup/generate-passphrase",
+            post(secrets_setup_generate_handler),
+        )
         .route("/admin/secrets/{name}/rotate", post(secrets_rotate_handler))
         .route("/status", get(status_handler))
         .route("/state", get(state_page_handler))
@@ -3215,7 +3219,10 @@ async fn install_job_handler(
 /// Names only; values stay encrypted on disk and are never surfaced
 /// from this page. Per-row Rotate button posts to
 /// `/admin/secrets/{name}/rotate` which replaces the value and shows
-/// the new value exactly once.
+/// the new value exactly once. When no store is attached
+/// (COMPUTEZA_SECRETS_PASSPHRASE unset), the page surfaces a first-
+/// boot wizard so the operator can generate a passphrase and copy
+/// it into a systemd drop-in.
 async fn secrets_index_handler(State(state): State<AppState>) -> Html<String> {
     let l = Localizer::english();
     let names = match &state.secrets {
@@ -3232,6 +3239,35 @@ async fn secrets_index_handler(State(state): State<AppState>) -> Html<String> {
         None => None,
     };
     Html(render_secrets_index(&l, names.as_deref()))
+}
+
+/// POST /admin/secrets/setup/generate-passphrase -- generate a 256-bit
+/// CSPRNG passphrase (32 random bytes, hex-encoded), display it once
+/// alongside the systemd drop-in template the operator needs to wire
+/// it into `computeza serve`. The passphrase is **not** persisted by
+/// Computeza -- the operator must copy it out before navigating away
+/// (and back up alongside the salt + ciphertext files per the
+/// disaster-recovery rule in [`computeza_secrets`]).
+async fn secrets_setup_generate_handler() -> Response {
+    let passphrase = generate_passphrase_hex();
+    let l = Localizer::english();
+    Html(render_secrets_setup_generated(&l, &passphrase)).into_response()
+}
+
+/// 64-char hex passphrase backed by 256 bits of CSPRNG entropy.
+/// Hex keeps the value ASCII-only so it survives every shell quoting
+/// rule without re-encoding -- safe to paste into a systemd
+/// EnvironmentFile, a `.env` file, or `export FOO=...`.
+fn generate_passphrase_hex() -> String {
+    use aes_gcm::aead::rand_core::RngCore;
+    use aes_gcm::aead::OsRng;
+    let mut buf = [0u8; 32];
+    OsRng.fill_bytes(&mut buf);
+    let mut out = String::with_capacity(64);
+    for b in &buf {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
 }
 
 /// POST /admin/secrets/{name}/rotate -- replace the named secret's
@@ -8380,6 +8416,74 @@ pub fn render_admin_branding(
     render_shell(localizer, &title, NavLink::Branding, &body)
 }
 
+/// Render the one-time-view page produced by the
+/// "Generate passphrase" button on `/admin/secrets`. The passphrase
+/// is shown verbatim with copy-to-clipboard affordance and a ready-
+/// made systemd EnvironmentFile snippet. Computeza does not retain
+/// the passphrase -- this is the operator's only chance to grab it.
+#[must_use]
+pub fn render_secrets_setup_generated(localizer: &Localizer, passphrase: &str) -> String {
+    let title = localizer.t("ui-secrets-title");
+    let pphr_esc = html_escape(passphrase);
+    let body = format!(
+        r#"<section class="cz-hero">
+<h1>Passphrase generated</h1>
+<p>Copy the value below into your environment before navigating away. Computeza did not save it -- if you lose this tab, click Generate again to mint a fresh one (every newly-derived KEK requires re-encrypting any previously-stored secrets, so generate now and back up before storing anything sensitive).</p>
+</section>
+<section class="cz-section">
+<div class="cz-card" style="border-color: rgba(245, 181, 68, 0.55);">
+<p class="cz-card-body" style="margin: 0;"><span class="cz-badge cz-badge-warn">One-time view</span>&nbsp; Treat this passphrase like a root password. Anyone with it + the salt file + the ciphertext file recovers every stored secret.</p>
+</div>
+</section>
+<section class="cz-section">
+<div class="cz-card">
+<h3 style="margin: 0 0 0.4rem;">Your passphrase</h3>
+<div style="display: flex; gap: 0.5rem; align-items: stretch;">
+<input id="cz-pphr" type="text" readonly value="{passphrase}" class="cz-input" style="font-family: ui-monospace, monospace; font-size: 0.85rem; flex: 1; margin: 0;" />
+<button type="button" class="cz-btn" onclick="(function(){{var i=document.getElementById('cz-pphr'); i.select(); navigator.clipboard.writeText(i.value); this.textContent='Copied'; setTimeout(function(){{document.querySelector('button[onclick*=cz-pphr]').textContent='Copy';}},2000);}}).call(this)">Copy</button>
+</div>
+</div>
+</section>
+<section class="cz-section">
+<div class="cz-card">
+<h3 style="margin: 0 0 0.4rem;">systemd drop-in template</h3>
+<p class="cz-muted" style="margin: 0 0 0.6rem; font-size: 0.85rem;">Drop the env file into <code>/etc/computeza/</code> with restrictive permissions, then reference it from your <code>computeza.service</code> unit via <code>EnvironmentFile=</code>. Reload + restart for the change to take effect.</p>
+<pre style="background: var(--surface-2, #161b22); padding: 0.85rem; border-radius: 0.4rem; font-size: 0.78rem; overflow-x: auto; margin: 0;">sudo install -d -m 0750 -o root -g root /etc/computeza
+sudo tee /etc/computeza/computeza.env &gt;/dev/null &lt;&lt;'EOF'
+COMPUTEZA_SECRETS_PASSPHRASE={passphrase}
+EOF
+sudo chmod 0640 /etc/computeza/computeza.env
+sudo chown root:root /etc/computeza/computeza.env
+
+# In computeza.service (or via systemctl edit computeza.service):
+#   [Service]
+#   EnvironmentFile=/etc/computeza/computeza.env
+
+sudo systemctl daemon-reload
+sudo systemctl restart computeza</pre>
+</div>
+</section>
+<section class="cz-section">
+<div class="cz-card">
+<h3 style="margin: 0 0 0.4rem;">Inline shell (dev / one-off)</h3>
+<pre style="background: var(--surface-2, #161b22); padding: 0.85rem; border-radius: 0.4rem; font-size: 0.78rem; overflow-x: auto; margin: 0;">export COMPUTEZA_SECRETS_PASSPHRASE={passphrase}
+computeza serve --addr 127.0.0.1:8400 --state-db /var/lib/computeza/state.db</pre>
+</div>
+</section>
+<section class="cz-section">
+<div class="cz-card" style="border-color: rgba(245, 181, 68, 0.55);">
+<p class="cz-card-body" style="margin: 0;"><strong>Back up THREE things together:</strong> this passphrase, the salt file (<code>computeza-secrets.salt</code>), and the ciphertext file (<code>computeza-secrets.jsonl</code>). Losing any one of them = permanent secret loss.</p>
+</div>
+</section>
+<section class="cz-section">
+<a href="/admin/secrets" class="cz-btn">Return to secrets</a>
+</section>"#,
+        passphrase = pphr_esc,
+    );
+    let _ = title;
+    render_shell(localizer, "Passphrase generated", NavLink::Secrets, &body)
+}
+
 /// Render `GET /admin/license` -- live license envelope viewer +
 /// activation form. `status` is the live verification result; the
 /// page surfaces a renewal banner when `status.should_warn()` and
@@ -8932,7 +9036,41 @@ pub fn render_secrets_index(localizer: &Localizer, names: Option<&[String]>) -> 
 </section>
 <section class="cz-section">
 <div class="cz-card" style="border-color: rgba(245, 181, 68, 0.55);">
-<p class="cz-card-body" style="margin: 0; color: var(--warn);">{store_missing}</p>
+<p class="cz-card-body" style="margin: 0 0 0.6rem; color: var(--warn);"><strong>No secrets store attached.</strong> {store_missing}</p>
+<p class="cz-muted" style="margin: 0; font-size: 0.85rem;">Walk through the three-step wizard below to wire one up in under a minute. The control plane keeps running in degraded mode (in-band credentials only) until you do.</p>
+</div>
+</section>
+<section class="cz-section">
+<div class="cz-card">
+<h3 style="margin: 0 0 0.4rem;">Step 1 -- Generate a strong passphrase</h3>
+<p class="cz-muted" style="margin: 0 0 0.85rem; font-size: 0.85rem;">Computeza emits 256 bits of CSPRNG entropy as a 64-character hex string. The passphrase is shown to you exactly once on the next page; copy it out before navigating away. Computeza never persists the passphrase.</p>
+<form method="post" action="/admin/secrets/setup/generate-passphrase" style="margin: 0;">
+<input type="hidden" name="csrf_token" value="" />
+<button type="submit" class="cz-btn cz-btn-primary">Generate passphrase</button>
+</form>
+</div>
+</section>
+<section class="cz-section">
+<div class="cz-card">
+<h3 style="margin: 0 0 0.4rem;">Step 2 -- Wire it into <code>computeza serve</code></h3>
+<p class="cz-muted" style="margin: 0 0 0.6rem; font-size: 0.85rem;">After generating: put the passphrase in your environment. The recommended shape is a systemd drop-in env file at <code>/etc/computeza/computeza.env</code> referenced by <code>EnvironmentFile=</code> in your service unit -- the template appears on the result page. For dev / one-off runs an inline <code>export</code> works too.</p>
+<pre style="background: var(--surface-2, #161b22); padding: 0.85rem; border-radius: 0.4rem; font-size: 0.78rem; overflow-x: auto; margin: 0;">sudo install -d -m 0750 -o root -g root /etc/computeza
+sudo install -m 0640 -o root -g root /dev/null /etc/computeza/computeza.env
+sudo tee /etc/computeza/computeza.env &gt;/dev/null &lt;&lt;'EOF'
+COMPUTEZA_SECRETS_PASSPHRASE=&lt;paste your generated passphrase here&gt;
+EOF</pre>
+</div>
+</section>
+<section class="cz-section">
+<div class="cz-card">
+<h3 style="margin: 0 0 0.4rem;">Step 3 -- Back up the disaster-recovery triple</h3>
+<p class="cz-muted" style="margin: 0 0 0.6rem; font-size: 0.85rem;">Losing <em>any one</em> of these three renders every secret unrecoverable -- by design, no master recovery path:</p>
+<ol class="cz-muted" style="margin: 0 0 0.6rem 1.2rem; font-size: 0.85rem;">
+<li>the <code>COMPUTEZA_SECRETS_PASSPHRASE</code> value</li>
+<li>the salt file (<code>computeza-secrets.salt</code>) next to the state DB</li>
+<li>the ciphertext file (<code>computeza-secrets.jsonl</code>) next to the state DB</li>
+</ol>
+<p class="cz-muted" style="margin: 0; font-size: 0.85rem;">Restart <code>computeza serve</code> after editing the env file. This page will switch to the live secret list once the store attaches.</p>
 </div>
 </section>"#,
             title = html_escape(&title),
@@ -10691,6 +10829,45 @@ mod tests {
         });
         assert!(banner.contains("Renewal due"));
         assert!(banner.contains("14"));
+    }
+
+    // ---- Secrets first-boot wizard ----
+
+    #[test]
+    fn generate_passphrase_hex_returns_64_hex_chars() {
+        let p = generate_passphrase_hex();
+        assert_eq!(p.len(), 64);
+        assert!(p.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn generate_passphrase_hex_produces_distinct_values_per_call() {
+        let a = generate_passphrase_hex();
+        let b = generate_passphrase_hex();
+        assert_ne!(a, b, "passphrases must be unique per call");
+    }
+
+    #[test]
+    fn render_secrets_setup_generated_embeds_passphrase_and_systemd_template() {
+        let l = Localizer::english();
+        let pphr = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let html = render_secrets_setup_generated(&l, pphr);
+        assert!(html.contains(pphr), "passphrase must render verbatim");
+        assert!(html.contains("EnvironmentFile"));
+        assert!(html.contains("computeza-secrets.salt"));
+        assert!(html.contains("computeza-secrets.jsonl"));
+        assert!(html.contains("daemon-reload"));
+        assert!(html.contains("One-time view"));
+    }
+
+    #[test]
+    fn render_secrets_index_shows_three_step_wizard_when_store_missing() {
+        let l = Localizer::english();
+        let html = render_secrets_index(&l, None);
+        assert!(html.contains("Step 1"));
+        assert!(html.contains("Step 2"));
+        assert!(html.contains("Step 3"));
+        assert!(html.contains("/admin/secrets/setup/generate-passphrase"));
     }
 
     #[test]
