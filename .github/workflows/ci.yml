@@ -74,23 +74,7 @@ jobs:
       - name: Install Rust toolchain
         run: rustup show
       - uses: Swatinem/rust-cache@v2
-      - name: clippy (with output captured to job summary)
-        # Temporary: pipe stderr to the public job summary so the
-        # actual lint error is visible without log-download admin rights.
-        # Revert this step back to a plain `cargo clippy ... --locked`
-        # once the linux-specific failure is fixed.
-        run: |
-          set -o pipefail
-          {
-            echo '## clippy output'
-            echo
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-          cargo clippy --workspace --all-targets --locked 2>&1 \
-            | tee -a "$GITHUB_STEP_SUMMARY"
-          status=$?
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          exit "$status"
+      - run: cargo clippy --workspace --all-targets --locked
 
   audit:
     name: cargo audit
@@ -129,25 +113,5 @@ jobs:
       - name: Install Rust toolchain
         run: rustup show
       - uses: Swatinem/rust-cache@v2
-      - name: build + test (with output captured to job summary)
-        # Temporary: same diagnostic capture as the clippy job. Revert
-        # once the linux-specific build failure is fixed.
-        run: |
-          set -o pipefail
-          {
-            echo '## test output'
-            echo
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-          cargo build --workspace --locked 2>&1 \
-            | tee -a "$GITHUB_STEP_SUMMARY"
-          build_status=$?
-          if [ "$build_status" -ne 0 ]; then
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-            exit "$build_status"
-          fi
-          cargo test --workspace --locked 2>&1 \
-            | tee -a "$GITHUB_STEP_SUMMARY"
-          test_status=$?
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          exit "$test_status"
+      - run: cargo build --workspace --locked
+      - run: cargo test --workspace --locked
