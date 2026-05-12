@@ -109,7 +109,7 @@ async fn server_serves_localized_home_and_healthz() {
     let body: serde_json::Value = resp.json().await.expect("json body");
     assert_eq!(body["store_attached"], false);
 
-    // /install -- wizard form page with a postgres option
+    // /install -- hub of component cards.
     let resp = client
         .get(format!("http://{addr}/install"))
         .send()
@@ -121,9 +121,30 @@ async fn server_serves_localized_home_and_healthz() {
         resp.status()
     );
     let body = resp.text().await.expect("body text");
-    assert!(body.contains("Install a component"));
+    assert!(body.contains("Choose a component"));
     assert!(body.contains("PostgreSQL"));
+    assert!(body.contains("Kanidm"));
+    assert!(body.contains(r#"href="/install/postgres""#));
+
+    // /install/postgres -- the actual install wizard form.
+    let resp = client
+        .get(format!("http://{addr}/install/postgres"))
+        .send()
+        .await
+        .expect("GET /install/postgres");
+    assert!(resp.status().is_success());
+    let body = resp.text().await.expect("body text");
     assert!(body.contains(r#"action="/install/postgres""#));
+
+    // /install/<other> -- coming-soon page.
+    let resp = client
+        .get(format!("http://{addr}/install/kanidm"))
+        .send()
+        .await
+        .expect("GET /install/kanidm");
+    assert!(resp.status().is_success());
+    let body = resp.text().await.expect("body text");
+    assert!(body.contains("Coming soon"));
 
     // /status -- with no store attached, surfaces the store-missing hint
     let resp = client

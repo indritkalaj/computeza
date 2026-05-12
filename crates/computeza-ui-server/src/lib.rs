@@ -128,12 +128,16 @@ pub fn router_with_state(state: AppState) -> Router {
     Router::new()
         .route("/", get(home_handler))
         .route("/components", get(components_handler))
-        .route("/install", get(install_handler))
-        .route("/install/postgres", post(install_postgres_handler))
+        .route("/install", get(install_hub_handler))
+        .route(
+            "/install/postgres",
+            get(install_postgres_form_handler).post(install_postgres_handler),
+        )
         .route(
             "/install/postgres/uninstall",
             get(uninstall_confirm_handler).post(uninstall_postgres_handler),
         )
+        .route("/install/{component}", get(install_component_handler))
         .route("/install/job/{id}", get(install_job_handler))
         .route("/api/install/job/{id}", get(install_job_api_handler))
         .route("/status", get(status_handler))
@@ -158,10 +162,22 @@ pub fn router_with_state(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn install_handler() -> Html<String> {
+async fn install_hub_handler() -> Html<String> {
+    let l = Localizer::english();
+    Html(render_install_hub(&l))
+}
+
+async fn install_postgres_form_handler() -> Html<String> {
     let l = Localizer::english();
     let detected = computeza_driver_native::detect::postgres().await;
     Html(render_install(&l, &detected))
+}
+
+async fn install_component_handler(Path(component): Path<String>) -> Html<String> {
+    let l = Localizer::english();
+    // Postgres lives at `/install/postgres` with its own route; this
+    // catch-all handles the other 10 entries on the install hub.
+    Html(render_install_coming_soon(&l, &component))
 }
 
 #[derive(serde::Deserialize)]
@@ -1354,6 +1370,188 @@ fn html_escape(s: &str) -> String {
 /// Render the `/install` page: a wizard form that POSTs to
 /// `/install/postgres` and lays down a native PostgreSQL service on the
 /// host. Per spec section 2.1 / 4.2 the install path is GUI-equivalent
+/// One row in the install hub: a component the operator can install.
+#[derive(Clone, Copy, Debug)]
+struct ComponentEntry {
+    /// URL slug used by `/install/<slug>` -- matches the
+    /// `<component>-instance` kind in the metadata store.
+    slug: &'static str,
+    /// i18n key for the localized display name (defined in `ui.ftl`
+    /// under `component-<slug>-name`).
+    name_key: &'static str,
+    /// i18n key for the localized one-line role description.
+    role_key: &'static str,
+    /// When true, the install wizard is fully wired. When false the
+    /// row links to a "coming soon" page.
+    available: bool,
+}
+
+const COMPONENTS: &[ComponentEntry] = &[
+    ComponentEntry {
+        slug: "postgres",
+        name_key: "component-postgres-name",
+        role_key: "component-postgres-role",
+        available: true,
+    },
+    ComponentEntry {
+        slug: "kanidm",
+        name_key: "component-kanidm-name",
+        role_key: "component-kanidm-role",
+        available: false,
+    },
+    ComponentEntry {
+        slug: "garage",
+        name_key: "component-garage-name",
+        role_key: "component-garage-role",
+        available: false,
+    },
+    ComponentEntry {
+        slug: "lakekeeper",
+        name_key: "component-lakekeeper-name",
+        role_key: "component-lakekeeper-role",
+        available: false,
+    },
+    ComponentEntry {
+        slug: "xtable",
+        name_key: "component-xtable-name",
+        role_key: "component-xtable-role",
+        available: false,
+    },
+    ComponentEntry {
+        slug: "databend",
+        name_key: "component-databend-name",
+        role_key: "component-databend-role",
+        available: false,
+    },
+    ComponentEntry {
+        slug: "qdrant",
+        name_key: "component-qdrant-name",
+        role_key: "component-qdrant-role",
+        available: false,
+    },
+    ComponentEntry {
+        slug: "restate",
+        name_key: "component-restate-name",
+        role_key: "component-restate-role",
+        available: false,
+    },
+    ComponentEntry {
+        slug: "greptime",
+        name_key: "component-greptime-name",
+        role_key: "component-greptime-role",
+        available: false,
+    },
+    ComponentEntry {
+        slug: "grafana",
+        name_key: "component-grafana-name",
+        role_key: "component-grafana-role",
+        available: false,
+    },
+    ComponentEntry {
+        slug: "openfga",
+        name_key: "component-openfga-name",
+        role_key: "component-openfga-role",
+        available: false,
+    },
+];
+
+/// Render the `/install` page: a grid of cards, one per component
+/// Computeza manages. The card links to either `/install/<slug>`
+/// (available components, current wizard) or `/install/<slug>`
+/// (which serves the coming-soon page).
+#[must_use]
+pub fn render_install_hub(localizer: &Localizer) -> String {
+    let title = localizer.t("ui-install-hub-title");
+    let intro = localizer.t("ui-install-hub-intro");
+    let status_available = localizer.t("ui-install-status-available");
+    let status_planned = localizer.t("ui-install-status-planned");
+
+    let cards: String = COMPONENTS
+        .iter()
+        .map(|c| {
+            let name = localizer.t(c.name_key);
+            let role = localizer.t(c.role_key);
+            let (badge_class, badge_text) = if c.available {
+                ("cz-badge cz-badge-ok", status_available.as_str())
+            } else {
+                ("cz-badge cz-badge-info", status_planned.as_str())
+            };
+            format!(
+                r#"<a href="/install/{slug}" class="cz-card">
+<h3 class="cz-card-title">{name}</h3>
+<p class="cz-card-body">{role}</p>
+<p class="cz-card-meta"><span class="{badge_class}">{badge_text}</span></p>
+</a>"#,
+                slug = html_escape(c.slug),
+                name = html_escape(&name),
+                role = html_escape(&role),
+                badge_class = badge_class,
+                badge_text = html_escape(badge_text),
+            )
+        })
+        .collect();
+
+    let body = format!(
+        r#"<section class="cz-hero">
+<h1>{title}</h1>
+<p>{intro}</p>
+</section>
+<section class="cz-section">
+<div class="cz-card-grid">{cards}</div>
+</section>"#,
+        title = html_escape(&title),
+        intro = html_escape(&intro),
+    );
+
+    render_shell(localizer, &title, NavLink::Install, &body)
+}
+
+/// Render the per-component "coming soon" page. Shown for every
+/// component on the hub that isn't yet wired up. Includes a short
+/// localized blurb about what the component will do and a link back
+/// to the install hub.
+#[must_use]
+pub fn render_install_coming_soon(localizer: &Localizer, slug: &str) -> String {
+    let title = localizer.t("ui-install-coming-soon-title");
+    let back = localizer.t("ui-install-coming-soon-back");
+
+    let component = COMPONENTS.iter().find(|c| c.slug == slug);
+    let display_name = match component {
+        Some(c) => localizer.t(c.name_key),
+        None => slug.to_string(),
+    };
+    let role = component.map(|c| localizer.t(c.role_key));
+
+    let body_copy = localizer.t("ui-install-coming-soon-body");
+
+    let role_block = match role {
+        Some(r) => format!(
+            r#"<p class="cz-muted" style="margin-top: 1rem;">{}</p>"#,
+            html_escape(&r)
+        ),
+        None => String::new(),
+    };
+
+    let body = format!(
+        r#"<section class="cz-hero">
+<span class="cz-tag">{display_name}</span>
+<h1>{title}</h1>
+<p>{body_copy}</p>
+{role_block}
+</section>
+<section class="cz-section">
+<a class="cz-btn" href="/install">&lt;-&nbsp;{back}</a>
+</section>"#,
+        display_name = html_escape(&display_name),
+        title = html_escape(&title),
+        body_copy = html_escape(&body_copy),
+        role_block = role_block,
+        back = html_escape(&back),
+    );
+
+    render_shell(localizer, &title, NavLink::Install, &body)
+}
+
 /// to the CLI's `computeza install postgres`.
 ///
 /// `detected` is the host-state survey from

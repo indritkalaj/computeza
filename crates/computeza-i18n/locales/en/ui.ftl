@@ -94,6 +94,13 @@ ui-resource-delete-failed = Could not delete resource:
 
 ui-install-title         = Install a component
 ui-install-intro         = `computeza install <component>` lays down a native OS service. The same install path runs from the CLI -- this page is the GUI-equivalent per spec section 2.1 / 4.2.
+ui-install-hub-title     = Choose a component
+ui-install-hub-intro     = Pick the component you want to lay down. Per the playbook each one ships a per-OS native install (no Docker, no Kubernetes) with a configurable port, data directory, and service name; multi-version pins; an uninstall flow; and host-state detection so a second install of the same component doesn't collide with the first.
+ui-install-status-available  = Available
+ui-install-status-planned    = Planned
+ui-install-coming-soon-title = Coming soon
+ui-install-coming-soon-body  = This component is on the v0.0.x roadmap but not yet shipped as a one-click install. The Components reference page lists what it will do once the install path lands. Track progress on the project board, or pre-install it manually -- the reconciler is already wired to observe a running instance once the spec is in the metadata store.
+ui-install-coming-soon-back  = Back to install hub
 ui-install-target-label  = Component
 ui-install-postgres      = PostgreSQL (spec section 7.13)
 ui-install-button        = Install
