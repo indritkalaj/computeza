@@ -140,6 +140,37 @@ ui-landing-final-subtitle = Sign in to your console to lay down the data plane, 
 ui-landing-final-primary  = Sign in
 ui-landing-final-secondary = Browse components
 
+# --- Login + setup + logout ---
+
+ui-login-title             = Sign in
+ui-login-intro             = Sign in with your operator account to drive the install / uninstall / rotate flows.
+ui-login-username          = Username
+ui-login-password          = Password
+ui-login-submit            = Sign in
+ui-login-failed            = Incorrect username or password. Try again, or restart the server and use the first-boot setup flow if you have lost the credentials.
+ui-login-no-account        = No operator account yet?
+ui-login-go-to-setup       = Run first-boot setup
+ui-login-back-to-landing   = Back to the landing page
+
+ui-setup-title             = First-boot setup
+ui-setup-intro             = Create the first operator account for this Computeza install. After this account exists, the public /setup page is closed and additional operators are added from inside the console.
+ui-setup-username          = Operator username
+ui-setup-username-help     = ASCII alphanumeric, underscore, hyphen, or dot. 1 to 64 characters.
+ui-setup-password          = Password
+ui-setup-password-help     = At least 12 characters. We store the Argon2id hash, never the plaintext.
+ui-setup-password-confirm  = Confirm password
+ui-setup-submit            = Create account and sign in
+ui-setup-already-done      = An operator account already exists on this Computeza install. The first-boot setup page is closed; sign in instead.
+ui-setup-password-mismatch = The two password fields do not match. Re-type the password.
+
+ui-nav-logout              = Sign out
+ui-nav-signed-in-as        = Signed in as
+ui-nav-account             = Account
+ui-account-title           = Your account
+ui-account-intro           = Details for your operator account. Signing out destroys the session cookie on this server and forces a sign-in on the next protected request.
+ui-account-username        = Username
+ui-account-session-since   = Session started
+
 # --- Home dashboard cards ---
 
 ui-home-card-components-title = Managed components

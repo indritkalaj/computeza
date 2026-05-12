@@ -135,6 +135,41 @@ fn main() -> anyhow::Result<()> {
                 tracing::info!(state_db = %state_db, "metadata store ready");
 
                 let mut state = computeza_ui_server::AppState::with_store(store);
+
+                // Open the operator account file next to the metadata
+                // store so login / setup / logout work on the next
+                // serve invocation. The file is created (empty) on
+                // first run; the operator hits /setup to mint the
+                // first credential.
+                let operator_path = std::path::Path::new(&state_db)
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .map(std::path::Path::to_path_buf)
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+                    .join("operators.jsonl");
+                let operators = computeza_ui_server::auth::OperatorFile::open(&operator_path)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "opening operator file at {}: {e}",
+                            operator_path.display()
+                        )
+                    })?;
+                if operators.is_empty().await {
+                    tracing::warn!(
+                        path = %operator_path.display(),
+                        "no operator account exists yet; the first-boot setup form is open at /setup. \
+                         Anyone with network access to this server can create the initial account -- \
+                         bind 127.0.0.1 (the default) until /setup has been completed."
+                    );
+                } else {
+                    tracing::info!(
+                        path = %operator_path.display(),
+                        "operator account(s) loaded; sign in at /login"
+                    );
+                }
+                state = state.with_operators(operators);
+
                 match open_secrets_store(&state_db).await? {
                     Some(s) => {
                         tracing::info!(

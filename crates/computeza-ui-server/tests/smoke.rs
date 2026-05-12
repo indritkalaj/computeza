@@ -367,6 +367,47 @@ async fn server_serves_localized_home_and_healthz() {
         "the home page nav must link to /admin/secrets"
     );
 
+    // /login renders the sign-in form for unauthenticated visitors.
+    let resp = client
+        .get(format!("http://{addr}/login"))
+        .send()
+        .await
+        .expect("GET /login");
+    assert!(resp.status().is_success());
+    let body = resp.text().await.expect("body text");
+    assert!(body.contains("Sign in"));
+    assert!(body.contains(r#"action="/login""#));
+    assert!(body.contains(r#"name="username""#));
+    assert!(body.contains(r#"name="password""#));
+
+    // /setup renders the first-boot form for unauthenticated visitors.
+    let resp = client
+        .get(format!("http://{addr}/setup"))
+        .send()
+        .await
+        .expect("GET /setup");
+    assert!(resp.status().is_success());
+    let body = resp.text().await.expect("body text");
+    assert!(body.contains("First-boot setup"));
+    assert!(body.contains(r#"action="/setup""#));
+    assert!(body.contains(r#"name="password_confirm""#));
+
+    // Auth is disabled on this test harness (AppState::empty() ships no
+    // OperatorFile) -- the auth middleware lets every request through.
+    // We still verify the /account route renders something sensible
+    // when the middleware does NOT inject a Session: it should 5xx
+    // cleanly (the Extension extractor rejects) rather than panic.
+    let resp = client
+        .get(format!("http://{addr}/account"))
+        .send()
+        .await
+        .expect("GET /account on auth-disabled harness");
+    assert!(
+        resp.status() == 500 || resp.status() == 200,
+        "/account should not panic when no session is present; got {}",
+        resp.status()
+    );
+
     // Tear down. We abort rather than initiate graceful shutdown -- sufficient
     // for a smoke test, and avoids needing a shutdown channel in the public API.
     server.abort();

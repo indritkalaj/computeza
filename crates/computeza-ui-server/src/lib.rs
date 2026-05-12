@@ -161,9 +161,74 @@ pub fn router() -> Router {
     router_with_state(AppState::empty())
 }
 
+/// Auth middleware -- gates every non-public path behind a valid
+/// session cookie.
+///
+/// Public paths (landing page, /login, /setup, /static/*, /healthz,
+/// /favicon.ico, /components) flow through unchanged. Everything
+/// else looks up the `computeza_session` cookie against
+/// [`auth::SessionStore`]; a missing or stale cookie redirects to
+/// `/login` with `?next=<original-path>` so the operator lands back
+/// on the page they wanted after signing in.
+///
+/// When `state.operators` is `None` (the unit-test smoke router)
+/// auth is disabled wholesale -- the middleware lets every request
+/// through. The real binary always attaches an [`auth::OperatorFile`].
+async fn auth_middleware(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    request: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    let path = request.uri().path();
+
+    if auth::is_public_path(path) {
+        return next.run(request).await;
+    }
+    if state.operators.is_none() {
+        // No operator file attached -- smoke-test surface. Skip auth.
+        return next.run(request).await;
+    }
+
+    let cookie_header = request
+        .headers()
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let session_id = cookie_header
+        .as_deref()
+        .and_then(auth::session_id_from_cookies);
+    let session = match session_id {
+        Some(id) => state.sessions.get(&id).await,
+        None => None,
+    };
+
+    let Some(session) = session else {
+        // Redirect to /login with the original path captured so we
+        // can land them back here after sign-in.
+        let next_url = format!(
+            "/login?next={}",
+            urlencoding_min(&format!(
+                "{}{}",
+                path,
+                request
+                    .uri()
+                    .query()
+                    .map(|q| format!("?{q}"))
+                    .unwrap_or_default()
+            ))
+        );
+        return Redirect303(next_url).into_response();
+    };
+
+    let mut request = request;
+    request.extensions_mut().insert(session);
+    next.run(request).await
+}
+
 /// Build the axum router with an `AppState` attached. Every handler that
 /// needs the store extracts it via `State<AppState>`.
 pub fn router_with_state(state: AppState) -> Router {
+    let auth_layer = axum::middleware::from_fn_with_state(state.clone(), auth_middleware);
     Router::new()
         .route("/", get(home_handler))
         .route("/components", get(components_handler))
@@ -264,6 +329,10 @@ pub fn router_with_state(state: AppState) -> Router {
             "/resource/{kind}/{name}/delete",
             post(resource_delete_handler),
         )
+        .route("/login", get(login_form_handler).post(login_post_handler))
+        .route("/setup", get(setup_form_handler).post(setup_post_handler))
+        .route("/logout", post(logout_handler))
+        .route("/account", get(account_handler))
         .route("/healthz", get(healthz_handler))
         .route("/api/state/info", get(state_info_handler))
         .route("/static/computeza.css", get(css_handler))
@@ -275,6 +344,7 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/static/brand/computeza-favicon.svg", get(favicon_handler))
         .route("/static/brand/computeza-pulse.json", get(lottie_handler))
         .route("/favicon.ico", get(favicon_handler))
+        .layer(auth_layer)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -3274,6 +3344,161 @@ pub enum StoreSummary {
     Counted(usize),
 }
 
+/// Form submitted to `POST /login`.
+#[derive(serde::Deserialize)]
+struct LoginForm {
+    /// Operator username.
+    username: String,
+    /// Plaintext password. Never logged.
+    password: String,
+    /// Optional `?next=<path>` redirect target carried through from
+    /// the auth middleware. Validated server-side -- only relative
+    /// paths starting with `/` are honored, so an attacker can't use
+    /// the login redirect as an open-redirect into another origin.
+    #[serde(default)]
+    next: String,
+}
+
+/// GET /login -- render the sign-in form. When no operator account
+/// exists yet, redirect to `/setup` instead so the operator gets the
+/// first-boot flow without having to know the URL.
+async fn login_form_handler(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> Response {
+    let l = Localizer::english();
+    if let Some(ops) = &state.operators {
+        if ops.is_empty().await {
+            return Redirect303("/setup".into()).into_response();
+        }
+    }
+    let next = params.get("next").cloned().unwrap_or_default();
+    Html(render_login(&l, &next, None)).into_response()
+}
+
+/// POST /login -- verify credentials, mint a session, set the cookie,
+/// redirect onward.
+async fn login_post_handler(
+    State(state): State<AppState>,
+    Form(form): Form<LoginForm>,
+) -> Response {
+    let l = Localizer::english();
+    let Some(operators) = &state.operators else {
+        // No operator file = no auth = nothing to log into.
+        return Redirect303("/".into()).into_response();
+    };
+
+    match operators.verify(&form.username, &form.password).await {
+        Ok(rec) => {
+            let session_id = state.sessions.create(rec.username.clone()).await;
+            let cookie = auth::session_cookie_header(&session_id);
+            let target = safe_next_path(&form.next).unwrap_or_else(|| "/".to_string());
+            let mut response = Redirect303(target).into_response();
+            if let Ok(value) = axum::http::HeaderValue::from_str(&cookie) {
+                response.headers_mut().append(header::SET_COOKIE, value);
+            }
+            tracing::info!(
+                username = %rec.username,
+                "operator signed in; session minted and cookie set"
+            );
+            response
+        }
+        Err(_) => {
+            let failure = l.t("ui-login-failed");
+            Html(render_login(&l, &form.next, Some(&failure))).into_response()
+        }
+    }
+}
+
+/// Validate a `next` redirect target. Only relative paths starting
+/// with a single `/` (and not `//`, which would be a protocol-relative
+/// URL) are honored.
+fn safe_next_path(next: &str) -> Option<String> {
+    if next.is_empty() {
+        return None;
+    }
+    if !next.starts_with('/') {
+        return None;
+    }
+    if next.starts_with("//") {
+        return None;
+    }
+    Some(next.to_string())
+}
+
+/// Form submitted to `POST /setup`.
+#[derive(serde::Deserialize)]
+struct SetupForm {
+    username: String,
+    password: String,
+    password_confirm: String,
+}
+
+/// GET /setup -- render the first-boot operator creation form.
+/// Refuses (with an explanatory page) once at least one operator
+/// exists, so an attacker who lands on the URL after first boot
+/// cannot create additional operators without authenticating.
+async fn setup_form_handler(State(state): State<AppState>) -> Response {
+    let l = Localizer::english();
+    if let Some(ops) = &state.operators {
+        if !ops.is_empty().await {
+            return Html(render_setup_already_done(&l)).into_response();
+        }
+    }
+    Html(render_setup(&l, None)).into_response()
+}
+
+/// POST /setup -- create the first operator account, mint a session,
+/// and sign them in.
+async fn setup_post_handler(
+    State(state): State<AppState>,
+    Form(form): Form<SetupForm>,
+) -> Response {
+    let l = Localizer::english();
+    let Some(operators) = &state.operators else {
+        return Redirect303("/".into()).into_response();
+    };
+    if !operators.is_empty().await {
+        return Html(render_setup_already_done(&l)).into_response();
+    }
+    if form.password != form.password_confirm {
+        let msg = l.t("ui-setup-password-mismatch");
+        return Html(render_setup(&l, Some(&msg))).into_response();
+    }
+    if let Err(e) = operators.create(&form.username, &form.password).await {
+        return Html(render_setup(&l, Some(&e.to_string()))).into_response();
+    }
+    let session_id = state.sessions.create(form.username.clone()).await;
+    let cookie = auth::session_cookie_header(&session_id);
+    let mut response = Redirect303("/".into()).into_response();
+    if let Ok(value) = axum::http::HeaderValue::from_str(&cookie) {
+        response.headers_mut().append(header::SET_COOKIE, value);
+    }
+    response
+}
+
+/// POST /logout -- destroy the current session and clear the cookie.
+async fn logout_handler(State(state): State<AppState>, headers: axum::http::HeaderMap) -> Response {
+    if let Some(cookie_header) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok()) {
+        if let Some(id) = auth::session_id_from_cookies(cookie_header) {
+            state.sessions.destroy(&id).await;
+        }
+    }
+    let mut response = Redirect303("/".into()).into_response();
+    if let Ok(value) = axum::http::HeaderValue::from_str(&auth::clear_session_cookie_header()) {
+        response.headers_mut().append(header::SET_COOKIE, value);
+    }
+    response
+}
+
+/// GET /account -- operator account detail page with a Sign out
+/// form. Auth-required: the middleware bounces unauthenticated
+/// requests to /login first.
+async fn account_handler(axum::Extension(session): axum::Extension<auth::Session>) -> Html<String> {
+    let l = Localizer::english();
+    Html(render_account(&l, &session))
+}
+
 async fn healthz_handler() -> String {
     let l = Localizer::english();
     l.t("ui-healthz-ok")
@@ -3334,6 +3559,8 @@ pub enum NavLink {
     State,
     /// Admin / secrets page.
     Secrets,
+    /// Operator account / sign-out page.
+    Account,
     /// No nav link highlighted (e.g. resource detail page).
     None,
 }
@@ -3355,6 +3582,7 @@ pub fn render_shell(
     let nav_status = localizer.t("ui-nav-status");
     let nav_state = localizer.t("ui-nav-state");
     let nav_secrets = localizer.t("ui-admin-secrets");
+    let nav_account = localizer.t("ui-nav-account");
     let version_label = localizer.t("ui-footer-version");
     let version = env!("CARGO_PKG_VERSION");
 
@@ -3388,6 +3616,7 @@ pub fn render_shell(
     <a href="/status" class="{ns}">{nav_status}</a>
     <a href="/state" class="{nm}">{nav_state}</a>
     <a href="/admin/secrets" class="{na}">{nav_secrets}</a>
+    <a href="/account" class="{nacc}">{nav_account}</a>
   </div>
 </nav>
 <main class="cz-page">
@@ -3404,6 +3633,7 @@ pub fn render_shell(
         ns = nav_class(NavLink::Status),
         nm = nav_class(NavLink::State),
         na = nav_class(NavLink::Secrets),
+        nacc = nav_class(NavLink::Account),
     )
 }
 
@@ -6510,6 +6740,187 @@ fn human_bytes(n: u64) -> String {
     } else {
         format!("{v:.1} {}", UNITS[i])
     }
+}
+
+/// Render `GET /login`. `failure_message` populates a warn-styled
+/// card above the form when a previous POST attempt failed (wrong
+/// credentials, validation error, etc).
+#[must_use]
+pub fn render_login(localizer: &Localizer, next: &str, failure_message: Option<&str>) -> String {
+    let title = localizer.t("ui-login-title");
+    let intro = localizer.t("ui-login-intro");
+    let username_label = localizer.t("ui-login-username");
+    let password_label = localizer.t("ui-login-password");
+    let submit = localizer.t("ui-login-submit");
+    let no_account = localizer.t("ui-login-no-account");
+    let go_to_setup = localizer.t("ui-login-go-to-setup");
+    let back_to_landing = localizer.t("ui-login-back-to-landing");
+
+    let failure_block = match failure_message {
+        Some(msg) => format!(
+            r#"<div class="cz-card" style="border-color: rgba(255, 157, 166, 0.55); margin-bottom: 1rem;">
+<p class="cz-card-body" style="margin: 0; color: var(--fail);">{}</p>
+</div>"#,
+            html_escape(msg)
+        ),
+        None => String::new(),
+    };
+
+    let body = format!(
+        r#"<section class="cz-hero" style="text-align: center;">
+<h1>{title}</h1>
+<p>{intro}</p>
+</section>
+<section class="cz-section" style="max-width: 26rem; margin: 0 auto;">
+{failure_block}
+<div class="cz-card">
+<form method="post" action="/login" class="cz-form" style="max-width: none;">
+<input type="hidden" name="next" value="{next}" />
+<label for="login-username">{username_label}</label>
+<input id="login-username" name="username" class="cz-input" type="text" autocomplete="username" required />
+<label for="login-password">{password_label}</label>
+<input id="login-password" name="password" class="cz-input" type="password" autocomplete="current-password" required />
+<button type="submit" class="cz-btn cz-btn-primary" style="margin-top: 0.5rem;">{submit}</button>
+</form>
+</div>
+<p class="cz-muted" style="margin-top: 1rem; font-size: 0.85rem; text-align: center;">
+{no_account} <a href="/setup">{go_to_setup}</a>
+</p>
+<p class="cz-muted" style="margin-top: 0.5rem; font-size: 0.85rem; text-align: center;">
+<a href="/">{back_to_landing}</a>
+</p>
+</section>"#,
+        title = html_escape(&title),
+        intro = html_escape(&intro),
+        next = html_escape(next),
+        failure_block = failure_block,
+        username_label = html_escape(&username_label),
+        password_label = html_escape(&password_label),
+        submit = html_escape(&submit),
+        no_account = html_escape(&no_account),
+        go_to_setup = html_escape(&go_to_setup),
+        back_to_landing = html_escape(&back_to_landing),
+    );
+    render_shell(localizer, &title, NavLink::None, &body)
+}
+
+/// Render `GET /setup` -- the first-boot operator-creation form.
+/// `failure_message` populates a warn-styled card above the form when
+/// the previous POST attempt failed (mismatched passwords, validation
+/// error, etc).
+#[must_use]
+pub fn render_setup(localizer: &Localizer, failure_message: Option<&str>) -> String {
+    let title = localizer.t("ui-setup-title");
+    let intro = localizer.t("ui-setup-intro");
+    let username = localizer.t("ui-setup-username");
+    let username_help = localizer.t("ui-setup-username-help");
+    let password = localizer.t("ui-setup-password");
+    let password_help = localizer.t("ui-setup-password-help");
+    let password_confirm = localizer.t("ui-setup-password-confirm");
+    let submit = localizer.t("ui-setup-submit");
+
+    let failure_block = match failure_message {
+        Some(msg) => format!(
+            r#"<div class="cz-card" style="border-color: rgba(255, 157, 166, 0.55); margin-bottom: 1rem;">
+<p class="cz-card-body" style="margin: 0; color: var(--fail);">{}</p>
+</div>"#,
+            html_escape(msg)
+        ),
+        None => String::new(),
+    };
+
+    let body = format!(
+        r#"<section class="cz-hero" style="text-align: center;">
+<h1>{title}</h1>
+<p>{intro}</p>
+</section>
+<section class="cz-section" style="max-width: 32rem; margin: 0 auto;">
+{failure_block}
+<div class="cz-card">
+<form method="post" action="/setup" class="cz-form" style="max-width: none;">
+<label for="setup-username">{username}</label>
+<input id="setup-username" name="username" class="cz-input" type="text" autocomplete="username" required pattern="[A-Za-z0-9_.\-]+" maxlength="64" />
+<p class="cz-muted" style="margin: -0.5rem 0 0; font-size: 0.8rem;">{username_help}</p>
+<label for="setup-password">{password}</label>
+<input id="setup-password" name="password" class="cz-input" type="password" autocomplete="new-password" minlength="12" required />
+<p class="cz-muted" style="margin: -0.5rem 0 0; font-size: 0.8rem;">{password_help}</p>
+<label for="setup-password-confirm">{password_confirm}</label>
+<input id="setup-password-confirm" name="password_confirm" class="cz-input" type="password" autocomplete="new-password" minlength="12" required />
+<button type="submit" class="cz-btn cz-btn-primary" style="margin-top: 0.5rem;">{submit}</button>
+</form>
+</div>
+</section>"#,
+        title = html_escape(&title),
+        intro = html_escape(&intro),
+        failure_block = failure_block,
+        username = html_escape(&username),
+        username_help = html_escape(&username_help),
+        password = html_escape(&password),
+        password_help = html_escape(&password_help),
+        password_confirm = html_escape(&password_confirm),
+        submit = html_escape(&submit),
+    );
+    render_shell(localizer, &title, NavLink::None, &body)
+}
+
+/// Render `GET /account` -- operator account details with a Sign out
+/// form. Auth-required surface.
+#[must_use]
+pub fn render_account(localizer: &Localizer, session: &auth::Session) -> String {
+    let title = localizer.t("ui-account-title");
+    let intro = localizer.t("ui-account-intro");
+    let username_label = localizer.t("ui-account-username");
+    let session_since = localizer.t("ui-account-session-since");
+    let logout = localizer.t("ui-nav-logout");
+
+    let body = format!(
+        r#"<section class="cz-hero" style="text-align: center;">
+<h1>{title}</h1>
+<p>{intro}</p>
+</section>
+<section class="cz-section" style="max-width: 32rem; margin: 0 auto;">
+<div class="cz-card">
+<dl class="cz-dl">
+<dt>{username_label}</dt><dd><code>{username}</code></dd>
+<dt>{session_since}</dt><dd><code>{created_at}</code></dd>
+</dl>
+<form method="post" action="/logout" style="margin-top: 1.25rem;">
+<button type="submit" class="cz-btn cz-btn-danger">{logout}</button>
+</form>
+</div>
+</section>"#,
+        title = html_escape(&title),
+        intro = html_escape(&intro),
+        username_label = html_escape(&username_label),
+        session_since = html_escape(&session_since),
+        logout = html_escape(&logout),
+        username = html_escape(&session.username),
+        created_at = html_escape(&session.created_at.to_rfc3339()),
+    );
+    render_shell(localizer, &title, NavLink::Account, &body)
+}
+
+/// Render `GET /setup` when an operator account already exists.
+/// Carries a link onward to `/login` so the operator can sign in.
+#[must_use]
+pub fn render_setup_already_done(localizer: &Localizer) -> String {
+    let title = localizer.t("ui-setup-title");
+    let msg = localizer.t("ui-setup-already-done");
+    let sign_in = localizer.t("ui-login-submit");
+
+    let body = format!(
+        r#"<section class="cz-hero" style="text-align: center;">
+<h1>{title}</h1>
+<p>{msg}</p>
+<div class="cz-cta-row">
+<a class="cz-btn cz-btn-primary cz-btn-lg" href="/login">{sign_in}</a>
+</div>
+</section>"#,
+        title = html_escape(&title),
+        msg = html_escape(&msg),
+        sign_in = html_escape(&sign_in),
+    );
+    render_shell(localizer, &title, NavLink::None, &body)
 }
 
 /// Render the result page for a completed install. `success` switches
