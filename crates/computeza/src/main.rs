@@ -306,50 +306,22 @@ fn install_postgres(_l: &Localizer) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(not(target_os = "linux"))]
 fn install_postgres(_l: &Localizer) -> anyhow::Result<()> {
-    use computeza_driver_native::macos::postgres;
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-    let result = runtime.block_on(postgres::install(postgres::InstallOptions::default()))?;
-    println!(
-        "PostgreSQL installed.\n  bin_dir: {}\n  data_dir: {}\n  plist:   {}\n  port:    {}",
-        result.bin_dir.display(),
-        result.data_dir.display(),
-        result.plist_path.display(),
-        result.port,
-    );
-    if let Some(link) = result.psql_symlink {
-        println!("  psql:    {}", link.display());
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "windows")]
-fn install_postgres(_l: &Localizer) -> anyhow::Result<()> {
-    use computeza_driver_native::windows::postgres;
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-    let result = runtime.block_on(postgres::install(postgres::InstallOptions::default()))?;
-    println!(
-        "PostgreSQL installed.\n  bin_dir: {}\n  data_dir: {}\n  service: {}\n  port:    {}",
-        result.bin_dir.display(),
-        result.data_dir.display(),
-        result.service_name,
-        result.port,
-    );
-    if let Some(shim) = result.psql_shim {
-        println!("  psql:    {}", shim.display());
-    }
-    Ok(())
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn install_postgres(l: &Localizer) -> anyhow::Result<()> {
-    println!("{}", l.t("install-postgres-unsupported-os"));
-    Ok(())
+    // PostgreSQL is Linux-only in v0.0.x to stay consistent with the
+    // other 10 components. The macOS + Windows driver modules under
+    // crates/computeza-driver-native/src/{macos,windows}/postgres.rs
+    // are reference code from earlier iterations but no longer
+    // reachable through the CLI or the wizard. Re-enable at v0.1+
+    // when the macOS / Windows variants of the generic service
+    // helper land and every component can be installed multi-OS
+    // together.
+    anyhow::bail!(
+        "`computeza install postgres` is currently implemented for Linux only. \
+         v0.0.x targets systemd-based Linux on x86_64 for the entire data plane. \
+         macOS + Windows native install drivers ship in v0.1+. See README \
+         'Platform support' for the supported distro list."
+    )
 }
 
 /// Periodic in-process reconcile tick. Reads every `postgres-instance`

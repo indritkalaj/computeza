@@ -2003,6 +2003,14 @@ const COMPONENTS: &[ComponentEntry] = &[
         slug: "postgres",
         name_key: "component-postgres-name",
         role_key: "component-postgres-role",
+        // Linux install live: downloads the PostgreSQL bundle from
+        // EDB's CDN, runs initdb -U postgres, prepends pg_hba.conf
+        // trust block, registers a systemd unit, starts. The wizard
+        // refuses installs on non-Linux hosts via guard_supported_os.
+        // The macOS + Windows postgres driver modules under
+        // crates/computeza-driver-native/src/{macos,windows}/postgres.rs
+        // exist as reference code but are not reachable through the
+        // wizard for v0.0.x (Linux-only per the platform constraint).
         available: true,
     },
     ComponentEntry {
