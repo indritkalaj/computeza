@@ -19,6 +19,16 @@ async-trait = { workspace = true }
 secrecy = { workspace = true }
 chrono = { workspace = true }
 url = "2"
+# OIDC primitives we ship directly: PKCE (sha2 + base64ct + getrandom)
+# and discovery parsing (reqwest GET + serde). Full JWT verification
+# moves to the openidconnect 4.x crate in v0.1+ once we settle on its
+# new AsyncHttpClient adapter API; today we own the small surface so
+# the dep tree stays bounded.
+reqwest = { workspace = true }
+sha2 = { workspace = true }
+base64ct = { version = "1", features = ["alloc"] }
+getrandom = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true }
+wiremock = "0.6"
