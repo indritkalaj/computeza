@@ -234,6 +234,8 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/install/job/{id}", get(install_job_handler))
         .route("/install/job/{id}/rollback", post(install_rollback_handler))
         .route("/api/install/job/{id}", get(install_job_api_handler))
+        .route("/admin/secrets", get(secrets_index_handler))
+        .route("/admin/secrets/{name}/rotate", post(secrets_rotate_handler))
         .route("/status", get(status_handler))
         .route("/state", get(state_page_handler))
         .route("/resource/{kind}/{name}", get(resource_handler))
@@ -2613,6 +2615,84 @@ async fn install_job_handler(
             Html(render_install_progress(&l, &job_id, &p)),
         ),
     }
+}
+
+/// GET /admin/secrets -- list every secret in the encrypted store.
+/// Names only; values stay encrypted on disk and are never surfaced
+/// from this page. Per-row Rotate button posts to
+/// `/admin/secrets/{name}/rotate` which replaces the value and shows
+/// the new value exactly once.
+async fn secrets_index_handler(State(state): State<AppState>) -> Html<String> {
+    let l = Localizer::english();
+    let names = match &state.secrets {
+        Some(s) => match s.list_names().await {
+            Ok(mut n) => {
+                n.sort();
+                Some(n)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "secrets list_names failed");
+                Some(Vec::new())
+            }
+        },
+        None => None,
+    };
+    Html(render_secrets_index(&l, names.as_deref()))
+}
+
+/// POST /admin/secrets/{name}/rotate -- replace the named secret's
+/// value with a freshly generated 96-bit random hex string, show the
+/// new value to the operator exactly once. Returns 404 if no secrets
+/// store is attached or the name doesn't exist.
+async fn secrets_rotate_handler(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Response {
+    let l = Localizer::english();
+    let Some(secrets) = &state.secrets else {
+        return (
+            StatusCode::NOT_FOUND,
+            Html(render_install_result(
+                &l,
+                false,
+                "No secrets store is attached on this server. Set COMPUTEZA_SECRETS_PASSPHRASE and restart `computeza serve`.",
+            )),
+        )
+            .into_response();
+    };
+    match secrets.get(&name).await {
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Html(render_install_result(
+                    &l,
+                    false,
+                    &format!("Secret not found: {name}"),
+                )),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return Html(render_install_result(
+                &l,
+                false,
+                &format!("Reading secret {name} failed: {e}"),
+            ))
+            .into_response();
+        }
+        Ok(Some(_)) => {}
+    }
+    let new_value = generate_random_password();
+    if let Err(e) = secrets.put(&name, &new_value).await {
+        return Html(render_install_result(
+            &l,
+            false,
+            &format!("Rotating secret {name} failed: {e}"),
+        ))
+        .into_response();
+    }
+    tracing::info!(name = %name, "secret rotated; new value surfaced on the rotate result page once");
+    Html(render_secret_rotated(&l, &name, &new_value)).into_response()
 }
 
 /// POST /install/job/{id}/rollback -- uninstall every component the
@@ -6184,6 +6264,135 @@ pub fn render_install_result_with_credentials(
         title = html_escape(&title),
         outcome = html_escape(&outcome),
         back = html_escape(&back),
+    );
+
+    render_shell(localizer, &title, NavLink::Install, &body)
+}
+
+/// Render the `/admin/secrets` page: one row per secret name with a
+/// Rotate button. `names = None` indicates no secrets store is
+/// attached -- we render an explanatory card instead of an empty
+/// table.
+#[must_use]
+pub fn render_secrets_index(localizer: &Localizer, names: Option<&[String]>) -> String {
+    let title = localizer.t("ui-secrets-title");
+    let intro = localizer.t("ui-secrets-intro");
+    let store_missing = localizer.t("ui-secrets-store-missing");
+    let empty = localizer.t("ui-secrets-empty");
+    let col_name = localizer.t("ui-secrets-col-name");
+    let col_action = localizer.t("ui-secrets-col-action");
+    let rotate = localizer.t("ui-secrets-rotate-button");
+    let note = localizer.t("ui-secrets-rotate-note");
+
+    let body = match names {
+        None => format!(
+            r#"<section class="cz-hero">
+<h1>{title}</h1>
+<p>{intro}</p>
+</section>
+<section class="cz-section">
+<div class="cz-card" style="border-color: rgba(245, 181, 68, 0.55);">
+<p class="cz-card-body" style="margin: 0; color: var(--warn);">{store_missing}</p>
+</div>
+</section>"#,
+            title = html_escape(&title),
+            intro = html_escape(&intro),
+            store_missing = html_escape(&store_missing),
+        ),
+        Some(n) if n.is_empty() => format!(
+            r#"<section class="cz-hero">
+<h1>{title}</h1>
+<p>{intro}</p>
+</section>
+<section class="cz-section">
+<div class="cz-card"><p class="cz-card-body" style="margin: 0;">{empty}</p></div>
+</section>"#,
+            title = html_escape(&title),
+            intro = html_escape(&intro),
+            empty = html_escape(&empty),
+        ),
+        Some(n) => {
+            let rows: String = n
+                .iter()
+                .map(|name| {
+                    format!(
+                        r#"<tr>
+<td><code>{name_html}</code></td>
+<td><form method="post" action="/admin/secrets/{name_enc}/rotate" style="margin: 0;">
+<button type="submit" class="cz-btn">{rotate}</button>
+</form></td>
+</tr>"#,
+                        name_html = html_escape(name),
+                        name_enc = urlencoding_min(name),
+                        rotate = html_escape(&rotate),
+                    )
+                })
+                .collect();
+
+            format!(
+                r#"<section class="cz-hero">
+<h1>{title}</h1>
+<p>{intro}</p>
+</section>
+<section class="cz-section">
+<div class="cz-card">
+<table class="cz-table" style="width: 100%;">
+<thead><tr><th>{col_name}</th><th>{col_action}</th></tr></thead>
+<tbody>
+{rows}
+</tbody>
+</table>
+<p class="cz-muted" style="margin: 0.85rem 0 0; font-size: 0.85rem;">{note}</p>
+</div>
+</section>"#,
+                title = html_escape(&title),
+                intro = html_escape(&intro),
+                col_name = html_escape(&col_name),
+                col_action = html_escape(&col_action),
+                rows = rows,
+                note = html_escape(&note),
+            )
+        }
+    };
+
+    render_shell(localizer, &title, NavLink::Install, &body)
+}
+
+/// Render the post-rotation result page. Shows the freshly-generated
+/// value once -- there's no recovery if the operator dismisses this
+/// page without copying it out (re-rotating gets a new value, not the
+/// missed one).
+#[must_use]
+pub fn render_secret_rotated(localizer: &Localizer, name: &str, new_value: &str) -> String {
+    let title = localizer.t("ui-secrets-rotated-title");
+    let warning = localizer.t("ui-install-credentials-warning");
+    let name_label = localizer.t("ui-secrets-rotated-name");
+    let value_label = localizer.t("ui-secrets-rotated-value");
+    let back = localizer.t("ui-secrets-rotated-back");
+
+    let body = format!(
+        r#"<section class="cz-hero">
+<h1>{title}</h1>
+</section>
+<section class="cz-section">
+<div class="cz-card" style="border-color: rgba(245, 181, 68, 0.55);">
+<p class="cz-muted" style="margin: 0 0 0.85rem; font-size: 0.85rem;">{warning}</p>
+<dl class="cz-dl">
+<dt>{name_label}</dt><dd><code>{name_html}</code></dd>
+<dt>{value_label}</dt><dd><code>{value_html}</code></dd>
+</dl>
+</div>
+</section>
+<section class="cz-section">
+<a class="cz-btn" href="/admin/secrets">{back}</a>
+</section>"#,
+        title = html_escape(&title),
+        warning = html_escape(&warning),
+        name_label = html_escape(&name_label),
+        value_label = html_escape(&value_label),
+        back = html_escape(&back),
+        name_html = html_escape(name),
+        value_html = html_escape(new_value),
     );
 
     render_shell(localizer, &title, NavLink::Install, &body)

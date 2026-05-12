@@ -146,6 +146,23 @@ ui-resource-repair-heading = Repair this component
 ui-resource-repair-intro   = Re-run the install for this component. Idempotent: existing on-disk state is preserved where possible and only out-of-date pieces are regenerated. Use this when the service is down, the systemd unit went missing, or the spec was edited externally and you want the install path to re-apply it.
 ui-resource-repair-button  = Re-install
 
+# --- Secrets admin page ---
+
+ui-secrets-title         = Secrets
+ui-secrets-intro         = Encrypted secrets stored under the AES-256-GCM data-encryption key derived from `COMPUTEZA_SECRETS_PASSPHRASE`. Each entry's value never touches disk in plaintext; names are stored in clear so this page can list them.
+ui-secrets-empty         = The secrets store is attached but no secrets are stored yet. New entries land here as soon as an install path generates them (e.g. initial admin passwords).
+ui-secrets-store-missing = No secrets store is attached on this server. Set `COMPUTEZA_SECRETS_PASSPHRASE` in the environment and restart `computeza serve` to enable encrypted secret storage; until then install paths surface generated credentials in-band on the result page only.
+ui-secrets-col-name      = Name
+ui-secrets-col-action    = Action
+ui-secrets-rotate-button = Rotate
+ui-secrets-rotate-note   = Rotating replaces the value with a fresh 96-bit random hex string. The previous value is unrecoverable; downstream consumers must be updated to the new value before they next authenticate. The new value is shown once on the result page.
+ui-secrets-rotated-title = Secret rotated
+ui-secrets-rotated-name  = Secret name
+ui-secrets-rotated-value = New value
+ui-secrets-rotated-back  = Back to secrets
+ui-nav-admin             = Admin
+ui-admin-secrets         = Secrets
+
 # --- Active-job resume banner on /install ---
 
 ui-install-active-title   = Install in progress
