@@ -161,6 +161,14 @@ pub fn router_with_state(state: AppState) -> Router {
             "/install/openfga/uninstall",
             get(uninstall_openfga_confirm_handler).post(uninstall_openfga_handler),
         )
+        .route(
+            "/install/qdrant",
+            get(install_qdrant_form_handler).post(install_qdrant_handler),
+        )
+        .route(
+            "/install/qdrant/uninstall",
+            get(uninstall_qdrant_confirm_handler).post(uninstall_qdrant_handler),
+        )
         .route("/install/{component}", get(install_component_handler))
         .route("/install/job/{id}", get(install_job_handler))
         .route("/api/install/job/{id}", get(install_job_api_handler))
@@ -974,6 +982,169 @@ async fn run_openfga_uninstall() -> Result<String, String> {
 #[cfg(not(target_os = "linux"))]
 async fn run_openfga_uninstall() -> Result<String, String> {
     Err("OpenFGA uninstall requires a supported Linux host.".into())
+}
+
+// ============================================================
+// Qdrant install path
+// ============================================================
+
+async fn install_qdrant_form_handler() -> Html<String> {
+    let l = Localizer::english();
+    Html(render_install_qdrant(&l))
+}
+
+async fn install_qdrant_handler(
+    State(state): State<AppState>,
+    Form(form): Form<InstallForm>,
+) -> Response {
+    let l = Localizer::english();
+    if let Err(resp) = guard_supported_os(&l) {
+        return resp;
+    }
+    if form.component != "qdrant" {
+        return Html(render_install_result(
+            &l,
+            false,
+            &format!("unknown component: {}", form.component),
+        ))
+        .into_response();
+    }
+    let config = match form.into_config() {
+        Ok(c) => c,
+        Err(msg) => return Html(render_install_result(&l, false, &msg)).into_response(),
+    };
+
+    let job_id = Uuid::new_v4().to_string();
+    let progress_state = Arc::new(StdMutex::new(InstallProgress::default()));
+    state
+        .jobs
+        .lock()
+        .unwrap()
+        .insert(job_id.clone(), progress_state.clone());
+
+    let store = state.store.clone();
+    let progress = ProgressHandle::new(progress_state);
+    tokio::spawn(async move {
+        match run_qdrant_install_with_progress(&progress, &config).await {
+            Ok((summary, port)) => {
+                let mut summary = summary;
+                if let Some(store) = &store {
+                    let key = ResourceKey::cluster_scoped("qdrant-instance", "local");
+                    let spec = serde_json::json!({
+                        "endpoint": {
+                            "base_url": format!("http://127.0.0.1:{port}"),
+                            "insecure_skip_tls_verify": false,
+                        },
+                    });
+                    let expected_revision = match store.load(&key).await {
+                        Ok(Some(existing)) => Some(existing.revision),
+                        _ => None,
+                    };
+                    match store.save(&key, &spec, expected_revision).await {
+                        Ok(_) => summary.push_str(
+                            "\n\nRegistered as qdrant-instance/local in the metadata store.\nVisit /status to see it.",
+                        ),
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "qdrant install: store.save failed; the on-disk service is fine."
+                            );
+                            summary.push_str(&format!(
+                                "\n\nNote: did not register qdrant-instance/local ({e}). Visit /status to inspect current state."
+                            ));
+                        }
+                    }
+                }
+                progress.finish_success(summary);
+            }
+            Err(detail) => progress.finish_failure(detail),
+        }
+    });
+
+    Redirect303(format!("/install/job/{job_id}")).into_response()
+}
+
+async fn uninstall_qdrant_confirm_handler() -> Html<String> {
+    let l = Localizer::english();
+    Html(render_uninstall_qdrant_confirm(&l))
+}
+
+async fn uninstall_qdrant_handler(State(state): State<AppState>) -> Response {
+    let l = Localizer::english();
+    let result = run_qdrant_uninstall().await;
+    if let Some(store) = &state.store {
+        let key = ResourceKey::cluster_scoped("qdrant-instance", "local");
+        if let Err(e) = store.delete(&key, None).await {
+            tracing::warn!(
+                error = %e,
+                "uninstall: store.delete(qdrant-instance/local) failed"
+            );
+        }
+    }
+    let body = match result {
+        Ok(summary) => render_install_result(&l, true, &summary),
+        Err(detail) => render_install_result(&l, false, &detail),
+    };
+    Html(body).into_response()
+}
+
+#[cfg(target_os = "linux")]
+async fn run_qdrant_install_with_progress(
+    progress: &ProgressHandle,
+    config: &InstallConfig,
+) -> Result<(String, u16), String> {
+    use computeza_driver_native::linux::qdrant;
+    let mut opts = qdrant::InstallOptions::default();
+    if let Some(p) = config.port {
+        opts.port = p;
+    }
+    if let Some(d) = &config.root_dir {
+        opts.root_dir = std::path::PathBuf::from(d);
+    }
+    if let Some(s) = &config.service_name {
+        opts.unit_name = format!("{s}.service");
+    }
+    if let Some(v) = &config.version {
+        opts.version = Some(v.clone());
+    }
+    match qdrant::install(opts, progress).await {
+        Ok(r) => Ok((
+            format!(
+                "bin_dir: {}\nunit_path: {}\nREST port: {}\ngRPC port: {}",
+                r.bin_dir.display(),
+                r.unit_path.display(),
+                r.port,
+                r.port + 1,
+            ),
+            r.port,
+        )),
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn run_qdrant_install_with_progress(
+    _progress: &ProgressHandle,
+    _config: &InstallConfig,
+) -> Result<(String, u16), String> {
+    Err(
+        "Qdrant install requires a supported Linux host. v0.0.x ships only the Linux driver."
+            .into(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+async fn run_qdrant_uninstall() -> Result<String, String> {
+    use computeza_driver_native::linux::qdrant;
+    match qdrant::uninstall(qdrant::UninstallOptions::default()).await {
+        Ok(r) => Ok(format_uninstall_summary(&r.steps, &r.warnings)),
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn run_qdrant_uninstall() -> Result<String, String> {
+    Err("Qdrant uninstall requires a supported Linux host.".into())
 }
 
 /// Build the data-dir placeholder for the form. Suffixes the leaf
@@ -2059,7 +2230,11 @@ const COMPONENTS: &[ComponentEntry] = &[
         slug: "qdrant",
         name_key: "component-qdrant-name",
         role_key: "component-qdrant-role",
-        available: false,
+        // Linux install live: downloads the qdrant binary from the
+        // GitHub release tarball, writes config.yaml with the chosen
+        // HTTP port + gRPC=port+1 + storage_path under data/,
+        // registers a systemd unit. Linux only for v0.0.x.
+        available: true,
     },
     ComponentEntry {
         slug: "restate",
@@ -2964,6 +3139,172 @@ fn openfga_version_options() -> Vec<VersionOption> {
         vec![VersionOption {
             value: String::new(),
             label: "OpenFGA (Linux only for v0.0.x)".into(),
+        }]
+    }
+}
+
+/// Render the `/install/qdrant` wizard form.
+#[must_use]
+pub fn render_install_qdrant(localizer: &Localizer) -> String {
+    let title = localizer.t("ui-install-qdrant-title");
+    let intro = localizer.t("ui-install-qdrant-intro");
+    let port_label = localizer.t("ui-install-port-label");
+    let port_help = localizer.t("ui-install-port-help");
+    let version_label = localizer.t("ui-install-version-label");
+    let version_help = localizer.t("ui-install-version-help");
+    let data_dir_label = localizer.t("ui-install-data-dir-label");
+    let data_dir_help = localizer.t("ui-install-data-dir-help");
+    let service_name_label = localizer.t("ui-install-service-name-label");
+    let service_name_help = localizer.t("ui-install-service-name-help");
+    let advanced_label = localizer.t("ui-install-advanced");
+    let button = localizer.t("ui-install-button");
+    let requires_root = localizer.t("ui-install-requires-root");
+    let already_installed = localizer.t("ui-install-already-installed");
+    let uninstall_button = localizer.t("ui-uninstall-button");
+
+    let version_options = qdrant_version_options();
+    let version_options_html: String = version_options
+        .iter()
+        .map(|v| {
+            format!(
+                r#"<option value="{value}">{label}</option>"#,
+                value = html_escape(&v.value),
+                label = html_escape(&v.label),
+            )
+        })
+        .collect();
+
+    let port_placeholder = "6333";
+    let service_name_placeholder = "computeza-qdrant";
+    let root_dir_placeholder = root_dir_placeholder_for_leaf("qdrant");
+
+    let body = format!(
+        r#"<section class="cz-hero">
+<h1>{title}</h1>
+<p>{intro}</p>
+</section>
+<section class="cz-section" style="max-width: 36rem;">
+<div class="cz-card">
+<form method="post" action="/install/qdrant" class="cz-form" style="max-width: none;">
+<input type="hidden" name="component" value="qdrant" />
+
+<label for="version">{version_label}</label>
+<select id="version" name="version" class="cz-select">
+{version_options_html}
+</select>
+<p class="cz-muted" style="margin: -0.5rem 0 0; font-size: 0.8rem;">{version_help}</p>
+
+<label for="port">{port_label}</label>
+<input id="port" name="port" class="cz-input" type="number" min="1" max="65535" placeholder="{port_placeholder}" />
+<p class="cz-muted" style="margin: -0.5rem 0 0; font-size: 0.8rem;">{port_help} Qdrant binds REST on this port and gRPC on port+1.</p>
+
+<details style="margin-top: 0.5rem;">
+<summary class="cz-tag" style="cursor: pointer;">{advanced_label}</summary>
+<div style="display: flex; flex-direction: column; gap: 0.9rem; margin-top: 1rem;">
+<div>
+<label for="root_dir" style="display: block; margin-bottom: 0.4rem;">{data_dir_label}</label>
+<input id="root_dir" name="root_dir" class="cz-input" type="text" placeholder="{root_dir_placeholder}" />
+<p class="cz-muted" style="margin: 0.35rem 0 0; font-size: 0.8rem;">{data_dir_help}</p>
+</div>
+<div>
+<label for="service_name" style="display: block; margin-bottom: 0.4rem;">{service_name_label}</label>
+<input id="service_name" name="service_name" class="cz-input" type="text" placeholder="{service_name_placeholder}" pattern="[A-Za-z0-9_-]+" />
+<p class="cz-muted" style="margin: 0.35rem 0 0; font-size: 0.8rem;">{service_name_help}</p>
+</div>
+</div>
+</details>
+
+<button type="submit" class="cz-btn cz-btn-primary" style="align-self: flex-start; margin-top: 0.5rem;">{button}</button>
+</form>
+</div>
+<p class="cz-muted" style="margin-top: 1rem; font-size: 0.85rem;">{requires_root}</p>
+
+<div class="cz-card" style="margin-top: 1.5rem;">
+<p class="cz-card-body" style="margin: 0 0 1rem;">{already_installed}</p>
+<form method="get" action="/install/qdrant/uninstall">
+<button type="submit" class="cz-btn cz-btn-danger">{uninstall_button}</button>
+</form>
+</div>
+</section>"#,
+        title = html_escape(&title),
+        intro = html_escape(&intro),
+        version_label = html_escape(&version_label),
+        version_help = html_escape(&version_help),
+        version_options_html = version_options_html,
+        port_label = html_escape(&port_label),
+        port_help = html_escape(&port_help),
+        port_placeholder = html_escape(port_placeholder),
+        advanced_label = html_escape(&advanced_label),
+        data_dir_label = html_escape(&data_dir_label),
+        data_dir_help = html_escape(&data_dir_help),
+        root_dir_placeholder = html_escape(&root_dir_placeholder),
+        service_name_label = html_escape(&service_name_label),
+        service_name_help = html_escape(&service_name_help),
+        service_name_placeholder = html_escape(service_name_placeholder),
+        button = html_escape(&button),
+        requires_root = html_escape(&requires_root),
+        already_installed = html_escape(&already_installed),
+        uninstall_button = html_escape(&uninstall_button),
+    );
+
+    render_shell(localizer, &title, NavLink::Install, &body)
+}
+
+/// Render the qdrant uninstall confirmation page.
+#[must_use]
+pub fn render_uninstall_qdrant_confirm(localizer: &Localizer) -> String {
+    let title = localizer.t("ui-uninstall-qdrant-title");
+    let intro = localizer.t("ui-uninstall-qdrant-intro");
+    let confirm = localizer.t("ui-uninstall-confirm");
+    let button = localizer.t("ui-uninstall-button");
+    let cancel = localizer.t("ui-uninstall-cancel");
+
+    let body = format!(
+        r#"<section class="cz-hero">
+<h1>{title}</h1>
+<p>{intro}</p>
+</section>
+<section class="cz-section" style="max-width: 36rem;">
+<div class="cz-card" style="border-color: rgba(255, 157, 166, 0.45);">
+<p class="cz-card-body" style="margin: 0 0 1.25rem; color: var(--fail);">{confirm}</p>
+<form method="post" action="/install/qdrant/uninstall" style="display: flex; gap: 0.75rem;">
+<button type="submit" class="cz-btn cz-btn-danger">{button}</button>
+<a class="cz-btn" href="/install/qdrant">{cancel}</a>
+</form>
+</div>
+</section>"#,
+        title = html_escape(&title),
+        intro = html_escape(&intro),
+        confirm = html_escape(&confirm),
+        button = html_escape(&button),
+        cancel = html_escape(&cancel),
+    );
+
+    render_shell(localizer, &title, NavLink::Install, &body)
+}
+
+fn qdrant_version_options() -> Vec<VersionOption> {
+    #[cfg(target_os = "linux")]
+    {
+        use computeza_driver_native::linux::qdrant;
+        qdrant::available_versions()
+            .iter()
+            .enumerate()
+            .map(|(i, b)| VersionOption {
+                value: b.version.into(),
+                label: format!(
+                    "Qdrant {}{}",
+                    b.version,
+                    if i == 0 { " (latest)" } else { "" }
+                ),
+            })
+            .collect()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        vec![VersionOption {
+            value: String::new(),
+            label: "Qdrant (Linux only for v0.0.x)".into(),
         }]
     }
 }
