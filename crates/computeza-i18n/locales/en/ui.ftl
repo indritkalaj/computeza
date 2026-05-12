@@ -9,7 +9,7 @@
 ui-app-title          = Computeza
 ui-app-tagline        = Open lakehouse control plane
 
-# --- Index page (the "Hello, GUI" placeholder) ---
+# --- Index page (the "Hello, GUI" placeholder, retained for legacy refs) ---
 
 ui-welcome-title      = Welcome to Computeza
 ui-welcome-lead       = Welcome to
@@ -18,6 +18,127 @@ ui-home-surfaces      = Operator surfaces
 ui-home-pre-alpha     = pre-alpha
 ui-welcome-status     = Pre-alpha -- the operator console is a placeholder while the rest of the platform is being built.
 ui-welcome-spec       = See the Architecture & Product Specification v1.5 for the full feature plan.
+
+# --- Public landing page (the marketing front door at /) ---
+#
+# Strings here power the public-facing landing page. Every visible
+# word goes through the localizer so the page can be rebranded /
+# translated per the reseller chain in v0.1+.
+
+ui-landing-nav-signin    = Sign in
+ui-landing-nav-docs      = Documentation
+ui-landing-nav-github    = GitHub
+
+ui-landing-hero-eyebrow   = Open lakehouse control plane
+ui-landing-hero-title-pre = The Rust-native lakehouse,
+ui-landing-hero-title-em  = in one self-hosted binary.
+ui-landing-hero-subtitle  = Computeza installs, observes, and operates eleven open-source data components -- Postgres, Kanidm, Garage, Lakekeeper, Qdrant, Restate, Databend, GreptimeDB, Grafana, OpenFGA, Apache XTable -- through a single GUI-first console. No Docker. No Kubernetes. No SaaS lock-in. The data plane runs on your hardware; the operator console is the single pane of glass over it.
+ui-landing-hero-cta-primary   = Sign in to your console
+ui-landing-hero-cta-secondary = Browse the 11 components
+
+ui-landing-stat-1-value = 11
+ui-landing-stat-1-label = Managed components
+ui-landing-stat-2-value = 0
+ui-landing-stat-2-label = Docker containers
+ui-landing-stat-3-value = 100%
+ui-landing-stat-3-label = Rust toolchain
+ui-landing-stat-4-value = MPL-2.0
+ui-landing-stat-4-label = Open license
+
+# --- What is Computeza ---
+
+ui-landing-about-eyebrow   = What it is
+ui-landing-about-title     = An operator console for the lakehouse stack you already understand.
+ui-landing-about-subtitle  = Computeza is not a new database, not a new query engine, and not a new ML framework. It is the missing operator layer that turns eleven best-in-class open-source projects into one production-shaped data plane -- installed natively, observed continuously, and torn down cleanly when you no longer need them.
+
+# --- Features ---
+
+ui-landing-features-eyebrow  = Capabilities
+ui-landing-features-title    = Built for operators who deliver, not who tinker.
+ui-landing-features-subtitle = Every surface below is GUI-first and CLI-equivalent. Anything you can click in the console, you can drive from `computeza`, your shell pipelines, or your CI.
+
+ui-landing-feature-1-title = Unified one-click install
+ui-landing-feature-1-body  = One Install button lays down every component in dependency order: postgres, openfga, kanidm, garage, qdrant, lakekeeper, greptime, grafana, restate, databend. Sequenced, idempotent, and resumable across browser refreshes.
+ui-landing-feature-2-title = Encrypted secrets store
+ui-landing-feature-2-body  = AES-256-GCM at rest, Argon2id-derived KEK, zero-on-drop in memory. Initial admin credentials generated post-install and surfaced one time; everything else lives under the rotate-secrets UI.
+ui-landing-feature-3-title = Audit-grade event log
+ui-landing-feature-3-body  = Every install, uninstall, and rotation routes through an ed25519-signed append-only audit log. Tamper-evident on disk, verifiable from the CLI, ready for compliance review without ad-hoc scraping.
+ui-landing-feature-4-title = Live reconciler status
+ui-landing-feature-4-body  = Each managed component is observed against its desired spec on a 30-second cadence. Drift surfaces immediately on the status page, with per-resource drill-down into the last successful observation and full spec history.
+ui-landing-feature-5-title = Native OS services
+ui-landing-feature-5-body  = systemd on Linux, launchd on macOS, Windows SCM. No container runtime required, no orchestrator to babysit, no inner network to debug -- the installed binary is the daemon your `ps` already understands.
+ui-landing-feature-6-title = Single-binary, single-host
+ui-landing-feature-6-body  = One signed binary boots the operator console and the data plane. Toolchains needed for component builds (the Rust toolchain for Kanidm) auto-install into a sandboxed root and never touch your existing PATH state.
+ui-landing-feature-7-title = Idempotent rollback
+ui-landing-feature-7-body  = Every install path remembers what it changed -- service names, root directories, generated credentials -- and the rollback button can tear it down in exact reverse dependency order, leaving no orphan rows, no orphan units, no orphan secrets.
+ui-landing-feature-8-title = Reseller-ready by design
+ui-landing-feature-8-body  = Multi-tier license chains, white-label theming, channel-partner API contracts. Whether you sell direct, via a reseller, or via a sub-reseller, the platform encodes the relationship in the license and routes telemetry up the chain without leaking customer-private content.
+ui-landing-feature-9-title = GUI-first, CLI-equivalent
+ui-landing-feature-9-body  = Spec section 2.1 mandate: every administrative action reachable from the web console must also work from `computeza`. No "use the CLI" escape hatches, no operator-only flags, no production drift between your scripts and your operators' fingertips.
+
+# --- Built for (target personas) ---
+
+ui-landing-audiences-eyebrow  = Built for
+ui-landing-audiences-title    = One control plane, three operator stories.
+ui-landing-audiences-subtitle = Whether you are running this for yourself, your team, or a reseller chain, the surfaces below get out of your way.
+
+ui-landing-audience-1-role  = Platform engineers
+ui-landing-audience-1-title = Self-host the modern lakehouse without losing a quarter to YAML.
+ui-landing-audience-1-body  = One binary boots the entire stack. The install wizard reads your hardware, picks safe defaults, and never asks you to write a manifest. Use the console for day-one bring-up, leave the CLI for CI; both drive the same code.
+ui-landing-audience-2-role  = Enterprise operations
+ui-landing-audience-2-title = On-prem compliance, audit, and observability without a sidecar zoo.
+ui-landing-audience-2-body  = AES-256-GCM secrets, ed25519-signed audit, native OS services your ops team already monitors. SOC 2 and ISO controls map onto our surfaces line-by-line; the reseller chain claim on the license keeps procurement happy.
+ui-landing-audience-3-role  = Resellers and OEMs
+ui-landing-audience-3-title = Brand it, bill it, ship it as your data product.
+ui-landing-audience-3-body  = The console renders through CSS-variable theming and accepts a tenant-supplied SVG mark. The license envelope carries your tier; the channel-partner API drives provisioning at scale; downstream telemetry aggregates upward without exposing customer content.
+
+# --- Pricing ---
+
+ui-landing-pricing-eyebrow  = Pricing
+ui-landing-pricing-title    = Self-host on us. Pay only when you need the lift.
+ui-landing-pricing-subtitle = Computeza is free to use, fork, and resell. The paid tiers add SLA-backed support, security review, and the reseller-chain primitives an OEM needs to put their name on the console.
+
+ui-landing-pricing-1-name     = Community
+ui-landing-pricing-1-price    = $0
+ui-landing-pricing-1-unit     = / forever
+ui-landing-pricing-1-tagline  = For individual operators, homelabs, and zero-budget pilots.
+ui-landing-pricing-1-feature-1 = Every one of the 11 managed components
+ui-landing-pricing-1-feature-2 = Unified install + rollback + repair
+ui-landing-pricing-1-feature-3 = Encrypted secrets store + rotate UI
+ui-landing-pricing-1-feature-4 = Local-only deployment (single host)
+ui-landing-pricing-1-feature-5 = Community support via GitHub issues
+ui-landing-pricing-1-cta      = Download
+
+ui-landing-pricing-2-name     = Pro
+ui-landing-pricing-2-price    = $40
+ui-landing-pricing-2-unit     = / seat / month
+ui-landing-pricing-2-tagline  = For small platform teams putting Computeza into production.
+ui-landing-pricing-2-feature-1 = Everything in Community
+ui-landing-pricing-2-feature-2 = Priority support (24h response)
+ui-landing-pricing-2-feature-3 = Multi-host orchestration
+ui-landing-pricing-2-feature-4 = Audit-log export to external SIEM
+ui-landing-pricing-2-feature-5 = Early access to v0.1 federation features
+ui-landing-pricing-2-cta      = Start free trial
+ui-landing-pricing-2-badge    = Most popular
+
+ui-landing-pricing-3-name     = Enterprise
+ui-landing-pricing-3-price    = Custom
+ui-landing-pricing-3-unit     = annual contract
+ui-landing-pricing-3-tagline  = For regulated industries, sovereign workloads, and reseller chains.
+ui-landing-pricing-3-feature-1 = Everything in Pro
+ui-landing-pricing-3-feature-2 = SLA-backed support (4h critical)
+ui-landing-pricing-3-feature-3 = White-label theming + brand SVG
+ui-landing-pricing-3-feature-4 = Multi-tier license chain + reseller billing
+ui-landing-pricing-3-feature-5 = Dedicated security review on every release
+ui-landing-pricing-3-feature-6 = Channel-partner gRPC API for provisioning
+ui-landing-pricing-3-cta      = Contact sales
+
+# --- Final CTA ---
+
+ui-landing-final-title    = Run the lakehouse you already understand. On your hardware.
+ui-landing-final-subtitle = Sign in to your console to lay down the data plane, or browse the eleven components Computeza manages. Either way, you stay in control.
+ui-landing-final-primary  = Sign in
+ui-landing-final-secondary = Browse components
 
 # --- Home dashboard cards ---
 

@@ -3386,115 +3386,380 @@ pub fn render_shell(
     )
 }
 
-/// Render one navigation card on the home dashboard. `extra` is an
-/// optional one-line context tail (e.g. resource count) shown beneath
-/// the body text in a smaller font.
-fn render_home_card(href: &str, title: &str, body: &str, extra: Option<&str>) -> String {
-    let extra_html = match extra {
-        Some(e) => format!(r#"<p class="cz-card-meta">{}</p>"#, html_escape(e)),
-        None => String::new(),
-    };
-    format!(
-        r#"<a href="{href}" class="cz-card">
-<h3 class="cz-card-title">{title}</h3>
-<p class="cz-card-body">{body}</p>
-{extra_html}
-</a>"#,
-        href = html_escape(href),
-        title = html_escape(title),
-        body = html_escape(body),
-    )
-}
-
 /// Render the home page to a complete HTML document.
 ///
 /// `store_summary` drives the "Metadata store" card -- pass
 /// `StoreSummary::Missing` when no store is attached to this server.
 #[must_use]
-pub fn render_home(localizer: &Localizer, store_summary: StoreSummary) -> String {
-    let tagline = localizer.t("ui-app-tagline");
+pub fn render_home(localizer: &Localizer, _store_summary: StoreSummary) -> String {
+    render_landing_page(localizer)
+}
+
+/// Render the public marketing landing page at `/`. Unauthenticated
+/// surface: anyone visiting the operator console root sees this page
+/// before being asked to sign in. Mirrors the multi-section structure
+/// of mature B2B SaaS landings (hero + stats + about + features +
+/// audiences + pricing + final CTA) so a CISO browsing the marketing
+/// copy gets the full operator pitch without needing to drop into
+/// the console first.
+///
+/// All visible strings flow through the i18n bundle so the reseller
+/// chain (v0.1+) can swap brand voice per tenant.
+#[must_use]
+pub fn render_landing_page(localizer: &Localizer) -> String {
     let title = localizer.t("ui-welcome-title");
-    let subtitle = localizer.t("ui-welcome-subtitle");
-    let status = localizer.t("ui-welcome-status");
-    let spec_note = localizer.t("ui-welcome-spec");
 
-    let card_components_title = localizer.t("ui-home-card-components-title");
-    let card_components_body = localizer.t("ui-home-card-components-body");
-    let card_install_title = localizer.t("ui-home-card-install-title");
-    let card_install_body = localizer.t("ui-home-card-install-body");
-    let card_status_title = localizer.t("ui-home-card-status-title");
-    let card_status_body = localizer.t("ui-home-card-status-body");
-    let card_state_title = localizer.t("ui-home-card-state-title");
-    let card_state_body = localizer.t("ui-home-card-state-body");
+    // Hero
+    let hero_eyebrow = localizer.t("ui-landing-hero-eyebrow");
+    let hero_title_pre = localizer.t("ui-landing-hero-title-pre");
+    let hero_title_em = localizer.t("ui-landing-hero-title-em");
+    let hero_subtitle = localizer.t("ui-landing-hero-subtitle");
+    let hero_cta_primary = localizer.t("ui-landing-hero-cta-primary");
+    let hero_cta_secondary = localizer.t("ui-landing-hero-cta-secondary");
 
-    let store_line = match store_summary {
-        StoreSummary::Missing => localizer.t("ui-home-store-missing"),
-        StoreSummary::Counted(0) => localizer.t("ui-home-store-empty"),
-        StoreSummary::Counted(n) => format!("{n} resource(s) registered."),
-    };
+    // Stats
+    let stat_1_value = localizer.t("ui-landing-stat-1-value");
+    let stat_1_label = localizer.t("ui-landing-stat-1-label");
+    let stat_2_value = localizer.t("ui-landing-stat-2-value");
+    let stat_2_label = localizer.t("ui-landing-stat-2-label");
+    let stat_3_value = localizer.t("ui-landing-stat-3-value");
+    let stat_3_label = localizer.t("ui-landing-stat-3-label");
+    let stat_4_value = localizer.t("ui-landing-stat-4-value");
+    let stat_4_label = localizer.t("ui-landing-stat-4-label");
 
-    let cards_html = format!(
-        r#"<div class="cz-card-grid">
-{c1}
-{c2}
-{c3}
-{c4}
+    // About
+    let about_eyebrow = localizer.t("ui-landing-about-eyebrow");
+    let about_title = localizer.t("ui-landing-about-title");
+    let about_subtitle = localizer.t("ui-landing-about-subtitle");
+
+    // Features
+    let features_eyebrow = localizer.t("ui-landing-features-eyebrow");
+    let features_title = localizer.t("ui-landing-features-title");
+    let features_subtitle = localizer.t("ui-landing-features-subtitle");
+
+    let features = [
+        (
+            "01",
+            localizer.t("ui-landing-feature-1-title"),
+            localizer.t("ui-landing-feature-1-body"),
+        ),
+        (
+            "02",
+            localizer.t("ui-landing-feature-2-title"),
+            localizer.t("ui-landing-feature-2-body"),
+        ),
+        (
+            "03",
+            localizer.t("ui-landing-feature-3-title"),
+            localizer.t("ui-landing-feature-3-body"),
+        ),
+        (
+            "04",
+            localizer.t("ui-landing-feature-4-title"),
+            localizer.t("ui-landing-feature-4-body"),
+        ),
+        (
+            "05",
+            localizer.t("ui-landing-feature-5-title"),
+            localizer.t("ui-landing-feature-5-body"),
+        ),
+        (
+            "06",
+            localizer.t("ui-landing-feature-6-title"),
+            localizer.t("ui-landing-feature-6-body"),
+        ),
+        (
+            "07",
+            localizer.t("ui-landing-feature-7-title"),
+            localizer.t("ui-landing-feature-7-body"),
+        ),
+        (
+            "08",
+            localizer.t("ui-landing-feature-8-title"),
+            localizer.t("ui-landing-feature-8-body"),
+        ),
+        (
+            "09",
+            localizer.t("ui-landing-feature-9-title"),
+            localizer.t("ui-landing-feature-9-body"),
+        ),
+    ];
+    let feature_cards: String = features
+        .iter()
+        .map(|(icon, t, b)| {
+            format!(
+                r#"<div class="cz-feature">
+<span class="cz-feature-icon">{icon}</span>
+<h3 class="cz-feature-title">{t}</h3>
+<p class="cz-feature-body">{b}</p>
 </div>"#,
-        c1 = render_home_card(
-            "/components",
-            &card_components_title,
-            &card_components_body,
-            None
+                icon = html_escape(icon),
+                t = html_escape(t),
+                b = html_escape(b),
+            )
+        })
+        .collect();
+
+    // Audiences
+    let audiences_eyebrow = localizer.t("ui-landing-audiences-eyebrow");
+    let audiences_title = localizer.t("ui-landing-audiences-title");
+    let audiences_subtitle = localizer.t("ui-landing-audiences-subtitle");
+    let personas = [
+        (
+            localizer.t("ui-landing-audience-1-role"),
+            localizer.t("ui-landing-audience-1-title"),
+            localizer.t("ui-landing-audience-1-body"),
         ),
-        c2 = render_home_card("/install", &card_install_title, &card_install_body, None),
-        c3 = render_home_card("/status", &card_status_title, &card_status_body, None),
-        c4 = render_home_card(
-            "/state",
-            &card_state_title,
-            &card_state_body,
-            Some(&store_line),
+        (
+            localizer.t("ui-landing-audience-2-role"),
+            localizer.t("ui-landing-audience-2-title"),
+            localizer.t("ui-landing-audience-2-body"),
         ),
+        (
+            localizer.t("ui-landing-audience-3-role"),
+            localizer.t("ui-landing-audience-3-title"),
+            localizer.t("ui-landing-audience-3-body"),
+        ),
+    ];
+    let persona_cards: String = personas
+        .iter()
+        .map(|(role, t, b)| {
+            format!(
+                r#"<div class="cz-persona">
+<p class="cz-persona-role">{role}</p>
+<h3 class="cz-persona-title">{t}</h3>
+<p class="cz-persona-body">{b}</p>
+</div>"#,
+                role = html_escape(role),
+                t = html_escape(t),
+                b = html_escape(b),
+            )
+        })
+        .collect();
+
+    // Pricing
+    let pricing_eyebrow = localizer.t("ui-landing-pricing-eyebrow");
+    let pricing_title = localizer.t("ui-landing-pricing-title");
+    let pricing_subtitle = localizer.t("ui-landing-pricing-subtitle");
+
+    let tier1 = render_pricing_card(
+        &localizer.t("ui-landing-pricing-1-name"),
+        &localizer.t("ui-landing-pricing-1-price"),
+        &localizer.t("ui-landing-pricing-1-unit"),
+        &localizer.t("ui-landing-pricing-1-tagline"),
+        &[
+            localizer.t("ui-landing-pricing-1-feature-1"),
+            localizer.t("ui-landing-pricing-1-feature-2"),
+            localizer.t("ui-landing-pricing-1-feature-3"),
+            localizer.t("ui-landing-pricing-1-feature-4"),
+            localizer.t("ui-landing-pricing-1-feature-5"),
+        ],
+        &localizer.t("ui-landing-pricing-1-cta"),
+        "/install",
+        None,
+        false,
+    );
+    let tier2 = render_pricing_card(
+        &localizer.t("ui-landing-pricing-2-name"),
+        &localizer.t("ui-landing-pricing-2-price"),
+        &localizer.t("ui-landing-pricing-2-unit"),
+        &localizer.t("ui-landing-pricing-2-tagline"),
+        &[
+            localizer.t("ui-landing-pricing-2-feature-1"),
+            localizer.t("ui-landing-pricing-2-feature-2"),
+            localizer.t("ui-landing-pricing-2-feature-3"),
+            localizer.t("ui-landing-pricing-2-feature-4"),
+            localizer.t("ui-landing-pricing-2-feature-5"),
+        ],
+        &localizer.t("ui-landing-pricing-2-cta"),
+        "/login",
+        Some(&localizer.t("ui-landing-pricing-2-badge")),
+        true,
+    );
+    let tier3 = render_pricing_card(
+        &localizer.t("ui-landing-pricing-3-name"),
+        &localizer.t("ui-landing-pricing-3-price"),
+        &localizer.t("ui-landing-pricing-3-unit"),
+        &localizer.t("ui-landing-pricing-3-tagline"),
+        &[
+            localizer.t("ui-landing-pricing-3-feature-1"),
+            localizer.t("ui-landing-pricing-3-feature-2"),
+            localizer.t("ui-landing-pricing-3-feature-3"),
+            localizer.t("ui-landing-pricing-3-feature-4"),
+            localizer.t("ui-landing-pricing-3-feature-5"),
+            localizer.t("ui-landing-pricing-3-feature-6"),
+        ],
+        &localizer.t("ui-landing-pricing-3-cta"),
+        "/login",
+        None,
+        false,
     );
 
-    let welcome_lead = localizer.t("ui-welcome-lead");
-    let app_title = localizer.t("ui-app-title");
-    let surfaces_heading = localizer.t("ui-home-surfaces");
-    let pre_alpha = localizer.t("ui-home-pre-alpha");
+    // Final CTA
+    let final_title = localizer.t("ui-landing-final-title");
+    let final_subtitle = localizer.t("ui-landing-final-subtitle");
+    let final_primary = localizer.t("ui-landing-final-primary");
+    let final_secondary = localizer.t("ui-landing-final-secondary");
+
     let body = format!(
-        r#"<section class="cz-hero" style="display: grid; grid-template-columns: 1.1fr 0.9fr; gap: 3rem; align-items: center;">
-<div>
-<span class="cz-tag">{tagline}</span>
-<h1>{welcome_lead} <em>{app_title}</em></h1>
-<p>{subtitle}</p>
+        r#"<div class="cz-landing">
+<section class="cz-landing-hero">
+<span class="cz-landing-eyebrow">{hero_eyebrow}</span>
+<h1 class="cz-landing-title">{hero_title_pre}<br /><em>{hero_title_em}</em></h1>
+<p class="cz-landing-subtitle">{hero_subtitle}</p>
+<div class="cz-cta-row">
+<a class="cz-btn cz-btn-primary cz-btn-lg" href="/login">{hero_cta_primary}</a>
+<a class="cz-btn cz-btn-lg" href="/components">{hero_cta_secondary}</a>
 </div>
-<div class="cz-stage">
-<img src="/static/brand/computeza-logo.svg" alt="" />
+<div class="cz-stat-strip">
+<div class="cz-stat"><span class="cz-stat-value">{s1v}</span><span class="cz-stat-label">{s1l}</span></div>
+<div class="cz-stat"><span class="cz-stat-value">{s2v}</span><span class="cz-stat-label">{s2l}</span></div>
+<div class="cz-stat"><span class="cz-stat-value">{s3v}</span><span class="cz-stat-label">{s3l}</span></div>
+<div class="cz-stat"><span class="cz-stat-value">{s4v}</span><span class="cz-stat-label">{s4l}</span></div>
 </div>
 </section>
-<section class="cz-section">
-<div class="cz-section-head">
-<h2>{surfaces_heading}</h2>
-<span class="cz-meta">{pre_alpha}</span>
+
+<section class="cz-landing-section">
+<div class="cz-landing-section-head">
+<p class="cz-landing-section-eyebrow">{about_eyebrow}</p>
+<h2 class="cz-landing-section-title">{about_title}</h2>
+<p class="cz-landing-section-subtitle">{about_subtitle}</p>
 </div>
-{cards_html}
 </section>
-<section class="cz-section">
-<div class="cz-card">
-<p class="cz-card-body" style="margin: 0 0 0.5rem;">{status}</p>
-<p class="cz-card-meta" style="margin: 0;">{spec_note}</p>
+
+<section class="cz-landing-section">
+<div class="cz-landing-section-head">
+<p class="cz-landing-section-eyebrow">{features_eyebrow}</p>
+<h2 class="cz-landing-section-title">{features_title}</h2>
+<p class="cz-landing-section-subtitle">{features_subtitle}</p>
 </div>
-</section>"#,
-        welcome_lead = html_escape(&welcome_lead),
-        app_title = html_escape(&app_title),
-        subtitle = html_escape(&subtitle),
-        tagline = html_escape(&tagline),
-        surfaces_heading = html_escape(&surfaces_heading),
-        pre_alpha = html_escape(&pre_alpha),
-        status = html_escape(&status),
-        spec_note = html_escape(&spec_note),
+<div class="cz-feature-grid">{feature_cards}</div>
+</section>
+
+<section class="cz-landing-section">
+<div class="cz-landing-section-head">
+<p class="cz-landing-section-eyebrow">{audiences_eyebrow}</p>
+<h2 class="cz-landing-section-title">{audiences_title}</h2>
+<p class="cz-landing-section-subtitle">{audiences_subtitle}</p>
+</div>
+<div class="cz-persona-grid">{persona_cards}</div>
+</section>
+
+<section class="cz-landing-section">
+<div class="cz-landing-section-head">
+<p class="cz-landing-section-eyebrow">{pricing_eyebrow}</p>
+<h2 class="cz-landing-section-title">{pricing_title}</h2>
+<p class="cz-landing-section-subtitle">{pricing_subtitle}</p>
+</div>
+<div class="cz-pricing-grid">
+{tier1}
+{tier2}
+{tier3}
+</div>
+</section>
+
+<section class="cz-landing-section">
+<div class="cz-final-cta">
+<h2>{final_title}</h2>
+<p>{final_subtitle}</p>
+<div class="cz-cta-row">
+<a class="cz-btn cz-btn-primary cz-btn-lg" href="/login">{final_primary}</a>
+<a class="cz-btn cz-btn-lg" href="/components">{final_secondary}</a>
+</div>
+</div>
+</section>
+</div>"#,
+        hero_eyebrow = html_escape(&hero_eyebrow),
+        hero_title_pre = html_escape(&hero_title_pre),
+        hero_title_em = html_escape(&hero_title_em),
+        hero_subtitle = html_escape(&hero_subtitle),
+        hero_cta_primary = html_escape(&hero_cta_primary),
+        hero_cta_secondary = html_escape(&hero_cta_secondary),
+        s1v = html_escape(&stat_1_value),
+        s1l = html_escape(&stat_1_label),
+        s2v = html_escape(&stat_2_value),
+        s2l = html_escape(&stat_2_label),
+        s3v = html_escape(&stat_3_value),
+        s3l = html_escape(&stat_3_label),
+        s4v = html_escape(&stat_4_value),
+        s4l = html_escape(&stat_4_label),
+        about_eyebrow = html_escape(&about_eyebrow),
+        about_title = html_escape(&about_title),
+        about_subtitle = html_escape(&about_subtitle),
+        features_eyebrow = html_escape(&features_eyebrow),
+        features_title = html_escape(&features_title),
+        features_subtitle = html_escape(&features_subtitle),
+        feature_cards = feature_cards,
+        audiences_eyebrow = html_escape(&audiences_eyebrow),
+        audiences_title = html_escape(&audiences_title),
+        audiences_subtitle = html_escape(&audiences_subtitle),
+        persona_cards = persona_cards,
+        pricing_eyebrow = html_escape(&pricing_eyebrow),
+        pricing_title = html_escape(&pricing_title),
+        pricing_subtitle = html_escape(&pricing_subtitle),
+        tier1 = tier1,
+        tier2 = tier2,
+        tier3 = tier3,
+        final_title = html_escape(&final_title),
+        final_subtitle = html_escape(&final_subtitle),
+        final_primary = html_escape(&final_primary),
+        final_secondary = html_escape(&final_secondary),
     );
 
     render_shell(localizer, &title, NavLink::Home, &body)
+}
+
+/// Render a single pricing-tier card on the landing page.
+/// `featured = true` swaps in the lavender-bordered variant with the
+/// `data-badge` ribbon ("Most popular" or the localized equivalent).
+#[allow(clippy::too_many_arguments)]
+fn render_pricing_card(
+    name: &str,
+    price: &str,
+    unit: &str,
+    tagline: &str,
+    features: &[String],
+    cta_label: &str,
+    cta_href: &str,
+    badge: Option<&str>,
+    featured: bool,
+) -> String {
+    let features_html: String = features
+        .iter()
+        .map(|f| format!("<li>{}</li>", html_escape(f)))
+        .collect();
+    let class = if featured {
+        "cz-pricing cz-pricing-featured"
+    } else {
+        "cz-pricing"
+    };
+    let badge_attr = badge
+        .map(|b| format!(r#" data-badge="{}""#, html_escape(b)))
+        .unwrap_or_default();
+    let btn_class = if featured {
+        "cz-btn cz-btn-primary"
+    } else {
+        "cz-btn"
+    };
+    format!(
+        r#"<div class="{class}"{badge_attr}>
+<p class="cz-pricing-name">{name}</p>
+<p class="cz-pricing-price">{price} <span class="cz-pricing-price-unit">{unit}</span></p>
+<p class="cz-pricing-tagline">{tagline}</p>
+<ul class="cz-pricing-features">{features_html}</ul>
+<a class="{btn_class}" href="{cta_href}">{cta_label}</a>
+</div>"#,
+        class = class,
+        badge_attr = badge_attr,
+        name = html_escape(name),
+        price = html_escape(price),
+        unit = html_escape(unit),
+        tagline = html_escape(tagline),
+        features_html = features_html,
+        btn_class = btn_class,
+        cta_href = html_escape(cta_href),
+        cta_label = html_escape(cta_label),
+    )
 }
 
 /// Render the `/components` page: a table of every component the
@@ -7094,48 +7359,65 @@ mod tests {
     }
 
     #[test]
-    fn render_home_dashboard_links_to_every_surface() {
+    fn render_home_landing_links_to_login_and_components() {
         let l = Localizer::english();
         let html = render_home(&l, StoreSummary::Missing);
-        for href in [
-            r#"href="/components""#,
-            r#"href="/install""#,
-            r#"href="/status""#,
-            r#"href="/state""#,
-        ] {
+        // The landing page is the marketing front door; primary CTAs
+        // are sign-in and browse-components. The top nav (rendered
+        // separately via render_shell) handles the rest of the
+        // operator surfaces.
+        for href in [r#"href="/login""#, r#"href="/components""#] {
             assert!(
                 html.contains(href),
-                "home dashboard should link to {href}; got HTML excerpt:\n{}",
+                "landing page should link to {href}; got HTML excerpt:\n{}",
                 &html[..html.len().min(2000)]
             );
         }
     }
 
     #[test]
-    fn render_home_state_card_shows_missing_when_no_store() {
+    fn render_home_landing_renders_all_three_pricing_tiers() {
         let l = Localizer::english();
         let html = render_home(&l, StoreSummary::Missing);
-        assert!(html.contains("No metadata store attached"));
+        assert!(html.contains("Community"));
+        assert!(html.contains("Pro"));
+        assert!(html.contains("Enterprise"));
+        assert!(
+            html.contains(r#"data-badge="Most popular""#),
+            "Pro tier should carry the featured badge"
+        );
     }
 
     #[test]
-    fn render_home_state_card_shows_count_when_store_attached() {
+    fn render_home_landing_carries_all_marketing_sections() {
         let l = Localizer::english();
-        let html = render_home(&l, StoreSummary::Counted(3));
-        assert!(html.contains("3 resource(s) registered."));
+        let html = render_home(&l, StoreSummary::Missing);
+        // Hero
+        assert!(html.contains("The Rust-native lakehouse,"));
+        assert!(html.contains("Sign in to your console"));
+        // Stat strip
+        assert!(html.contains("Managed components"));
+        // About
+        assert!(html.contains("What it is"));
+        // Features
+        assert!(html.contains("Capabilities"));
+        assert!(html.contains("Unified one-click install"));
+        // Audiences
+        assert!(html.contains("Built for"));
+        assert!(html.contains("Platform engineers"));
+        // Final CTA
+        assert!(html.contains("Run the lakehouse you already understand"));
     }
 
     #[test]
     fn render_home_has_no_hardcoded_english_strings_outside_attributes() {
         // Sanity check: every <p> and <h*> text node should be a value the
         // localizer produced. We assert by checking that strings the .ftl
-        // bundle defines actually appear (positive check) and that some
-        // common hardcoded-English smell doesn't (negative check).
+        // bundle defines actually appear (positive check).
         let l = Localizer::english();
         let html = render_home(&l, StoreSummary::Missing);
-        assert!(html.contains("Computeza")); // ui-app-title
-        assert!(html.contains("Open lakehouse control plane")); // ui-app-tagline
-        assert!(html.contains("Pre-alpha")); // ui-welcome-status starts with this
+        assert!(html.contains("Computeza")); // ui-app-title (in <title>)
+        assert!(html.contains("Open lakehouse control plane")); // ui-landing-hero-eyebrow
     }
 
     #[test]

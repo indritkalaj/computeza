@@ -440,6 +440,330 @@ a.cz-card:hover {
 .cz-muted { color: var(--muted); }
 .cz-strong { color: var(--ink); font-weight: 600; }
 
+/* ---------- Landing page (the public marketing surface at /) ---------- */
+
+.cz-landing { max-width: 78rem; margin: 0 auto; padding: 0 1.5rem; }
+.cz-landing-hero {
+  padding: 5rem 0 4.5rem;
+  text-align: center;
+  position: relative;
+}
+.cz-landing-hero::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(700px 320px at 50% 30%, rgba(196, 184, 232, 0.18), transparent 65%),
+    radial-gradient(900px 420px at 50% 100%, rgba(232, 184, 200, 0.08), transparent 65%);
+  pointer-events: none;
+  z-index: -1;
+}
+.cz-landing-eyebrow {
+  display: inline-block;
+  font-family: 'Geist Mono', monospace;
+  font-size: 0.72rem;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--lavender);
+  padding: 0.4rem 0.85rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(196, 184, 232, 0.06);
+  margin-bottom: 1.5rem;
+}
+.cz-landing-title {
+  font-size: clamp(2.2rem, 5.5vw, 4rem);
+  line-height: 1.05;
+  letter-spacing: -0.03em;
+  font-weight: 700;
+  margin: 0 0 1.5rem;
+  color: var(--ink);
+}
+.cz-landing-title em {
+  font-style: normal;
+  background: linear-gradient(120deg, var(--lavender) 0%, var(--pink) 60%, var(--peach) 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+}
+.cz-landing-subtitle {
+  font-size: 1.15rem;
+  line-height: 1.6;
+  color: var(--muted);
+  max-width: 46rem;
+  margin: 0 auto 2.25rem;
+}
+.cz-cta-row {
+  display: flex;
+  gap: 0.85rem;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+.cz-btn-lg {
+  padding: 0.85rem 1.6rem;
+  font-size: 1rem;
+  font-weight: 600;
+  border-radius: 10px;
+}
+
+/* Stat strip just under the hero. */
+.cz-stat-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 1rem;
+  margin: 3rem 0 1rem;
+  padding: 1.5rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--navy-2);
+}
+.cz-stat { text-align: center; }
+.cz-stat-value {
+  font-size: 1.8rem;
+  font-weight: 700;
+  color: var(--ink);
+  letter-spacing: -0.02em;
+  display: block;
+  line-height: 1.1;
+}
+.cz-stat-label {
+  font-family: 'Geist Mono', monospace;
+  font-size: 0.72rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-top: 0.4rem;
+  display: block;
+}
+
+/* Generic section heading used across the landing surface. */
+.cz-landing-section { padding: 4rem 0; border-top: 1px solid var(--line); }
+.cz-landing-section-head {
+  max-width: 48rem;
+  margin: 0 auto 2.5rem;
+  text-align: center;
+}
+.cz-landing-section-eyebrow {
+  font-family: 'Geist Mono', monospace;
+  font-size: 0.72rem;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--lavender);
+  margin: 0 0 0.85rem;
+}
+.cz-landing-section-title {
+  font-size: clamp(1.6rem, 3.5vw, 2.4rem);
+  line-height: 1.15;
+  letter-spacing: -0.02em;
+  font-weight: 700;
+  margin: 0 0 1rem;
+  color: var(--ink);
+}
+.cz-landing-section-subtitle {
+  font-size: 1.02rem;
+  color: var(--muted);
+  margin: 0;
+  line-height: 1.6;
+}
+
+/* Feature grid (3 columns on desktop, single column on narrow). */
+.cz-feature-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 1rem;
+}
+.cz-feature {
+  padding: 1.4rem 1.4rem 1.5rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--navy-2);
+  transition: border-color 120ms ease, transform 120ms ease;
+}
+.cz-feature:hover { border-color: var(--lavender); transform: translateY(-2px); }
+.cz-feature-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: 9px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-family: 'Geist Mono', monospace;
+  font-weight: 600;
+  font-size: 0.95rem;
+  background: linear-gradient(135deg, rgba(196, 184, 232, 0.2), rgba(232, 184, 200, 0.12));
+  color: var(--lavender);
+  margin-bottom: 0.9rem;
+}
+.cz-feature-title {
+  font-size: 1.02rem;
+  font-weight: 600;
+  color: var(--ink);
+  margin: 0 0 0.5rem;
+  letter-spacing: -0.01em;
+}
+.cz-feature-body {
+  color: var(--muted);
+  font-size: 0.92rem;
+  line-height: 1.55;
+  margin: 0;
+}
+
+/* Persona grid for the "Built for" section. */
+.cz-persona-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 1rem;
+}
+.cz-persona {
+  padding: 1.6rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background:
+    linear-gradient(180deg, rgba(196, 184, 232, 0.04), transparent 60%),
+    var(--navy-2);
+}
+.cz-persona-role {
+  font-family: 'Geist Mono', monospace;
+  font-size: 0.7rem;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--peach);
+  margin: 0 0 0.75rem;
+}
+.cz-persona-title {
+  font-size: 1.15rem;
+  font-weight: 600;
+  color: var(--ink);
+  margin: 0 0 0.65rem;
+  letter-spacing: -0.01em;
+}
+.cz-persona-body {
+  color: var(--muted);
+  font-size: 0.92rem;
+  line-height: 1.55;
+  margin: 0;
+}
+
+/* Pricing tier cards. */
+.cz-pricing-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 1rem;
+  align-items: stretch;
+}
+.cz-pricing {
+  display: flex;
+  flex-direction: column;
+  padding: 2rem 1.75rem 1.75rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--navy-2);
+  position: relative;
+}
+.cz-pricing-featured {
+  border-color: var(--lavender);
+  background:
+    linear-gradient(180deg, rgba(196, 184, 232, 0.08), transparent 40%),
+    var(--navy-2);
+  box-shadow: 0 0 0 1px var(--lavender) inset, var(--shadow-card);
+}
+.cz-pricing-featured::before {
+  content: attr(data-badge);
+  position: absolute;
+  top: -0.7rem;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 0.25rem 0.7rem;
+  border-radius: 999px;
+  background: linear-gradient(120deg, var(--lavender), var(--pink));
+  color: var(--navy);
+  font-family: 'Geist Mono', monospace;
+  font-size: 0.68rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  font-weight: 600;
+}
+.cz-pricing-name {
+  font-size: 0.78rem;
+  font-family: 'Geist Mono', monospace;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--lavender);
+  margin: 0 0 0.75rem;
+}
+.cz-pricing-price {
+  font-size: 2.2rem;
+  font-weight: 700;
+  color: var(--ink);
+  letter-spacing: -0.02em;
+  margin: 0;
+  line-height: 1.1;
+}
+.cz-pricing-price-unit {
+  font-size: 0.9rem;
+  color: var(--muted);
+  font-weight: 400;
+  letter-spacing: 0;
+}
+.cz-pricing-tagline {
+  color: var(--muted);
+  font-size: 0.92rem;
+  margin: 0.5rem 0 1.5rem;
+  line-height: 1.5;
+}
+.cz-pricing-features {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 1.5rem;
+  flex: 1;
+}
+.cz-pricing-features li {
+  padding: 0.45rem 0;
+  border-bottom: 1px dashed var(--line);
+  color: var(--ink);
+  font-size: 0.9rem;
+  line-height: 1.5;
+  position: relative;
+  padding-left: 1.3rem;
+}
+.cz-pricing-features li:last-child { border-bottom: none; }
+.cz-pricing-features li::before {
+  content: "+";
+  position: absolute;
+  left: 0;
+  top: 0.45rem;
+  color: var(--lavender);
+  font-family: 'Geist Mono', monospace;
+  font-weight: 700;
+}
+
+/* Final CTA at the bottom of the landing. */
+.cz-final-cta {
+  text-align: center;
+  padding: 4rem 2rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background:
+    radial-gradient(500px 220px at 50% 0%, rgba(196, 184, 232, 0.12), transparent 70%),
+    var(--navy-2);
+  margin-top: 1rem;
+}
+.cz-final-cta h2 {
+  font-size: clamp(1.6rem, 3.5vw, 2.4rem);
+  letter-spacing: -0.02em;
+  margin: 0 0 1rem;
+  color: var(--ink);
+}
+.cz-final-cta p {
+  color: var(--muted);
+  margin: 0 0 2rem;
+  font-size: 1rem;
+  max-width: 38rem;
+  margin-left: auto;
+  margin-right: auto;
+}
+
 /* ---------- Tailwind-compat fallback (legacy class names still in templates) ---------- */
 .bg-indigo-900 { background-color: transparent; }
 .text-slate-100 { color: var(--ink); }
