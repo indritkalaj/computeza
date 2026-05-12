@@ -79,11 +79,32 @@ enum Command {
     License,
 }
 
-/// Components recognised by `computeza install`.
+/// Components recognised by `computeza install`. Postgres has full
+/// multi-OS coverage; the other 10 currently ship Linux-only drivers.
 #[derive(clap::ValueEnum, Clone, Debug)]
 enum InstallComponent {
-    /// PostgreSQL (Linux-only in v0.0.x).
+    /// PostgreSQL.
     Postgres,
+    /// Kanidm identity provider. Linux-only.
+    Kanidm,
+    /// Garage S3-compatible object storage. Linux-only.
+    Garage,
+    /// Lakekeeper Iceberg REST catalog. Linux-only.
+    Lakekeeper,
+    /// Apache XTable Iceberg<->Delta<->Hudi sync. Linux-only.
+    Xtable,
+    /// Databend columnar SQL engine. Linux-only.
+    Databend,
+    /// Qdrant vector store. Linux-only.
+    Qdrant,
+    /// Restate durable execution. Linux-only.
+    Restate,
+    /// GreptimeDB unified observability. Linux-only.
+    Greptime,
+    /// Grafana visualisation. Linux-only.
+    Grafana,
+    /// OpenFGA fine-grained authorization. Linux-only.
+    Openfga,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -163,12 +184,106 @@ async fn status(url: &str, l: &Localizer) -> anyhow::Result<()> {
 }
 
 /// Dispatch `computeza install <component>` to the appropriate platform
-/// install path. v0.0.x is Linux-only; macOS / Windows print a localized
-/// "not yet supported" message.
+/// install path. Postgres has full multi-OS coverage; the rest are
+/// Linux-only today.
 fn install_component(component: InstallComponent, l: &Localizer) -> anyhow::Result<()> {
     match component {
         InstallComponent::Postgres => install_postgres(l),
+        InstallComponent::Kanidm => install_simple_linux("kanidm", l),
+        InstallComponent::Garage => install_simple_linux("garage", l),
+        InstallComponent::Lakekeeper => install_simple_linux("lakekeeper", l),
+        InstallComponent::Xtable => install_simple_linux("xtable", l),
+        InstallComponent::Databend => install_simple_linux("databend", l),
+        InstallComponent::Qdrant => install_simple_linux("qdrant", l),
+        InstallComponent::Restate => install_simple_linux("restate", l),
+        InstallComponent::Greptime => install_simple_linux("greptime", l),
+        InstallComponent::Grafana => install_simple_linux("grafana", l),
+        InstallComponent::Openfga => install_simple_linux("openfga", l),
     }
+}
+
+/// Run a Linux single-binary-service install for the named component.
+/// On non-Linux this is a clear-error stub until per-OS drivers land.
+#[cfg(target_os = "linux")]
+fn install_simple_linux(component: &str, _l: &Localizer) -> anyhow::Result<()> {
+    use computeza_driver_native::linux;
+    use computeza_driver_native::progress::ProgressHandle;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let progress = ProgressHandle::noop();
+    let result = runtime.block_on(async move {
+        match component {
+            "kanidm" => linux::kanidm::install(linux::kanidm::InstallOptions::default(), &progress)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))
+                .map(|r| (r.bin_dir.display().to_string(), r.port)),
+            "garage" => linux::garage::install(linux::garage::InstallOptions::default(), &progress)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))
+                .map(|r| (r.bin_dir.display().to_string(), r.port)),
+            "lakekeeper" => {
+                linux::lakekeeper::install(linux::lakekeeper::InstallOptions::default(), &progress)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+                    .map(|r| (r.bin_dir.display().to_string(), r.port))
+            }
+            "xtable" => linux::xtable::install(linux::xtable::InstallOptions::default(), &progress)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))
+                .map(|r| (r.bin_dir.display().to_string(), r.port)),
+            "databend" => {
+                linux::databend::install(linux::databend::InstallOptions::default(), &progress)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+                    .map(|r| (r.bin_dir.display().to_string(), r.port))
+            }
+            "qdrant" => linux::qdrant::install(linux::qdrant::InstallOptions::default(), &progress)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))
+                .map(|r| (r.bin_dir.display().to_string(), r.port)),
+            "restate" => {
+                linux::restate::install(linux::restate::InstallOptions::default(), &progress)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+                    .map(|r| (r.bin_dir.display().to_string(), r.port))
+            }
+            "greptime" => {
+                linux::greptime::install(linux::greptime::InstallOptions::default(), &progress)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+                    .map(|r| (r.bin_dir.display().to_string(), r.port))
+            }
+            "grafana" => {
+                linux::grafana::install(linux::grafana::InstallOptions::default(), &progress)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+                    .map(|r| (r.bin_dir.display().to_string(), r.port))
+            }
+            "openfga" => {
+                linux::openfga::install(linux::openfga::InstallOptions::default(), &progress)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+                    .map(|r| (r.bin_dir.display().to_string(), r.port))
+            }
+            other => Err(anyhow::anyhow!("unknown component: {other}")),
+        }
+    })?;
+    println!(
+        "{component} installed.\n  bin_dir: {}\n  port: {}",
+        result.0, result.1
+    );
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn install_simple_linux(component: &str, _l: &Localizer) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "`computeza install {component}` is currently implemented for Linux only. \
+         The driver code is in `crates/computeza-driver-native/src/linux/{component}.rs`; \
+         the Windows + macOS variants ship in follow-up commits. Postgres is the only \
+         component with full multi-OS coverage so far."
+    )
 }
 
 #[cfg(target_os = "linux")]

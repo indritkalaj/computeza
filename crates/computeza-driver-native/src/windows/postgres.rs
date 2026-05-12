@@ -28,7 +28,7 @@ use tracing::{debug, info, warn};
 
 use super::{path, sc};
 use crate::{
-    fetch::{self, Bundle, FetchError},
+    fetch::{self, ArchiveKind, Bundle, FetchError},
     progress::{InstallPhase, ProgressHandle},
 };
 
@@ -46,12 +46,14 @@ const PG_WINDOWS_BUNDLES: &[Bundle] = &[
     Bundle {
         version: "18.3-1",
         url: "https://get.enterprisedb.com/postgresql/postgresql-18.3-1-windows-x64-binaries.zip",
+        kind: ArchiveKind::Zip,
         sha256: None,
         bin_subpath: "pgsql/bin",
     },
     Bundle {
         version: "17.9-1",
         url: "https://get.enterprisedb.com/postgresql/postgresql-17.9-1-windows-x64-binaries.zip",
+        kind: ArchiveKind::Zip,
         sha256: None,
         bin_subpath: "pgsql/bin",
     },

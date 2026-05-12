@@ -144,7 +144,7 @@ async fn server_serves_localized_home_and_healthz() {
         .expect("GET /install/kanidm");
     assert!(resp.status().is_success());
     let body = resp.text().await.expect("body text");
-    assert!(body.contains("Coming soon"));
+    assert!(body.contains("Install from the CLI"));
 
     // /status -- with no store attached, surfaces the store-missing hint
     let resp = client

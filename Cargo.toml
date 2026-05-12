@@ -48,8 +48,10 @@ tower-http = { version = "0.6", features = ["trace"] }
 # --- HTTP client (for reconcilers that talk to managed components over REST) ---
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
 
-# --- Zip extraction (driver-native uses this to unpack downloaded binary bundles) ---
+# --- Archive extraction (driver-native uses these to unpack downloaded binary bundles) ---
 zip = { version = "2", default-features = false, features = ["deflate"] }
+tar = "0.4"
+flate2 = "1"
 futures-util = "0.3"
 
 # --- UI framework (Leptos SSR) ---

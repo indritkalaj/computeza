@@ -38,21 +38,41 @@ use tracing::{info, warn};
 
 use crate::progress::{InstallPhase, ProgressHandle};
 
+/// Format of the downloaded archive. Tells `fetch_and_extract` how to
+/// unpack the payload after the SHA-256 check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArchiveKind {
+    /// `.zip` (handled by the `zip` crate).
+    Zip,
+    /// `.tar.gz` / `.tgz` (handled by `tar` over `flate2::GzDecoder`).
+    TarGz,
+    /// A raw binary, not an archive. Saved verbatim to
+    /// `<cache>/<version>/<bin_subpath>/<filename>` and chmod 0755 on
+    /// Unix. `bin_subpath` typically points to a `bin/` directory and
+    /// the raw filename is taken from the URL's last segment.
+    Raw,
+}
+
 /// One pinned upstream bundle: where to download it from, what version
-/// it represents, and the SHA-256 checksum we verify after download.
+/// it represents, the format of the archive, and the SHA-256 checksum
+/// we verify after download.
 #[derive(Clone, Debug)]
 pub struct Bundle {
     /// Human-readable version label, used as the cache subdirectory
     /// name. Stable across re-runs so the cache hits.
     pub version: &'static str,
-    /// Full HTTPS URL to fetch. Must be a zip archive.
+    /// Full HTTPS URL to fetch.
     pub url: &'static str,
-    /// Hex-encoded SHA-256 of the zip. `None` opts out of verification
-    /// for v0.0.x when we don't yet have an authoritative checksum
-    /// published by the vendor -- a TODO, not a permanent state.
+    /// Archive format. See [`ArchiveKind`].
+    pub kind: ArchiveKind,
+    /// Hex-encoded SHA-256 of the downloaded file. `None` opts out of
+    /// verification for v0.0.x when we don't yet have an authoritative
+    /// checksum published by the vendor -- a TODO, not a permanent
+    /// state.
     pub sha256: Option<&'static str>,
     /// After extraction, this relative path under the cache directory
-    /// is what callers actually want (typically `pgsql/bin`).
+    /// is the directory callers expect to contain the runnable
+    /// binaries.
     pub bin_subpath: &'static str,
 }
 
@@ -170,18 +190,28 @@ pub async fn fetch_and_extract(
     info!(
         archive = %zip_path.display(),
         target = %extracted_root.display(),
+        kind = ?bundle.kind,
         "extracting binary bundle"
     );
     progress.set_phase(InstallPhase::Extracting);
     progress.set_message(format!("Extracting to {}", extracted_root.display()));
-    let zip_clone = zip_path.clone();
+    let archive_clone = zip_path.clone();
     let target_clone = extracted_root.clone();
-    tokio::task::spawn_blocking(move || extract_zip(&zip_clone, &target_clone))
-        .await
-        .map_err(|e| FetchError::Io(io::Error::other(e)))??;
+    let kind = bundle.kind;
+    let url = bundle.url.to_string();
+    let bin_subpath = bundle.bin_subpath.to_string();
+    tokio::task::spawn_blocking(move || {
+        extract(kind, &archive_clone, &target_clone, &url, &bin_subpath)
+    })
+    .await
+    .map_err(|e| FetchError::Io(io::Error::other(e)))??;
 
-    // Drop the zip; the extracted tree is what we keep.
-    let _ = fs::remove_file(&zip_path).await;
+    // For zip/tar.gz we drop the downloaded archive once extracted.
+    // For Raw bundles the "archive" IS the artifact -- extract()
+    // already moved it to its final spot; no separate file to clean.
+    if !matches!(bundle.kind, ArchiveKind::Raw) {
+        let _ = fs::remove_file(&zip_path).await;
+    }
 
     // Sentinel marks "this version is fully extracted; safe to reuse".
     fs::write(&sentinel, b"ok").await?;
@@ -251,16 +281,74 @@ async fn sha256_file(path: &Path) -> Result<String, FetchError> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-fn extract_zip(zip_path: &Path, dest: &Path) -> Result<(), FetchError> {
-    let file = std::fs::File::open(zip_path)?;
+fn extract(
+    kind: ArchiveKind,
+    archive_path: &Path,
+    dest: &Path,
+    url: &str,
+    bin_subpath: &str,
+) -> Result<(), FetchError> {
+    match kind {
+        ArchiveKind::Zip => extract_zip(archive_path, dest),
+        ArchiveKind::TarGz => extract_tar_gz(archive_path, dest),
+        ArchiveKind::Raw => place_raw(archive_path, dest, url, bin_subpath),
+    }
+}
+
+fn extract_zip(archive_path: &Path, dest: &Path) -> Result<(), FetchError> {
+    let file = std::fs::File::open(archive_path)?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| FetchError::Extract {
-        path: zip_path.to_path_buf(),
+        path: archive_path.to_path_buf(),
         message: e.to_string(),
     })?;
     archive.extract(dest).map_err(|e| FetchError::Extract {
-        path: zip_path.to_path_buf(),
+        path: archive_path.to_path_buf(),
         message: e.to_string(),
     })?;
+    Ok(())
+}
+
+fn extract_tar_gz(archive_path: &Path, dest: &Path) -> Result<(), FetchError> {
+    let file = std::fs::File::open(archive_path)?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+    archive.unpack(dest).map_err(|e| FetchError::Extract {
+        path: archive_path.to_path_buf(),
+        message: e.to_string(),
+    })?;
+    Ok(())
+}
+
+/// Move the downloaded "archive" (actually a raw binary) into
+/// `<dest>/<bin_subpath>/<filename>` and set executable permission
+/// on Unix. The filename is taken from the URL's last path segment.
+fn place_raw(
+    archive_path: &Path,
+    dest: &Path,
+    url: &str,
+    bin_subpath: &str,
+) -> Result<(), FetchError> {
+    let filename = url
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("binary");
+    let target_dir = dest.join(bin_subpath);
+    std::fs::create_dir_all(&target_dir)?;
+    let target = target_dir.join(filename);
+    std::fs::rename(archive_path, &target).or_else(|_| {
+        // Cross-device rename can fail; fall back to copy + remove.
+        std::fs::copy(archive_path, &target).map(|_| ())?;
+        let _ = std::fs::remove_file(archive_path);
+        Ok::<_, FetchError>(())
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&target)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&target, perms)?;
+    }
     Ok(())
 }
 
@@ -273,6 +361,7 @@ mod tests {
         let b = Bundle {
             version: "17.2-3",
             url: "https://example.invalid/x.zip",
+            kind: ArchiveKind::Zip,
             sha256: Some("deadbeef"),
             bin_subpath: "pgsql/bin",
         };
