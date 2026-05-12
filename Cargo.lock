@@ -517,6 +517,7 @@ dependencies = [
 name = "computeza"
 version = "0.0.1"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "chrono",
  "clap",
@@ -524,6 +525,7 @@ dependencies = [
  "computeza-driver-native",
  "computeza-i18n",
  "computeza-reconciler-postgres",
+ "computeza-secrets",
  "computeza-state",
  "computeza-ui-server",
  "reqwest",
@@ -902,6 +904,7 @@ dependencies = [
  "computeza-driver-native",
  "computeza-i18n",
  "computeza-reconciler-postgres",
+ "computeza-secrets",
  "computeza-state",
  "reqwest",
  "serde",

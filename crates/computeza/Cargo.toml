@@ -30,6 +30,8 @@ computeza-state = { workspace = true }
 computeza-ui-server = { workspace = true }
 computeza-driver-native = { workspace = true }
 computeza-reconciler-postgres = { workspace = true }
+computeza-secrets = { workspace = true }
 secrecy = { workspace = true }
 chrono = { workspace = true }
 serde_json = { workspace = true }
+aes-gcm = { workspace = true }

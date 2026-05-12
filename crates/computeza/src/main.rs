@@ -133,7 +133,27 @@ fn main() -> anyhow::Result<()> {
                         )
                     })?;
                 tracing::info!(state_db = %state_db, "metadata store ready");
-                let state = computeza_ui_server::AppState::with_store(store);
+
+                let mut state = computeza_ui_server::AppState::with_store(store);
+                match open_secrets_store(&state_db).await? {
+                    Some(s) => {
+                        tracing::info!(
+                            "secrets store attached; install paths that generate credentials \
+                             (initial admin passwords, API tokens) will persist them encrypted"
+                        );
+                        state = state.with_secrets(s);
+                    }
+                    None => {
+                        tracing::warn!(
+                            "COMPUTEZA_SECRETS_PASSPHRASE not set; secrets store is NOT attached. \
+                             Install paths that generate credentials will surface them on the \
+                             result page only (one-time view; the operator must copy them out). \
+                             Set COMPUTEZA_SECRETS_PASSPHRASE before `computeza serve` to enable \
+                             encrypted persistence + the rotate-secrets UI."
+                        );
+                    }
+                }
+
                 let store_for_tick = state
                     .store
                     .clone()
@@ -381,6 +401,81 @@ async fn reconcile_tick(store: std::sync::Arc<computeza_state::SqliteStore>) {
             let _ = reconciler.observe(&ctx).await;
         }
     }
+}
+
+/// Bootstrap the encrypted secrets store at startup.
+///
+/// Reads `COMPUTEZA_SECRETS_PASSPHRASE` from the environment; returns
+/// `Ok(None)` (with a warning at the call site) when the var is unset
+/// so a fresh `computeza serve` still boots without forcing the
+/// operator to set up secrets immediately. When the passphrase IS set,
+/// the salt and ciphertext live next to `state_db` (default CWD):
+///
+/// - `<state_db_parent>/computeza-secrets.salt` -- 16 random bytes,
+///   generated on first run and stable thereafter.
+/// - `<state_db_parent>/computeza-secrets.jsonl` -- AES-256-GCM
+///   ciphertext lines, one per secret name.
+///
+/// Loss of the passphrase OR the salt makes existing ciphertext
+/// unrecoverable; the operator should back both up.
+async fn open_secrets_store(
+    state_db_path: &str,
+) -> anyhow::Result<Option<computeza_secrets::SecretsStore>> {
+    let passphrase = match std::env::var("COMPUTEZA_SECRETS_PASSPHRASE") {
+        Ok(p) if !p.is_empty() => p,
+        _ => return Ok(None),
+    };
+
+    let parent = std::path::Path::new(state_db_path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let salt_path = parent.join("computeza-secrets.salt");
+    let store_path = parent.join("computeza-secrets.jsonl");
+
+    let salt = ensure_secrets_salt(&salt_path).await?;
+    let key = computeza_secrets::derive_kek_from_passphrase(passphrase.as_bytes(), &salt)
+        .map_err(|e| anyhow::anyhow!("deriving secrets KEK: {e}"))?;
+    let store = computeza_secrets::SecretsStore::open(&store_path, &key)
+        .await
+        .map_err(|e| anyhow::anyhow!("opening SecretsStore at {}: {e}", store_path.display()))?;
+    tracing::info!(
+        salt = %salt_path.display(),
+        store = %store_path.display(),
+        "secrets store opened"
+    );
+    Ok(Some(store))
+}
+
+/// Read the secrets salt from disk, or generate + persist a fresh
+/// 16-byte random salt on first run. The salt is NOT secret on its own
+/// (it's only useful in combination with the passphrase) but it MUST
+/// be stable -- regenerating it would render every existing ciphertext
+/// unreadable.
+async fn ensure_secrets_salt(path: &std::path::Path) -> anyhow::Result<Vec<u8>> {
+    if tokio::fs::try_exists(path).await.unwrap_or(false) {
+        let s = tokio::fs::read(path).await?;
+        if s.len() >= 16 {
+            return Ok(s);
+        }
+        tracing::warn!(
+            path = %path.display(),
+            len = s.len(),
+            "secrets salt file present but shorter than 16 bytes; regenerating. \
+             Existing ciphertext (if any) will become unreadable."
+        );
+    }
+    use aes_gcm::aead::rand_core::RngCore;
+    use aes_gcm::aead::OsRng;
+    let mut salt = [0u8; 16];
+    OsRng.fill_bytes(&mut salt);
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(path, salt).await?;
+    tracing::info!(path = %path.display(), "wrote new 16-byte secrets salt");
+    Ok(salt.to_vec())
 }
 
 /// Configure the global tracing subscriber. Reads `RUST_LOG` for filtering

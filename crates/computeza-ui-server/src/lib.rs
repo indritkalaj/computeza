@@ -37,6 +37,7 @@ use axum::{
 };
 use computeza_driver_native::progress::{InstallProgress, ProgressHandle};
 use computeza_i18n::Localizer;
+use computeza_secrets::SecretsStore;
 use computeza_state::{ResourceKey, SqliteStore, Store};
 use std::{
     collections::HashMap,
@@ -68,14 +69,21 @@ const COMPUTEZA_LOTTIE_PULSE: &str = include_str!("../assets/brand/lottie/comput
 pub type JobRegistry = Arc<StdMutex<HashMap<String, Arc<StdMutex<InstallProgress>>>>>;
 
 /// Shared state passed to every handler. Holds the `SqliteStore` (when
-/// `computeza serve` opens one) plus the background-job registry.
-/// Wrapped in `Arc` so axum can clone it cheaply per request.
+/// `computeza serve` opens one), the encrypted [`SecretsStore`] (when
+/// the operator has set `COMPUTEZA_SECRETS_PASSPHRASE`), and the
+/// background-job registry. Wrapped in `Arc` so axum can clone it
+/// cheaply per request.
 #[derive(Clone)]
 pub struct AppState {
     /// Persistent metadata store, `None` for the unit-test smoke router.
     pub store: Option<Arc<SqliteStore>>,
     /// Background install jobs in flight or recently finished.
     pub jobs: JobRegistry,
+    /// Encrypted secrets store. `None` when the operator hasn't set
+    /// `COMPUTEZA_SECRETS_PASSPHRASE`; install paths that generate
+    /// credentials degrade to surfacing them in-band on the result
+    /// page instead of persisting them encrypted.
+    pub secrets: Option<Arc<SecretsStore>>,
 }
 
 impl AppState {
@@ -85,6 +93,7 @@ impl AppState {
         Self {
             store: None,
             jobs: Arc::new(StdMutex::new(HashMap::new())),
+            secrets: None,
         }
     }
 
@@ -94,7 +103,16 @@ impl AppState {
         Self {
             store: Some(Arc::new(store)),
             jobs: Arc::new(StdMutex::new(HashMap::new())),
+            secrets: None,
         }
+    }
+
+    /// Attach an encrypted [`SecretsStore`] to the state. Chainable
+    /// with [`AppState::with_store`].
+    #[must_use]
+    pub fn with_secrets(mut self, secrets: SecretsStore) -> Self {
+        self.secrets = Some(Arc::new(secrets));
+        self
     }
 }
 
