@@ -23,21 +23,35 @@ pub const SERVICE_NAME: &str = "computeza-kanidm";
 pub const UNIT_NAME: &str = "computeza-kanidm.service";
 pub const DEFAULT_PORT: u16 = 8443;
 
+// IMPORTANT: kanidm does NOT publish prebuilt binaries on GitHub
+// releases (the asset list is empty across all v1.x tags). The
+// upstream-supported install paths are distro package managers
+// (zypper / dnf / apt / pacman / apk / pkg), `cargo install`, or
+// Docker. Our download-tarball-from-GitHub assumption was wrong.
+//
+// Until the package-manager dispatch lands (v0.1 task), the Bundle
+// URLs below remain pinned at the current stable versions but they
+// will 404. Install attempts surface that 404 verbatim through the
+// existing fetch error chain so the operator sees what went wrong.
+//
+// Tracking the actual install strategy refactor as the next pass
+// over this module.
 const KANIDM_BUNDLES: &[Bundle] = &[
     Bundle {
-        version: "1.6.0",
-        // TODO: verify against https://github.com/kanidm/kanidm/releases
-        url: "https://github.com/kanidm/kanidm/releases/download/v1.6.0/kanidm-1.6.0-linux-x86_64.tar.gz",
+        version: "1.10.1",
+        // No corresponding asset on the GitHub release page;
+        // see module-level note above.
+        url: "https://github.com/kanidm/kanidm/releases/download/v1.10.1/kanidm-1.10.1-linux-x86_64.tar.gz",
         kind: ArchiveKind::TarGz,
         sha256: None,
-        bin_subpath: "kanidm-1.6.0-linux-x86_64",
+        bin_subpath: "kanidm-1.10.1-linux-x86_64",
     },
     Bundle {
-        version: "1.5.0",
-        url: "https://github.com/kanidm/kanidm/releases/download/v1.5.0/kanidm-1.5.0-linux-x86_64.tar.gz",
+        version: "1.9.3",
+        url: "https://github.com/kanidm/kanidm/releases/download/v1.9.3/kanidm-1.9.3-linux-x86_64.tar.gz",
         kind: ArchiveKind::TarGz,
         sha256: None,
-        bin_subpath: "kanidm-1.5.0-linux-x86_64",
+        bin_subpath: "kanidm-1.9.3-linux-x86_64",
     },
 ];
 

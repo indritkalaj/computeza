@@ -126,6 +126,46 @@ and the fixes are now infrastructure other components MUST reuse
 rather than rediscover. When adding a new component reconciler +
 driver pair, check this playbook before pretending any step is simple.
 
+### Verify the distribution channel BEFORE writing a driver
+
+The autonomous-binary-download pattern in `fetch::Bundle` only works
+for components whose vendor publishes a binary tarball / zip / raw
+binary at a stable URL. Before assuming that pattern fits a new
+component, **verify the vendor's actual distribution channel** via
+the GitHub Releases API or equivalent. The kanidm pass got this
+wrong: every recent v1.x release tag had **0 binary assets attached**
+(distribution is via distro package managers + Docker + `cargo
+install`), so the download-from-GitHub Bundle URLs were 404s from
+the start.
+
+Quick API check before pinning URLs:
+
+```sh
+curl -s "https://api.github.com/repos/<vendor>/<repo>/releases/tags/<tag>" \
+  | python -c "import sys, json; d=json.load(sys.stdin); print(len(d.get('assets',[])))"
+```
+
+If the asset count is 0, the component does not fit the
+`fetch::Bundle` pattern. Pick one of:
+
+- **Package-manager dispatch** (apt / dnf / zypper / brew / pacman /
+  apk / pkg). Detect the host PM, shell to its install command,
+  trust it to place binaries on PATH. Works for kanidm, garage,
+  greptime when distro packages exist.
+- **`cargo install`** with a pinned `--version`. Requires the Rust
+  toolchain on the host; slow but always works for pure-Rust
+  components published on crates.io.
+- **Bundled container runtime**. Conflicts with the no-Docker spec
+  mandate; do not pursue.
+- **Vendor's own CDN**. Some components (Garage, Grafana, Databend)
+  publish binaries on their own infrastructure rather than GitHub
+  releases. The Bundle URL points there directly.
+
+The kanidm driver retains its 3-OS structure + wizard + uninstall
+even with the broken URLs; the package-manager dispatch slots into
+`fetch_and_extract`'s position when it lands. The card stays
+`available: false` until then to keep the hub honest.
+
 ### Binary acquisition
 
 - **Three-tier resolution.** The driver must try, in order:

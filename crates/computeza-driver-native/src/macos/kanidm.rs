@@ -16,21 +16,25 @@ use super::service::{
 pub const SERVICE_LABEL: &str = "com.computeza.kanidm";
 pub const DEFAULT_PORT: u16 = 8443;
 
+// See note in `linux::kanidm`: kanidm does not ship prebuilt binaries
+// on GitHub releases. macOS users are expected to `brew install kanidm`
+// (CLI only) and run the server in a container or build from source.
+// These Bundle entries are placeholders until the package-manager
+// dispatch lands.
 const KANIDM_BUNDLES: &[Bundle] = &[
     Bundle {
-        version: "1.6.0",
-        // TODO: verify against https://github.com/kanidm/kanidm/releases
-        url: "https://github.com/kanidm/kanidm/releases/download/v1.6.0/kanidm-1.6.0-aarch64-apple-darwin.tar.gz",
+        version: "1.10.1",
+        url: "https://github.com/kanidm/kanidm/releases/download/v1.10.1/kanidm-1.10.1-aarch64-apple-darwin.tar.gz",
         kind: ArchiveKind::TarGz,
         sha256: None,
-        bin_subpath: "kanidm-1.6.0-aarch64-apple-darwin",
+        bin_subpath: "kanidm-1.10.1-aarch64-apple-darwin",
     },
     Bundle {
-        version: "1.5.0",
-        url: "https://github.com/kanidm/kanidm/releases/download/v1.5.0/kanidm-1.5.0-aarch64-apple-darwin.tar.gz",
+        version: "1.9.3",
+        url: "https://github.com/kanidm/kanidm/releases/download/v1.9.3/kanidm-1.9.3-aarch64-apple-darwin.tar.gz",
         kind: ArchiveKind::TarGz,
         sha256: None,
-        bin_subpath: "kanidm-1.5.0-aarch64-apple-darwin",
+        bin_subpath: "kanidm-1.9.3-aarch64-apple-darwin",
     },
 ];
 

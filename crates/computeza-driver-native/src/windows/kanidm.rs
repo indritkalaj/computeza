@@ -97,7 +97,9 @@ pub async fn uninstall(_opts: UninstallOptions) -> Result<Uninstalled, InstallEr
     // Returning Ok with a single explanatory step keeps the UI's
     // result page useful (instead of "service does not exist" warnings).
     Ok(Uninstalled {
-        steps: vec!["kanidm is not installed on Windows (upstream does not ship a Windows binary)".into()],
+        steps: vec![
+            "kanidm is not installed on Windows (upstream does not ship a Windows binary)".into(),
+        ],
         warnings: vec![],
     })
 }

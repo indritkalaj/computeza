@@ -136,24 +136,15 @@ async fn server_serves_localized_home_and_healthz() {
     let body = resp.text().await.expect("body text");
     assert!(body.contains(r#"action="/install/postgres""#));
 
-    // /install/kanidm -- kanidm now has its own wizard (Available
-    // at full postgres parity).
+    // /install/<other-non-postgres> -- the CLI explainer page.
+    // Kanidm has wizard code in tree but routes are commented out
+    // because its vendor doesn't ship prebuilt binaries (see
+    // module note); it falls through to the catch-all.
     let resp = client
         .get(format!("http://{addr}/install/kanidm"))
         .send()
         .await
         .expect("GET /install/kanidm");
-    assert!(resp.status().is_success());
-    let body = resp.text().await.expect("body text");
-    assert!(body.contains("Install Kanidm"));
-    assert!(body.contains(r#"action="/install/kanidm""#));
-
-    // /install/<other-non-postgres-non-kanidm> -- still the CLI explainer.
-    let resp = client
-        .get(format!("http://{addr}/install/garage"))
-        .send()
-        .await
-        .expect("GET /install/garage");
     assert!(resp.status().is_success());
     let body = resp.text().await.expect("body text");
     assert!(body.contains("Install from the CLI"));
