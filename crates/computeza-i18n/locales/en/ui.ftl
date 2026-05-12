@@ -213,6 +213,39 @@ ui-admin-groups-col-perms = Permissions
 ui-nav-admin-operators = Operators
 ui-nav-admin-groups    = Groups
 
+# --- /admin/workspaces ---
+
+ui-admin-workspaces-title = Workspaces
+ui-admin-workspaces-intro = Workspaces isolate one tenant's resources from another's. v0.0.x ships a single `default` workspace that every existing install row falls under. Multi-tenant installs (v0.1+) will let the operator carve out per-tenant workspaces with separate quotas and reseller chains.
+ui-admin-workspaces-col-name = Name
+ui-admin-workspaces-col-created = Created
+ui-admin-workspaces-default-note = `default` is the implicit workspace for every existing install row. Until v0.1 ships multi-tenant migration, you cannot create or rename workspaces from the console.
+
+# --- /admin/branding ---
+
+ui-admin-branding-title = Branding
+ui-admin-branding-intro = White-label the operator console for resellers and OEMs. v0.0.x lets you override the accent color used across buttons, links, and gradient text; v0.1+ adds tenant-supplied SVG logos and footer support-routing text.
+ui-admin-branding-accent = Accent color
+ui-admin-branding-accent-help = Hex value, e.g. #C4B8E8 (the default lavender). Applied to every page via a CSS custom property override.
+ui-admin-branding-submit = Save accent color
+ui-admin-branding-saved = Branding updated. Reload the page to see the new accent color throughout the console.
+ui-admin-branding-reset = Reset to default
+
+# --- /admin/license ---
+
+ui-admin-license-title = License
+ui-admin-license-intro = Entitlement envelope for this Computeza install. v0.0.x renders the reseller chain + validity window read-only; v0.1+ adds the activation form and seat enforcement.
+ui-admin-license-none = No license has been activated on this install. Computeza runs in Community mode (unlimited seats, no SLA, community support only).
+ui-admin-license-tier = Tier
+ui-admin-license-seats = Seat cap
+ui-admin-license-chain = Resale chain
+ui-admin-license-not-before = Valid from
+ui-admin-license-not-after = Valid until
+
+ui-nav-admin-workspaces = Workspaces
+ui-nav-admin-branding   = Branding
+ui-nav-admin-license    = License
+
 # --- Home dashboard cards ---
 
 ui-home-card-components-title = Managed components

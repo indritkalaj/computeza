@@ -610,6 +610,12 @@ pub fn router_with_state(state: AppState) -> Router {
             post(admin_delete_operator_handler),
         )
         .route("/admin/groups", get(admin_groups_handler))
+        .route("/admin/workspaces", get(admin_workspaces_handler))
+        .route(
+            "/admin/branding",
+            get(admin_branding_handler).post(admin_branding_save_handler),
+        )
+        .route("/admin/license", get(admin_license_handler))
         .route("/healthz", get(healthz_handler))
         .route("/api/state/info", get(state_info_handler))
         .route("/static/computeza.css", get(css_handler))
@@ -4171,6 +4177,98 @@ async fn admin_groups_handler() -> Html<String> {
     Html(render_admin_groups(&l))
 }
 
+/// GET /admin/workspaces -- list workspaces. v0.0.x always shows
+/// the implicit `default` workspace; v0.1+ wires creation + per-
+/// tenant resource scoping.
+async fn admin_workspaces_handler() -> Html<String> {
+    let l = Localizer::english();
+    Html(render_admin_workspaces(&l))
+}
+
+/// GET /admin/branding -- the white-labeling page. Reads the
+/// current accent color from the install-config row under
+/// `branding/default` (if any) and surfaces it on the form.
+async fn admin_branding_handler(State(state): State<AppState>) -> Html<String> {
+    let l = Localizer::english();
+    let accent = current_accent_color(&state).await;
+    Html(render_admin_branding(&l, accent.as_deref(), None))
+}
+
+#[derive(serde::Deserialize)]
+struct BrandingForm {
+    accent: String,
+}
+
+/// POST /admin/branding -- persist the accent color. v0.0.x stores
+/// it in a dedicated state-store row under `branding/default`;
+/// v0.1+ extends to a full tenant theme.
+async fn admin_branding_save_handler(
+    State(state): State<AppState>,
+    Form(form): Form<BrandingForm>,
+) -> Response {
+    let l = Localizer::english();
+    let accent_trimmed = form.accent.trim().to_string();
+    if !is_valid_hex_color(&accent_trimmed) && !accent_trimmed.is_empty() {
+        return Html(render_admin_branding(
+            &l,
+            Some(&accent_trimmed),
+            Some("Accent must be a hex color like #C4B8E8 or empty to reset."),
+        ))
+        .into_response();
+    }
+    if let Some(store) = &state.store {
+        let key = ResourceKey::cluster_scoped("branding", "default");
+        let value = serde_json::json!({"accent_color": accent_trimmed});
+        let expected = match store.load(&key).await {
+            Ok(Some(existing)) => Some(existing.revision),
+            _ => None,
+        };
+        if let Err(e) = store.save(&key, &value, expected).await {
+            tracing::warn!(error = %e, "admin_branding_save_handler: store.save failed");
+            return Html(render_admin_branding(
+                &l,
+                Some(&accent_trimmed),
+                Some(&format!("Saving branding failed: {e}")),
+            ))
+            .into_response();
+        }
+    }
+    Redirect303("/admin/branding".into()).into_response()
+}
+
+/// Validate a hex color like `#C4B8E8` or `#fff`. Loose -- we
+/// accept `#abc` and `#aabbcc`; v0.1+ extends to rgba / hsl when
+/// the palette form grows.
+fn is_valid_hex_color(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix('#') else {
+        return false;
+    };
+    matches!(rest.len(), 3 | 6) && rest.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Read the persisted accent color from the metadata store. Returns
+/// `None` when no branding row exists or the store is detached.
+async fn current_accent_color(state: &AppState) -> Option<String> {
+    let store = state.store.as_ref()?;
+    let key = ResourceKey::cluster_scoped("branding", "default");
+    let stored = store.load(&key).await.ok().flatten()?;
+    stored
+        .spec
+        .get("accent_color")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+/// GET /admin/license -- read-only render of the license envelope,
+/// including the resale chain. v0.0.x doesn't persist licenses yet;
+/// the page shows the Community-mode card when no envelope is
+/// attached.
+async fn admin_license_handler() -> Html<String> {
+    let l = Localizer::english();
+    Html(render_admin_license(&l, None))
+}
+
 async fn healthz_handler() -> String {
     let l = Localizer::english();
     l.t("ui-healthz-ok")
@@ -4239,6 +4337,12 @@ pub enum NavLink {
     Operators,
     /// Admin group-listing page.
     Groups,
+    /// Admin workspaces page.
+    Workspaces,
+    /// Admin branding / white-labeling page.
+    Branding,
+    /// Admin license envelope viewer.
+    License,
     /// No nav link highlighted (e.g. resource detail page).
     None,
 }
@@ -4264,6 +4368,9 @@ pub fn render_shell(
     let nav_audit = localizer.t("ui-audit-nav");
     let nav_admin_operators = localizer.t("ui-nav-admin-operators");
     let nav_admin_groups = localizer.t("ui-nav-admin-groups");
+    let nav_admin_workspaces = localizer.t("ui-nav-admin-workspaces");
+    let nav_admin_branding = localizer.t("ui-nav-admin-branding");
+    let nav_admin_license = localizer.t("ui-nav-admin-license");
     let version_label = localizer.t("ui-footer-version");
     let version = env!("CARGO_PKG_VERSION");
 
@@ -4300,6 +4407,9 @@ pub fn render_shell(
     <a href="/audit" class="{naud}">{nav_audit}</a>
     <a href="/admin/operators" class="{nops}">{nav_admin_operators}</a>
     <a href="/admin/groups" class="{ngrp}">{nav_admin_groups}</a>
+    <a href="/admin/workspaces" class="{nwsp}">{nav_admin_workspaces}</a>
+    <a href="/admin/branding" class="{nbrd}">{nav_admin_branding}</a>
+    <a href="/admin/license" class="{nlic}">{nav_admin_license}</a>
     <a href="/account" class="{nacc}">{nav_account}</a>
   </div>
 </nav>
@@ -4343,6 +4453,9 @@ pub fn render_shell(
         naud = nav_class(NavLink::Audit),
         nops = nav_class(NavLink::Operators),
         ngrp = nav_class(NavLink::Groups),
+        nwsp = nav_class(NavLink::Workspaces),
+        nbrd = nav_class(NavLink::Branding),
+        nlic = nav_class(NavLink::License),
         nacc = nav_class(NavLink::Account),
     )
 }
@@ -7793,6 +7906,184 @@ pub fn render_admin_operators(
         new_submit = html_escape(&new_submit),
     );
     render_shell(localizer, &title, NavLink::Operators, &body)
+}
+
+/// Render `GET /admin/workspaces` -- v0.0.x list. Always shows the
+/// implicit `default` workspace.
+#[must_use]
+pub fn render_admin_workspaces(localizer: &Localizer) -> String {
+    let title = localizer.t("ui-admin-workspaces-title");
+    let intro = localizer.t("ui-admin-workspaces-intro");
+    let col_name = localizer.t("ui-admin-workspaces-col-name");
+    let col_created = localizer.t("ui-admin-workspaces-col-created");
+    let note = localizer.t("ui-admin-workspaces-default-note");
+
+    let body = format!(
+        r#"<section class="cz-hero">
+<h1>{title}</h1>
+<p>{intro}</p>
+</section>
+<section class="cz-section">
+<div class="cz-card">
+<table class="cz-table" style="width: 100%;">
+<thead><tr><th>{col_name}</th><th>{col_created}</th></tr></thead>
+<tbody>
+<tr><td><code>default</code></td><td class="cz-cell-mono cz-cell-dim">(implicit)</td></tr>
+</tbody>
+</table>
+<p class="cz-muted" style="margin: 0.85rem 0 0; font-size: 0.85rem;">{note}</p>
+</div>
+</section>"#,
+        title = html_escape(&title),
+        intro = html_escape(&intro),
+        col_name = html_escape(&col_name),
+        col_created = html_escape(&col_created),
+        note = html_escape(&note),
+    );
+    render_shell(localizer, &title, NavLink::Workspaces, &body)
+}
+
+/// Render `GET /admin/branding` -- the white-labeling form.
+#[must_use]
+pub fn render_admin_branding(
+    localizer: &Localizer,
+    current_accent: Option<&str>,
+    error_message: Option<&str>,
+) -> String {
+    let title = localizer.t("ui-admin-branding-title");
+    let intro = localizer.t("ui-admin-branding-intro");
+    let label = localizer.t("ui-admin-branding-accent");
+    let help = localizer.t("ui-admin-branding-accent-help");
+    let submit = localizer.t("ui-admin-branding-submit");
+    let reset = localizer.t("ui-admin-branding-reset");
+
+    let value = current_accent.unwrap_or("");
+    let error_block = match error_message {
+        Some(msg) => format!(
+            r#"<div class="cz-card" style="border-color: rgba(255, 157, 166, 0.55); margin-bottom: 1rem;">
+<p class="cz-card-body" style="margin: 0; color: var(--fail);">{}</p>
+</div>"#,
+            html_escape(msg)
+        ),
+        None => String::new(),
+    };
+
+    let body = format!(
+        r##"<section class="cz-hero">
+<h1>{title}</h1>
+<p>{intro}</p>
+</section>
+<section class="cz-section" style="max-width: 32rem;">
+{error_block}
+<div class="cz-card">
+<form method="post" action="/admin/branding" class="cz-form" style="max-width: none;">
+<input type="hidden" name="csrf_token" value="" />
+<label for="accent">{label}</label>
+<input id="accent" name="accent" class="cz-input" type="text" value="{value}" placeholder="#C4B8E8" pattern="^(#[A-Fa-f0-9]{{3}}|#[A-Fa-f0-9]{{6}})?$" />
+<p class="cz-muted" style="margin: -0.5rem 0 0; font-size: 0.8rem;">{help}</p>
+<button type="submit" class="cz-btn cz-btn-primary" style="margin-top: 0.5rem;">{submit}</button>
+</form>
+</div>
+<p class="cz-muted" style="margin-top: 0.75rem; font-size: 0.85rem;">Leave the field blank and submit to {reset_lower}.</p>
+</section>"##,
+        title = html_escape(&title),
+        intro = html_escape(&intro),
+        error_block = error_block,
+        label = html_escape(&label),
+        help = html_escape(&help),
+        value = html_escape(value),
+        submit = html_escape(&submit),
+        reset_lower = html_escape(&reset.to_lowercase()),
+    );
+    render_shell(localizer, &title, NavLink::Branding, &body)
+}
+
+/// Render `GET /admin/license` -- read-only license envelope view.
+/// `license = None` indicates no license has been activated; the
+/// page surfaces a Community-mode card in that case.
+#[must_use]
+pub fn render_admin_license(
+    localizer: &Localizer,
+    license: Option<&computeza_license::License>,
+) -> String {
+    let title = localizer.t("ui-admin-license-title");
+    let intro = localizer.t("ui-admin-license-intro");
+    let none = localizer.t("ui-admin-license-none");
+    let tier_label = localizer.t("ui-admin-license-tier");
+    let seats_label = localizer.t("ui-admin-license-seats");
+    let chain_label = localizer.t("ui-admin-license-chain");
+    let not_before_label = localizer.t("ui-admin-license-not-before");
+    let not_after_label = localizer.t("ui-admin-license-not-after");
+
+    let body = match license {
+        None => format!(
+            r#"<section class="cz-hero">
+<h1>{title}</h1>
+<p>{intro}</p>
+</section>
+<section class="cz-section">
+<div class="cz-card"><p class="cz-card-body" style="margin: 0;">{none}</p></div>
+</section>"#,
+            title = html_escape(&title),
+            intro = html_escape(&intro),
+            none = html_escape(&none),
+        ),
+        Some(lic) => {
+            let chain_rows: String = lic
+                .payload
+                .chain
+                .iter()
+                .enumerate()
+                .map(|(i, entry)| {
+                    let support = entry
+                        .support_contact
+                        .as_deref()
+                        .map(|s| format!(" -- support: <code>{}</code>", html_escape(s)))
+                        .unwrap_or_default();
+                    format!(
+                        r#"<li>Tier {i}: <strong>{name}</strong>{support}</li>"#,
+                        name = html_escape(&entry.name),
+                    )
+                })
+                .collect();
+            let seats = lic
+                .payload
+                .seats
+                .map(|n| format!("{n}"))
+                .unwrap_or_else(|| "unlimited".into());
+            format!(
+                r#"<section class="cz-hero">
+<h1>{title}</h1>
+<p>{intro}</p>
+</section>
+<section class="cz-section">
+<div class="cz-card">
+<dl class="cz-dl">
+<dt>{tier}</dt><dd>{tier_value}</dd>
+<dt>{seats}</dt><dd>{seats_value}</dd>
+<dt>{nb}</dt><dd><code>{nb_value}</code></dd>
+<dt>{na}</dt><dd><code>{na_value}</code></dd>
+</dl>
+<h3 style="margin-top: 1rem;">{chain}</h3>
+<ol class="cz-muted" style="margin-top: 0.4rem; padding-left: 1.2rem;">{rows}</ol>
+</div>
+</section>"#,
+                title = html_escape(&title),
+                intro = html_escape(&intro),
+                tier = html_escape(&tier_label),
+                tier_value = html_escape(&lic.payload.tier),
+                seats = html_escape(&seats_label),
+                seats_value = html_escape(&seats),
+                nb = html_escape(&not_before_label),
+                nb_value = html_escape(&lic.payload.not_before.to_rfc3339()),
+                na = html_escape(&not_after_label),
+                na_value = html_escape(&lic.payload.not_after.to_rfc3339()),
+                chain = html_escape(&chain_label),
+                rows = chain_rows,
+            )
+        }
+    };
+    render_shell(localizer, &title, NavLink::License, &body)
 }
 
 /// Render `GET /admin/groups` -- read-only listing of built-in groups

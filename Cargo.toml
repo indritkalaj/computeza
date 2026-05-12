@@ -111,6 +111,7 @@ computeza-driver    = { path = "crates/computeza-driver",    version = "0.0.1" }
 computeza-tenancy   = { path = "crates/computeza-tenancy",   version = "0.0.1" }
 computeza-pipelines = { path = "crates/computeza-pipelines", version = "0.0.1" }
 computeza-identity-federation = { path = "crates/computeza-identity-federation", version = "0.0.1" }
+computeza-license = { path = "crates/computeza-license", version = "0.0.1" }
 
 # Tier 2 -- Drivers
 computeza-driver-native = { path = "crates/computeza-driver-native", version = "0.0.1" }

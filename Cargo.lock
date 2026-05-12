@@ -629,6 +629,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "computeza-license"
+version = "0.0.1"
+dependencies = [
+ "base64ct",
+ "chrono",
+ "ed25519-dalek",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "computeza-pipelines"
 version = "0.0.1"
 dependencies = [
@@ -923,6 +935,7 @@ dependencies = [
  "computeza-driver-native",
  "computeza-i18n",
  "computeza-identity-federation",
+ "computeza-license",
  "computeza-reconciler-postgres",
  "computeza-secrets",
  "computeza-state",
