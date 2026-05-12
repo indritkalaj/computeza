@@ -103,6 +103,18 @@ ui-platform-banner-unsupported = Host not supported
 ui-platform-supported-title    = Supported platforms
 ui-platform-supported-intro    = Computeza v0.0.x installs data-plane components on systemd-based Linux only. The operator console (this web UI) runs anywhere; the install actions need a Linux host. Once the multi-host install path lands in v0.1+ you'll be able to run the console here and point it at remote Linux targets.
 ui-platform-supported-distros  = Ubuntu 22.04 LTS or newer, Debian 12 or newer, Fedora 38 or newer, RHEL / CentOS Stream 9, Rocky Linux 9, AlmaLinux 9, OpenSUSE Leap 15.6 or Tumbleweed, SLES 15, Arch Linux (rolling), Manjaro (rolling). Architecture: x86_64.
+
+# --- Prerequisite banner ---
+#
+# Shown above an install wizard when a host command the driver shells
+# out to is missing from $PATH. The component-specific list of required
+# commands lives in the component's wizard handler; the strings here are
+# component-agnostic.
+
+ui-prerequisite-banner-title        = Host command missing
+ui-prerequisite-banner-intro        = This install shells out to commands that are not on `$PATH`. Install them on the host and refresh this page. The install button will work once every command below resolves.
+ui-prerequisite-banner-needed-for   = Needed for
+ui-prerequisite-banner-install-hint = Install with
 ui-install-status-available  = Available
 ui-install-status-planned    = Planned
 ui-install-coming-soon-title = Install from the CLI

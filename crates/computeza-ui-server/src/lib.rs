@@ -3232,6 +3232,80 @@ fn render_platform_banner(localizer: &Localizer) -> String {
     }
 }
 
+/// Probe a list of [`SystemCommand`] names against `$PATH` and return
+/// the rows that aren't found. Separated from the renderer so the
+/// pure-string formatter is testable without touching the host
+/// environment.
+///
+/// [`SystemCommand`]: computeza_driver_native::prerequisites::SystemCommand
+fn missing_prerequisites(
+    required: &[&str],
+) -> Vec<computeza_driver_native::prerequisites::SystemCommand> {
+    use computeza_driver_native::prerequisites::{which_on_path, SYSTEM_COMMANDS};
+    required
+        .iter()
+        .filter(|name| which_on_path(name).is_none())
+        .filter_map(|name| SYSTEM_COMMANDS.iter().find(|c| c.name == *name).copied())
+        .collect()
+}
+
+/// Render the missing-prerequisite warning card for an install wizard.
+///
+/// `missing` is the pre-computed slice of [`SystemCommand`] rows whose
+/// `name` did not resolve on `$PATH`. Returns an empty string when the
+/// slice is empty so the caller can `format!("{prereq_banner}...")`
+/// unconditionally.
+///
+/// [`SystemCommand`]: computeza_driver_native::prerequisites::SystemCommand
+fn render_prerequisite_banner(
+    localizer: &Localizer,
+    missing: &[computeza_driver_native::prerequisites::SystemCommand],
+) -> String {
+    if missing.is_empty() {
+        return String::new();
+    }
+
+    let title = localizer.t("ui-prerequisite-banner-title");
+    let intro = localizer.t("ui-prerequisite-banner-intro");
+    let needed_for = localizer.t("ui-prerequisite-banner-needed-for");
+    let install_hint_label = localizer.t("ui-prerequisite-banner-install-hint");
+
+    let rows: String = missing
+        .iter()
+        .map(|c| {
+            format!(
+                r#"<li style="margin-top: 0.75rem;">
+<p style="margin: 0 0 0.25rem;"><span class="cz-badge cz-badge-warn">{name}</span></p>
+<p class="cz-muted" style="margin: 0 0 0.25rem; font-size: 0.85rem;"><strong>{needed_for}:</strong> {required_for}</p>
+<p class="cz-muted" style="margin: 0; font-size: 0.85rem;"><strong>{install_hint_label}:</strong> <code>{install_hint}</code></p>
+</li>"#,
+                name = html_escape(c.name),
+                needed_for = html_escape(&needed_for),
+                required_for = html_escape(c.required_for),
+                install_hint_label = html_escape(&install_hint_label),
+                install_hint = html_escape(c.install_hint),
+            )
+        })
+        .collect();
+
+    format!(
+        r#"<section class="cz-section" style="max-width: 36rem;">
+<div class="cz-card" style="border-color: rgba(245, 181, 68, 0.55);">
+<p class="cz-card-body" style="margin: 0 0 0.5rem;">
+<span class="cz-badge cz-badge-warn">{title}</span>
+</p>
+<p class="cz-muted" style="margin: 0 0 0.5rem;">{intro}</p>
+<ul style="list-style: none; padding-left: 0; margin: 0;">
+{rows}
+</ul>
+</div>
+</section>"#,
+        title = html_escape(&title),
+        intro = html_escape(&intro),
+        rows = rows,
+    )
+}
+
 /// Render the per-component "coming soon" page. Shown for every
 /// component on the hub that isn't yet wired up. Includes a short
 /// localized blurb about what the component will do and a link back
@@ -3539,11 +3613,21 @@ pub fn render_install_kanidm(localizer: &Localizer) -> String {
     let service_name_placeholder = "computeza-kanidm";
     let root_dir_placeholder = root_dir_placeholder_for_leaf("kanidm");
 
+    // openssl: self-signed TLS cert generation at install time.
+    // cargo: `cargo install kanidmd --locked` builds the binary from
+    // crates.io. Both are detect-and-surface (per AGENTS.md "Host
+    // prerequisites"); the form below still renders so the operator
+    // can read the wizard intro, but the banner is the actionable
+    // next step before the install button does anything useful.
+    let prereq_banner =
+        render_prerequisite_banner(localizer, &missing_prerequisites(&["openssl", "cargo"]));
+
     let body = format!(
         r#"<section class="cz-hero">
 <h1>{title}</h1>
 <p>{intro}</p>
 </section>
+{prereq_banner}
 <section class="cz-section" style="max-width: 36rem;">
 <div class="cz-card">
 <form method="post" action="/install/kanidm" class="cz-form" style="max-width: none;">
@@ -5725,5 +5809,47 @@ mod tests {
         assert!(html.contains("Computeza")); // ui-app-title
         assert!(html.contains("Open lakehouse control plane")); // ui-app-tagline
         assert!(html.contains("Pre-alpha")); // ui-welcome-status starts with this
+    }
+
+    #[test]
+    fn prereq_banner_is_empty_when_nothing_missing() {
+        let l = Localizer::english();
+        assert!(render_prerequisite_banner(&l, &[]).is_empty());
+    }
+
+    #[test]
+    fn prereq_banner_renders_missing_command_with_install_hint() {
+        use computeza_driver_native::prerequisites::SYSTEM_COMMANDS;
+        let l = Localizer::english();
+        let openssl = *SYSTEM_COMMANDS
+            .iter()
+            .find(|c| c.name == "openssl")
+            .expect("openssl row exists in SYSTEM_COMMANDS");
+        let html = render_prerequisite_banner(&l, &[openssl]);
+        assert!(
+            html.contains("Host command missing"),
+            "banner title from ui-prerequisite-banner-title should render"
+        );
+        assert!(
+            html.contains("openssl"),
+            "missing command name should render"
+        );
+        assert!(
+            html.contains("apt-get install -y openssl"),
+            "install hint should render verbatim from SYSTEM_COMMANDS"
+        );
+        assert!(
+            html.contains("cz-badge-warn"),
+            "banner should use the warn badge style"
+        );
+    }
+
+    #[test]
+    fn missing_prerequisites_returns_empty_for_unknown_name() {
+        // Names that aren't in SYSTEM_COMMANDS are filtered out -- even
+        // if the host happens not to have them on $PATH -- because we
+        // have no install hint to surface for them.
+        let result = missing_prerequisites(&["definitely-not-a-real-command-xyzzy"]);
+        assert!(result.is_empty());
     }
 }
