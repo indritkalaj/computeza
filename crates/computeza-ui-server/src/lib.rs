@@ -3963,14 +3963,15 @@ pub fn render_install_kanidm(localizer: &Localizer) -> String {
     let service_name_placeholder = "computeza-kanidm";
     let root_dir_placeholder = root_dir_placeholder_for_leaf("kanidm");
 
-    // openssl: self-signed TLS cert generation at install time.
-    // cargo: `cargo install kanidmd --locked` builds the binary from
-    // crates.io. Both are detect-and-surface (per AGENTS.md "Host
-    // prerequisites"); the form below still renders so the operator
-    // can read the wizard intro, but the banner is the actionable
-    // next step before the install button does anything useful.
-    let prereq_banner =
-        render_prerequisite_banner(localizer, &missing_prerequisites(&["openssl", "cargo"]));
+    // openssl: self-signed TLS cert generation at install time. Stays
+    // a hard host prereq because it's universally present on every
+    // supported distro's base install -- bundling it would be wasteful.
+    //
+    // cargo is intentionally NOT in this list. When cargo is missing
+    // the kanidm driver auto-bootstraps a sandboxed Rust toolchain
+    // into <root>/rust/ via prerequisites::ensure_bundled_cargo --
+    // see AGENTS.md "Host prerequisites" for the rationale.
+    let prereq_banner = render_prerequisite_banner(localizer, &missing_prerequisites(&["openssl"]));
 
     let body = format!(
         r#"<section class="cz-hero">

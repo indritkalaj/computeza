@@ -482,18 +482,42 @@ lives at `computeza-driver-native::prerequisites`. Today's split:
 **Host-installed (operator must provide):**
 
 - `openssl` -- kanidm install only, for self-signed TLS cert generation.
-  Wizard surfaces the per-distro install one-liner via
-  `prerequisites::SYSTEM_COMMANDS`.
-- `cargo` -- kanidm install only, for `cargo install kanidmd --locked`.
-  Wizard surfaces the rustup install one-liner.
+  Universally present on every supported distro's base install, so
+  Computeza does not bundle it; the wizard surfaces the per-distro
+  install one-liner via `prerequisites::SYSTEM_COMMANDS` for the rare
+  hardened-minimal-image case.
 
-**Computeza-delivered (auto-installed into the component root):**
+**Computeza-delivered (auto-installed on the host):**
 
+- Rust toolchain (`prerequisites::ensure_rust_toolchain`) -- system-
+  wide install for the `cargo install kanidmd --locked` step on the
+  kanidm path. When `cargo` is missing from `$PATH`, the driver
+  downloads the official `rustup-init` static binary from
+  `static.rust-lang.org` and runs it with
+  `CARGO_HOME=/var/lib/computeza/toolchain/rust/cargo`,
+  `RUSTUP_HOME=/var/lib/computeza/toolchain/rust/rustup`,
+  `--no-modify-path --profile minimal --default-toolchain stable -y`.
+  After install the driver symlinks `cargo`, `rustc`, `rustup` onto
+  `/usr/local/bin/` so the operator's shell (and any future component
+  install) can find them on `$PATH` immediately. We deliberately do
+  NOT modify shell rc files -- the `/usr/local/bin/` symlinks are
+  sufficient and reverse cleanly. Subsequent installs that find
+  `cargo` on `$PATH` skip the bootstrap entirely. ~500MB first-run,
+  shared across all components / re-installs after that.
 - Adoptium Temurin JRE 21 (`prerequisites::TEMURIN_JRE_21_X86_64_LINUX`)
   -- xtable install only. Drops into `<root_dir>/jre/` next to the
-  runner JAR, never touches system PATH, removed by uninstall. Designed
-  but not yet wired -- blocked on the xtable runner-JAR distribution
-  question (see below).
+  runner JAR, never touches system PATH (it's internal plumbing for
+  one component, not a tool the operator runs directly), removed by
+  uninstall. Designed but not yet wired -- blocked on the xtable
+  runner-JAR distribution question (see below).
+
+**Uninstall semantics for shared toolchains:** removing one component
+does NOT remove the shared Rust toolchain at
+`/var/lib/computeza/toolchain/rust/` -- another component may need it,
+and re-installing is expensive. A future v0.1 "purge toolchains"
+action will tear it down cleanly; today operators who want to fully
+clean can `rm -rf /var/lib/computeza/toolchain/` and
+`rm /usr/local/bin/{cargo,rustc,rustup}`.
 
 Adding a new host dep:
 

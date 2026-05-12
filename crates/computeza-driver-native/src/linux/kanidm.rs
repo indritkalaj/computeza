@@ -71,19 +71,30 @@ pub async fn install(
 ) -> Result<InstalledService, ServiceError> {
     let version = opts.version.as_deref().unwrap_or(KANIDM_VERSIONS[0]);
 
-    // 1. Toolchain probe.
+    // 1. Toolchain resolution.
+    //
+    //    openssl stays a hard host requirement -- it's a system library
+    //    universally present on every supported distro's base install,
+    //    so bundling it would be wasteful.
+    //
+    //    cargo, in contrast, is rare on production hosts. Rather than
+    //    surface "missing cargo" as an error and force the operator to
+    //    run rustup-init themselves, we install a shared Rust toolchain
+    //    into /var/lib/computeza/toolchain/rust and symlink cargo /
+    //    rustc / rustup onto /usr/local/bin so the operator's shell
+    //    (and any subsequent install) sees them on $PATH transparently.
     progress.set_phase(InstallPhase::DetectingBinaries);
-    progress.set_message("Verifying cargo + openssl are on PATH");
-    require_on_path("cargo").await?;
+    progress.set_message("Verifying openssl is on PATH; ensuring Rust toolchain is installed");
     require_on_path("openssl").await?;
+    fs::create_dir_all(&opts.root_dir).await?;
+    let cargo_path = crate::prerequisites::ensure_rust_toolchain(progress).await?;
 
     // 2. cargo install kanidmd.
     progress.set_phase(InstallPhase::Downloading);
     progress.set_message(format!(
         "cargo install kanidmd@{version} -- compiles from source, takes 10-15 minutes"
     ));
-    fs::create_dir_all(&opts.root_dir).await?;
-    cargo_install_kanidmd(&opts.root_dir, version).await?;
+    cargo_install_kanidmd(&cargo_path, &opts.root_dir, version).await?;
     let bin_dir = opts.root_dir.join("bin");
     if !fs::try_exists(bin_dir.join("kanidmd"))
         .await
@@ -197,13 +208,19 @@ async fn require_on_path(cmd: &str) -> Result<(), ServiceError> {
         Ok(())
     } else {
         Err(ServiceError::Io(std::io::Error::other(format!(
-            "`{cmd}` not found on PATH. Kanidm installs via `cargo install` from source; the host needs both `cargo` (Rust toolchain) and `openssl` (TLS cert generation) before this install can run. On Debian/Ubuntu: `apt install cargo openssl`. On Fedora: `dnf install cargo openssl`."
+            "`{cmd}` not found on PATH. Kanidm install needs `openssl` (TLS cert generation) on the host. \
+             Debian / Ubuntu: `apt install openssl`. Fedora / RHEL: `dnf install openssl`. \
+             OpenSUSE: `zypper install openssl`. Arch: `pacman -S openssl`."
         ))))
     }
 }
 
-async fn cargo_install_kanidmd(root_dir: &Path, version: &str) -> Result<(), ServiceError> {
-    let out = Command::new("cargo")
+async fn cargo_install_kanidmd(
+    cargo_bin: &Path,
+    root_dir: &Path,
+    version: &str,
+) -> Result<(), ServiceError> {
+    let out = Command::new(cargo_bin)
         .arg("install")
         .arg("kanidmd")
         .arg("--locked")
@@ -215,7 +232,8 @@ async fn cargo_install_kanidmd(root_dir: &Path, version: &str) -> Result<(), Ser
         .await?;
     if !out.status.success() {
         return Err(ServiceError::Io(std::io::Error::other(format!(
-            "cargo install kanidmd@{version} failed: {}",
+            "cargo install kanidmd@{version} failed (cargo={}): {}",
+            cargo_bin.display(),
             String::from_utf8_lossy(&out.stderr)
         ))));
     }
