@@ -368,37 +368,6 @@ async fn install_all_handler(
         let mut overall = String::new();
         let total = planned.len();
         for (idx, (slug, config)) in planned.into_iter().enumerate() {
-            // Pre-provision an admin credential for components that
-            // have one. Persisted encrypted when the secrets store is
-            // attached; surfaced once on the result page either way so
-            // the operator can copy it out before it disappears.
-            if let Some((_, username, label)) = COMPONENTS_WITH_ADMIN_CREDENTIAL
-                .iter()
-                .find(|(s, _, _)| *s == slug)
-                .copied()
-            {
-                let password = generate_random_password();
-                let secret_ref = format!("{slug}/admin-password");
-                if let Some(secrets) = &secrets {
-                    if let Err(e) = secrets.put(&secret_ref, &password).await {
-                        tracing::warn!(
-                            error = %e,
-                            component = slug,
-                            "unified install: secrets.put failed for {secret_ref}; \
-                             the credential will only appear in-band on the result page. \
-                             Verify COMPUTEZA_SECRETS_PASSPHRASE + write access to the secrets file."
-                        );
-                    }
-                }
-                progress.push_credential(computeza_driver_native::progress::GeneratedCredential {
-                    component: slug.to_string(),
-                    label: label.to_string(),
-                    value: password,
-                    username: Some(username.to_string()),
-                    secret_ref: Some(secret_ref),
-                });
-            }
-
             progress.start_component(slug);
             let banner = format!("[{}/{}] Installing {slug}...", idx + 1, total);
             progress.set_message(banner);
@@ -406,7 +375,46 @@ async fn install_all_handler(
                 Ok((summary, _port, spec)) => {
                     progress.finish_component(slug, &summary);
                     overall.push_str(&format!("=== {slug} ===\n{summary}\n\n"));
+
+                    // Provision an admin credential AFTER a successful
+                    // install so a failed install never leaves an
+                    // orphan secret in the store. Components without
+                    // an admin-credential concept skip this block.
+                    if let Some((_, username, label)) = COMPONENTS_WITH_ADMIN_CREDENTIAL
+                        .iter()
+                        .find(|(s, _, _)| *s == slug)
+                        .copied()
+                    {
+                        let password = generate_random_password();
+                        let secret_ref = format!("{slug}/admin-password");
+                        if let Some(secrets) = &secrets {
+                            if let Err(e) = secrets.put(&secret_ref, &password).await {
+                                tracing::warn!(
+                                    error = %e,
+                                    component = slug,
+                                    "unified install: secrets.put failed for {secret_ref}; \
+                                     the credential will only appear in-band on the result page. \
+                                     Verify COMPUTEZA_SECRETS_PASSPHRASE + write access to the secrets file."
+                                );
+                            }
+                        }
+                        progress.push_credential(
+                            computeza_driver_native::progress::GeneratedCredential {
+                                component: slug.to_string(),
+                                label: label.to_string(),
+                                value: password,
+                                username: Some(username.to_string()),
+                                secret_ref: Some(secret_ref),
+                            },
+                        );
+                    }
+
                     if let Some(store) = &store {
+                        // Persist the spec (the reconciler reads this)
+                        // and the InstallConfig (rollback / repair
+                        // read this to target the operator's chosen
+                        // service name / root dir rather than driver
+                        // defaults).
                         let kind = format!("{slug}-instance");
                         let key = ResourceKey::cluster_scoped(&kind, "local");
                         let expected_revision = match store.load(&key).await {
@@ -424,6 +432,14 @@ async fn install_all_handler(
                             overall.push_str(&format!(
                                 "Note: did not register {slug}-instance/local ({e}). Visit /status to inspect.\n\n"
                             ));
+                        }
+                        if let Err(e) = save_install_config(store.as_ref(), slug, &config).await {
+                            tracing::warn!(
+                                error = %e,
+                                component = slug,
+                                "unified install: failed to persist install-config/{slug}-local; \
+                                 rollback / repair on this row will fall back to driver defaults."
+                            );
                         }
                     }
                 }
@@ -461,6 +477,68 @@ const COMPONENTS_WITH_ADMIN_CREDENTIAL: &[(&str, &str, &str)] = &[
     ("kanidm", "admin", "initial admin password"),
     ("grafana", "admin", "initial admin password"),
 ];
+
+/// Persist a per-slug [`InstallConfig`] under the metadata-store kind
+/// `install-config` with name `<slug>-local`. Used by the unified
+/// install so rollback / repair can target the operator's chosen
+/// service name + root dir rather than blindly using driver defaults.
+///
+/// Upsert: on revision conflict we load the existing entry's revision
+/// and retry the save once. Returns `Err` only on the second failure.
+async fn save_install_config(
+    store: &SqliteStore,
+    slug: &str,
+    config: &InstallConfig,
+) -> anyhow::Result<()> {
+    let key = ResourceKey::cluster_scoped("install-config", &format!("{slug}-local"));
+    let value = serde_json::to_value(config)
+        .map_err(|e| anyhow::anyhow!("serialising InstallConfig for {slug}: {e}"))?;
+    let expected_revision = match store.load(&key).await {
+        Ok(Some(existing)) => Some(existing.revision),
+        _ => None,
+    };
+    store
+        .save(&key, &value, expected_revision)
+        .await
+        .map_err(|e| anyhow::anyhow!("save install-config/{slug}-local: {e}"))?;
+    Ok(())
+}
+
+/// Read back the per-slug [`InstallConfig`] persisted by
+/// [`save_install_config`]. Returns `None` when no row exists (e.g.
+/// the install ran before this persistence layer landed, or via the
+/// per-component pages that don't yet write install-config rows).
+async fn load_install_config(store: &SqliteStore, slug: &str) -> Option<InstallConfig> {
+    let key = ResourceKey::cluster_scoped("install-config", &format!("{slug}-local"));
+    match store.load(&key).await {
+        Ok(Some(stored)) => serde_json::from_value::<InstallConfig>(stored.spec)
+            .map_err(|e| {
+                tracing::warn!(
+                    error = %e,
+                    component = slug,
+                    "install-config/{slug}-local exists but is not a valid InstallConfig; \
+                     falling back to driver defaults"
+                );
+                e
+            })
+            .ok(),
+        _ => None,
+    }
+}
+
+/// Delete the persisted install-config for a slug. Called from
+/// rollback so the metadata store doesn't keep a stale row pointing
+/// at a service that no longer exists.
+async fn delete_install_config(store: &SqliteStore, slug: &str) {
+    let key = ResourceKey::cluster_scoped("install-config", &format!("{slug}-local"));
+    if let Err(e) = store.delete(&key, None).await {
+        tracing::debug!(
+            error = %e,
+            component = slug,
+            "delete install-config/{slug}-local: row may not have existed (this is fine on legacy installs)"
+        );
+    }
+}
 
 /// Generate a 96-bit random password rendered as a 24-character hex
 /// string. Hex avoids alphabet-modulo bias and is safe to paste into
@@ -658,12 +736,29 @@ struct InstallForm {
 
 /// Parsed user-facing install configuration. Each field defaults to
 /// the driver default when the corresponding form field was blank.
-#[derive(Clone, Debug, Default)]
-struct InstallConfig {
-    version: Option<String>,
-    port: Option<u16>,
-    root_dir: Option<String>,
-    service_name: Option<String>,
+///
+/// Serializable so the unified install can persist a per-slug copy
+/// alongside each component's spec, letting the rollback / repair
+/// flows target the same service name + root dir the operator
+/// originally chose (rather than blindly using driver defaults).
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct InstallConfig {
+    /// Version pin from the form's dropdown / text input. `None`
+    /// resolves to the driver's "latest" default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// TCP port to bind the service on. `None` uses the driver
+    /// default (e.g. 5432 for postgres, 8443 for kanidm).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// Override the install root. `None` uses the platform default
+    /// (`/var/lib/computeza/<slug>` on Linux).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_dir: Option<String>,
+    /// Service name registered with the OS service manager. `None`
+    /// uses the driver default (`computeza-<slug>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
 }
 
 impl InstallForm {
