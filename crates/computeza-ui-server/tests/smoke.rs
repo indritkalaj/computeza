@@ -109,7 +109,10 @@ async fn server_serves_localized_home_and_healthz() {
     let body: serde_json::Value = resp.json().await.expect("json body");
     assert_eq!(body["store_attached"], false);
 
-    // /install -- hub of component cards.
+    // /install -- the unified whole-stack install form. One card per
+    // component, one Install button at the bottom posting back to
+    // /install. Per-component pages stay accessible at /install/<slug>
+    // but the hub no longer links to them.
     let resp = client
         .get(format!("http://{addr}/install"))
         .send()
@@ -121,10 +124,21 @@ async fn server_serves_localized_home_and_healthz() {
         resp.status()
     );
     let body = resp.text().await.expect("body text");
-    assert!(body.contains("Choose a component"));
+    assert!(body.contains("Install Computeza"));
     assert!(body.contains("PostgreSQL"));
     assert!(body.contains("Kanidm"));
-    assert!(body.contains(r#"href="/install/postgres""#));
+    assert!(
+        body.contains(r#"action="/install""#),
+        "the unified hub form must post back to /install"
+    );
+    assert!(
+        body.contains(r#"name="postgres__port""#),
+        "the unified hub must collect per-slug port fields"
+    );
+    assert!(
+        body.contains("Install all components"),
+        "the global submit button must be rendered"
+    );
 
     // /install/postgres -- the actual install wizard form.
     let resp = client

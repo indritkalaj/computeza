@@ -95,8 +95,22 @@ ui-resource-delete-failed = Could not delete resource:
 
 ui-install-title         = Install a component
 ui-install-intro         = `computeza install <component>` lays down a native OS service. The same install path runs from the CLI -- this page is the GUI-equivalent per spec section 2.1 / 4.2.
-ui-install-hub-title     = Choose a component
-ui-install-hub-intro     = Pick the component you want to lay down. Per the playbook each one ships a per-OS native install (no Docker, no Kubernetes) with a configurable port, data directory, and service name; multi-version pins; an uninstall flow; and host-state detection so a second install of the same component doesn't collide with the first.
+ui-install-hub-title     = Install Computeza
+ui-install-hub-intro     = Computeza is a single product made of 11 data-plane components -- the lakehouse only works when each one is in place. Configure every service below in one pass, then click Install at the bottom of the page to lay them all down in dependency order. Each card collects the service name, network port, data directory, version pin, and (in v0.1+) the credentials and identity-federation binding for that component. v0.0.x ships 10 of the 11 components; xtable is blocked on its upstream runner-JAR distribution.
+
+# --- Unified install (whole-stack) page ---
+#
+# Strings used by the per-component cards inside the unified /install
+# page. One submit button at the bottom drives every install in the
+# canonical dependency order.
+
+ui-install-card-service-config = Service configuration
+ui-install-card-identity       = Identity and access
+ui-install-card-identity-help  = Service account, initial admin credentials, group permissions, and upstream IdP federation (Entra ID, AWS IAM, GCP IAM, on-prem LDAP / Kerberos) configure here in v0.1+. Today every component installs against a loopback-trust auth surface so the operator console can observe it; bind credentials and federation in v0.1 once `computeza-secrets` is wired into the install flow.
+ui-install-card-identity-v01   = Configurable in v0.1+
+ui-install-all-button          = Install all components
+ui-install-all-helper          = Clicking Install lays down each component in dependency order (postgres -> openfga -> kanidm -> garage -> qdrant -> lakekeeper -> greptime -> grafana -> restate -> databend). Progress for the running component shows on the next page; a failure stops the chain and leaves earlier components installed.
+ui-install-component-unavailable = Pinned in tree, not yet shippable on Linux. Skipped automatically.
 
 ui-platform-banner-supported   = Detected:
 ui-platform-banner-unsupported = Host not supported

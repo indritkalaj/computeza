@@ -128,7 +128,10 @@ pub fn router_with_state(state: AppState) -> Router {
     Router::new()
         .route("/", get(home_handler))
         .route("/components", get(components_handler))
-        .route("/install", get(install_hub_handler))
+        .route(
+            "/install",
+            get(install_hub_handler).post(install_all_handler),
+        )
         .route(
             "/install/postgres",
             get(install_postgres_form_handler).post(install_postgres_handler),
@@ -237,6 +240,213 @@ pub fn router_with_state(state: AppState) -> Router {
 async fn install_hub_handler() -> Html<String> {
     let l = Localizer::english();
     Html(render_install_hub(&l))
+}
+
+/// POST /install -- the unified whole-stack install. Parses one config
+/// per available component out of the flat `<slug>__<field>` form,
+/// spawns a single background job, and runs every install in
+/// [`INSTALL_ORDER`] sequentially. A failure on any component stops
+/// the chain (later components stay un-installed; earlier ones are
+/// left in place).
+async fn install_all_handler(
+    State(state): State<AppState>,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    let l = Localizer::english();
+    if let Err(resp) = guard_supported_os(&l) {
+        return resp;
+    }
+
+    let mut planned: Vec<(&'static str, InstallConfig)> = Vec::new();
+    for slug in INSTALL_ORDER {
+        if !is_available(slug) {
+            continue;
+        }
+        match build_unified_config(&form, slug) {
+            Ok(cfg) => planned.push((*slug, cfg)),
+            Err(msg) => return Html(render_install_result(&l, false, &msg)).into_response(),
+        }
+    }
+
+    let job_id = Uuid::new_v4().to_string();
+    let progress_state = Arc::new(StdMutex::new(InstallProgress::default()));
+    state
+        .jobs
+        .lock()
+        .unwrap()
+        .insert(job_id.clone(), progress_state.clone());
+
+    let store = state.store.clone();
+    let progress = ProgressHandle::new(progress_state);
+    tokio::spawn(async move {
+        let mut overall = String::new();
+        let total = planned.len();
+        for (idx, (slug, config)) in planned.into_iter().enumerate() {
+            let banner = format!("[{}/{}] Installing {slug}...", idx + 1, total);
+            progress.set_message(banner);
+            match dispatch_install(slug, &progress, &config).await {
+                Ok((summary, _port, spec)) => {
+                    overall.push_str(&format!("=== {slug} ===\n{summary}\n\n"));
+                    if let Some(store) = &store {
+                        let kind = format!("{slug}-instance");
+                        let key = ResourceKey::cluster_scoped(&kind, "local");
+                        let expected_revision = match store.load(&key).await {
+                            Ok(Some(existing)) => Some(existing.revision),
+                            _ => None,
+                        };
+                        if let Err(e) = store.save(&key, &spec, expected_revision).await {
+                            tracing::warn!(
+                                error = %e,
+                                component = slug,
+                                "unified install: store.save failed for {slug}-instance/local; \
+                                 the on-disk service is up but the metadata row was not written. \
+                                 Visit /status to confirm; re-run install to retry the registration."
+                            );
+                            overall.push_str(&format!(
+                                "Note: did not register {slug}-instance/local ({e}). Visit /status to inspect.\n\n"
+                            ));
+                        }
+                    }
+                }
+                Err(detail) => {
+                    progress.finish_failure(format!(
+                        "{slug} install failed: {detail}\n\nProgress before the failure:\n{overall}\n\
+                         Fix the underlying issue (see the log panel above) and re-submit the install form. \
+                         Components that already installed are idempotent on re-run."
+                    ));
+                    return;
+                }
+            }
+        }
+        progress.finish_success(format!(
+            "Installed {total} component(s) successfully.\n\n{overall}Visit /status for the live reconciler view."
+        ));
+    });
+
+    Redirect303(format!("/install/job/{job_id}")).into_response()
+}
+
+/// Look up whether a slug is marked `available: true` in [`COMPONENTS`].
+/// Used by [`install_all_handler`] to skip pinned-but-unshippable
+/// entries (xtable today) without erroring.
+fn is_available(slug: &str) -> bool {
+    COMPONENTS
+        .iter()
+        .find(|c| c.slug == slug)
+        .map(|c| c.available)
+        .unwrap_or(false)
+}
+
+/// Extract one component's [`InstallConfig`] from a unified form.
+/// Field names follow the `<slug>__<field>` convention so a single
+/// flat HashMap holds every component's inputs.
+fn build_unified_config(
+    form: &HashMap<String, String>,
+    slug: &str,
+) -> Result<InstallConfig, String> {
+    let get = |k: &str| -> &str {
+        form.get(&format!("{slug}__{k}"))
+            .map(String::as_str)
+            .unwrap_or("")
+            .trim()
+    };
+
+    let version = match get("version") {
+        "" => None,
+        s => Some(s.to_string()),
+    };
+    let port = match get("port") {
+        "" => None,
+        s => Some(s.parse::<u16>().map_err(|_| {
+            format!("{slug} port must be an integer between 1 and 65535; got {s:?}")
+        })?),
+    };
+    let root_dir = match get("root_dir") {
+        "" => None,
+        s => Some(s.to_string()),
+    };
+    let service_name = match get("service_name") {
+        "" => None,
+        s if s
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') =>
+        {
+            Some(s.to_string())
+        }
+        s => {
+            return Err(format!(
+                "{slug} service name {s:?} must be ASCII alphanumeric / hyphen / underscore only"
+            ));
+        }
+    };
+    Ok(InstallConfig {
+        version,
+        port,
+        root_dir,
+        service_name,
+    })
+}
+
+/// Run the install for one component and return `(summary, port, spec)`
+/// where `spec` is the JSON shape the metadata store wants under
+/// `<slug>-instance/local`. The per-component spec shapes mirror what
+/// the existing per-slug handlers (e.g. `install_postgres_handler`)
+/// write today.
+async fn dispatch_install(
+    slug: &str,
+    progress: &ProgressHandle,
+    config: &InstallConfig,
+) -> Result<(String, u16, serde_json::Value), String> {
+    let (summary, port) = match slug {
+        "postgres" => run_postgres_install_with_progress(progress, config).await?,
+        "kanidm" => run_kanidm_install_with_progress(progress, config).await?,
+        "garage" => run_garage_install_with_progress(progress, config).await?,
+        "openfga" => run_openfga_install_with_progress(progress, config).await?,
+        "qdrant" => run_qdrant_install_with_progress(progress, config).await?,
+        "lakekeeper" => run_lakekeeper_install_with_progress(progress, config).await?,
+        "greptime" => run_greptime_install_with_progress(progress, config).await?,
+        "grafana" => run_grafana_install_with_progress(progress, config).await?,
+        "restate" => run_restate_install_with_progress(progress, config).await?,
+        "databend" => run_databend_install_with_progress(progress, config).await?,
+        other => {
+            return Err(format!(
+                "dispatch_install: unknown component slug {other:?}"
+            ))
+        }
+    };
+    let spec = match slug {
+        "postgres" => serde_json::json!({
+            "endpoint": {
+                "host": "127.0.0.1",
+                "port": port,
+                "superuser": "postgres",
+            },
+            "databases": [],
+            "prune": false,
+        }),
+        "kanidm" => serde_json::json!({
+            "endpoint": {
+                "base_url": format!("https://127.0.0.1:{port}"),
+                "insecure_skip_tls_verify": true,
+            },
+        }),
+        "garage" => {
+            let admin = port + 3;
+            serde_json::json!({
+                "endpoint": {
+                    "base_url": format!("http://127.0.0.1:{admin}"),
+                    "insecure_skip_tls_verify": false,
+                },
+            })
+        }
+        _ => serde_json::json!({
+            "endpoint": {
+                "base_url": format!("http://127.0.0.1:{port}"),
+                "insecure_skip_tls_verify": false,
+            },
+        }),
+    };
+    Ok((summary, port, spec))
 }
 
 async fn install_postgres_form_handler() -> Html<String> {
@@ -3102,40 +3312,168 @@ const COMPONENTS: &[ComponentEntry] = &[
     },
 ];
 
-/// Render the `/install` page: a grid of cards, one per component
-/// Computeza manages. The card links to either `/install/<slug>`
-/// (available components, current wizard) or `/install/<slug>`
-/// (which serves the coming-soon page).
+/// Canonical install order. Components are laid down sequentially in
+/// this sequence so that downstream consumers find their dependencies
+/// already up: lakekeeper opens a Postgres connection at start, every
+/// component eventually federates auth through kanidm, etc. The order
+/// preserves the postgres-first rule from the playbook (see AGENTS.md
+/// "Component installer playbook") and groups stateful storage
+/// (garage, qdrant) ahead of the query / observability layers.
+///
+/// Slugs in this list MUST also appear as `available: true` entries in
+/// [`COMPONENTS`]; unavailable entries (today: xtable) are skipped at
+/// dispatch time.
+const INSTALL_ORDER: &[&str] = &[
+    "postgres",
+    "openfga",
+    "kanidm",
+    "garage",
+    "qdrant",
+    "lakekeeper",
+    "greptime",
+    "grafana",
+    "restate",
+    "databend",
+];
+
+/// Per-component canonical defaults shown as `placeholder=` text in the
+/// unified install form. The driver itself owns the actual defaults --
+/// these are surfaced purely so the operator sees "what would happen
+/// if I leave this blank" without having to read driver source.
+///
+/// Returns `(default_port, default_service_name)`. Port 0 indicates
+/// the component has no canonical port (xtable today).
+fn canonical_defaults_for(slug: &str) -> (u16, String) {
+    let port: u16 = match slug {
+        "postgres" => 5432,
+        "kanidm" => 8443,
+        "garage" => 3900,
+        "openfga" => 8080,
+        "qdrant" => 6333,
+        "greptime" => 4000,
+        "lakekeeper" => 8181,
+        "databend" => 8000,
+        "grafana" => 3000,
+        "restate" => 8081,
+        _ => 0,
+    };
+    (port, format!("computeza-{slug}"))
+}
+
+/// Render one component card inside the unified install form. The card
+/// has two `<details>` disclosures:
+///
+/// - **Service configuration** (open by default for available
+///   components): service name, port, data directory, version pin.
+///   Inputs use the `<slug>__<field>` naming convention so the unified
+///   POST handler can extract per-slug configs from a flat HashMap.
+/// - **Identity and access** (closed by default, marked v0.1+):
+///   placeholder for service account, initial admin credentials,
+///   group permissions, and upstream IdP federation
+///   (Entra ID / AWS IAM / GCP IAM / on-prem LDAP / Kerberos).
+///   No inputs render today because the underlying primitives
+///   (`computeza-secrets` binding, identity-federation crate) ship in
+///   v0.1+. The disclosure is here so the v0.1 shape is visible.
+fn render_unified_component_card(localizer: &Localizer, c: &ComponentEntry) -> String {
+    let name = localizer.t(c.name_key);
+    let role = localizer.t(c.role_key);
+    let service_config_label = localizer.t("ui-install-card-service-config");
+    let identity_label = localizer.t("ui-install-card-identity");
+    let identity_help = localizer.t("ui-install-card-identity-help");
+    let identity_v01 = localizer.t("ui-install-card-identity-v01");
+    let port_label = localizer.t("ui-install-port-label");
+    let data_dir_label = localizer.t("ui-install-data-dir-label");
+    let service_name_label = localizer.t("ui-install-service-name-label");
+    let version_label = localizer.t("ui-install-version-label");
+    let unavailable_msg = localizer.t("ui-install-component-unavailable");
+    let status_available = localizer.t("ui-install-status-available");
+    let status_planned = localizer.t("ui-install-status-planned");
+
+    let slug = c.slug;
+    let (default_port, default_service) = canonical_defaults_for(slug);
+
+    let (badge_class, badge_text) = if c.available {
+        ("cz-badge cz-badge-ok", status_available.as_str())
+    } else {
+        ("cz-badge cz-badge-info", status_planned.as_str())
+    };
+
+    let disabled_attr = if c.available { "" } else { " disabled" };
+    let open_attr = if c.available { " open" } else { "" };
+
+    let unavailable_block = if c.available {
+        String::new()
+    } else {
+        format!(
+            r#"<p class="cz-muted" style="margin: 0.5rem 0 0; font-size: 0.85rem;"><em>{}</em></p>"#,
+            html_escape(&unavailable_msg)
+        )
+    };
+
+    format!(
+        r#"<div class="cz-card" id="card-{slug}">
+<h3 class="cz-card-title">{name}</h3>
+<p class="cz-card-body">{role}</p>
+<p class="cz-card-meta"><span class="{badge_class}">{badge_text}</span></p>
+{unavailable_block}
+<details style="margin-top: 0.75rem;"{open_attr}>
+<summary class="cz-tag" style="cursor: pointer;">{service_config_label}</summary>
+<div style="display: flex; flex-direction: column; gap: 0.6rem; margin-top: 0.75rem;">
+<label for="{slug}__service_name" style="display: block; font-size: 0.85rem;">{service_name_label}</label>
+<input id="{slug}__service_name" name="{slug}__service_name" class="cz-input" type="text" placeholder="{default_service}" pattern="[A-Za-z0-9_-]+"{disabled_attr} />
+<label for="{slug}__port" style="display: block; font-size: 0.85rem;">{port_label}</label>
+<input id="{slug}__port" name="{slug}__port" class="cz-input" type="number" min="1" max="65535" placeholder="{default_port}"{disabled_attr} />
+<label for="{slug}__root_dir" style="display: block; font-size: 0.85rem;">{data_dir_label}</label>
+<input id="{slug}__root_dir" name="{slug}__root_dir" class="cz-input" type="text" placeholder="/var/lib/computeza/{slug}"{disabled_attr} />
+<label for="{slug}__version" style="display: block; font-size: 0.85rem;">{version_label}</label>
+<input id="{slug}__version" name="{slug}__version" class="cz-input" type="text" placeholder="latest"{disabled_attr} />
+</div>
+</details>
+<details style="margin-top: 0.5rem;">
+<summary class="cz-tag" style="cursor: pointer;">{identity_label} <span class="cz-badge cz-badge-info" style="margin-left: 0.5rem;">{identity_v01}</span></summary>
+<p class="cz-muted" style="margin: 0.6rem 0 0; font-size: 0.85rem;">{identity_help}</p>
+</details>
+</div>"#,
+        slug = slug,
+        name = html_escape(&name),
+        role = html_escape(&role),
+        badge_class = badge_class,
+        badge_text = html_escape(badge_text),
+        unavailable_block = unavailable_block,
+        open_attr = open_attr,
+        service_config_label = html_escape(&service_config_label),
+        identity_label = html_escape(&identity_label),
+        identity_help = html_escape(&identity_help),
+        identity_v01 = html_escape(&identity_v01),
+        port_label = html_escape(&port_label),
+        data_dir_label = html_escape(&data_dir_label),
+        service_name_label = html_escape(&service_name_label),
+        version_label = html_escape(&version_label),
+        default_port = default_port,
+        default_service = html_escape(&default_service),
+        disabled_attr = disabled_attr,
+    )
+}
+
+/// Render the `/install` page: the unified whole-stack install form.
+/// One card per component (each with inline service-config + a
+/// v0.1-placeholder identity disclosure), one Install button at the
+/// bottom that POSTs back to `/install` and runs every component in
+/// dependency order.
+///
+/// Per-component pages (`/install/postgres`, `/install/kanidm`, ...)
+/// remain available for power users and CI scripts but are no longer
+/// linked from the hub.
 #[must_use]
 pub fn render_install_hub(localizer: &Localizer) -> String {
     let title = localizer.t("ui-install-hub-title");
     let intro = localizer.t("ui-install-hub-intro");
-    let status_available = localizer.t("ui-install-status-available");
-    let status_planned = localizer.t("ui-install-status-planned");
+    let install_all_button = localizer.t("ui-install-all-button");
+    let install_all_helper = localizer.t("ui-install-all-helper");
 
     let cards: String = COMPONENTS
         .iter()
-        .map(|c| {
-            let name = localizer.t(c.name_key);
-            let role = localizer.t(c.role_key);
-            let (badge_class, badge_text) = if c.available {
-                ("cz-badge cz-badge-ok", status_available.as_str())
-            } else {
-                ("cz-badge cz-badge-info", status_planned.as_str())
-            };
-            format!(
-                r#"<a href="/install/{slug}" class="cz-card">
-<h3 class="cz-card-title">{name}</h3>
-<p class="cz-card-body">{role}</p>
-<p class="cz-card-meta"><span class="{badge_class}">{badge_text}</span></p>
-</a>"#,
-                slug = html_escape(c.slug),
-                name = html_escape(&name),
-                role = html_escape(&role),
-                badge_class = badge_class,
-                badge_text = html_escape(badge_text),
-            )
-        })
+        .map(|c| render_unified_component_card(localizer, c))
         .collect();
 
     let platform_banner = render_platform_banner(localizer);
@@ -3146,11 +3484,23 @@ pub fn render_install_hub(localizer: &Localizer) -> String {
 <p>{intro}</p>
 </section>
 {platform_banner}
+<form method="post" action="/install" style="display: contents;">
 <section class="cz-section">
 <div class="cz-card-grid">{cards}</div>
-</section>"#,
+</section>
+<section class="cz-section" style="max-width: 60rem;">
+<div class="cz-card">
+<p class="cz-card-body" style="margin: 0 0 1rem;">{install_all_helper}</p>
+<button type="submit" class="cz-btn cz-btn-primary">{install_all_button}</button>
+</div>
+</section>
+</form>"#,
         title = html_escape(&title),
         intro = html_escape(&intro),
+        platform_banner = platform_banner,
+        cards = cards,
+        install_all_helper = html_escape(&install_all_helper),
+        install_all_button = html_escape(&install_all_button),
     );
 
     render_shell(localizer, &title, NavLink::Install, &body)
@@ -5851,5 +6201,88 @@ mod tests {
         // have no install hint to surface for them.
         let result = missing_prerequisites(&["definitely-not-a-real-command-xyzzy"]);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn install_hub_renders_a_card_per_component_and_one_global_submit() {
+        let l = Localizer::english();
+        let html = render_install_hub(&l);
+        assert!(html.contains("Install Computeza"));
+        assert!(
+            html.contains(r#"action="/install""#),
+            "unified hub form must post to /install"
+        );
+        for slug in INSTALL_ORDER {
+            assert!(
+                html.contains(&format!(r#"name="{slug}__service_name""#)),
+                "card for {slug} must collect a service_name field"
+            );
+            assert!(
+                html.contains(&format!(r#"name="{slug}__port""#)),
+                "card for {slug} must collect a port field"
+            );
+        }
+        let install_button_occurrences = html.matches("Install all components").count();
+        assert_eq!(
+            install_button_occurrences, 1,
+            "there must be exactly one global Install button"
+        );
+        assert!(html.contains("Identity and access"));
+        assert!(html.contains("Configurable in v0.1+"));
+    }
+
+    #[test]
+    fn install_order_only_lists_available_components() {
+        for slug in INSTALL_ORDER {
+            let entry = COMPONENTS
+                .iter()
+                .find(|c| c.slug == *slug)
+                .unwrap_or_else(|| panic!("INSTALL_ORDER references unknown slug {slug:?}"));
+            assert!(
+                entry.available,
+                "INSTALL_ORDER entry {slug:?} must be marked available=true in COMPONENTS"
+            );
+        }
+    }
+
+    #[test]
+    fn build_unified_config_parses_per_slug_fields() {
+        let mut form = HashMap::new();
+        form.insert("postgres__port".into(), "5433".into());
+        form.insert(
+            "postgres__service_name".into(),
+            "computeza-postgres-18".into(),
+        );
+        form.insert("postgres__root_dir".into(), "/srv/pg18".into());
+        form.insert("postgres__version".into(), "18.3-1".into());
+        // kanidm fields should NOT bleed into the postgres config.
+        form.insert("kanidm__port".into(), "9999".into());
+
+        let cfg = build_unified_config(&form, "postgres").expect("postgres config");
+        assert_eq!(cfg.port, Some(5433));
+        assert_eq!(cfg.service_name.as_deref(), Some("computeza-postgres-18"));
+        assert_eq!(cfg.root_dir.as_deref(), Some("/srv/pg18"));
+        assert_eq!(cfg.version.as_deref(), Some("18.3-1"));
+    }
+
+    #[test]
+    fn build_unified_config_rejects_bad_service_name() {
+        let mut form = HashMap::new();
+        form.insert(
+            "postgres__service_name".into(),
+            "bad name with spaces".into(),
+        );
+        let err = build_unified_config(&form, "postgres").unwrap_err();
+        assert!(err.contains("service name"));
+    }
+
+    #[test]
+    fn build_unified_config_blank_fields_resolve_to_driver_defaults() {
+        let form: HashMap<String, String> = HashMap::new();
+        let cfg = build_unified_config(&form, "kanidm").expect("kanidm config");
+        assert!(cfg.port.is_none());
+        assert!(cfg.service_name.is_none());
+        assert!(cfg.root_dir.is_none());
+        assert!(cfg.version.is_none());
     }
 }

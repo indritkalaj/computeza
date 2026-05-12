@@ -427,6 +427,42 @@ When adding a new component (kanidm, garage, lakekeeper, ...):
   only install actions are Linux-gated.
 - v1.0 GA target: Q2 2027 per spec section 13.
 
+## Unified install (`/install`)
+
+The operator console's `/install` page is the unified whole-stack
+install form. One card per component lays out service-config inputs
+(service name, port, data directory, version pin); a single Install
+button at the bottom POSTs back to `/install`, which spawns one job
+that runs every available component sequentially through
+[`INSTALL_ORDER`] in `crates/computeza-ui-server/src/lib.rs`.
+
+Adding a new component to the unified install:
+
+1. Append the slug to `INSTALL_ORDER` in the position that respects
+   its dependencies (postgres-first, storage before query, etc.).
+2. Add a match arm in `dispatch_install` that calls the component's
+   `run_<slug>_install_with_progress` and returns the metadata-store
+   spec shape for `<slug>-instance/local`.
+3. Set `available: true` on the component's `ComponentEntry` once
+   driver + reconciler are wired -- the unit test
+   `install_order_only_lists_available_components` enforces that
+   every `INSTALL_ORDER` entry is marked available.
+4. Add the canonical default port to `canonical_defaults_for` so the
+   form placeholder shows the right number.
+
+The per-component pages (`/install/postgres`, `/install/kanidm`, ...)
+remain at their existing routes so power users / CI scripts can drive
+one install at a time; they are no longer linked from the hub.
+
+The unified flow's per-card "Identity and access" disclosure is a
+**v0.1+ placeholder** today -- service account, initial admin
+credentials, group permissions, and upstream IdP federation (Entra
+ID / AWS IAM / GCP IAM / on-prem LDAP / Kerberos) all configure
+through it once the `computeza-secrets` install-time binding and the
+identity-federation crate land. v0.0.x installs against loopback
+trust auth so the reconciler can observe; the unified form does not
+yet collect any credential material.
+
 ## Host prerequisites
 
 The product owner's directive: "we also need to deliver the dependencies
