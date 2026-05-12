@@ -122,6 +122,12 @@ ui-install-service-name-help  = Identifier registered with the OS service manage
 ui-install-advanced          = Advanced options
 ui-install-already-installed = Already installed? Uninstall first to start fresh.
 
+ui-install-kanidm-title  = Install Kanidm
+ui-install-kanidm-intro  = Kanidm is the identity provider Computeza uses for SSO, OAuth2, passkeys, and RADIUS. The install downloads the kanidmd server binary, writes a minimal `server.toml`, and registers a native OS service. Production deployments need a real TLS certificate placed under the data dir before the daemon will start.
+
+ui-uninstall-kanidm-title = Uninstall Kanidm
+ui-uninstall-kanidm-intro = Roll back the Kanidm install: stop the service, remove the OS service unit, delete the data directory under the install root, and drop kanidm-instance/local from the metadata store. The cached binary bundle is preserved so re-install is fast.
+
 ui-uninstall-title    = Uninstall PostgreSQL
 ui-uninstall-intro    = This rolls back the install: stops the Windows service, deletes the data directory, removes the psql shim from PATH, and drops postgres-instance/local from the metadata store. The cached binary bundle is preserved so re-install is fast.
 ui-uninstall-confirm  = This deletes the cluster's data directory. Any databases inside will be permanently lost. Make a backup first if you care about the data.

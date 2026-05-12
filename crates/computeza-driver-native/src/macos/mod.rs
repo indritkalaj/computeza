@@ -11,3 +11,6 @@
 pub mod launchctl;
 pub mod path;
 pub mod postgres;
+pub mod service;
+
+pub mod kanidm;

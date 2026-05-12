@@ -10,3 +10,5 @@
 pub mod path;
 pub mod postgres;
 pub mod sc;
+
+pub mod kanidm;
