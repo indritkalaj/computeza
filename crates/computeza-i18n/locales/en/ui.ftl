@@ -112,6 +112,18 @@ ui-install-all-button          = Install all components
 ui-install-all-helper          = Clicking Install lays down each component in dependency order (postgres -> openfga -> kanidm -> garage -> qdrant -> lakekeeper -> greptime -> grafana -> restate -> databend). Progress for the running component shows on the next page; a failure stops the chain and leaves earlier components installed.
 ui-install-component-unavailable = Pinned in tree, not yet shippable on Linux. Skipped automatically.
 
+# --- Install progress page (per-component checklist) ---
+
+ui-install-progress-title-multi  = Installing Computeza
+ui-install-progress-intro-multi  = Each component below is laid down in order. You can leave this page open; it polls the server every half second and survives browser refresh.
+ui-install-progress-title-single = Installing component
+ui-install-progress-intro-single = Computeza is preparing the service. You can leave this page open; it polls the server every half second.
+ui-install-progress-components   = Components
+ui-install-progress-state-pending = Pending
+ui-install-progress-state-running = Running
+ui-install-progress-state-done    = Done
+ui-install-progress-state-failed  = Failed
+
 ui-platform-banner-supported   = Detected:
 ui-platform-banner-unsupported = Host not supported
 ui-platform-supported-title    = Supported platforms

@@ -5463,6 +5463,10 @@ fn kanidm_version_options() -> Vec<VersionOption> {
 /// Render the in-flight wizard page. The page polls
 /// `/api/install/job/{id}` every 500ms via inline JS and redirects to
 /// the result page once `completed: true` lands in the snapshot.
+///
+/// When `p.components` is non-empty the page renders a per-component
+/// checklist above the running-component progress bar; the JS poller
+/// keeps each row's state badge in sync.
 #[must_use]
 pub fn render_install_progress(localizer: &Localizer, job_id: &str, p: &InstallProgress) -> String {
     let title = localizer.t("ui-install-title");
@@ -5476,20 +5480,94 @@ pub fn render_install_progress(localizer: &Localizer, job_id: &str, p: &InstallP
     };
     let job_id_js = html_escape(job_id);
 
-    // Render the initial log lines server-side so an operator who
-    // refreshes the page mid-install sees the existing history,
-    // not just whatever lines have arrived since the JS started.
     let initial_log_html: String = p
         .log
         .iter()
         .map(|l| format!("<div>{}</div>\n", html_escape(l)))
         .collect();
 
+    let multi = !p.components.is_empty();
+    let (hero_title, hero_intro) = if multi {
+        (
+            localizer.t("ui-install-progress-title-multi"),
+            localizer.t("ui-install-progress-intro-multi"),
+        )
+    } else {
+        (
+            localizer.t("ui-install-progress-title-single"),
+            localizer.t("ui-install-progress-intro-single"),
+        )
+    };
+
+    let components_label = localizer.t("ui-install-progress-components");
+    let state_pending = localizer.t("ui-install-progress-state-pending");
+    let state_running = localizer.t("ui-install-progress-state-running");
+    let state_done = localizer.t("ui-install-progress-state-done");
+    let state_failed = localizer.t("ui-install-progress-state-failed");
+    let state_pending_e = html_escape(&state_pending);
+    let state_running_e = html_escape(&state_running);
+    let state_done_e = html_escape(&state_done);
+    let state_failed_e = html_escape(&state_failed);
+
+    let components_block = if multi {
+        let rows: String = p
+            .components
+            .iter()
+            .map(|c| {
+                let (badge_class, badge_text) = match c.state {
+                    computeza_driver_native::progress::ComponentState::Pending => {
+                        ("cz-badge cz-badge-info", &state_pending_e)
+                    }
+                    computeza_driver_native::progress::ComponentState::Running => {
+                        ("cz-badge cz-badge-warn", &state_running_e)
+                    }
+                    computeza_driver_native::progress::ComponentState::Done => {
+                        ("cz-badge cz-badge-ok", &state_done_e)
+                    }
+                    computeza_driver_native::progress::ComponentState::Failed => {
+                        ("cz-badge cz-badge-fail", &state_failed_e)
+                    }
+                };
+                let row_weight = match c.state {
+                    computeza_driver_native::progress::ComponentState::Running => "600",
+                    _ => "400",
+                };
+                format!(
+                    r#"<li id="component-{slug}" data-state="{state_attr}" style="display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; padding: 0.45rem 0.75rem; border-radius: 0.5rem; background: rgba(255,255,255,0.04); margin-bottom: 0.35rem; font-weight: {row_weight};">
+<span class="cz-component-slug">{slug_html}</span>
+<span class="cz-component-state {badge_class}">{badge_text}</span>
+</li>"#,
+                    slug = html_escape(&c.slug),
+                    slug_html = html_escape(&c.slug),
+                    state_attr = format!("{:?}", c.state).to_lowercase(),
+                    badge_class = badge_class,
+                    badge_text = badge_text,
+                    row_weight = row_weight,
+                )
+            })
+            .collect();
+        format!(
+            r#"<section class="cz-section" style="max-width: 42rem;">
+<div class="cz-card">
+<p class="cz-card-body" style="margin: 0 0 0.6rem; font-weight: 600;">{components_label}</p>
+<ul id="components" style="list-style: none; padding: 0; margin: 0;">
+{rows}
+</ul>
+</div>
+</section>"#,
+            components_label = html_escape(&components_label),
+            rows = rows,
+        )
+    } else {
+        String::new()
+    };
+
     let body = format!(
         r#"<section class="cz-hero">
-<h1>Installing PostgreSQL</h1>
-<p>Computeza is preparing your local PostgreSQL service. You can leave this page open; it polls the server every half second.</p>
+<h1>{hero_title}</h1>
+<p>{hero_intro}</p>
 </section>
+{components_block}
 <section class="cz-section" style="max-width: 42rem;">
 <div class="cz-progress">
   <div class="cz-progress-phase">
@@ -5508,6 +5586,18 @@ pub fn render_install_progress(localizer: &Localizer, job_id: &str, p: &InstallP
 <script>
 const jobId = "{job_id_js}";
 let lastLogLen = {initial_log_len};
+const stateLabels = {{
+  "pending": "{state_pending_e}",
+  "running": "{state_running_e}",
+  "done": "{state_done_e}",
+  "failed": "{state_failed_e}",
+}};
+const stateBadgeClass = {{
+  "pending": "cz-badge cz-badge-info",
+  "running": "cz-badge cz-badge-warn",
+  "done": "cz-badge cz-badge-ok",
+  "failed": "cz-badge cz-badge-fail",
+}};
 function fmt(n) {{
   if (n === 0) return "0 B";
   const u = ["B","KB","MB","GB","TB"];
@@ -5525,6 +5615,21 @@ function appendLog(lines) {{
     el.appendChild(div);
   }}
   if (wasAtBottom) {{ el.scrollTop = el.scrollHeight; }}
+}}
+function updateComponents(components) {{
+  if (!Array.isArray(components)) return;
+  for (const c of components) {{
+    const row = document.getElementById("component-" + c.slug);
+    if (!row) continue;
+    if (row.dataset.state === c.state) continue;
+    row.dataset.state = c.state;
+    row.style.fontWeight = (c.state === "running") ? "600" : "400";
+    const badge = row.querySelector(".cz-component-state");
+    if (badge) {{
+      badge.className = "cz-component-state " + (stateBadgeClass[c.state] || "cz-badge cz-badge-info");
+      badge.textContent = stateLabels[c.state] || c.state;
+    }}
+  }}
 }}
 async function poll() {{
   try {{
@@ -5547,6 +5652,7 @@ async function poll() {{
       appendLog(p.log.slice(lastLogLen));
       lastLogLen = p.log.length;
     }}
+    updateComponents(p.components);
     if (p.completed) {{
       window.location.href = `/install/job/${{jobId}}`;
     }} else {{
@@ -5558,6 +5664,9 @@ async function poll() {{
 }}
 poll();
 </script>"#,
+        hero_title = html_escape(&hero_title),
+        hero_intro = html_escape(&hero_intro),
+        components_block = components_block,
         initial_log_len = p.log.len(),
     );
 
@@ -6214,6 +6323,57 @@ mod tests {
         // have no install hint to surface for them.
         let result = missing_prerequisites(&["definitely-not-a-real-command-xyzzy"]);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn progress_page_renders_per_component_checklist_when_multi() {
+        use computeza_driver_native::progress::{
+            ComponentProgress, ComponentState, InstallProgress,
+        };
+        let l = Localizer::english();
+        let p = InstallProgress {
+            components: vec![
+                ComponentProgress {
+                    slug: "postgres".into(),
+                    state: ComponentState::Done,
+                    summary: Some("ok".into()),
+                    error: None,
+                },
+                ComponentProgress {
+                    slug: "openfga".into(),
+                    state: ComponentState::Running,
+                    summary: None,
+                    error: None,
+                },
+                ComponentProgress {
+                    slug: "kanidm".into(),
+                    state: ComponentState::Pending,
+                    summary: None,
+                    error: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let html = render_install_progress(&l, "job-abc", &p);
+        assert!(
+            html.contains("Installing Computeza"),
+            "multi-component hero must render"
+        );
+        assert!(html.contains(r#"id="component-postgres""#));
+        assert!(html.contains(r#"id="component-openfga""#));
+        assert!(html.contains(r#"id="component-kanidm""#));
+        assert!(html.contains("Done"));
+        assert!(html.contains("Running"));
+        assert!(html.contains("Pending"));
+    }
+
+    #[test]
+    fn progress_page_skips_checklist_when_single_component() {
+        let l = Localizer::english();
+        let p = InstallProgress::default(); // empty components vec
+        let html = render_install_progress(&l, "job-abc", &p);
+        assert!(html.contains("Installing component"));
+        assert!(!html.contains(r#"id="components""#));
     }
 
     #[test]
