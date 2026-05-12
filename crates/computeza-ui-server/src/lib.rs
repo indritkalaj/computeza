@@ -265,6 +265,9 @@ async fn install_postgres_handler(
     Form(form): Form<InstallForm>,
 ) -> Response {
     let l = Localizer::english();
+    if let Err(resp) = guard_supported_os(&l) {
+        return resp;
+    }
     if form.component != "postgres" {
         return Html(render_install_result(
             &l,
@@ -407,6 +410,9 @@ async fn install_kanidm_handler(
     Form(form): Form<InstallForm>,
 ) -> Response {
     let l = Localizer::english();
+    if let Err(resp) = guard_supported_os(&l) {
+        return resp;
+    }
     if form.component != "kanidm" {
         return Html(render_install_result(
             &l,
@@ -1736,11 +1742,14 @@ pub fn render_install_hub(localizer: &Localizer) -> String {
         })
         .collect();
 
+    let platform_banner = render_platform_banner(localizer);
+
     let body = format!(
         r#"<section class="cz-hero">
 <h1>{title}</h1>
 <p>{intro}</p>
 </section>
+{platform_banner}
 <section class="cz-section">
 <div class="cz-card-grid">{cards}</div>
 </section>"#,
@@ -1749,6 +1758,82 @@ pub fn render_install_hub(localizer: &Localizer) -> String {
     );
 
     render_shell(localizer, &title, NavLink::Install, &body)
+}
+
+/// Guard helper: returns `Err(Response)` with a clean unsupported-OS
+/// result page when the host isn't a supported Linux distro. Install
+/// POST handlers call this before doing anything else so the operator
+/// never lands on a half-finished install on the wrong platform.
+#[allow(clippy::result_large_err)]
+fn guard_supported_os(localizer: &Localizer) -> Result<(), Response> {
+    let info = computeza_driver_native::os_detect::detect();
+    if info.supported {
+        return Ok(());
+    }
+    let title = localizer.t("ui-platform-banner-unsupported");
+    let supported = localizer.t("ui-platform-supported-distros");
+    let detected = info.distro_name.as_deref().unwrap_or("Unknown OS");
+    let arch = &info.arch;
+    let reason = info.unsupported_reason.as_deref().unwrap_or("");
+    let detail =
+        format!("{title}\n\n{detected} ({arch})\n\n{reason}\n\nSupported platforms: {supported}");
+    Err(Html(render_install_result(localizer, false, &detail)).into_response())
+}
+
+/// Render the host-OS banner above the install hub. Friendly green
+/// "Detected: Ubuntu 24.04 (x86_64)" on supported Linux, prominent
+/// warning card on macOS / Windows / Alpine / aarch64 hosts pointing
+/// the operator at a supported distro.
+fn render_platform_banner(localizer: &Localizer) -> String {
+    let info = computeza_driver_native::os_detect::detect();
+    let supported_distros = localizer.t("ui-platform-supported-distros");
+    if info.supported {
+        let label = info.distro_name.as_deref().unwrap_or("Linux").to_string();
+        let detected_label = localizer.t("ui-platform-banner-supported");
+        format!(
+            r#"<section class="cz-section">
+<div class="cz-card" style="border-color: rgba(159, 232, 196, 0.45);">
+<p class="cz-card-body" style="margin: 0; display: flex; align-items: center; gap: 0.75rem;">
+<span class="cz-badge cz-badge-ok">{detected}</span>
+<span class="cz-strong">{label}</span>
+<span class="cz-muted">({arch})</span>
+</p>
+</div>
+</section>"#,
+            detected = html_escape(&detected_label),
+            label = html_escape(&label),
+            arch = html_escape(&info.arch),
+        )
+    } else {
+        let detected_label = info
+            .distro_name
+            .as_deref()
+            .unwrap_or("Unknown OS")
+            .to_string();
+        let title = localizer.t("ui-platform-banner-unsupported");
+        let reason = info
+            .unsupported_reason
+            .clone()
+            .unwrap_or_else(|| "Unsupported platform".into());
+        format!(
+            r#"<section class="cz-section">
+<div class="cz-card" style="border-color: rgba(245, 181, 68, 0.55);">
+<p class="cz-card-body" style="margin: 0 0 0.75rem; display: flex; align-items: center; gap: 0.75rem;">
+<span class="cz-badge cz-badge-warn">{title}</span>
+<span class="cz-strong">{detected}</span>
+<span class="cz-muted">({arch})</span>
+</p>
+<p class="cz-muted" style="margin: 0 0 0.5rem;">{reason}</p>
+<p class="cz-muted" style="margin: 0; font-size: 0.85rem;"><strong>Supported:</strong> {distros}</p>
+</div>
+</section>"#,
+            title = html_escape(&title),
+            detected = html_escape(&detected_label),
+            arch = html_escape(&info.arch),
+            reason = html_escape(&reason),
+            distros = html_escape(&supported_distros),
+        )
+    }
 }
 
 /// Render the per-component "coming soon" page. Shown for every

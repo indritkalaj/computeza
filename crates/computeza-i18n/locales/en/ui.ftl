@@ -96,6 +96,12 @@ ui-install-title         = Install a component
 ui-install-intro         = `computeza install <component>` lays down a native OS service. The same install path runs from the CLI -- this page is the GUI-equivalent per spec section 2.1 / 4.2.
 ui-install-hub-title     = Choose a component
 ui-install-hub-intro     = Pick the component you want to lay down. Per the playbook each one ships a per-OS native install (no Docker, no Kubernetes) with a configurable port, data directory, and service name; multi-version pins; an uninstall flow; and host-state detection so a second install of the same component doesn't collide with the first.
+
+ui-platform-banner-supported   = Detected:
+ui-platform-banner-unsupported = Host not supported
+ui-platform-supported-title    = Supported platforms
+ui-platform-supported-intro    = Computeza v0.0.x installs data-plane components on systemd-based Linux only. The operator console (this web UI) runs anywhere; the install actions need a Linux host. Once the multi-host install path lands in v0.1+ you'll be able to run the console here and point it at remote Linux targets.
+ui-platform-supported-distros  = Ubuntu 22.04 LTS or newer, Debian 12 or newer, Fedora 38 or newer, RHEL / CentOS Stream 9, Rocky Linux 9, AlmaLinux 9, OpenSUSE Leap 15.6 or Tumbleweed, SLES 15, Arch Linux (rolling), Manjaro (rolling). Architecture: x86_64.
 ui-install-status-available  = Available
 ui-install-status-planned    = Planned
 ui-install-coming-soon-title = Install from the CLI
