@@ -55,6 +55,7 @@ ui-footer-version     = Version
 ui-nav-components     = Components
 ui-nav-install        = Install
 ui-nav-status         = Status
+ui-nav-state          = Metadata store
 
 # --- Status page ---
 

@@ -148,12 +148,23 @@ async fn server_serves_localized_home_and_healthz() {
     assert!(body.contains("Install Kanidm"));
     assert!(body.contains(r#"action="/install/kanidm""#));
 
-    // /install/<other-still-planned> -- still the CLI explainer.
+    // /install/garage -- garage has its own wizard now.
     let resp = client
         .get(format!("http://{addr}/install/garage"))
         .send()
         .await
         .expect("GET /install/garage");
+    assert!(resp.status().is_success());
+    let body = resp.text().await.expect("body text");
+    assert!(body.contains("Install Garage"));
+    assert!(body.contains(r#"action="/install/garage""#));
+
+    // /install/<still-planned> -- the CLI explainer page.
+    let resp = client
+        .get(format!("http://{addr}/install/qdrant"))
+        .send()
+        .await
+        .expect("GET /install/qdrant");
     assert!(resp.status().is_success());
     let body = resp.text().await.expect("body text");
     assert!(body.contains("Install from the CLI"));

@@ -60,6 +60,14 @@ pub async fn install(
     progress: &ProgressHandle,
 ) -> Result<InstalledService, ServiceError> {
     let bundle = pick_bundle(opts.version.as_deref()).clone();
+    // Garage binds four ports. The wizard collects the S3 API port
+    // and we derive the others by adding small offsets so re-runs
+    // with `port = 4000` don't collide with the canonical 3900-3903
+    // range either.
+    let s3_port = opts.port;
+    let rpc_port = s3_port + 1;
+    let web_port = s3_port + 2;
+    let admin_port = s3_port + 3;
     let config = ConfigFile {
         filename: "garage.toml".into(),
         contents: format!(
@@ -67,26 +75,29 @@ pub async fn install(
              data_dir = \"{root}/data/data\"\n\
              db_engine = \"sqlite\"\n\
              replication_factor = 1\n\
-             rpc_bind_addr = \"127.0.0.1:3901\"\n\
-             rpc_public_addr = \"127.0.0.1:3901\"\n\
+             rpc_bind_addr = \"127.0.0.1:{rpc}\"\n\
+             rpc_public_addr = \"127.0.0.1:{rpc}\"\n\
              rpc_secret = \"0000000000000000000000000000000000000000000000000000000000000000\"\n\
              \n\
              [s3_api]\n\
-             api_bind_addr = \"127.0.0.1:{port}\"\n\
+             api_bind_addr = \"127.0.0.1:{s3}\"\n\
              s3_region = \"garage\"\n\
              root_domain = \".s3.garage.local\"\n\
              \n\
              [s3_web]\n\
-             bind_addr = \"127.0.0.1:3902\"\n\
+             bind_addr = \"127.0.0.1:{web}\"\n\
              root_domain = \".web.garage.local\"\n\
              index = \"index.html\"\n\
              \n\
              [admin]\n\
-             api_bind_addr = \"127.0.0.1:3903\"\n\
+             api_bind_addr = \"127.0.0.1:{admin}\"\n\
              admin_token = \"change-me\"\n\
              metrics_token = \"change-me\"\n",
             root = opts.root_dir.display(),
-            port = opts.port,
+            s3 = s3_port,
+            rpc = rpc_port,
+            web = web_port,
+            admin = admin_port,
         ),
     };
     let args = vec![
