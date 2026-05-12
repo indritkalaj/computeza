@@ -7587,4 +7587,363 @@ mod tests {
         assert!(cfg.root_dir.is_none());
         assert!(cfg.version.is_none());
     }
+
+    // ---- generate_random_password ----
+
+    #[test]
+    fn generate_random_password_is_24_hex_chars_and_unique() {
+        let a = generate_random_password();
+        let b = generate_random_password();
+        assert_eq!(a.len(), 24, "expected 24-char hex string, got {a:?}");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b, "two random passwords must differ (entropy=96 bits)");
+    }
+
+    // ---- render_credentials_block ----
+
+    #[test]
+    fn render_credentials_block_is_empty_when_no_credentials() {
+        let l = Localizer::english();
+        assert!(render_credentials_block(&l, &[]).is_empty());
+    }
+
+    #[test]
+    fn render_credentials_block_includes_warning_and_each_row() {
+        use computeza_driver_native::progress::GeneratedCredential;
+        let l = Localizer::english();
+        let creds = vec![
+            GeneratedCredential {
+                component: "postgres".into(),
+                label: "superuser password".into(),
+                value: "deadbeef1234".into(),
+                username: Some("postgres".into()),
+                secret_ref: Some("postgres/admin-password".into()),
+            },
+            GeneratedCredential {
+                component: "kanidm".into(),
+                label: "initial admin password".into(),
+                value: "cafebabe5678".into(),
+                username: Some("admin".into()),
+                secret_ref: Some("kanidm/admin-password".into()),
+            },
+        ];
+        let html = render_credentials_block(&l, &creds);
+        assert!(html.contains("Generated credentials"));
+        assert!(html.contains("Copy these values"));
+        assert!(html.contains("postgres"));
+        assert!(html.contains("deadbeef1234"));
+        assert!(html.contains("kanidm"));
+        assert!(html.contains("cafebabe5678"));
+        assert!(html.contains("postgres/admin-password"));
+    }
+
+    // ---- render_install_result_with_credentials ----
+
+    #[test]
+    fn install_result_with_credentials_omits_rollback_when_id_is_none() {
+        let l = Localizer::english();
+        let html = render_install_result_with_credentials(&l, true, "ok", &[], None);
+        assert!(!html.contains("Roll back this install"));
+    }
+
+    #[test]
+    fn install_result_with_credentials_renders_rollback_when_id_provided() {
+        let l = Localizer::english();
+        let html = render_install_result_with_credentials(&l, true, "ok", &[], Some("abc-123"));
+        assert!(html.contains("Roll back this install"));
+        assert!(html.contains(r#"action="/install/job/abc-123/rollback""#));
+    }
+
+    // ---- render_secrets_index ----
+
+    #[test]
+    fn render_secrets_index_renders_store_missing_when_none() {
+        let l = Localizer::english();
+        let html = render_secrets_index(&l, None);
+        assert!(html.contains("No secrets store is attached"));
+        assert!(
+            !html.contains("Backup required"),
+            "backup card should NOT render when no store is attached"
+        );
+    }
+
+    #[test]
+    fn render_secrets_index_renders_empty_state_when_no_entries() {
+        let l = Localizer::english();
+        let html = render_secrets_index(&l, Some(&[]));
+        assert!(html.contains("no secrets are stored yet"));
+        assert!(
+            html.contains("Backup required"),
+            "backup-required card should appear even on an empty store -- the operator may add entries soon"
+        );
+    }
+
+    #[test]
+    fn render_secrets_index_renders_rotate_button_per_row() {
+        let l = Localizer::english();
+        let names = vec![
+            "postgres/admin-password".to_string(),
+            "kanidm/admin-password".to_string(),
+        ];
+        let html = render_secrets_index(&l, Some(&names));
+        assert!(html.contains("postgres/admin-password"));
+        assert!(html.contains("kanidm/admin-password"));
+        // Two rotate forms, one per row.
+        let rotate_count = html.matches("/admin/secrets/").count();
+        assert!(
+            rotate_count >= 2,
+            "expected at least 2 rotate form actions, got {rotate_count}"
+        );
+        assert!(html.contains("Backup required"));
+    }
+
+    // ---- render_secret_rotated ----
+
+    #[test]
+    fn render_secret_rotated_shows_name_and_value_and_warning() {
+        let l = Localizer::english();
+        let html = render_secret_rotated(&l, "postgres/admin-password", "newvalue1234");
+        assert!(html.contains("postgres/admin-password"));
+        assert!(html.contains("newvalue1234"));
+        assert!(html.contains("Copy these values"));
+        assert!(html.contains(r#"href="/admin/secrets""#));
+    }
+
+    // ---- render_resource repair-button hidden inputs ----
+
+    #[test]
+    fn render_resource_repair_form_embeds_persisted_install_config() {
+        use computeza_state::StoredResource;
+        let l = Localizer::english();
+        // The StoredResource shape only needs the spec field to be valid
+        // JSON for render_resource to format the dl/uuid/etc; we don't
+        // exercise that path here.
+        let stored = StoredResource {
+            key: ResourceKey::cluster_scoped("postgres-instance", "local"),
+            uuid: uuid::Uuid::nil(),
+            revision: 1,
+            spec: serde_json::json!({}),
+            status: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let config = InstallConfig {
+            version: Some("18.3-1".into()),
+            port: Some(5433),
+            root_dir: Some("/srv/pg-staging".into()),
+            service_name: Some("computeza-postgres-staging".into()),
+        };
+        let html = render_resource(
+            &l,
+            "postgres-instance",
+            "local",
+            Some(&stored),
+            Some(&config),
+            false,
+        );
+        assert!(html.contains(r#"action="/install/postgres""#));
+        assert!(html.contains(r#"name="component" value="postgres""#));
+        assert!(html.contains(r#"name="version" value="18.3-1""#));
+        assert!(html.contains(r#"name="port" value="5433""#));
+        assert!(html.contains(r#"name="root_dir" value="/srv/pg-staging""#));
+        assert!(html.contains(r#"name="service_name" value="computeza-postgres-staging""#));
+    }
+
+    #[test]
+    fn render_resource_repair_form_renders_with_no_persisted_config() {
+        use computeza_state::StoredResource;
+        let l = Localizer::english();
+        let stored = StoredResource {
+            key: ResourceKey::cluster_scoped("postgres-instance", "local"),
+            uuid: uuid::Uuid::nil(),
+            revision: 1,
+            spec: serde_json::json!({}),
+            status: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let html = render_resource(&l, "postgres-instance", "local", Some(&stored), None, false);
+        // The form still renders with the component slug, but with no
+        // version / port / root_dir / service_name overrides.
+        assert!(html.contains(r#"action="/install/postgres""#));
+        assert!(html.contains(r#"name="component" value="postgres""#));
+        assert!(!html.contains(r#"name="version""#));
+        assert!(!html.contains(r#"name="port""#));
+        assert!(!html.contains(r#"name="root_dir""#));
+        assert!(!html.contains(r#"name="service_name""#));
+    }
+
+    // ---- InstallConfig serde round-trip ----
+
+    #[test]
+    fn install_config_roundtrips_through_json_with_partial_fields() {
+        let original = InstallConfig {
+            version: Some("18.3-1".into()),
+            port: Some(5433),
+            root_dir: None,
+            service_name: Some("computeza-postgres-staging".into()),
+        };
+        let v = serde_json::to_value(&original).expect("serialize");
+        // None fields skip-serialize so blank input forms don't round-
+        // trip null into the metadata store -- they're absent.
+        assert!(
+            v.get("root_dir").is_none(),
+            "None fields must skip serialize"
+        );
+        let back: InstallConfig = serde_json::from_value(v).expect("deserialize");
+        assert_eq!(back.version, original.version);
+        assert_eq!(back.port, original.port);
+        assert_eq!(back.root_dir, original.root_dir);
+        assert_eq!(back.service_name, original.service_name);
+    }
+
+    #[test]
+    fn install_config_default_is_all_none() {
+        let c = InstallConfig::default();
+        assert!(c.version.is_none());
+        assert!(c.port.is_none());
+        assert!(c.root_dir.is_none());
+        assert!(c.service_name.is_none());
+    }
+
+    // ---- apply_uninstall_config_overrides (Linux-only) ----
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn apply_uninstall_config_overrides_honors_service_name_and_root_dir() {
+        let config = InstallConfig {
+            service_name: Some("my-postgres".into()),
+            root_dir: Some("/srv/pg".into()),
+            ..Default::default()
+        };
+        let mut unit = "computeza-postgres.service".to_string();
+        let mut root = std::path::PathBuf::from("/var/lib/computeza/postgres");
+        apply_uninstall_config_overrides(&config, &mut unit, &mut root);
+        assert_eq!(unit, "my-postgres.service");
+        assert_eq!(root, std::path::PathBuf::from("/srv/pg"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn apply_uninstall_config_overrides_keeps_defaults_when_unset() {
+        let config = InstallConfig::default();
+        let mut unit = "computeza-postgres.service".to_string();
+        let mut root = std::path::PathBuf::from("/var/lib/computeza/postgres");
+        apply_uninstall_config_overrides(&config, &mut unit, &mut root);
+        assert_eq!(unit, "computeza-postgres.service");
+        assert_eq!(
+            root,
+            std::path::PathBuf::from("/var/lib/computeza/postgres")
+        );
+    }
+
+    // ---- dispatch_install / dispatch_uninstall_with_config: unknown slugs ----
+
+    #[tokio::test]
+    async fn dispatch_install_unknown_slug_returns_error() {
+        let progress = ProgressHandle::noop();
+        let result =
+            dispatch_install("not-a-real-slug", &progress, &InstallConfig::default()).await;
+        let err = result.expect_err("unknown slug should be Err");
+        assert!(err.contains("unknown component slug"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_uninstall_with_config_unknown_slug_returns_error() {
+        let result =
+            dispatch_uninstall_with_config("not-a-real-slug", &InstallConfig::default()).await;
+        let err = result.expect_err("unknown slug should be Err");
+        // On Linux the error names the slug; on non-Linux it's the
+        // platform-not-supported message. Both are valid errors.
+        assert!(!err.is_empty());
+    }
+
+    // ---- InstallConfig round-trip through save_install_config / load_install_config ----
+
+    #[tokio::test]
+    async fn install_config_persistence_roundtrips_through_sqlite_store() {
+        let store = computeza_state::SqliteStore::open(":memory:")
+            .await
+            .expect("open in-memory sqlite store");
+        let config = InstallConfig {
+            version: Some("18.3-1".into()),
+            port: Some(5433),
+            root_dir: Some("/srv/pg".into()),
+            service_name: Some("computeza-postgres-staging".into()),
+        };
+        save_install_config(&store, "postgres", &config)
+            .await
+            .expect("save_install_config");
+        let back = load_install_config(&store, "postgres")
+            .await
+            .expect("load_install_config returned None");
+        assert_eq!(back.version, config.version);
+        assert_eq!(back.port, config.port);
+        assert_eq!(back.root_dir, config.root_dir);
+        assert_eq!(back.service_name, config.service_name);
+
+        // Upsert: a second save with the same slug should not error.
+        let updated = InstallConfig {
+            port: Some(5434),
+            ..config.clone()
+        };
+        save_install_config(&store, "postgres", &updated)
+            .await
+            .expect("upsert save");
+        let back2 = load_install_config(&store, "postgres").await.unwrap();
+        assert_eq!(back2.port, Some(5434));
+
+        // Delete leaves load returning None.
+        delete_install_config(&store, "postgres").await;
+        assert!(load_install_config(&store, "postgres").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn load_install_config_returns_none_when_absent() {
+        let store = computeza_state::SqliteStore::open(":memory:")
+            .await
+            .unwrap();
+        assert!(load_install_config(&store, "postgres").await.is_none());
+    }
+
+    // ---- hydrate_postgres_password ----
+
+    #[tokio::test]
+    async fn hydrate_postgres_password_no_secrets_store_leaves_password_unchanged() {
+        let mut spec = computeza_reconciler_postgres::PostgresSpec {
+            endpoint: computeza_reconciler_postgres::ServerEndpoint {
+                host: "127.0.0.1".into(),
+                port: 5432,
+                superuser: "postgres".into(),
+                sslmode: None,
+            },
+            superuser_password: secrecy::SecretString::from(String::new()),
+            superuser_password_ref: Some("postgres/admin-password".into()),
+            databases: Vec::new(),
+            prune: false,
+        };
+        hydrate_postgres_password(&mut spec, None).await;
+        use secrecy::ExposeSecret;
+        assert_eq!(spec.superuser_password.expose_secret(), "");
+    }
+
+    #[tokio::test]
+    async fn hydrate_postgres_password_no_ref_leaves_password_unchanged() {
+        // No secrets-store lookup needed -- the spec doesn't carry a ref.
+        let mut spec = computeza_reconciler_postgres::PostgresSpec {
+            endpoint: computeza_reconciler_postgres::ServerEndpoint {
+                host: "127.0.0.1".into(),
+                port: 5432,
+                superuser: "postgres".into(),
+                sslmode: None,
+            },
+            superuser_password: secrecy::SecretString::from("preset".to_string()),
+            superuser_password_ref: None,
+            databases: Vec::new(),
+            prune: false,
+        };
+        hydrate_postgres_password(&mut spec, None).await;
+        use secrecy::ExposeSecret;
+        assert_eq!(spec.superuser_password.expose_secret(), "preset");
+    }
 }

@@ -284,6 +284,89 @@ async fn server_serves_localized_home_and_healthz() {
         assert!(body.contains(c), "/components should mention {c}");
     }
 
+    // /admin/secrets -- secrets store is NOT attached on this server
+    // (the smoke harness uses AppState::empty()) so the page should
+    // render the "no secrets store attached" warning, not crash.
+    let resp = client
+        .get(format!("http://{addr}/admin/secrets"))
+        .send()
+        .await
+        .expect("GET /admin/secrets");
+    assert!(
+        resp.status().is_success(),
+        "/admin/secrets status: {}",
+        resp.status()
+    );
+    let body = resp.text().await.expect("body text");
+    assert!(body.contains("No secrets store is attached"));
+    assert!(
+        !body.contains("Backup required"),
+        "no backup card should render when the store is absent"
+    );
+
+    // /admin/secrets/{name}/rotate -- with no store attached this
+    // should return 404 cleanly rather than panic. The handler
+    // surfaces a clean error page.
+    let resp = client
+        .post(format!(
+            "http://{addr}/admin/secrets/postgres%2Fadmin-password/rotate"
+        ))
+        .send()
+        .await
+        .expect("POST /admin/secrets/.../rotate");
+    assert!(
+        resp.status() == 404,
+        "expected 404 when no secrets store is attached, got {}",
+        resp.status()
+    );
+    let body = resp.text().await.expect("body text");
+    assert!(body.contains("No secrets store is attached"));
+
+    // /install/job/{id} for an unknown id should 404 cleanly.
+    let resp = client
+        .get(format!("http://{addr}/install/job/this-id-does-not-exist"))
+        .send()
+        .await
+        .expect("GET /install/job/<unknown>");
+    assert!(resp.status() == 404);
+
+    // /install/job/{id}/rollback for an unknown id should render the
+    // unknown-job error page (200 OK with the error in the body).
+    let resp = client
+        .post(format!(
+            "http://{addr}/install/job/another-unknown/rollback"
+        ))
+        .send()
+        .await
+        .expect("POST /install/job/<unknown>/rollback");
+    assert!(resp.status().is_success());
+    let body = resp.text().await.expect("body text");
+    assert!(body.contains("Unknown install job"));
+
+    // /api/install/job/{id} for an unknown id should 404 with a JSON
+    // error -- the polling client uses this to learn the job died.
+    let resp = client
+        .get(format!("http://{addr}/api/install/job/poll-unknown"))
+        .send()
+        .await
+        .expect("GET /api/install/job/<unknown>");
+    assert!(resp.status() == 404);
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert!(body.get("error").is_some());
+
+    // Top nav should now link to /admin/secrets so an operator can find
+    // the secrets management page from anywhere in the console.
+    let resp = client
+        .get(format!("http://{addr}/"))
+        .send()
+        .await
+        .expect("GET / second time");
+    let body = resp.text().await.expect("body text");
+    assert!(
+        body.contains(r#"href="/admin/secrets""#),
+        "the home page nav must link to /admin/secrets"
+    );
+
     // Tear down. We abort rather than initiate graceful shutdown -- sufficient
     // for a smoke test, and avoids needing a shutdown channel in the public API.
     server.abort();
