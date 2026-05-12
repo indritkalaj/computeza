@@ -3294,6 +3294,8 @@ pub enum NavLink {
     Status,
     /// Metadata store summary.
     State,
+    /// Admin / secrets page.
+    Secrets,
     /// No nav link highlighted (e.g. resource detail page).
     None,
 }
@@ -3314,6 +3316,7 @@ pub fn render_shell(
     let nav_install = localizer.t("ui-nav-install");
     let nav_status = localizer.t("ui-nav-status");
     let nav_state = localizer.t("ui-nav-state");
+    let nav_secrets = localizer.t("ui-admin-secrets");
     let version_label = localizer.t("ui-footer-version");
     let version = env!("CARGO_PKG_VERSION");
 
@@ -3346,6 +3349,7 @@ pub fn render_shell(
     <a href="/install" class="{ni}">{nav_install}</a>
     <a href="/status" class="{ns}">{nav_status}</a>
     <a href="/state" class="{nm}">{nav_state}</a>
+    <a href="/admin/secrets" class="{na}">{nav_secrets}</a>
   </div>
 </nav>
 <main class="cz-page">
@@ -3361,6 +3365,7 @@ pub fn render_shell(
         ni = nav_class(NavLink::Install),
         ns = nav_class(NavLink::Status),
         nm = nav_class(NavLink::State),
+        na = nav_class(NavLink::Secrets),
     )
 }
 
@@ -6285,6 +6290,18 @@ pub fn render_secrets_index(localizer: &Localizer, names: Option<&[String]>) -> 
     let note = localizer.t("ui-secrets-rotate-note");
 
     let body = match names {
+        Some([]) => format!(
+            r#"<section class="cz-hero">
+<h1>{title}</h1>
+<p>{intro}</p>
+</section>
+<section class="cz-section">
+<div class="cz-card"><p class="cz-card-body" style="margin: 0;">{empty}</p></div>
+</section>"#,
+            title = html_escape(&title),
+            intro = html_escape(&intro),
+            empty = html_escape(&empty),
+        ),
         None => format!(
             r#"<section class="cz-hero">
 <h1>{title}</h1>
@@ -6298,18 +6315,6 @@ pub fn render_secrets_index(localizer: &Localizer, names: Option<&[String]>) -> 
             title = html_escape(&title),
             intro = html_escape(&intro),
             store_missing = html_escape(&store_missing),
-        ),
-        Some(n) if n.is_empty() => format!(
-            r#"<section class="cz-hero">
-<h1>{title}</h1>
-<p>{intro}</p>
-</section>
-<section class="cz-section">
-<div class="cz-card"><p class="cz-card-body" style="margin: 0;">{empty}</p></div>
-</section>"#,
-            title = html_escape(&title),
-            intro = html_escape(&intro),
-            empty = html_escape(&empty),
         ),
         Some(n) => {
             let rows: String = n
@@ -6355,7 +6360,7 @@ pub fn render_secrets_index(localizer: &Localizer, names: Option<&[String]>) -> 
         }
     };
 
-    render_shell(localizer, &title, NavLink::Install, &body)
+    render_shell(localizer, &title, NavLink::Secrets, &body)
 }
 
 /// Render the post-rotation result page. Shows the freshly-generated
@@ -6395,7 +6400,7 @@ pub fn render_secret_rotated(localizer: &Localizer, name: &str, new_value: &str)
         value_html = html_escape(new_value),
     );
 
-    render_shell(localizer, &title, NavLink::Install, &body)
+    render_shell(localizer, &title, NavLink::Secrets, &body)
 }
 
 /// Render the rollback card on the install result page. Posts to
