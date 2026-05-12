@@ -382,6 +382,65 @@ pub fn is_public_path(path: &str) -> bool {
     PUBLIC_PATH_PREFIXES.iter().any(|p| path.starts_with(p))
 }
 
+/// Render a hidden CSRF input. The value is left empty -- the inline
+/// JS in `render_shell` reads the [`CSRF_COOKIE_NAME`] cookie on form
+/// submit and fills every `input[name=csrf_token]` from there. This
+/// keeps renderer signatures simple (no csrf_token parameter to
+/// thread through every form) while still binding the token to the
+/// session via the cookie.
+#[must_use]
+pub const fn csrf_input() -> &'static str {
+    r#"<input type="hidden" name="csrf_token" value="" />"#
+}
+
+/// Cookie name carrying the per-session CSRF token (non-HttpOnly so
+/// the inline JS can read it). Set alongside the session cookie on
+/// every login and cleared on logout.
+pub const CSRF_COOKIE_NAME: &str = "computeza_csrf";
+
+/// Format a `Set-Cookie` value for the CSRF cookie. Non-HttpOnly so
+/// the inline JS in `render_shell` can read it; SameSite=Strict
+/// blocks cross-site reads via document.cookie just like the session
+/// cookie.
+pub fn csrf_cookie_header(token: &str) -> String {
+    format!("{CSRF_COOKIE_NAME}={token}; Path=/; SameSite=Strict; Max-Age=86400")
+}
+
+/// Clearing variant of [`csrf_cookie_header`], paired with the
+/// session-cookie clear in `POST /logout`.
+pub fn clear_csrf_cookie_header() -> String {
+    format!("{CSRF_COOKIE_NAME}=; Path=/; SameSite=Strict; Max-Age=0")
+}
+
+/// Constant-time check that `provided` matches the session's token.
+/// Both are random 32-char hex strings; we still avoid early-exit
+/// comparisons so a side-channel can't recover the token byte by byte.
+#[must_use]
+pub fn csrf_tokens_match(provided: &str, session_token: &str) -> bool {
+    if provided.len() != session_token.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (a, b) in provided.bytes().zip(session_token.bytes()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
+/// Paths that bypass the CSRF middleware specifically (separate from
+/// the auth-middleware bypass). The login / setup POSTs operate
+/// without an established session, so there's no CSRF token to bind
+/// against -- the protection there comes from SameSite=Strict + the
+/// fact that a successful POST grants only an authenticated session
+/// (no privileged side effects).
+pub const CSRF_EXEMPT_POST_PATHS: &[&str] = &["/login", "/setup"];
+
+/// Whether a POST path is exempt from CSRF verification.
+#[must_use]
+pub fn is_csrf_exempt(path: &str) -> bool {
+    CSRF_EXEMPT_POST_PATHS.contains(&path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,6 +569,50 @@ mod tests {
         store2.verify("admin", "hunter2hunter2").await.unwrap();
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[test]
+    fn csrf_tokens_match_is_constant_time_and_correct() {
+        let token = "deadbeefcafebabe1234567890abcdef";
+        assert!(csrf_tokens_match(token, token));
+        assert!(!csrf_tokens_match("short", token));
+        assert!(!csrf_tokens_match(token, "short"));
+        assert!(!csrf_tokens_match(
+            "deadbeefcafebabe1234567890abcdee", // last char differs
+            token
+        ));
+        assert!(!csrf_tokens_match("", token));
+        assert!(!csrf_tokens_match(token, ""));
+        assert!(csrf_tokens_match("", "")); // both empty matches but middleware rejects empty separately
+    }
+
+    #[test]
+    fn csrf_input_renders_empty_value() {
+        let s = csrf_input();
+        assert!(s.contains(r#"name="csrf_token""#));
+        assert!(s.contains(r#"value="""#));
+        assert!(s.contains(r#"type="hidden""#));
+    }
+
+    #[test]
+    fn csrf_cookie_header_carries_no_httponly() {
+        // The CSRF cookie must be readable by JS so the form-fill
+        // script can use it. Differs from the session cookie, which
+        // is HttpOnly.
+        let h = csrf_cookie_header("abc-token");
+        assert!(h.starts_with("computeza_csrf=abc-token"));
+        assert!(!h.contains("HttpOnly"));
+        assert!(h.contains("SameSite=Strict"));
+        assert!(h.contains("Max-Age=86400"));
+    }
+
+    #[test]
+    fn is_csrf_exempt_only_allows_login_setup() {
+        assert!(is_csrf_exempt("/login"));
+        assert!(is_csrf_exempt("/setup"));
+        assert!(!is_csrf_exempt("/logout"));
+        assert!(!is_csrf_exempt("/install"));
+        assert!(!is_csrf_exempt("/admin/secrets/foo/rotate"));
     }
 
     #[tokio::test]

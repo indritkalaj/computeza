@@ -551,16 +551,40 @@ metadata store, secrets, audit viewer, account page) requires a valid
 ### Threat model (v0.0.x)
 
 - Console binds 127.0.0.1 by default. Loopback-bound trust is the
-  baseline; CSRF + cross-origin attacks are mitigated by
-  `SameSite=Strict` on the session cookie.
+  baseline. Cross-origin POSTs are blocked by `SameSite=Strict` on
+  the session cookie AND by explicit CSRF-token middleware (see below).
 - HTTPS is out of scope for v0.0.x. Operators who expose the console
   beyond loopback should terminate TLS at a reverse proxy (nginx,
   Caddy) and set `Secure` on the cookie via a follow-up patch.
 - Sessions live in process memory; restart = forced re-sign-in.
   Persistent sessions are a v0.1+ ask.
-- Explicit CSRF tokens on every POST are a v0.1+ defense-in-depth
-  add. SameSite=Strict is sufficient until the console is exposed
-  beyond loopback (where subdomain-based CSRF becomes a concern).
+
+### CSRF defense
+
+Every non-public, non-`/login`-or-`/setup` POST request is gated by
+a CSRF middleware that:
+
+  1. Reads the `computeza_session` cookie and looks up the matching
+     `Session` for its bound `csrf_token`.
+  2. Buffers the request body, parses
+     `application/x-www-form-urlencoded`, extracts the `csrf_token`
+     field, and verifies it matches the session token in
+     constant time.
+  3. Rejects with 403 + a clean inline error page on any mismatch.
+  4. Re-feeds the buffered body to the downstream handler so the
+     handler reads the original form payload unchanged.
+
+How forms acquire a valid token: the login flow sets a NON-HttpOnly
+`computeza_csrf` cookie alongside the session cookie. Every form
+embeds an empty `<input type="hidden" name="csrf_token" value="" />`;
+a small inline script in `render_shell` listens for the form's
+`submit` event and fills the value from the cookie before the form
+actually submits.
+
+`/login` and `/setup` are explicitly CSRF-exempt because there's no
+established session to bind against; the protection there is
+`SameSite=Strict` plus the observation that a successful POST grants
+only an authenticated session (no privileged side effects).
 
 ### Adding a new public path
 

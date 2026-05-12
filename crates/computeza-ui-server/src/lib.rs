@@ -238,10 +238,166 @@ async fn auth_middleware(
     next.run(request).await
 }
 
+/// CSRF middleware -- verifies the `csrf_token` form field on every
+/// POST request to a non-public, non-exempt path.
+///
+/// `SameSite=Strict` on the session cookie already blocks cross-site
+/// POSTs at the browser level for v0.0.x's loopback-bound trust model;
+/// this middleware is the defense-in-depth layer that catches the rest
+/// (subdomain attacks if the console is later exposed, intermediary
+/// proxies that strip SameSite, etc.).
+///
+/// The middleware:
+///   1. Bypasses GET / HEAD requests (CSRF only protects mutations).
+///   2. Bypasses public paths (no session to bind against).
+///   3. Bypasses [`auth::CSRF_EXEMPT_POST_PATHS`] (/login, /setup --
+///      no established session yet, SameSite is the active defense).
+///   4. For every other POST, buffers the body, parses
+///      application/x-www-form-urlencoded, looks for `csrf_token`,
+///      verifies it matches the session's token in constant time,
+///      and re-builds the request with the buffered body so the
+///      handler sees the original form payload unchanged.
+///
+/// Any mismatch returns 403 with a clean error page.
+async fn csrf_middleware(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    request: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    use axum::body::Body;
+    use axum::http::Method;
+
+    if request.method() != Method::POST {
+        return next.run(request).await;
+    }
+    let path = request.uri().path();
+    if auth::is_public_path(path) || auth::is_csrf_exempt(path) {
+        return next.run(request).await;
+    }
+    if state.operators.is_none() {
+        // Smoke-test surface: no auth, no CSRF.
+        return next.run(request).await;
+    }
+
+    // Need the session to know which token to compare against.
+    let cookie_header = request
+        .headers()
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let session_id = cookie_header
+        .as_deref()
+        .and_then(auth::session_id_from_cookies);
+    let Some(session) = (match session_id {
+        Some(id) => state.sessions.get(&id).await,
+        None => None,
+    }) else {
+        // No session = the auth middleware would have already
+        // redirected. If we land here it means the request slipped
+        // past auth somehow; reject defensively.
+        return (StatusCode::FORBIDDEN, Html(render_csrf_failure())).into_response();
+    };
+
+    // Buffer the body so we can both inspect it AND re-feed it.
+    let (parts, body) = request.into_parts();
+    let bytes = match axum::body::to_bytes(body, 1024 * 1024 * 16).await {
+        Ok(b) => b,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, Html(render_csrf_failure())).into_response();
+        }
+    };
+
+    let provided_token = parse_csrf_token_from_form(&bytes).unwrap_or_default();
+    if !auth::csrf_tokens_match(&provided_token, &session.csrf_token) {
+        tracing::warn!(
+            path = %parts.uri.path(),
+            username = %session.username,
+            "CSRF token mismatch on POST request; rejecting with 403. \
+             Likely causes: stale browser tab (form rendered against a previous \
+             session), open-tab-after-logout, or an actual cross-origin attempt."
+        );
+        return (StatusCode::FORBIDDEN, Html(render_csrf_failure())).into_response();
+    }
+
+    // Reconstruct the request with the same buffered body so the
+    // downstream handler sees the original payload.
+    let new_request = axum::http::Request::from_parts(parts, Body::from(bytes));
+    next.run(new_request).await
+}
+
+/// Parse `csrf_token` out of an `application/x-www-form-urlencoded`
+/// body. Returns the first match; ignores any other fields.
+fn parse_csrf_token_from_form(bytes: &[u8]) -> Option<String> {
+    let s = std::str::from_utf8(bytes).ok()?;
+    for pair in s.split('&') {
+        let mut kv = pair.splitn(2, '=');
+        let k = kv.next()?;
+        if k == "csrf_token" {
+            let v = kv.next().unwrap_or("");
+            // form-urlencoded: + -> space, %xx -> byte. csrf tokens are
+            // hex so neither character appears, but we still decode
+            // to be safe.
+            let decoded = url_decode_minimal(v);
+            return Some(decoded);
+        }
+    }
+    None
+}
+
+/// Minimal application/x-www-form-urlencoded decoder for the CSRF
+/// token field. Handles `+` -> space + `%HH` percent escapes; assumes
+/// UTF-8. Our tokens are hex so the decoder is overkill but the
+/// safety net is cheap.
+fn url_decode_minimal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hi = (bytes[i + 1] as char).to_digit(16);
+                let lo = (bytes[i + 2] as char).to_digit(16);
+                if let (Some(h), Some(l)) = (hi, lo) {
+                    out.push(((h * 16 + l) as u8) as char);
+                    i += 3;
+                } else {
+                    out.push(bytes[i] as char);
+                    i += 1;
+                }
+            }
+            b => {
+                out.push(b as char);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Inline failure page for CSRF mismatch. Kept simple -- not localized
+/// because operators landing here either hit it via stale-form refresh
+/// (re-load the page) or via actual attack (the message is irrelevant).
+fn render_csrf_failure() -> String {
+    "<!DOCTYPE html><html><head><title>CSRF rejected</title></head>\
+     <body style=\"font-family:sans-serif;padding:2rem;max-width:40rem;margin:0 auto;\">\
+     <h1>CSRF rejected</h1>\
+     <p>Your request did not carry a valid CSRF token. The most common cause is a \
+     stale browser tab: the form was rendered against a previous session and the \
+     token expired when you signed in again. Reload the page and re-submit.</p>\
+     <p><a href=\"/\">Back to the landing page</a></p>\
+     </body></html>"
+        .to_string()
+}
+
 /// Build the axum router with an `AppState` attached. Every handler that
 /// needs the store extracts it via `State<AppState>`.
 pub fn router_with_state(state: AppState) -> Router {
     let auth_layer = axum::middleware::from_fn_with_state(state.clone(), auth_middleware);
+    let csrf_layer = axum::middleware::from_fn_with_state(state.clone(), csrf_middleware);
     Router::new()
         .route("/", get(home_handler))
         .route("/components", get(components_handler))
@@ -358,6 +514,7 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/static/brand/computeza-favicon.svg", get(favicon_handler))
         .route("/static/brand/computeza-pulse.json", get(lottie_handler))
         .route("/favicon.ico", get(favicon_handler))
+        .layer(csrf_layer)
         .layer(auth_layer)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -3405,15 +3562,28 @@ async fn login_post_handler(
     match operators.verify(&form.username, &form.password).await {
         Ok(rec) => {
             let session_id = state.sessions.create(rec.username.clone()).await;
-            let cookie = auth::session_cookie_header(&session_id);
+            // The session we just minted carries a freshly-generated
+            // csrf_token; read it back so we can set both cookies in
+            // the response.
+            let csrf_token = state
+                .sessions
+                .get(&session_id)
+                .await
+                .map(|s| s.csrf_token)
+                .unwrap_or_default();
+            let session_cookie = auth::session_cookie_header(&session_id);
+            let csrf_cookie = auth::csrf_cookie_header(&csrf_token);
             let target = safe_next_path(&form.next).unwrap_or_else(|| "/".to_string());
             let mut response = Redirect303(target).into_response();
-            if let Ok(value) = axum::http::HeaderValue::from_str(&cookie) {
+            if let Ok(value) = axum::http::HeaderValue::from_str(&session_cookie) {
+                response.headers_mut().append(header::SET_COOKIE, value);
+            }
+            if let Ok(value) = axum::http::HeaderValue::from_str(&csrf_cookie) {
                 response.headers_mut().append(header::SET_COOKIE, value);
             }
             tracing::info!(
                 username = %rec.username,
-                "operator signed in; session minted and cookie set"
+                "operator signed in; session minted and cookies set"
             );
             if let Some(audit) = &state.audit {
                 let _ = audit
@@ -3503,9 +3673,19 @@ async fn setup_post_handler(
         return Html(render_setup(&l, Some(&e.to_string()))).into_response();
     }
     let session_id = state.sessions.create(form.username.clone()).await;
-    let cookie = auth::session_cookie_header(&session_id);
+    let csrf_token = state
+        .sessions
+        .get(&session_id)
+        .await
+        .map(|s| s.csrf_token)
+        .unwrap_or_default();
+    let session_cookie = auth::session_cookie_header(&session_id);
+    let csrf_cookie = auth::csrf_cookie_header(&csrf_token);
     let mut response = Redirect303("/".into()).into_response();
-    if let Ok(value) = axum::http::HeaderValue::from_str(&cookie) {
+    if let Ok(value) = axum::http::HeaderValue::from_str(&session_cookie) {
+        response.headers_mut().append(header::SET_COOKIE, value);
+    }
+    if let Ok(value) = axum::http::HeaderValue::from_str(&csrf_cookie) {
         response.headers_mut().append(header::SET_COOKIE, value);
     }
     response
@@ -3520,6 +3700,9 @@ async fn logout_handler(State(state): State<AppState>, headers: axum::http::Head
     }
     let mut response = Redirect303("/".into()).into_response();
     if let Ok(value) = axum::http::HeaderValue::from_str(&auth::clear_session_cookie_header()) {
+        response.headers_mut().append(header::SET_COOKIE, value);
+    }
+    if let Ok(value) = axum::http::HeaderValue::from_str(&auth::clear_csrf_cookie_header()) {
         response.headers_mut().append(header::SET_COOKIE, value);
     }
     response
@@ -3681,6 +3864,29 @@ pub fn render_shell(
   <span>Computeza proprietary -- managed components retain upstream licenses (see /components)</span>
 </footer>
 </main>
+<script>
+// CSRF token auto-fill. The auth middleware sets a non-HttpOnly
+// computeza_csrf cookie on every authenticated request; on every
+// form submit we read it and populate any empty csrf_token inputs
+// before the form actually submits. Forms on public pages (login /
+// setup) have no csrf_token input, so this runs as a no-op there.
+(function () {{
+  function readCsrf() {{
+    const parts = document.cookie.split(";");
+    for (const p of parts) {{
+      const t = p.trim();
+      if (t.startsWith("computeza_csrf=")) return t.substring(15);
+    }}
+    return "";
+  }}
+  document.addEventListener("submit", function (e) {{
+    const token = readCsrf();
+    if (!token) return;
+    const inputs = e.target.querySelectorAll('input[name="csrf_token"]');
+    inputs.forEach(function (i) {{ if (!i.value) i.value = token; }});
+  }}, true);
+}})();
+</script>
 </body>
 </html>"#,
         nc = nav_class(NavLink::Components),
@@ -4513,6 +4719,7 @@ pub fn render_install_hub(localizer: &Localizer, active: &[ActiveJob]) -> String
 
     let platform_banner = render_platform_banner(localizer);
     let active_banner = render_active_jobs_banner(localizer, active);
+    let csrf = auth::csrf_input();
 
     let body = format!(
         r#"<section class="cz-hero">
@@ -4522,6 +4729,7 @@ pub fn render_install_hub(localizer: &Localizer, active: &[ActiveJob]) -> String
 {platform_banner}
 {active_banner}
 <form method="post" action="/install" style="display: contents;">
+{csrf}
 <section class="cz-section" style="max-width: 60rem;">
 <ul class="cz-install-rows" style="list-style: none; padding: 0; margin: 0;">{cards}</ul>
 </section>
@@ -5024,6 +5232,7 @@ pub fn render_uninstall_confirm(localizer: &Localizer) -> String {
 <div class="cz-card" style="border-color: rgba(255, 157, 166, 0.45);">
 <p class="cz-card-body" style="margin: 0 0 1.25rem; color: var(--fail);">{confirm}</p>
 <form method="post" action="/install/postgres/uninstall" style="display: flex; gap: 0.75rem;">
+<input type="hidden" name="csrf_token" value="" />
 <button type="submit" class="cz-btn cz-btn-danger">{button}</button>
 <a class="cz-btn" href="/install">{cancel}</a>
 </form>
@@ -5092,6 +5301,7 @@ pub fn render_install_kanidm(localizer: &Localizer) -> String {
 <section class="cz-section" style="max-width: 36rem;">
 <div class="cz-card">
 <form method="post" action="/install/kanidm" class="cz-form" style="max-width: none;">
+<input type="hidden" name="csrf_token" value="" />
 <input type="hidden" name="component" value="kanidm" />
 
 <label for="version">{version_label}</label>
@@ -5174,6 +5384,7 @@ pub fn render_uninstall_kanidm_confirm(localizer: &Localizer) -> String {
 <div class="cz-card" style="border-color: rgba(255, 157, 166, 0.45);">
 <p class="cz-card-body" style="margin: 0 0 1.25rem; color: var(--fail);">{confirm}</p>
 <form method="post" action="/install/kanidm/uninstall" style="display: flex; gap: 0.75rem;">
+<input type="hidden" name="csrf_token" value="" />
 <button type="submit" class="cz-btn cz-btn-danger">{button}</button>
 <a class="cz-btn" href="/install/kanidm">{cancel}</a>
 </form>
@@ -5233,6 +5444,7 @@ pub fn render_install_garage(localizer: &Localizer) -> String {
 <section class="cz-section" style="max-width: 36rem;">
 <div class="cz-card">
 <form method="post" action="/install/garage" class="cz-form" style="max-width: none;">
+<input type="hidden" name="csrf_token" value="" />
 <input type="hidden" name="component" value="garage" />
 
 <label for="version">{version_label}</label>
@@ -5315,6 +5527,7 @@ pub fn render_uninstall_garage_confirm(localizer: &Localizer) -> String {
 <div class="cz-card" style="border-color: rgba(255, 157, 166, 0.45);">
 <p class="cz-card-body" style="margin: 0 0 1.25rem; color: var(--fail);">{confirm}</p>
 <form method="post" action="/install/garage/uninstall" style="display: flex; gap: 0.75rem;">
+<input type="hidden" name="csrf_token" value="" />
 <button type="submit" class="cz-btn cz-btn-danger">{button}</button>
 <a class="cz-btn" href="/install/garage">{cancel}</a>
 </form>
@@ -5400,6 +5613,7 @@ pub fn render_install_openfga(localizer: &Localizer) -> String {
 <section class="cz-section" style="max-width: 36rem;">
 <div class="cz-card">
 <form method="post" action="/install/openfga" class="cz-form" style="max-width: none;">
+<input type="hidden" name="csrf_token" value="" />
 <input type="hidden" name="component" value="openfga" />
 
 <label for="version">{version_label}</label>
@@ -5482,6 +5696,7 @@ pub fn render_uninstall_openfga_confirm(localizer: &Localizer) -> String {
 <div class="cz-card" style="border-color: rgba(255, 157, 166, 0.45);">
 <p class="cz-card-body" style="margin: 0 0 1.25rem; color: var(--fail);">{confirm}</p>
 <form method="post" action="/install/openfga/uninstall" style="display: flex; gap: 0.75rem;">
+<input type="hidden" name="csrf_token" value="" />
 <button type="submit" class="cz-btn cz-btn-danger">{button}</button>
 <a class="cz-btn" href="/install/openfga">{cancel}</a>
 </form>
@@ -5566,6 +5781,7 @@ pub fn render_install_qdrant(localizer: &Localizer) -> String {
 <section class="cz-section" style="max-width: 36rem;">
 <div class="cz-card">
 <form method="post" action="/install/qdrant" class="cz-form" style="max-width: none;">
+<input type="hidden" name="csrf_token" value="" />
 <input type="hidden" name="component" value="qdrant" />
 
 <label for="version">{version_label}</label>
@@ -5648,6 +5864,7 @@ pub fn render_uninstall_qdrant_confirm(localizer: &Localizer) -> String {
 <div class="cz-card" style="border-color: rgba(255, 157, 166, 0.45);">
 <p class="cz-card-body" style="margin: 0 0 1.25rem; color: var(--fail);">{confirm}</p>
 <form method="post" action="/install/qdrant/uninstall" style="display: flex; gap: 0.75rem;">
+<input type="hidden" name="csrf_token" value="" />
 <button type="submit" class="cz-btn cz-btn-danger">{button}</button>
 <a class="cz-btn" href="/install/qdrant">{cancel}</a>
 </form>
@@ -5706,6 +5923,7 @@ pub fn render_install_greptime(localizer: &Localizer) -> String {
 <section class="cz-section" style="max-width: 36rem;">
 <div class="cz-card">
 <form method="post" action="/install/greptime" class="cz-form" style="max-width: none;">
+<input type="hidden" name="csrf_token" value="" />
 <input type="hidden" name="component" value="greptime" />
 
 <label for="version">{version_label}</label>
@@ -5788,6 +6006,7 @@ pub fn render_uninstall_greptime_confirm(localizer: &Localizer) -> String {
 <div class="cz-card" style="border-color: rgba(255, 157, 166, 0.45);">
 <p class="cz-card-body" style="margin: 0 0 1.25rem; color: var(--fail);">{confirm}</p>
 <form method="post" action="/install/greptime/uninstall" style="display: flex; gap: 0.75rem;">
+<input type="hidden" name="csrf_token" value="" />
 <button type="submit" class="cz-btn cz-btn-danger">{button}</button>
 <a class="cz-btn" href="/install/greptime">{cancel}</a>
 </form>
@@ -5846,6 +6065,7 @@ pub fn render_install_lakekeeper(localizer: &Localizer) -> String {
 <section class="cz-section" style="max-width: 36rem;">
 <div class="cz-card">
 <form method="post" action="/install/lakekeeper" class="cz-form" style="max-width: none;">
+<input type="hidden" name="csrf_token" value="" />
 <input type="hidden" name="component" value="lakekeeper" />
 
 <label for="version">{version_label}</label>
@@ -5928,6 +6148,7 @@ pub fn render_uninstall_lakekeeper_confirm(localizer: &Localizer) -> String {
 <div class="cz-card" style="border-color: rgba(255, 157, 166, 0.45);">
 <p class="cz-card-body" style="margin: 0 0 1.25rem; color: var(--fail);">{confirm}</p>
 <form method="post" action="/install/lakekeeper/uninstall" style="display: flex; gap: 0.75rem;">
+<input type="hidden" name="csrf_token" value="" />
 <button type="submit" class="cz-btn cz-btn-danger">{button}</button>
 <a class="cz-btn" href="/install/lakekeeper">{cancel}</a>
 </form>
@@ -5986,6 +6207,7 @@ pub fn render_install_databend(localizer: &Localizer) -> String {
 <section class="cz-section" style="max-width: 36rem;">
 <div class="cz-card">
 <form method="post" action="/install/databend" class="cz-form" style="max-width: none;">
+<input type="hidden" name="csrf_token" value="" />
 <input type="hidden" name="component" value="databend" />
 
 <label for="version">{version_label}</label>
@@ -6068,6 +6290,7 @@ pub fn render_uninstall_databend_confirm(localizer: &Localizer) -> String {
 <div class="cz-card" style="border-color: rgba(255, 157, 166, 0.45);">
 <p class="cz-card-body" style="margin: 0 0 1.25rem; color: var(--fail);">{confirm}</p>
 <form method="post" action="/install/databend/uninstall" style="display: flex; gap: 0.75rem;">
+<input type="hidden" name="csrf_token" value="" />
 <button type="submit" class="cz-btn cz-btn-danger">{button}</button>
 <a class="cz-btn" href="/install/databend">{cancel}</a>
 </form>
@@ -6126,6 +6349,7 @@ pub fn render_install_grafana(localizer: &Localizer) -> String {
 <section class="cz-section" style="max-width: 36rem;">
 <div class="cz-card">
 <form method="post" action="/install/grafana" class="cz-form" style="max-width: none;">
+<input type="hidden" name="csrf_token" value="" />
 <input type="hidden" name="component" value="grafana" />
 
 <label for="version">{version_label}</label>
@@ -6208,6 +6432,7 @@ pub fn render_uninstall_grafana_confirm(localizer: &Localizer) -> String {
 <div class="cz-card" style="border-color: rgba(255, 157, 166, 0.45);">
 <p class="cz-card-body" style="margin: 0 0 1.25rem; color: var(--fail);">{confirm}</p>
 <form method="post" action="/install/grafana/uninstall" style="display: flex; gap: 0.75rem;">
+<input type="hidden" name="csrf_token" value="" />
 <button type="submit" class="cz-btn cz-btn-danger">{button}</button>
 <a class="cz-btn" href="/install/grafana">{cancel}</a>
 </form>
@@ -6266,6 +6491,7 @@ pub fn render_install_restate(localizer: &Localizer) -> String {
 <section class="cz-section" style="max-width: 36rem;">
 <div class="cz-card">
 <form method="post" action="/install/restate" class="cz-form" style="max-width: none;">
+<input type="hidden" name="csrf_token" value="" />
 <input type="hidden" name="component" value="restate" />
 
 <label for="version">{version_label}</label>
@@ -6348,6 +6574,7 @@ pub fn render_uninstall_restate_confirm(localizer: &Localizer) -> String {
 <div class="cz-card" style="border-color: rgba(255, 157, 166, 0.45);">
 <p class="cz-card-body" style="margin: 0 0 1.25rem; color: var(--fail);">{confirm}</p>
 <form method="post" action="/install/restate/uninstall" style="display: flex; gap: 0.75rem;">
+<input type="hidden" name="csrf_token" value="" />
 <button type="submit" class="cz-btn cz-btn-danger">{button}</button>
 <a class="cz-btn" href="/install/restate">{cancel}</a>
 </form>
@@ -6941,6 +7168,7 @@ pub fn render_account(localizer: &Localizer, session: &auth::Session) -> String 
 <dt>{session_since}</dt><dd><code>{created_at}</code></dd>
 </dl>
 <form method="post" action="/logout" style="margin-top: 1.25rem;">
+<input type="hidden" name="csrf_token" value="" />
 <button type="submit" class="cz-btn cz-btn-danger">{logout}</button>
 </form>
 </div>
@@ -7225,6 +7453,7 @@ pub fn render_secrets_index(localizer: &Localizer, names: Option<&[String]>) -> 
                         r#"<tr>
 <td><code>{name_html}</code></td>
 <td><form method="post" action="/admin/secrets/{name_enc}/rotate" style="margin: 0;">
+<input type="hidden" name="csrf_token" value="" />
 <button type="submit" class="cz-btn">{rotate}</button>
 </form></td>
 </tr>"#,
@@ -7319,6 +7548,7 @@ fn render_rollback_block(localizer: &Localizer, job_id: &str) -> String {
 <p class="cz-card-body" style="margin: 0 0 0.5rem;"><span class="cz-badge cz-badge-fail">{title}</span></p>
 <p class="cz-muted" style="margin: 0 0 0.85rem; font-size: 0.85rem;">{intro}</p>
 <form method="post" action="/install/job/{job_id}/rollback">
+<input type="hidden" name="csrf_token" value="" />
 <button type="submit" class="cz-btn cz-btn-danger">{button}</button>
 </form>
 </div>
@@ -7683,6 +7913,7 @@ pub fn render_resource(
 <h3 style="margin: 0 0 0.5rem;">{heading}</h3>
 <p class="cz-muted" style="margin: 0 0 0.85rem; font-size: 0.85rem;">{intro}</p>
 <form method="post" action="/install/{slug}">
+<input type="hidden" name="csrf_token" value="" />
 <input type="hidden" name="component" value="{slug}" />
 {hidden_inputs}
 <button type="submit" class="cz-btn">{button}</button>
@@ -7719,6 +7950,7 @@ pub fn render_resource(
 {repair_block}
 <section class="cz-section">
 <form method="post" action="/resource/{kind_enc}/{name_enc}/delete" onsubmit="return confirm('{confirm}');">
+<input type="hidden" name="csrf_token" value="" />
 <button type="submit" class="cz-btn cz-btn-danger">{delete_button}</button>
 <p class="cz-muted" style="margin-top: 0.5rem; font-size: 0.85rem;">{confirm_note}</p>
 </form>
@@ -8122,6 +8354,10 @@ mod tests {
         let l = Localizer::english();
         let html = render_install_hub(&l, &[]);
         assert!(html.contains("Install Computeza"));
+        assert!(
+            html.contains(r#"name="csrf_token""#),
+            "the unified install form must embed a csrf_token input"
+        );
         assert!(
             !html.contains("Install in progress"),
             "no active-jobs banner should render when none are passed"
