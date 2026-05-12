@@ -232,6 +232,7 @@ pub fn router_with_state(state: AppState) -> Router {
         )
         .route("/install/{component}", get(install_component_handler))
         .route("/install/job/{id}", get(install_job_handler))
+        .route("/install/job/{id}/rollback", post(install_rollback_handler))
         .route("/api/install/job/{id}", get(install_job_api_handler))
         .route("/status", get(status_handler))
         .route("/state", get(state_page_handler))
@@ -533,6 +534,26 @@ fn build_unified_config(
         root_dir,
         service_name,
     })
+}
+
+/// Dispatch the uninstall path for a slug. Mirrors [`dispatch_install`]
+/// but for teardown -- used by the unified rollback flow.
+async fn dispatch_uninstall(slug: &str) -> Result<String, String> {
+    match slug {
+        "postgres" => run_postgres_uninstall().await,
+        "kanidm" => run_kanidm_uninstall().await,
+        "garage" => run_garage_uninstall().await,
+        "openfga" => run_openfga_uninstall().await,
+        "qdrant" => run_qdrant_uninstall().await,
+        "lakekeeper" => run_lakekeeper_uninstall().await,
+        "greptime" => run_greptime_uninstall().await,
+        "grafana" => run_grafana_uninstall().await,
+        "restate" => run_restate_uninstall().await,
+        "databend" => run_databend_uninstall().await,
+        other => Err(format!(
+            "dispatch_uninstall: unknown component slug {other:?}"
+        )),
+    }
 }
 
 /// Run the install for one component and return `(summary, port, spec)`
@@ -2547,6 +2568,21 @@ async fn install_job_handler(
                 .map(|s| std::mem::take(&mut s.lock().unwrap().generated_credentials))
                 .unwrap_or_default();
 
+            // Show the rollback button whenever at least one component
+            // in the job successfully installed -- failure runs benefit
+            // from rolling back partial state, and successful runs may
+            // want to undo the whole stack.
+            let rollback_id = if p.components.iter().any(|c| {
+                matches!(
+                    c.state,
+                    computeza_driver_native::progress::ComponentState::Done
+                )
+            }) {
+                Some(job_id.as_str())
+            } else {
+                None
+            };
+
             if let Some(err) = &p.error {
                 (
                     StatusCode::OK,
@@ -2555,6 +2591,7 @@ async fn install_job_handler(
                         false,
                         err,
                         &credentials,
+                        rollback_id,
                     )),
                 )
             } else {
@@ -2566,6 +2603,7 @@ async fn install_job_handler(
                         true,
                         &summary,
                         &credentials,
+                        rollback_id,
                     )),
                 )
             }
@@ -2575,6 +2613,95 @@ async fn install_job_handler(
             Html(render_install_progress(&l, &job_id, &p)),
         ),
     }
+}
+
+/// POST /install/job/{id}/rollback -- uninstall every component the
+/// job successfully installed, in reverse dependency order. Used to
+/// roll back a partial-success run (some components installed, then
+/// one failed) or to fully tear down a successful run.
+///
+/// Reads the job's components checklist, picks slugs with
+/// `state == Done`, and dispatches each through the existing
+/// per-component uninstall path. Errors during teardown are logged
+/// and surfaced in the summary but do NOT stop the rollback -- best
+/// effort tear-down across the board.
+async fn install_rollback_handler(
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+) -> Response {
+    let l = Localizer::english();
+    let snapshot = state
+        .jobs
+        .lock()
+        .unwrap()
+        .get(&job_id)
+        .map(|s| s.lock().unwrap().clone());
+    let Some(p) = snapshot else {
+        return Html(render_install_result(
+            &l,
+            false,
+            &format!("Unknown install job: {job_id}"),
+        ))
+        .into_response();
+    };
+
+    let installed: Vec<String> = p
+        .components
+        .iter()
+        .filter(|c| {
+            matches!(
+                c.state,
+                computeza_driver_native::progress::ComponentState::Done
+            )
+        })
+        .map(|c| c.slug.clone())
+        .collect();
+    if installed.is_empty() {
+        return Html(render_install_result(
+            &l,
+            false,
+            "Nothing to roll back: this job's components vec contains no Done entries.",
+        ))
+        .into_response();
+    }
+
+    let store = state.store.clone();
+    let mut summary = String::new();
+    let mut any_failed = false;
+    // Reverse dependency order so consumers come down before their
+    // dependencies (e.g. lakekeeper before postgres).
+    for slug in installed.iter().rev() {
+        summary.push_str(&format!("=== rollback: {slug} ===\n"));
+        match dispatch_uninstall(slug).await {
+            Ok(detail) => summary.push_str(&format!("{detail}\n\n")),
+            Err(e) => {
+                any_failed = true;
+                summary.push_str(&format!("FAIL  {e}\n\n"));
+                tracing::warn!(
+                    component = %slug,
+                    error = %e,
+                    "rollback: dispatch_uninstall failed; continuing with the rest of the chain"
+                );
+            }
+        }
+        if let Some(store) = &store {
+            let kind = format!("{slug}-instance");
+            let key = ResourceKey::cluster_scoped(&kind, "local");
+            if let Err(e) = store.delete(&key, None).await {
+                tracing::warn!(
+                    error = %e,
+                    component = %slug,
+                    "rollback: store.delete({slug}-instance/local) failed; \
+                     row may linger -- inspect via /resource and clean up manually"
+                );
+                summary.push_str(&format!(
+                    "Note: failed to drop {slug}-instance/local from metadata store ({e}).\n\n"
+                ));
+            }
+        }
+    }
+
+    Html(render_install_result(&l, !any_failed, &summary)).into_response()
 }
 
 /// GET /api/install/job/{id} -- JSON snapshot of progress, polled by
@@ -6003,7 +6130,7 @@ fn human_bytes(n: u64) -> String {
 /// `<pre>` block after HTML-escaping.
 #[must_use]
 pub fn render_install_result(localizer: &Localizer, success: bool, detail: &str) -> String {
-    render_install_result_with_credentials(localizer, success, detail, &[])
+    render_install_result_with_credentials(localizer, success, detail, &[], None)
 }
 
 /// Variant of [`render_install_result`] that also displays one-time
@@ -6011,12 +6138,17 @@ pub fn render_install_result(localizer: &Localizer, success: bool, detail: &str)
 /// passwords) above the summary block. Caller MUST have drained the
 /// credentials from the job state already; passing an empty slice
 /// reverts to the plain result page.
+///
+/// `rollback_job_id` controls whether a "Roll back this install"
+/// button renders below the summary. `Some(id)` posts the rollback
+/// to `/install/job/{id}/rollback`; `None` omits the button.
 #[must_use]
 pub fn render_install_result_with_credentials(
     localizer: &Localizer,
     success: bool,
     detail: &str,
     credentials: &[computeza_driver_native::progress::GeneratedCredential],
+    rollback_job_id: Option<&str>,
 ) -> String {
     let title = localizer.t("ui-install-result-title");
     let outcome = if success {
@@ -6032,6 +6164,9 @@ pub fn render_install_result_with_credentials(
         "cz-badge cz-badge-fail"
     };
     let credentials_block = render_credentials_block(localizer, credentials);
+    let rollback_block = rollback_job_id
+        .map(|id| render_rollback_block(localizer, id))
+        .unwrap_or_default();
 
     let body = format!(
         r#"<section class="cz-hero">
@@ -6042,6 +6177,7 @@ pub fn render_install_result_with_credentials(
 <section class="cz-section">
 <pre class="cz-pre">{detail_html}</pre>
 </section>
+{rollback_block}
 <section class="cz-section">
 <a class="cz-btn" href="/install">{back}</a>
 </section>"#,
@@ -6051,6 +6187,30 @@ pub fn render_install_result_with_credentials(
     );
 
     render_shell(localizer, &title, NavLink::Install, &body)
+}
+
+/// Render the rollback card on the install result page. Posts to
+/// `/install/job/{id}/rollback`, which uninstalls every Done
+/// component on the job in reverse dependency order.
+fn render_rollback_block(localizer: &Localizer, job_id: &str) -> String {
+    let title = localizer.t("ui-install-rollback-title");
+    let intro = localizer.t("ui-install-rollback-intro");
+    let button = localizer.t("ui-install-rollback-button");
+    format!(
+        r#"<section class="cz-section" style="max-width: 42rem;">
+<div class="cz-card" style="border-color: rgba(255, 157, 166, 0.45);">
+<p class="cz-card-body" style="margin: 0 0 0.5rem;"><span class="cz-badge cz-badge-fail">{title}</span></p>
+<p class="cz-muted" style="margin: 0 0 0.85rem; font-size: 0.85rem;">{intro}</p>
+<form method="post" action="/install/job/{job_id}/rollback">
+<button type="submit" class="cz-btn cz-btn-danger">{button}</button>
+</form>
+</div>
+</section>"#,
+        title = html_escape(&title),
+        intro = html_escape(&intro),
+        button = html_escape(&button),
+        job_id = html_escape(job_id),
+    )
 }
 
 /// Render the one-time generated-credentials block on the install
