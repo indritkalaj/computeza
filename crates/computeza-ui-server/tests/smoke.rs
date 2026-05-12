@@ -181,14 +181,36 @@ async fn server_serves_localized_home_and_healthz() {
     assert!(body.contains("Install Lakekeeper"));
     assert!(body.contains(r#"action="/install/lakekeeper""#));
 
-    // /install/<still-planned> -- the CLI explainer page.
-    // Picked databend as the assertion slot; if it ships, swap
-    // to xtable or restate (both blocked on infrastructure).
+    // /install/databend -- databend has its own wizard now.
     let resp = client
         .get(format!("http://{addr}/install/databend"))
         .send()
         .await
         .expect("GET /install/databend");
+    assert!(resp.status().is_success());
+    let body = resp.text().await.expect("body text");
+    assert!(body.contains("Install Databend"));
+    assert!(body.contains(r#"action="/install/databend""#));
+
+    // /install/grafana -- grafana has its own wizard now.
+    let resp = client
+        .get(format!("http://{addr}/install/grafana"))
+        .send()
+        .await
+        .expect("GET /install/grafana");
+    assert!(resp.status().is_success());
+    let body = resp.text().await.expect("body text");
+    assert!(body.contains("Install Grafana"));
+    assert!(body.contains(r#"action="/install/grafana""#));
+
+    // /install/<still-planned> -- the CLI explainer page.
+    // Picked xtable as the assertion slot; if it ships, swap
+    // to restate (blocked on .tar.xz infrastructure).
+    let resp = client
+        .get(format!("http://{addr}/install/xtable"))
+        .send()
+        .await
+        .expect("GET /install/xtable");
     assert!(resp.status().is_success());
     let body = resp.text().await.expect("body text");
     assert!(body.contains("Install from the CLI"));
