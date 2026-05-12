@@ -374,74 +374,22 @@ async fn install_all_handler(
             match dispatch_install(slug, &progress, &config).await {
                 Ok((summary, _port, spec)) => {
                     progress.finish_component(slug, &summary);
+                    // finalize_managed_install_after_success persists
+                    // the spec + the InstallConfig + the admin
+                    // credential (when applicable). Same helper the
+                    // per-component install handlers call so install
+                    // and rollback stay symmetric across both paths.
+                    let summary = finalize_managed_install_after_success(
+                        slug,
+                        &config,
+                        &spec,
+                        summary,
+                        store.as_deref(),
+                        secrets.as_deref(),
+                        &progress,
+                    )
+                    .await;
                     overall.push_str(&format!("=== {slug} ===\n{summary}\n\n"));
-
-                    // Provision an admin credential AFTER a successful
-                    // install so a failed install never leaves an
-                    // orphan secret in the store. Components without
-                    // an admin-credential concept skip this block.
-                    if let Some((_, username, label)) = COMPONENTS_WITH_ADMIN_CREDENTIAL
-                        .iter()
-                        .find(|(s, _, _)| *s == slug)
-                        .copied()
-                    {
-                        let password = generate_random_password();
-                        let secret_ref = format!("{slug}/admin-password");
-                        if let Some(secrets) = &secrets {
-                            if let Err(e) = secrets.put(&secret_ref, &password).await {
-                                tracing::warn!(
-                                    error = %e,
-                                    component = slug,
-                                    "unified install: secrets.put failed for {secret_ref}; \
-                                     the credential will only appear in-band on the result page. \
-                                     Verify COMPUTEZA_SECRETS_PASSPHRASE + write access to the secrets file."
-                                );
-                            }
-                        }
-                        progress.push_credential(
-                            computeza_driver_native::progress::GeneratedCredential {
-                                component: slug.to_string(),
-                                label: label.to_string(),
-                                value: password,
-                                username: Some(username.to_string()),
-                                secret_ref: Some(secret_ref),
-                            },
-                        );
-                    }
-
-                    if let Some(store) = &store {
-                        // Persist the spec (the reconciler reads this)
-                        // and the InstallConfig (rollback / repair
-                        // read this to target the operator's chosen
-                        // service name / root dir rather than driver
-                        // defaults).
-                        let kind = format!("{slug}-instance");
-                        let key = ResourceKey::cluster_scoped(&kind, "local");
-                        let expected_revision = match store.load(&key).await {
-                            Ok(Some(existing)) => Some(existing.revision),
-                            _ => None,
-                        };
-                        if let Err(e) = store.save(&key, &spec, expected_revision).await {
-                            tracing::warn!(
-                                error = %e,
-                                component = slug,
-                                "unified install: store.save failed for {slug}-instance/local; \
-                                 the on-disk service is up but the metadata row was not written. \
-                                 Visit /status to confirm; re-run install to retry the registration."
-                            );
-                            overall.push_str(&format!(
-                                "Note: did not register {slug}-instance/local ({e}). Visit /status to inspect.\n\n"
-                            ));
-                        }
-                        if let Err(e) = save_install_config(store.as_ref(), slug, &config).await {
-                            tracing::warn!(
-                                error = %e,
-                                component = slug,
-                                "unified install: failed to persist install-config/{slug}-local; \
-                                 rollback / repair on this row will fall back to driver defaults."
-                            );
-                        }
-                    }
                 }
                 Err(detail) => {
                     progress.fail_component(slug, &detail);
@@ -538,6 +486,93 @@ async fn delete_install_config(store: &SqliteStore, slug: &str) {
             "delete install-config/{slug}-local: row may not have existed (this is fine on legacy installs)"
         );
     }
+}
+
+/// Shared post-install work for the per-component install handlers
+/// (and reusable by the unified install). Persists the spec under
+/// `<slug>-instance/local`, persists the `InstallConfig` under
+/// `install-config/<slug>-local`, and generates the admin credential
+/// for components that have one (postgres / kanidm / grafana) --
+/// storing the credential encrypted in the secrets store and pushing
+/// it onto the progress handle for one-time display on the result
+/// page.
+///
+/// Mirrors `teardown_managed_uninstall` so install and uninstall stay
+/// symmetric: anything written here is dropped there.
+///
+/// Returns the (possibly augmented) summary string; the caller passes
+/// it to `progress.finish_success`. Best-effort throughout -- a
+/// failed metadata write leaves the on-disk service running and
+/// appends a `Note:` line to the summary.
+async fn finalize_managed_install_after_success(
+    slug: &str,
+    config: &InstallConfig,
+    spec: &serde_json::Value,
+    mut summary: String,
+    store: Option<&SqliteStore>,
+    secrets: Option<&SecretsStore>,
+    progress: &ProgressHandle,
+) -> String {
+    if let Some(store) = store {
+        let kind = format!("{slug}-instance");
+        let key = ResourceKey::cluster_scoped(&kind, "local");
+        let expected_revision = match store.load(&key).await {
+            Ok(Some(existing)) => Some(existing.revision),
+            _ => None,
+        };
+        match store.save(&key, spec, expected_revision).await {
+            Ok(_) => summary.push_str(&format!(
+                "\n\nRegistered as {slug}-instance/local in the metadata store.\nVisit /status to see it.",
+            )),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    component = slug,
+                    "install: store.save failed for {slug}-instance/local; \
+                     the on-disk service is fine. Visit /status or re-run install to retry."
+                );
+                summary.push_str(&format!(
+                    "\n\nNote: did not register {slug}-instance/local ({e}). Visit /status to inspect."
+                ));
+            }
+        }
+        if let Err(e) = save_install_config(store, slug, config).await {
+            tracing::warn!(
+                error = %e,
+                component = slug,
+                "install: failed to persist install-config/{slug}-local; \
+                 rollback / repair on this row will fall back to driver defaults."
+            );
+        }
+    }
+
+    if let Some((_, username, label)) = COMPONENTS_WITH_ADMIN_CREDENTIAL
+        .iter()
+        .find(|(s, _, _)| *s == slug)
+        .copied()
+    {
+        let password = generate_random_password();
+        let secret_ref = format!("{slug}/admin-password");
+        if let Some(secrets) = secrets {
+            if let Err(e) = secrets.put(&secret_ref, &password).await {
+                tracing::warn!(
+                    error = %e,
+                    component = slug,
+                    "install: secrets.put failed for {secret_ref}; \
+                     the credential will only appear in-band on the result page."
+                );
+            }
+        }
+        progress.push_credential(computeza_driver_native::progress::GeneratedCredential {
+            component: slug.to_string(),
+            label: label.to_string(),
+            value: password,
+            username: Some(username.to_string()),
+            secret_ref: Some(secret_ref),
+        });
+    }
+
+    summary
 }
 
 /// Shared teardown for the per-component uninstall handlers. Loads
@@ -992,57 +1027,39 @@ async fn install_postgres_handler(
         .insert(job_id.clone(), progress_state.clone());
 
     let store = state.store.clone();
+    let secrets = state.secrets.clone();
     let progress = ProgressHandle::new(progress_state);
     tokio::spawn(async move {
         match run_postgres_install_with_progress(&progress, &config).await {
             Ok((summary, port)) => {
-                let mut summary = summary;
-                if let Some(store) = &store {
-                    let key = ResourceKey::cluster_scoped("postgres-instance", "local");
-                    let spec = serde_json::json!({
-                        "endpoint": {
-                            "host": "127.0.0.1",
-                            "port": port,
-                            "superuser": "postgres",
-                        },
-                        "databases": [],
-                        "prune": false,
-                    });
-                    // Upsert: load to discover an existing revision, then
-                    // save with that revision so re-installs update in
-                    // place instead of erroring with "revision conflict
-                    // on postgres-instance/local: expected None, found
-                    // Some(1)".
-                    let expected_revision = match store.load(&key).await {
-                        Ok(Some(existing)) => Some(existing.revision),
-                        _ => None,
-                    };
-                    match store.save(&key, &spec, expected_revision).await {
-                        Ok(_) => {
-                            summary.push_str(
-                                "\n\nRegistered as postgres-instance/local in the metadata store.\nVisit /status to see it.",
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "install background task: store.save failed; install succeeded but \
-                                 the resource is not registered. Most likely another writer raced \
-                                 the upsert. Re-run the install if /status is wrong."
-                            );
-                            summary.push_str(&format!(
-                                "\n\nNote: did not register postgres-instance/local ({e}). Visit /status to inspect current state."
-                            ));
-                        }
-                    }
+                let spec = serde_json::json!({
+                    "endpoint": {
+                        "host": "127.0.0.1",
+                        "port": port,
+                        "superuser": "postgres",
+                    },
+                    "superuser_password_ref": "postgres/admin-password",
+                    "databases": [],
+                    "prune": false,
+                });
+                let summary = finalize_managed_install_after_success(
+                    "postgres",
+                    &config,
+                    &spec,
+                    summary,
+                    store.as_deref(),
+                    secrets.as_deref(),
+                    &progress,
+                )
+                .await;
 
-                    // Kick a single observe() immediately so /status
-                    // doesn't sit on the previous (likely failed) tick
-                    // result for up to 30 seconds. Best-effort: the
-                    // periodic tick will retry regardless.
+                // Kick a single observe() immediately so /status doesn't
+                // sit on the previous (likely failed) tick result for up
+                // to 30 seconds. Best-effort: the periodic tick will
+                // retry regardless.
+                if let Some(store) = &store {
                     if let Err(e) =
-                        observe_postgres_instance_now(store.clone(), state.secrets.clone(), &spec)
-                            .await
+                        observe_postgres_instance_now(store.clone(), secrets.clone(), &spec).await
                     {
                         tracing::debug!(
                             error = %e,
@@ -1127,39 +1144,27 @@ async fn install_kanidm_handler(
         .insert(job_id.clone(), progress_state.clone());
 
     let store = state.store.clone();
+    let secrets = state.secrets.clone();
     let progress = ProgressHandle::new(progress_state);
     tokio::spawn(async move {
         match run_kanidm_install_with_progress(&progress, &config).await {
             Ok((summary, port)) => {
-                let mut summary = summary;
-                if let Some(store) = &store {
-                    let key = ResourceKey::cluster_scoped("kanidm-instance", "local");
-                    let spec = serde_json::json!({
-                        "endpoint": {
-                            "base_url": format!("https://127.0.0.1:{port}"),
-                            "insecure_skip_tls_verify": true,
-                        },
-                    });
-                    let expected_revision = match store.load(&key).await {
-                        Ok(Some(existing)) => Some(existing.revision),
-                        _ => None,
-                    };
-                    match store.save(&key, &spec, expected_revision).await {
-                        Ok(_) => summary.push_str(
-                            "\n\nRegistered as kanidm-instance/local in the metadata store.\nVisit /status to see it.",
-                        ),
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "kanidm install: store.save failed; the on-disk service is fine. \
-                                 Visit /status or re-run install to retry the registration."
-                            );
-                            summary.push_str(&format!(
-                                "\n\nNote: did not register kanidm-instance/local ({e}). Visit /status to inspect current state."
-                            ));
-                        }
-                    }
-                }
+                let spec = serde_json::json!({
+                    "endpoint": {
+                        "base_url": format!("https://127.0.0.1:{port}"),
+                        "insecure_skip_tls_verify": true,
+                    },
+                });
+                let summary = finalize_managed_install_after_success(
+                    "kanidm",
+                    &config,
+                    &spec,
+                    summary,
+                    store.as_deref(),
+                    secrets.as_deref(),
+                    &progress,
+                )
+                .await;
                 progress.finish_success(summary);
             }
             Err(detail) => progress.finish_failure(detail),
@@ -1319,42 +1324,30 @@ async fn install_garage_handler(
         .insert(job_id.clone(), progress_state.clone());
 
     let store = state.store.clone();
+    let secrets = state.secrets.clone();
     let progress = ProgressHandle::new(progress_state);
     tokio::spawn(async move {
         match run_garage_install_with_progress(&progress, &config).await {
             Ok((summary, s3_port)) => {
-                let mut summary = summary;
-                if let Some(store) = &store {
-                    let key = ResourceKey::cluster_scoped("garage-instance", "local");
-                    // Reconciler hits the admin API at s3_port + 3
-                    // (3903 with the canonical 3900 layout).
-                    let admin_port = s3_port + 3;
-                    let spec = serde_json::json!({
-                        "endpoint": {
-                            "base_url": format!("http://127.0.0.1:{admin_port}"),
-                            "insecure_skip_tls_verify": false,
-                        },
-                    });
-                    let expected_revision = match store.load(&key).await {
-                        Ok(Some(existing)) => Some(existing.revision),
-                        _ => None,
-                    };
-                    match store.save(&key, &spec, expected_revision).await {
-                        Ok(_) => summary.push_str(
-                            "\n\nRegistered as garage-instance/local in the metadata store.\nVisit /status to see it.",
-                        ),
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "garage install: store.save failed; the on-disk service is fine. \
-                                 Visit /status or re-run install to retry the registration."
-                            );
-                            summary.push_str(&format!(
-                                "\n\nNote: did not register garage-instance/local ({e}). Visit /status to inspect current state."
-                            ));
-                        }
-                    }
-                }
+                // Reconciler hits the admin API at s3_port + 3
+                // (3903 with the canonical 3900 layout).
+                let admin_port = s3_port + 3;
+                let spec = serde_json::json!({
+                    "endpoint": {
+                        "base_url": format!("http://127.0.0.1:{admin_port}"),
+                        "insecure_skip_tls_verify": false,
+                    },
+                });
+                let summary = finalize_managed_install_after_success(
+                    "garage",
+                    &config,
+                    &spec,
+                    summary,
+                    store.as_deref(),
+                    secrets.as_deref(),
+                    &progress,
+                )
+                .await;
                 progress.finish_success(summary);
             }
             Err(detail) => progress.finish_failure(detail),
@@ -1466,38 +1459,27 @@ async fn install_openfga_handler(
         .insert(job_id.clone(), progress_state.clone());
 
     let store = state.store.clone();
+    let secrets = state.secrets.clone();
     let progress = ProgressHandle::new(progress_state);
     tokio::spawn(async move {
         match run_openfga_install_with_progress(&progress, &config).await {
             Ok((summary, port)) => {
-                let mut summary = summary;
-                if let Some(store) = &store {
-                    let key = ResourceKey::cluster_scoped("openfga-instance", "local");
-                    let spec = serde_json::json!({
-                        "endpoint": {
-                            "base_url": format!("http://127.0.0.1:{port}"),
-                            "insecure_skip_tls_verify": false,
-                        },
-                    });
-                    let expected_revision = match store.load(&key).await {
-                        Ok(Some(existing)) => Some(existing.revision),
-                        _ => None,
-                    };
-                    match store.save(&key, &spec, expected_revision).await {
-                        Ok(_) => summary.push_str(
-                            "\n\nRegistered as openfga-instance/local in the metadata store.\nVisit /status to see it.",
-                        ),
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "openfga install: store.save failed; the on-disk service is fine."
-                            );
-                            summary.push_str(&format!(
-                                "\n\nNote: did not register openfga-instance/local ({e}). Visit /status to inspect current state."
-                            ));
-                        }
-                    }
-                }
+                let spec = serde_json::json!({
+                    "endpoint": {
+                        "base_url": format!("http://127.0.0.1:{port}"),
+                        "insecure_skip_tls_verify": false,
+                    },
+                });
+                let summary = finalize_managed_install_after_success(
+                    "openfga",
+                    &config,
+                    &spec,
+                    summary,
+                    store.as_deref(),
+                    secrets.as_deref(),
+                    &progress,
+                )
+                .await;
                 progress.finish_success(summary);
             }
             Err(detail) => progress.finish_failure(detail),
@@ -1608,38 +1590,27 @@ async fn install_qdrant_handler(
         .insert(job_id.clone(), progress_state.clone());
 
     let store = state.store.clone();
+    let secrets = state.secrets.clone();
     let progress = ProgressHandle::new(progress_state);
     tokio::spawn(async move {
         match run_qdrant_install_with_progress(&progress, &config).await {
             Ok((summary, port)) => {
-                let mut summary = summary;
-                if let Some(store) = &store {
-                    let key = ResourceKey::cluster_scoped("qdrant-instance", "local");
-                    let spec = serde_json::json!({
-                        "endpoint": {
-                            "base_url": format!("http://127.0.0.1:{port}"),
-                            "insecure_skip_tls_verify": false,
-                        },
-                    });
-                    let expected_revision = match store.load(&key).await {
-                        Ok(Some(existing)) => Some(existing.revision),
-                        _ => None,
-                    };
-                    match store.save(&key, &spec, expected_revision).await {
-                        Ok(_) => summary.push_str(
-                            "\n\nRegistered as qdrant-instance/local in the metadata store.\nVisit /status to see it.",
-                        ),
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "qdrant install: store.save failed; the on-disk service is fine."
-                            );
-                            summary.push_str(&format!(
-                                "\n\nNote: did not register qdrant-instance/local ({e}). Visit /status to inspect current state."
-                            ));
-                        }
-                    }
-                }
+                let spec = serde_json::json!({
+                    "endpoint": {
+                        "base_url": format!("http://127.0.0.1:{port}"),
+                        "insecure_skip_tls_verify": false,
+                    },
+                });
+                let summary = finalize_managed_install_after_success(
+                    "qdrant",
+                    &config,
+                    &spec,
+                    summary,
+                    store.as_deref(),
+                    secrets.as_deref(),
+                    &progress,
+                )
+                .await;
                 progress.finish_success(summary);
             }
             Err(detail) => progress.finish_failure(detail),
@@ -1750,35 +1721,27 @@ async fn install_greptime_handler(
         .insert(job_id.clone(), progress_state.clone());
 
     let store = state.store.clone();
+    let secrets = state.secrets.clone();
     let progress = ProgressHandle::new(progress_state);
     tokio::spawn(async move {
         match run_greptime_install_with_progress(&progress, &config).await {
             Ok((summary, port)) => {
-                let mut summary = summary;
-                if let Some(store) = &store {
-                    let key = ResourceKey::cluster_scoped("greptime-instance", "local");
-                    let spec = serde_json::json!({
-                        "endpoint": {
-                            "base_url": format!("http://127.0.0.1:{port}"),
-                            "insecure_skip_tls_verify": false,
-                        },
-                    });
-                    let expected_revision = match store.load(&key).await {
-                        Ok(Some(existing)) => Some(existing.revision),
-                        _ => None,
-                    };
-                    match store.save(&key, &spec, expected_revision).await {
-                        Ok(_) => summary.push_str(
-                            "\n\nRegistered as greptime-instance/local in the metadata store.\nVisit /status to see it.",
-                        ),
-                        Err(e) => {
-                            tracing::warn!(error = %e, "greptime install: store.save failed");
-                            summary.push_str(&format!(
-                                "\n\nNote: did not register greptime-instance/local ({e})."
-                            ));
-                        }
-                    }
-                }
+                let spec = serde_json::json!({
+                    "endpoint": {
+                        "base_url": format!("http://127.0.0.1:{port}"),
+                        "insecure_skip_tls_verify": false,
+                    },
+                });
+                let summary = finalize_managed_install_after_success(
+                    "greptime",
+                    &config,
+                    &spec,
+                    summary,
+                    store.as_deref(),
+                    secrets.as_deref(),
+                    &progress,
+                )
+                .await;
                 progress.finish_success(summary);
             }
             Err(detail) => progress.finish_failure(detail),
@@ -1885,35 +1848,27 @@ async fn install_lakekeeper_handler(
         .insert(job_id.clone(), progress_state.clone());
 
     let store = state.store.clone();
+    let secrets = state.secrets.clone();
     let progress = ProgressHandle::new(progress_state);
     tokio::spawn(async move {
         match run_lakekeeper_install_with_progress(&progress, &config).await {
             Ok((summary, port)) => {
-                let mut summary = summary;
-                if let Some(store) = &store {
-                    let key = ResourceKey::cluster_scoped("lakekeeper-instance", "local");
-                    let spec = serde_json::json!({
-                        "endpoint": {
-                            "base_url": format!("http://127.0.0.1:{port}"),
-                            "insecure_skip_tls_verify": false,
-                        },
-                    });
-                    let expected_revision = match store.load(&key).await {
-                        Ok(Some(existing)) => Some(existing.revision),
-                        _ => None,
-                    };
-                    match store.save(&key, &spec, expected_revision).await {
-                        Ok(_) => summary.push_str(
-                            "\n\nRegistered as lakekeeper-instance/local in the metadata store.\nVisit /status to see it.",
-                        ),
-                        Err(e) => {
-                            tracing::warn!(error = %e, "lakekeeper install: store.save failed");
-                            summary.push_str(&format!(
-                                "\n\nNote: did not register lakekeeper-instance/local ({e})."
-                            ));
-                        }
-                    }
-                }
+                let spec = serde_json::json!({
+                    "endpoint": {
+                        "base_url": format!("http://127.0.0.1:{port}"),
+                        "insecure_skip_tls_verify": false,
+                    },
+                });
+                let summary = finalize_managed_install_after_success(
+                    "lakekeeper",
+                    &config,
+                    &spec,
+                    summary,
+                    store.as_deref(),
+                    secrets.as_deref(),
+                    &progress,
+                )
+                .await;
                 progress.finish_success(summary);
             }
             Err(detail) => progress.finish_failure(detail),
@@ -2023,35 +1978,27 @@ async fn install_databend_handler(
         .insert(job_id.clone(), progress_state.clone());
 
     let store = state.store.clone();
+    let secrets = state.secrets.clone();
     let progress = ProgressHandle::new(progress_state);
     tokio::spawn(async move {
         match run_databend_install_with_progress(&progress, &config).await {
             Ok((summary, port)) => {
-                let mut summary = summary;
-                if let Some(store) = &store {
-                    let key = ResourceKey::cluster_scoped("databend-instance", "local");
-                    let spec = serde_json::json!({
-                        "endpoint": {
-                            "base_url": format!("http://127.0.0.1:{port}"),
-                            "insecure_skip_tls_verify": false,
-                        },
-                    });
-                    let expected_revision = match store.load(&key).await {
-                        Ok(Some(existing)) => Some(existing.revision),
-                        _ => None,
-                    };
-                    match store.save(&key, &spec, expected_revision).await {
-                        Ok(_) => summary.push_str(
-                            "\n\nRegistered as databend-instance/local in the metadata store.\nVisit /status to see it.",
-                        ),
-                        Err(e) => {
-                            tracing::warn!(error = %e, "databend install: store.save failed");
-                            summary.push_str(&format!(
-                                "\n\nNote: did not register databend-instance/local ({e})."
-                            ));
-                        }
-                    }
-                }
+                let spec = serde_json::json!({
+                    "endpoint": {
+                        "base_url": format!("http://127.0.0.1:{port}"),
+                        "insecure_skip_tls_verify": false,
+                    },
+                });
+                let summary = finalize_managed_install_after_success(
+                    "databend",
+                    &config,
+                    &spec,
+                    summary,
+                    store.as_deref(),
+                    secrets.as_deref(),
+                    &progress,
+                )
+                .await;
                 progress.finish_success(summary);
             }
             Err(detail) => progress.finish_failure(detail),
@@ -2158,35 +2105,27 @@ async fn install_grafana_handler(
         .insert(job_id.clone(), progress_state.clone());
 
     let store = state.store.clone();
+    let secrets = state.secrets.clone();
     let progress = ProgressHandle::new(progress_state);
     tokio::spawn(async move {
         match run_grafana_install_with_progress(&progress, &config).await {
             Ok((summary, port)) => {
-                let mut summary = summary;
-                if let Some(store) = &store {
-                    let key = ResourceKey::cluster_scoped("grafana-instance", "local");
-                    let spec = serde_json::json!({
-                        "endpoint": {
-                            "base_url": format!("http://127.0.0.1:{port}"),
-                            "insecure_skip_tls_verify": false,
-                        },
-                    });
-                    let expected_revision = match store.load(&key).await {
-                        Ok(Some(existing)) => Some(existing.revision),
-                        _ => None,
-                    };
-                    match store.save(&key, &spec, expected_revision).await {
-                        Ok(_) => summary.push_str(
-                            "\n\nRegistered as grafana-instance/local in the metadata store.\nVisit /status to see it.",
-                        ),
-                        Err(e) => {
-                            tracing::warn!(error = %e, "grafana install: store.save failed");
-                            summary.push_str(&format!(
-                                "\n\nNote: did not register grafana-instance/local ({e})."
-                            ));
-                        }
-                    }
-                }
+                let spec = serde_json::json!({
+                    "endpoint": {
+                        "base_url": format!("http://127.0.0.1:{port}"),
+                        "insecure_skip_tls_verify": false,
+                    },
+                });
+                let summary = finalize_managed_install_after_success(
+                    "grafana",
+                    &config,
+                    &spec,
+                    summary,
+                    store.as_deref(),
+                    secrets.as_deref(),
+                    &progress,
+                )
+                .await;
                 progress.finish_success(summary);
             }
             Err(detail) => progress.finish_failure(detail),
@@ -2293,35 +2232,27 @@ async fn install_restate_handler(
         .insert(job_id.clone(), progress_state.clone());
 
     let store = state.store.clone();
+    let secrets = state.secrets.clone();
     let progress = ProgressHandle::new(progress_state);
     tokio::spawn(async move {
         match run_restate_install_with_progress(&progress, &config).await {
             Ok((summary, port)) => {
-                let mut summary = summary;
-                if let Some(store) = &store {
-                    let key = ResourceKey::cluster_scoped("restate-instance", "local");
-                    let spec = serde_json::json!({
-                        "endpoint": {
-                            "base_url": format!("http://127.0.0.1:{port}"),
-                            "insecure_skip_tls_verify": false,
-                        },
-                    });
-                    let expected_revision = match store.load(&key).await {
-                        Ok(Some(existing)) => Some(existing.revision),
-                        _ => None,
-                    };
-                    match store.save(&key, &spec, expected_revision).await {
-                        Ok(_) => summary.push_str(
-                            "\n\nRegistered as restate-instance/local in the metadata store.\nVisit /status to see it.",
-                        ),
-                        Err(e) => {
-                            tracing::warn!(error = %e, "restate install: store.save failed");
-                            summary.push_str(&format!(
-                                "\n\nNote: did not register restate-instance/local ({e})."
-                            ));
-                        }
-                    }
-                }
+                let spec = serde_json::json!({
+                    "endpoint": {
+                        "base_url": format!("http://127.0.0.1:{port}"),
+                        "insecure_skip_tls_verify": false,
+                    },
+                });
+                let summary = finalize_managed_install_after_success(
+                    "restate",
+                    &config,
+                    &spec,
+                    summary,
+                    store.as_deref(),
+                    secrets.as_deref(),
+                    &progress,
+                )
+                .await;
                 progress.finish_success(summary);
             }
             Err(detail) => progress.finish_failure(detail),
@@ -7746,6 +7677,117 @@ mod tests {
         hydrate_postgres_password(&mut spec, None).await;
         use secrecy::ExposeSecret;
         assert_eq!(spec.superuser_password.expose_secret(), "");
+    }
+
+    #[tokio::test]
+    async fn finalize_managed_install_persists_spec_and_install_config() {
+        let store = computeza_state::SqliteStore::open(":memory:")
+            .await
+            .unwrap();
+        let config = InstallConfig {
+            service_name: Some("computeza-postgres-staging".into()),
+            port: Some(5433),
+            root_dir: Some("/srv/pg".into()),
+            version: None,
+        };
+        let spec = serde_json::json!({"endpoint": {"host": "127.0.0.1", "port": 5433}});
+
+        let state = Arc::new(StdMutex::new(InstallProgress::default()));
+        let progress = ProgressHandle::new(state.clone());
+
+        let summary = finalize_managed_install_after_success(
+            "postgres",
+            &config,
+            &spec,
+            "ok".to_string(),
+            Some(&store),
+            None,
+            &progress,
+        )
+        .await;
+        assert!(summary.contains("Registered as postgres-instance/local"));
+
+        // Spec persisted.
+        let spec_row = store
+            .load(&ResourceKey::cluster_scoped("postgres-instance", "local"))
+            .await
+            .unwrap()
+            .expect("spec row missing");
+        assert_eq!(spec_row.spec, spec);
+
+        // Install-config persisted.
+        let cfg = load_install_config(&store, "postgres").await.unwrap();
+        assert_eq!(cfg.service_name, config.service_name);
+        assert_eq!(cfg.port, config.port);
+
+        // Credentials pushed (postgres is in COMPONENTS_WITH_ADMIN_CREDENTIAL).
+        let creds = progress.drain_credentials();
+        assert_eq!(creds.len(), 1);
+        assert_eq!(creds[0].component, "postgres");
+        assert_eq!(creds[0].value.len(), 24);
+    }
+
+    #[tokio::test]
+    async fn finalize_managed_install_skips_credentials_for_components_without_one() {
+        let store = computeza_state::SqliteStore::open(":memory:")
+            .await
+            .unwrap();
+        let state = Arc::new(StdMutex::new(InstallProgress::default()));
+        let progress = ProgressHandle::new(state.clone());
+
+        // garage is not in COMPONENTS_WITH_ADMIN_CREDENTIAL; no
+        // credential should be generated, but the spec + install-
+        // config should still be persisted.
+        let _ = finalize_managed_install_after_success(
+            "garage",
+            &InstallConfig::default(),
+            &serde_json::json!({"endpoint": {"base_url": "http://127.0.0.1:3903"}}),
+            "ok".to_string(),
+            Some(&store),
+            None,
+            &progress,
+        )
+        .await;
+        assert!(progress.drain_credentials().is_empty());
+        assert!(load_install_config(&store, "garage").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn teardown_managed_uninstall_handles_unknown_slug_cleanly() {
+        let store = computeza_state::SqliteStore::open(":memory:")
+            .await
+            .unwrap();
+        let result = teardown_managed_uninstall("not-a-real-slug", Some(&store), None).await;
+        assert!(
+            result.is_err(),
+            "unknown slug should propagate the dispatch error"
+        );
+    }
+
+    #[tokio::test]
+    async fn teardown_managed_uninstall_drops_install_config_row() {
+        // Pre-populate an install-config and ensure teardown removes it
+        // even on dispatch failure (operator may have manually deleted
+        // the service; we still want the metadata clean).
+        let store = computeza_state::SqliteStore::open(":memory:")
+            .await
+            .unwrap();
+        save_install_config(&store, "postgres", &InstallConfig::default())
+            .await
+            .unwrap();
+        assert!(load_install_config(&store, "postgres").await.is_some());
+
+        // Dispatch will fail on a Windows/non-Linux test runner since
+        // dispatch_uninstall_with_config has a non-Linux Err branch;
+        // teardown_managed_uninstall continues to drop the metadata
+        // either way. On Linux runners the dispatch attempts a real
+        // teardown which will Err because no service exists -- same
+        // cleanup behavior.
+        let _ = teardown_managed_uninstall("postgres", Some(&store), None).await;
+        assert!(
+            load_install_config(&store, "postgres").await.is_none(),
+            "teardown must drop install-config regardless of dispatch result"
+        );
     }
 
     #[tokio::test]

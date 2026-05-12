@@ -465,15 +465,33 @@ The repair flow on `/resource/{kind}/{name}` reads the persisted
 config and embeds it as hidden inputs on the Re-install form so the
 re-run targets the same service the install created.
 
-**Known gap (per-component pages):** the legacy per-component pages
-at `/install/<slug>` and `/install/<slug>/uninstall` do NOT yet save
-or read `install-config/<slug>-local`. Operators who mix flows
-(install via `/install`, then teardown via `/install/postgres/uninstall`)
-will hit the same custom-service-name miss the rollback flow used to
-have. The fix is symmetric: each per-component install handler should
-save install-config + generate credentials, and each per-component
-uninstall handler should load install-config + dispatch through
-`dispatch_uninstall_with_config`. Tracked as a v0.0.x follow-up.
+### Install / uninstall symmetry
+
+Two shared helpers in `crates/computeza-ui-server/src/lib.rs` keep
+install and uninstall flows symmetric across every entry point:
+
+- `finalize_managed_install_after_success(slug, config, spec, summary,
+  store, secrets, progress)` -- called from BOTH the unified
+  `install_all_handler` and every per-component install handler.
+  Persists the spec under `<slug>-instance/local`, persists the
+  `InstallConfig` under `install-config/<slug>-local`, generates the
+  admin credential for components in `COMPONENTS_WITH_ADMIN_CREDENTIAL`
+  (postgres / kanidm / grafana), stores it encrypted under
+  `<slug>/admin-password`, and pushes a `GeneratedCredential` onto
+  the progress handle so the result page can display it once.
+
+- `teardown_managed_uninstall(slug, store, secrets)` -- called from
+  BOTH the unified rollback handler and every per-component uninstall
+  handler. Loads `install-config/<slug>-local` to get the operator's
+  chosen service name + root dir, dispatches uninstall with those
+  overrides via `dispatch_uninstall_with_config`, then drops the
+  spec row, the install-config row, and the credential entry.
+
+Net effect: any combination of install and uninstall paths (unified
+install + per-component uninstall, per-component install + unified
+rollback, etc.) preserves the operator's custom service name across
+the lifecycle, cleans up metadata + credentials on teardown, and
+never leaves orphan secrets in the store.
 
 Adding a new component to the unified install:
 
