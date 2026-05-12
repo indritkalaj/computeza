@@ -615,6 +615,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "computeza-identity-federation"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "computeza-pipelines"
 version = "0.0.1"
 dependencies = [
