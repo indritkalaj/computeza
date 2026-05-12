@@ -125,6 +125,15 @@ ui-install-progress-state-running = Running
 ui-install-progress-state-done    = Done
 ui-install-progress-state-failed  = Failed
 
+# --- Generated credentials on the result page (one-time view) ---
+
+ui-install-credentials-title   = Generated credentials
+ui-install-credentials-warning = Copy these values out of this page now. They will not be shown again on a refresh. When the secrets store is attached they remain recoverable through the rotate-secrets UI; without the secrets store this is the only place they appear.
+ui-install-credentials-component = Component
+ui-install-credentials-username  = Username
+ui-install-credentials-password  = Password
+ui-install-credentials-ref       = Secrets ref
+
 # --- Active-job resume banner on /install ---
 
 ui-install-active-title   = Install in progress

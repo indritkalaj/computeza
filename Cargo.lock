@@ -898,6 +898,7 @@ dependencies = [
 name = "computeza-ui-server"
 version = "0.0.1"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "axum",
  "computeza-core",

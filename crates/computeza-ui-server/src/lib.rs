@@ -353,6 +353,7 @@ async fn install_all_handler(
         .insert(job_id.clone(), progress_state.clone());
 
     let store = state.store.clone();
+    let secrets = state.secrets.clone();
     let progress = ProgressHandle::new(progress_state);
 
     // Seed the per-component checklist up front so the wizard can
@@ -364,6 +365,37 @@ async fn install_all_handler(
         let mut overall = String::new();
         let total = planned.len();
         for (idx, (slug, config)) in planned.into_iter().enumerate() {
+            // Pre-provision an admin credential for components that
+            // have one. Persisted encrypted when the secrets store is
+            // attached; surfaced once on the result page either way so
+            // the operator can copy it out before it disappears.
+            if let Some((_, username, label)) = COMPONENTS_WITH_ADMIN_CREDENTIAL
+                .iter()
+                .find(|(s, _, _)| *s == slug)
+                .copied()
+            {
+                let password = generate_random_password();
+                let secret_ref = format!("{slug}/admin-password");
+                if let Some(secrets) = &secrets {
+                    if let Err(e) = secrets.put(&secret_ref, &password).await {
+                        tracing::warn!(
+                            error = %e,
+                            component = slug,
+                            "unified install: secrets.put failed for {secret_ref}; \
+                             the credential will only appear in-band on the result page. \
+                             Verify COMPUTEZA_SECRETS_PASSPHRASE + write access to the secrets file."
+                        );
+                    }
+                }
+                progress.push_credential(computeza_driver_native::progress::GeneratedCredential {
+                    component: slug.to_string(),
+                    label: label.to_string(),
+                    value: password,
+                    username: Some(username.to_string()),
+                    secret_ref: Some(secret_ref),
+                });
+            }
+
             progress.start_component(slug);
             let banner = format!("[{}/{}] Installing {slug}...", idx + 1, total);
             progress.set_message(banner);
@@ -409,6 +441,37 @@ async fn install_all_handler(
     });
 
     Redirect303(format!("/install/job/{job_id}")).into_response()
+}
+
+/// Slugs whose drivers will eventually consume a per-instance admin
+/// credential. The unified install generates a strong random password
+/// for each one, stores it encrypted in the secrets store (when
+/// attached), and surfaces it on the result page exactly once.
+///
+/// v0.0.x drivers don't *apply* these passwords yet (postgres still
+/// uses loopback trust; kanidm uses `kanidmd recover_account`; grafana
+/// uses its default `admin` user). The credentials are pre-provisioned
+/// so the operator has them on hand when the driver wiring lands in a
+/// follow-up.
+const COMPONENTS_WITH_ADMIN_CREDENTIAL: &[(&str, &str, &str)] = &[
+    ("postgres", "postgres", "superuser password"),
+    ("kanidm", "admin", "initial admin password"),
+    ("grafana", "admin", "initial admin password"),
+];
+
+/// Generate a 96-bit random password rendered as a 24-character hex
+/// string. Hex avoids alphabet-modulo bias and is safe to paste into
+/// shell prompts / config files (no quoting / escaping needed).
+fn generate_random_password() -> String {
+    use aes_gcm::aead::rand_core::RngCore;
+    use aes_gcm::aead::OsRng;
+    let mut buf = [0u8; 12];
+    OsRng.fill_bytes(&mut buf);
+    let mut out = String::with_capacity(24);
+    for b in &buf {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
 }
 
 /// Look up whether a slug is marked `available: true` in [`COMPONENTS`].
@@ -2405,12 +2468,10 @@ async fn install_job_handler(
     Path(job_id): Path<String>,
 ) -> (StatusCode, Html<String>) {
     let l = Localizer::english();
-    let snapshot = state
-        .jobs
-        .lock()
-        .unwrap()
-        .get(&job_id)
-        .map(|s| s.lock().unwrap().clone());
+    // Look up the job state without cloning the inner Arc so we can
+    // drain generated_credentials on the live state below.
+    let job_arc = state.jobs.lock().unwrap().get(&job_id).cloned();
+    let snapshot = job_arc.as_ref().map(|s| s.lock().unwrap().clone());
     match snapshot {
         None => (
             StatusCode::NOT_FOUND,
@@ -2421,15 +2482,37 @@ async fn install_job_handler(
             )),
         ),
         Some(p) if p.completed => {
-            // Render the final result page (success or failure) so
-            // refreshing the URL after completion keeps working.
+            // Drain credentials from the LIVE state so a refresh of
+            // this URL renders the result page without the plaintext
+            // password block. We do this even on the failure path
+            // (some components may have generated credentials before
+            // a later component failed -- the operator still needs
+            // to capture them).
+            let credentials = job_arc
+                .as_ref()
+                .map(|s| std::mem::take(&mut s.lock().unwrap().generated_credentials))
+                .unwrap_or_default();
+
             if let Some(err) = &p.error {
-                (StatusCode::OK, Html(render_install_result(&l, false, err)))
+                (
+                    StatusCode::OK,
+                    Html(render_install_result_with_credentials(
+                        &l,
+                        false,
+                        err,
+                        &credentials,
+                    )),
+                )
             } else {
                 let summary = p.success_summary.clone().unwrap_or_default();
                 (
                     StatusCode::OK,
-                    Html(render_install_result(&l, true, &summary)),
+                    Html(render_install_result_with_credentials(
+                        &l,
+                        true,
+                        &summary,
+                        &credentials,
+                    )),
                 )
             }
         }
@@ -5860,12 +5943,27 @@ fn human_bytes(n: u64) -> String {
     }
 }
 
-/// Render the `/install/postgres` result page. `success` switches the
-/// heading between the success and failure i18n keys; `detail` is the
-/// raw output (success summary or error chain) shown verbatim in a
+/// Render the result page for a completed install. `success` switches
+/// the heading between the success and failure i18n keys; `detail` is
+/// the raw output (success summary or error chain) shown verbatim in a
 /// `<pre>` block after HTML-escaping.
 #[must_use]
 pub fn render_install_result(localizer: &Localizer, success: bool, detail: &str) -> String {
+    render_install_result_with_credentials(localizer, success, detail, &[])
+}
+
+/// Variant of [`render_install_result`] that also displays one-time
+/// credentials generated during the install (e.g. initial admin
+/// passwords) above the summary block. Caller MUST have drained the
+/// credentials from the job state already; passing an empty slice
+/// reverts to the plain result page.
+#[must_use]
+pub fn render_install_result_with_credentials(
+    localizer: &Localizer,
+    success: bool,
+    detail: &str,
+    credentials: &[computeza_driver_native::progress::GeneratedCredential],
+) -> String {
     let title = localizer.t("ui-install-result-title");
     let outcome = if success {
         localizer.t("ui-install-result-success")
@@ -5879,12 +5977,14 @@ pub fn render_install_result(localizer: &Localizer, success: bool, detail: &str)
     } else {
         "cz-badge cz-badge-fail"
     };
+    let credentials_block = render_credentials_block(localizer, credentials);
 
     let body = format!(
         r#"<section class="cz-hero">
 <h1>{title}</h1>
 <p><span class="{badge_class}">{outcome}</span></p>
 </section>
+{credentials_block}
 <section class="cz-section">
 <pre class="cz-pre">{detail_html}</pre>
 </section>
@@ -5897,6 +5997,64 @@ pub fn render_install_result(localizer: &Localizer, success: bool, detail: &str)
     );
 
     render_shell(localizer, &title, NavLink::Install, &body)
+}
+
+/// Render the one-time generated-credentials block on the install
+/// result page. Returns the empty string when `creds` is empty so the
+/// caller can interpolate the result unconditionally.
+fn render_credentials_block(
+    localizer: &Localizer,
+    creds: &[computeza_driver_native::progress::GeneratedCredential],
+) -> String {
+    if creds.is_empty() {
+        return String::new();
+    }
+    let title = localizer.t("ui-install-credentials-title");
+    let warning = localizer.t("ui-install-credentials-warning");
+    let comp_h = localizer.t("ui-install-credentials-component");
+    let user_h = localizer.t("ui-install-credentials-username");
+    let pass_h = localizer.t("ui-install-credentials-password");
+    let ref_h = localizer.t("ui-install-credentials-ref");
+
+    let rows: String = creds
+        .iter()
+        .map(|c| {
+            format!(
+                r#"<tr>
+<td>{component}</td>
+<td>{username}</td>
+<td><code>{password}</code></td>
+<td><code class="cz-muted">{secret_ref}</code></td>
+</tr>"#,
+                component = html_escape(&c.component),
+                username = html_escape(c.username.as_deref().unwrap_or("")),
+                password = html_escape(&c.value),
+                secret_ref = html_escape(c.secret_ref.as_deref().unwrap_or("")),
+            )
+        })
+        .collect();
+
+    format!(
+        r#"<section class="cz-section">
+<div class="cz-card" style="border-color: rgba(245, 181, 68, 0.55);">
+<p class="cz-card-body" style="margin: 0 0 0.5rem;"><span class="cz-badge cz-badge-warn">{title}</span></p>
+<p class="cz-muted" style="margin: 0 0 0.85rem; font-size: 0.85rem;">{warning}</p>
+<table class="cz-table" style="width: 100%;">
+<thead><tr><th>{comp_h}</th><th>{user_h}</th><th>{pass_h}</th><th>{ref_h}</th></tr></thead>
+<tbody>
+{rows}
+</tbody>
+</table>
+</div>
+</section>"#,
+        title = html_escape(&title),
+        warning = html_escape(&warning),
+        comp_h = html_escape(&comp_h),
+        user_h = html_escape(&user_h),
+        pass_h = html_escape(&pass_h),
+        ref_h = html_escape(&ref_h),
+        rows = rows,
+    )
 }
 
 /// Render the `/status` page: one row per persisted reconciler
