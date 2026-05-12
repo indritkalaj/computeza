@@ -72,6 +72,10 @@ unic-langid = { version = "0.9", features = ["macros"] }
 ed25519-dalek = "2"
 blake3 = "1"
 sha2 = "0.11"
+# Pure-Rust X.509 + key generation. driver-native uses this for the
+# kanidm self-signed TLS cert so we don't shell out to `openssl req`
+# (and don't make openssl a host prereq).
+rcgen = "0.14"
 
 # --- Time ---
 chrono = { version = "0.4", features = ["serde"] }

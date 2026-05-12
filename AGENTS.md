@@ -476,16 +476,18 @@ lives at `computeza-driver-native::prerequisites`. Today's split:
   raw binaries
 - HTTP fetch -- `reqwest`
 - SHA-256 verification -- `sha2`
+- X.509 self-signed cert generation -- `rcgen` (kanidm TLS bootstrap).
+  Used to require an `openssl` shell-out; the pure-Rust path means a
+  virgin Linux host without the openssl CLI installed still works.
 - Service registration -- `systemctl` shell wrapper (systemd is a
   baseline assumption on every supported distro)
 
 **Host-installed (operator must provide):**
 
-- `openssl` -- kanidm install only, for self-signed TLS cert generation.
-  Universally present on every supported distro's base install, so
-  Computeza does not bundle it; the wizard surfaces the per-distro
-  install one-liner via `prerequisites::SYSTEM_COMMANDS` for the rare
-  hardened-minimal-image case.
+- *(empty)* -- as of the rcgen + bundled-cargo work, the install path
+  has no remaining hard host prereqs on a virgin Linux. Future entries
+  go here only when adding a dependency that genuinely cannot be
+  auto-installed.
 
 **Computeza-delivered (auto-installed on the host):**
 

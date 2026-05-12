@@ -34,3 +34,7 @@ zip = { workspace = true }
 tar = { workspace = true }
 flate2 = { workspace = true }
 liblzma = { workspace = true }
+# rcgen: self-signed X.509 generation for the kanidm TLS cert step.
+# Replaces a shell-out to `openssl req` so a virgin Linux host doesn't
+# need openssl on $PATH for the kanidm install path to work.
+rcgen = { workspace = true }

@@ -8,8 +8,8 @@
 //!
 //! | Component | Prerequisite | Used for                              | Strategy             |
 //! |-----------|--------------|---------------------------------------|----------------------|
-//! | kanidm    | openssl      | self-signed TLS cert at install time  | host-required        |
-//! | kanidm    | cargo        | building kanidmd from crates.io       | bundled (auto)       |
+//! | kanidm    | rcgen        | self-signed TLS cert at install time  | pure Rust (no host)  |
+//! | kanidm    | cargo        | building kanidmd from crates.io       | installed (auto)     |
 //! | xtable    | java >= 17   | runtime for the xtable runner JAR     | bundled (auto, JRE)  |
 //! | postgres  | psql         | post-install role bootstrap           | shipped in bundle    |
 //!
@@ -59,19 +59,24 @@ pub struct SystemCommand {
 
 /// The fixed table of host commands Computeza shells out to.
 ///
-/// **`cargo` is intentionally not in this table.** Kanidm builds from
-/// crates.io via `cargo install kanidmd`, but rather than surface
-/// "cargo missing" as a host requirement, the kanidm driver calls
-/// [`ensure_bundled_cargo`] which auto-installs a sandboxed Rust
-/// toolchain under `<root_dir>/rust/` when `cargo` isn't on `$PATH`.
-/// That keeps the operator's host untouched and turns the install into
-/// a single-click flow on a virgin Linux.
+/// **No entry currently surfaces as a hard host prereq.** The table
+/// exists as the registration point for future host commands; today
+/// the install path is fully self-bootstrapping:
+///
+/// - `cargo`: installed by [`ensure_rust_toolchain`] into
+///   `/var/lib/computeza/toolchain/rust` when missing, then symlinked
+///   onto `/usr/local/bin/`.
+/// - `openssl`: no longer needed -- the kanidm TLS cert step now uses
+///   the pure-Rust `rcgen` crate instead of shelling out to
+///   `openssl req`.
+/// - `psql`: shipped inside the PostgreSQL bundle Computeza downloads.
+/// - `java`: planned to install via [`TEMURIN_JRE_21_X86_64_LINUX`]
+///   when xtable wiring lands.
+///
+/// The `psql` and `java` rows below are informational only -- they
+/// document the install-time bundling so the wizard's prereq banner
+/// (which checks against this table) does not light up.
 pub const SYSTEM_COMMANDS: &[SystemCommand] = &[
-    SystemCommand {
-        name: "openssl",
-        required_for: "kanidm install (self-signed TLS cert generation)",
-        install_hint: "apt-get install -y openssl  (Debian/Ubuntu) | dnf install -y openssl (RHEL family) | zypper install -y openssl (SUSE) | pacman -S --noconfirm openssl (Arch)",
-    },
     SystemCommand {
         name: "psql",
         required_for: "postgres install (post-install role bootstrap)",

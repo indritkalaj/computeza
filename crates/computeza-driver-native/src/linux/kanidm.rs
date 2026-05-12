@@ -7,12 +7,16 @@
 //!
 //! Flow on a fresh host:
 //!
-//! 1. Verify `cargo` is on PATH.
+//! 1. Resolve `cargo` -- use it from `$PATH` if present, otherwise
+//!    install the toolchain via `prerequisites::ensure_rust_toolchain`
+//!    (system-wide into `/var/lib/computeza/toolchain/rust` + symlinks
+//!    on `/usr/local/bin`).
 //! 2. `cargo install kanidmd --locked --version <X> --root <root>`.
 //!    Slow (10-15 min compile on a 4-core box); progress messages
 //!    communicate this.
-//! 3. Generate a self-signed TLS cert via openssl shell-out --
-//!    kanidm refuses to start without TLS even on loopback.
+//! 3. Generate a self-signed TLS cert in pure Rust via `rcgen` --
+//!    kanidm refuses to start without TLS even on loopback. No host
+//!    openssl dependency.
 //! 4. Write `server.toml` referencing the cert paths.
 //! 5. Write systemd unit, daemon-reload, enable --now.
 //! 6. Wait for the TCP port.
@@ -71,21 +75,17 @@ pub async fn install(
 ) -> Result<InstalledService, ServiceError> {
     let version = opts.version.as_deref().unwrap_or(KANIDM_VERSIONS[0]);
 
-    // 1. Toolchain resolution.
-    //
-    //    openssl stays a hard host requirement -- it's a system library
-    //    universally present on every supported distro's base install,
-    //    so bundling it would be wasteful.
-    //
-    //    cargo, in contrast, is rare on production hosts. Rather than
-    //    surface "missing cargo" as an error and force the operator to
-    //    run rustup-init themselves, we install a shared Rust toolchain
-    //    into /var/lib/computeza/toolchain/rust and symlink cargo /
-    //    rustc / rustup onto /usr/local/bin so the operator's shell
-    //    (and any subsequent install) sees them on $PATH transparently.
+    // 1. Toolchain resolution. cargo is rare on production hosts;
+    //    rather than surface "missing cargo" as an error and force the
+    //    operator to run rustup themselves, we install a shared Rust
+    //    toolchain into /var/lib/computeza/toolchain/rust and symlink
+    //    cargo / rustc / rustup onto /usr/local/bin so the operator's
+    //    shell (and any subsequent install) sees them on $PATH
+    //    transparently. openssl used to be a hard prereq here too
+    //    (for the TLS cert step below); it's now generated in pure
+    //    Rust via rcgen, so no host openssl is needed.
     progress.set_phase(InstallPhase::DetectingBinaries);
-    progress.set_message("Verifying openssl is on PATH; ensuring Rust toolchain is installed");
-    require_on_path("openssl").await?;
+    progress.set_message("Ensuring Rust toolchain is installed");
     fs::create_dir_all(&opts.root_dir).await?;
     let cargo_path = crate::prerequisites::ensure_rust_toolchain(progress).await?;
 
@@ -108,7 +108,7 @@ pub async fn install(
 
     // 3. Self-signed TLS cert (kanidm requires TLS even on loopback).
     progress.set_phase(InstallPhase::Initdb);
-    progress.set_message("Generating self-signed TLS cert via openssl");
+    progress.set_message("Generating self-signed TLS cert (pure Rust via rcgen)");
     let data_dir = opts.root_dir.join("data");
     fs::create_dir_all(&data_dir).await?;
     let cert_path = opts.root_dir.join("cert.pem");
@@ -202,19 +202,6 @@ pub async fn detect_installed() -> Vec<crate::detect::DetectedInstall> {
     }]
 }
 
-async fn require_on_path(cmd: &str) -> Result<(), ServiceError> {
-    let out = Command::new("which").arg(cmd).output().await?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(ServiceError::Io(std::io::Error::other(format!(
-            "`{cmd}` not found on PATH. Kanidm install needs `openssl` (TLS cert generation) on the host. \
-             Debian / Ubuntu: `apt install openssl`. Fedora / RHEL: `dnf install openssl`. \
-             OpenSUSE: `zypper install openssl`. Arch: `pacman -S openssl`."
-        ))))
-    }
-}
-
 async fn cargo_install_kanidmd(
     cargo_bin: &Path,
     root_dir: &Path,
@@ -240,29 +227,48 @@ async fn cargo_install_kanidmd(
     Ok(())
 }
 
+/// Generate a self-signed TLS cert + private key for the local kanidm
+/// service. Pure Rust via `rcgen` -- no shell-out to `openssl`, so a
+/// virgin Linux host without the openssl CLI installed can still run
+/// the kanidm install path. The cert has CN=localhost and a SAN list
+/// of `["localhost", "127.0.0.1"]` so kanidm (and clients) accept it
+/// for the loopback bind that v0.0.x ships.
+///
+/// rcgen picks sane defaults (ECDSA P-256 / SHA-256, validity ending
+/// roughly 2 years from now) -- the previous openssl shell-out
+/// produced an RSA 2048 / 365-day cert, but the algorithm doesn't
+/// matter for a loopback-only self-signed cert and the longer expiry
+/// is operator-friendly.
 async fn generate_self_signed(cert: &Path, key: &Path) -> Result<(), ServiceError> {
-    let out = Command::new("openssl")
-        .arg("req")
-        .arg("-x509")
-        .arg("-newkey")
-        .arg("rsa:2048")
-        .arg("-nodes")
-        .arg("-keyout")
-        .arg(key)
-        .arg("-out")
-        .arg(cert)
-        .arg("-days")
-        .arg("365")
-        .arg("-subj")
-        .arg("/CN=localhost")
-        .output()
-        .await?;
-    if !out.status.success() {
-        return Err(ServiceError::Io(std::io::Error::other(format!(
-            "openssl self-signed cert generation failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        ))));
-    }
+    let cert_path = cert.to_path_buf();
+    let key_path = key.to_path_buf();
+    let (cert_pem, key_pem) =
+        tokio::task::spawn_blocking(move || -> Result<(String, String), rcgen::Error> {
+            let sans = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+            let key_pair = rcgen::KeyPair::generate()?;
+            let mut params = rcgen::CertificateParams::new(sans)?;
+            params.distinguished_name = {
+                let mut dn = rcgen::DistinguishedName::new();
+                dn.push(rcgen::DnType::CommonName, "localhost");
+                dn
+            };
+            let cert = params.self_signed(&key_pair)?;
+            Ok((cert.pem(), key_pair.serialize_pem()))
+        })
+        .await
+        .map_err(|e| {
+            ServiceError::Io(std::io::Error::other(format!(
+                "rcgen task join failed: {e}"
+            )))
+        })?
+        .map_err(|e| {
+            ServiceError::Io(std::io::Error::other(format!(
+                "rcgen self-signed cert generation failed: {e}"
+            )))
+        })?;
+
+    fs::write(&cert_path, cert_pem).await?;
+    fs::write(&key_path, key_pem).await?;
     Ok(())
 }
 

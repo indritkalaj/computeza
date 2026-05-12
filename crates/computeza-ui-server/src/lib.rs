@@ -3963,15 +3963,12 @@ pub fn render_install_kanidm(localizer: &Localizer) -> String {
     let service_name_placeholder = "computeza-kanidm";
     let root_dir_placeholder = root_dir_placeholder_for_leaf("kanidm");
 
-    // openssl: self-signed TLS cert generation at install time. Stays
-    // a hard host prereq because it's universally present on every
-    // supported distro's base install -- bundling it would be wasteful.
-    //
-    // cargo is intentionally NOT in this list. When cargo is missing
-    // the kanidm driver auto-bootstraps a sandboxed Rust toolchain
-    // into <root>/rust/ via prerequisites::ensure_bundled_cargo --
-    // see AGENTS.md "Host prerequisites" for the rationale.
-    let prereq_banner = render_prerequisite_banner(localizer, &missing_prerequisites(&["openssl"]));
+    // No host prereqs are surfaced for kanidm anymore: cargo is
+    // installed by prerequisites::ensure_rust_toolchain when missing,
+    // and the TLS cert step uses rcgen (pure Rust) instead of
+    // shelling out to openssl. The banner-rendering call stays so
+    // future per-component host deps can hook in here cleanly.
+    let prereq_banner = render_prerequisite_banner(localizer, &missing_prerequisites(&[]));
 
     let body = format!(
         r#"<section class="cz-hero">
@@ -6170,24 +6167,30 @@ mod tests {
 
     #[test]
     fn prereq_banner_renders_missing_command_with_install_hint() {
-        use computeza_driver_native::prerequisites::SYSTEM_COMMANDS;
+        use computeza_driver_native::prerequisites::SystemCommand;
         let l = Localizer::english();
-        let openssl = *SYSTEM_COMMANDS
-            .iter()
-            .find(|c| c.name == "openssl")
-            .expect("openssl row exists in SYSTEM_COMMANDS");
-        let html = render_prerequisite_banner(&l, &[openssl]);
+        // Synthesize the command rather than picking one out of
+        // SYSTEM_COMMANDS so the test stays decoupled from churn in
+        // that table (e.g. the table was emptied of hard host prereqs
+        // once cargo got auto-installed and openssl got replaced by
+        // rcgen).
+        let fake = SystemCommand {
+            name: "test-prereq-cmd",
+            required_for: "the unit-test purpose",
+            install_hint: "apt-get install -y test-prereq-cmd",
+        };
+        let html = render_prerequisite_banner(&l, &[fake]);
         assert!(
             html.contains("Host command missing"),
             "banner title from ui-prerequisite-banner-title should render"
         );
         assert!(
-            html.contains("openssl"),
+            html.contains("test-prereq-cmd"),
             "missing command name should render"
         );
         assert!(
-            html.contains("apt-get install -y openssl"),
-            "install hint should render verbatim from SYSTEM_COMMANDS"
+            html.contains("apt-get install -y test-prereq-cmd"),
+            "install hint should render verbatim"
         );
         assert!(
             html.contains("cz-badge-warn"),
