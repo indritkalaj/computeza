@@ -247,11 +247,15 @@ async fn install_hub_handler(State(state): State<AppState>) -> Html<String> {
 /// so the operator can re-attach the wizard after a browser refresh
 /// or navigation away.
 #[derive(Clone, Debug)]
-struct ActiveJob {
-    id: String,
-    running_slug: Option<String>,
-    components_done: usize,
-    components_total: usize,
+pub struct ActiveJob {
+    /// Opaque job id; used as the path component of `/install/job/{id}`.
+    pub id: String,
+    /// Slug of whichever component is currently running, if any.
+    pub running_slug: Option<String>,
+    /// How many components in the job's checklist have finished.
+    pub components_done: usize,
+    /// Total components in the job's checklist.
+    pub components_total: usize,
 }
 
 /// Return an entry for every job whose snapshot says it hasn't
@@ -3423,24 +3427,25 @@ fn canonical_defaults_for(slug: &str) -> (u16, String) {
     (port, format!("computeza-{slug}"))
 }
 
-/// Render one component card inside the unified install form. The card
-/// has two `<details>` disclosures:
+/// Render one component as a stackable accordion row inside the unified
+/// install form. Collapsed by default; the summary shows the
+/// component name, its one-line role description, and a status badge.
+/// Opening the row reveals the service-config inputs (service name,
+/// port, data dir, version) plus a v0.1+ placeholder block for the
+/// "Identity and access" surface (service account, credentials,
+/// permissions, upstream IdP federation).
 ///
-/// - **Service configuration** (open by default for available
-///   components): service name, port, data directory, version pin.
-///   Inputs use the `<slug>__<field>` naming convention so the unified
-///   POST handler can extract per-slug configs from a flat HashMap.
-/// - **Identity and access** (closed by default, marked v0.1+):
-///   placeholder for service account, initial admin credentials,
-///   group permissions, and upstream IdP federation
-///   (Entra ID / AWS IAM / GCP IAM / on-prem LDAP / Kerberos).
-///   No inputs render today because the underlying primitives
-///   (`computeza-secrets` binding, identity-federation crate) ship in
-///   v0.1+. The disclosure is here so the v0.1 shape is visible.
+/// A small inline JS hook flips a `Reviewed` badge on once the
+/// operator has expanded and then collapsed the row, so a vertical
+/// scan of the install page shows at-a-glance which components have
+/// been touched and which still need attention.
+///
+/// Inputs use the `<slug>__<field>` naming convention so the unified
+/// POST handler can extract per-slug configs from a flat HashMap.
+/// Blank fields fall through to driver defaults.
 fn render_unified_component_card(localizer: &Localizer, c: &ComponentEntry) -> String {
     let name = localizer.t(c.name_key);
     let role = localizer.t(c.role_key);
-    let service_config_label = localizer.t("ui-install-card-service-config");
     let identity_label = localizer.t("ui-install-card-identity");
     let identity_help = localizer.t("ui-install-card-identity-help");
     let identity_v01 = localizer.t("ui-install-card-identity-v01");
@@ -3451,60 +3456,67 @@ fn render_unified_component_card(localizer: &Localizer, c: &ComponentEntry) -> S
     let unavailable_msg = localizer.t("ui-install-component-unavailable");
     let status_available = localizer.t("ui-install-status-available");
     let status_planned = localizer.t("ui-install-status-planned");
+    let configured_label = localizer.t("ui-install-card-configured");
 
     let slug = c.slug;
     let (default_port, default_service) = canonical_defaults_for(slug);
 
     let (badge_class, badge_text) = if c.available {
-        ("cz-badge cz-badge-ok", status_available.as_str())
+        ("cz-badge cz-badge-info", status_available.as_str())
     } else {
         ("cz-badge cz-badge-info", status_planned.as_str())
     };
 
     let disabled_attr = if c.available { "" } else { " disabled" };
-    let open_attr = if c.available { " open" } else { "" };
 
     let unavailable_block = if c.available {
         String::new()
     } else {
         format!(
-            r#"<p class="cz-muted" style="margin: 0.5rem 0 0; font-size: 0.85rem;"><em>{}</em></p>"#,
+            r#"<p class="cz-muted" style="margin: 0 0 0.75rem; font-size: 0.85rem;"><em>{}</em></p>"#,
             html_escape(&unavailable_msg)
         )
     };
 
     format!(
-        r#"<div class="cz-card" id="card-{slug}">
-<h3 class="cz-card-title">{name}</h3>
-<p class="cz-card-body">{role}</p>
-<p class="cz-card-meta"><span class="{badge_class}">{badge_text}</span></p>
+        r#"<li class="cz-install-row" id="card-{slug}" style="margin-bottom: 0.5rem;">
+<details class="cz-install-details" style="background: rgba(255,255,255,0.04); border-radius: 0.6rem; overflow: hidden;">
+<summary class="cz-install-summary" style="cursor: pointer; padding: 0.85rem 1rem; display: flex; align-items: center; justify-content: space-between; gap: 1rem; list-style: none;">
+<div style="display: flex; flex-direction: column; gap: 0.2rem; flex: 1; min-width: 0;">
+<span style="font-weight: 600;">{name}</span>
+<span class="cz-muted" style="font-size: 0.82rem;">{role}</span>
+</div>
+<div style="display: flex; align-items: center; gap: 0.5rem; flex-shrink: 0;">
+<span class="{badge_class}">{badge_text}</span>
+<span class="cz-badge cz-badge-ok cz-install-configured-badge" style="display: none;">{configured_label}</span>
+</div>
+</summary>
+<div style="padding: 0.25rem 1rem 1rem;">
 {unavailable_block}
-<details style="margin-top: 0.75rem;"{open_attr}>
-<summary class="cz-tag" style="cursor: pointer;">{service_config_label}</summary>
-<div style="display: flex; flex-direction: column; gap: 0.6rem; margin-top: 0.75rem;">
-<label for="{slug}__service_name" style="display: block; font-size: 0.85rem;">{service_name_label}</label>
+<div style="display: flex; flex-direction: column; gap: 0.55rem;">
+<label for="{slug}__service_name" style="font-size: 0.85rem;">{service_name_label}</label>
 <input id="{slug}__service_name" name="{slug}__service_name" class="cz-input" type="text" placeholder="{default_service}" pattern="[A-Za-z0-9_-]+"{disabled_attr} />
-<label for="{slug}__port" style="display: block; font-size: 0.85rem;">{port_label}</label>
+<label for="{slug}__port" style="font-size: 0.85rem;">{port_label}</label>
 <input id="{slug}__port" name="{slug}__port" class="cz-input" type="number" min="1" max="65535" placeholder="{default_port}"{disabled_attr} />
-<label for="{slug}__root_dir" style="display: block; font-size: 0.85rem;">{data_dir_label}</label>
+<label for="{slug}__root_dir" style="font-size: 0.85rem;">{data_dir_label}</label>
 <input id="{slug}__root_dir" name="{slug}__root_dir" class="cz-input" type="text" placeholder="/var/lib/computeza/{slug}"{disabled_attr} />
-<label for="{slug}__version" style="display: block; font-size: 0.85rem;">{version_label}</label>
+<label for="{slug}__version" style="font-size: 0.85rem;">{version_label}</label>
 <input id="{slug}__version" name="{slug}__version" class="cz-input" type="text" placeholder="latest"{disabled_attr} />
 </div>
+<div style="margin-top: 0.85rem; padding: 0.75rem 0.9rem; border-radius: 0.5rem; background: rgba(245, 181, 68, 0.08); border: 1px solid rgba(245, 181, 68, 0.25);">
+<p style="margin: 0 0 0.35rem; font-weight: 600; font-size: 0.85rem;">{identity_label} <span class="cz-badge cz-badge-info" style="margin-left: 0.5rem;">{identity_v01}</span></p>
+<p class="cz-muted" style="margin: 0; font-size: 0.82rem;">{identity_help}</p>
+</div>
+</div>
 </details>
-<details style="margin-top: 0.5rem;">
-<summary class="cz-tag" style="cursor: pointer;">{identity_label} <span class="cz-badge cz-badge-info" style="margin-left: 0.5rem;">{identity_v01}</span></summary>
-<p class="cz-muted" style="margin: 0.6rem 0 0; font-size: 0.85rem;">{identity_help}</p>
-</details>
-</div>"#,
+</li>"#,
         slug = slug,
         name = html_escape(&name),
         role = html_escape(&role),
         badge_class = badge_class,
         badge_text = html_escape(badge_text),
+        configured_label = html_escape(&configured_label),
         unavailable_block = unavailable_block,
-        open_attr = open_attr,
-        service_config_label = html_escape(&service_config_label),
         identity_label = html_escape(&identity_label),
         identity_help = html_escape(&identity_help),
         identity_v01 = html_escape(&identity_v01),
@@ -3554,8 +3566,8 @@ pub fn render_install_hub(localizer: &Localizer, active: &[ActiveJob]) -> String
 {platform_banner}
 {active_banner}
 <form method="post" action="/install" style="display: contents;">
-<section class="cz-section">
-<div class="cz-card-grid">{cards}</div>
+<section class="cz-section" style="max-width: 60rem;">
+<ul class="cz-install-rows" style="list-style: none; padding: 0; margin: 0;">{cards}</ul>
 </section>
 <section class="cz-section" style="max-width: 60rem;">
 <div class="cz-card">
@@ -3563,7 +3575,29 @@ pub fn render_install_hub(localizer: &Localizer, active: &[ActiveJob]) -> String
 <button type="submit" class="cz-btn cz-btn-primary">{install_all_button}</button>
 </div>
 </section>
-</form>"#,
+</form>
+<script>
+// Light the per-row "Reviewed" badge once every enabled input in the
+// row holds a non-empty value. Watches input events so the badge
+// reflects the live field state -- blank rows stay un-badged so the
+// operator can scan vertically and see which components still need
+// attention, but a fully-filled row tells them "this one is done,
+// move on to the next".
+(function () {{
+  const rows = document.querySelectorAll(".cz-install-details");
+  rows.forEach(row => {{
+    const inputs = row.querySelectorAll("input.cz-input:not([disabled])");
+    const badge = row.querySelector(".cz-install-configured-badge");
+    if (!badge || inputs.length === 0) return;
+    function recompute() {{
+      const allFilled = Array.from(inputs).every(i => i.value.trim() !== "");
+      badge.style.display = allFilled ? "inline-block" : "none";
+    }}
+    inputs.forEach(i => i.addEventListener("input", recompute));
+    recompute();
+  }});
+}})();
+</script>"#,
         title = html_escape(&title),
         intro = html_escape(&intro),
         platform_banner = platform_banner,

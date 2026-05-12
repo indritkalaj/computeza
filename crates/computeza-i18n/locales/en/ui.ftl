@@ -105,6 +105,7 @@ ui-install-hub-intro     = Computeza is a single product made of 11 data-plane c
 # canonical dependency order.
 
 ui-install-card-service-config = Service configuration
+ui-install-card-configured     = Reviewed
 ui-install-card-identity       = Identity and access
 ui-install-card-identity-help  = Service account, initial admin credentials, group permissions, and upstream IdP federation (Entra ID, AWS IAM, GCP IAM, on-prem LDAP / Kerberos) configure here in v0.1+. Today every component installs against a loopback-trust auth surface so the operator console can observe it; bind credentials and federation in v0.1 once `computeza-secrets` is wired into the install flow.
 ui-install-card-identity-v01   = Configurable in v0.1+
