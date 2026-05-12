@@ -1,0 +1,152 @@
+syntax = "proto3";
+
+// Channel-partner provisioning + telemetry API.
+//
+// Implements the multi-tier resale chain product constraint from
+// AGENTS.md: resellers and OEMs need a programmatic surface for
+// tenant provisioning and aggregate telemetry without an operator
+// clicking through the web console. mTLS provides per-tier
+// authentication; the chain claim on the customer's license
+// authorises billable operations against the right tier.
+
+package computeza.channel_partner.v1;
+
+// Provisioning operations the reseller drives against an instance
+// of Computeza they're managing. Each request is authenticated via
+// the mTLS client cert; the cert's CN identifies the reseller tier.
+service ChannelPartner {
+  // Create a new tenant workspace inside the customer's Computeza
+  // install. Idempotent on tenant_id.
+  rpc ProvisionTenant(ProvisionTenantRequest) returns (ProvisionTenantResponse);
+
+  // Update an existing tenant's seat cap, branding, or status.
+  rpc UpdateTenant(UpdateTenantRequest) returns (UpdateTenantResponse);
+
+  // Deprovision a tenant. Removes the workspace + every resource
+  // scoped to it. Idempotent.
+  rpc DeprovisionTenant(DeprovisionTenantRequest) returns (DeprovisionTenantResponse);
+
+  // List every tenant the calling reseller has visibility into.
+  rpc ListTenants(ListTenantsRequest) returns (ListTenantsResponse);
+
+  // Stream aggregate telemetry events upward through the chain.
+  // The customer's local pipeline pre-aggregates so customer-private
+  // content never crosses the tier boundary.
+  rpc StreamTelemetry(stream TelemetryEvent) returns (TelemetryAcknowledgement);
+}
+
+message ProvisionTenantRequest {
+  // Stable identifier the reseller assigns. UUID v4 is the
+  // convention; the field is bytes so callers can use any 16-byte
+  // shape.
+  bytes tenant_id = 1;
+
+  // Human-readable display name surfaced in the operator console.
+  string display_name = 2;
+
+  // Seat cap for this tenant. Zero means "inherit from the
+  // reseller's chain entitlement".
+  uint32 seat_cap = 3;
+
+  // Optional per-tenant branding override (accent color, brand
+  // mark URL).
+  TenantBranding branding = 4;
+}
+
+message ProvisionTenantResponse {
+  // Workspace identifier as understood by the customer's
+  // computeza-state schema.
+  string workspace_id = 1;
+
+  // Timestamp the workspace became active.
+  int64 provisioned_at_unix_seconds = 2;
+}
+
+message UpdateTenantRequest {
+  bytes tenant_id = 1;
+
+  // Fields the reseller wants to update. Unset fields are not
+  // modified.
+  optional uint32 seat_cap = 2;
+  optional string display_name = 3;
+  optional TenantBranding branding = 4;
+  optional TenantStatus status = 5;
+}
+
+message UpdateTenantResponse {
+  string workspace_id = 1;
+}
+
+message DeprovisionTenantRequest {
+  bytes tenant_id = 1;
+
+  // When true, also deletes the metadata-store rows for every
+  // resource the tenant owned. Default (false) keeps the rows for
+  // audit purposes and just marks the workspace tombstoned.
+  bool purge_resources = 2;
+}
+
+message DeprovisionTenantResponse {
+  // True when the tenant was found + deprovisioned; false when no
+  // matching tenant_id existed (idempotent semantics).
+  bool removed = 1;
+}
+
+message ListTenantsRequest {
+  // Pagination cursor from a previous response. Empty for the
+  // first page.
+  string page_token = 1;
+
+  // Page size cap. Server ignores values > 1000.
+  uint32 page_size = 2;
+}
+
+message ListTenantsResponse {
+  repeated TenantSummary tenants = 1;
+
+  // Empty when the result set is exhausted.
+  string next_page_token = 2;
+}
+
+message TenantSummary {
+  bytes tenant_id = 1;
+  string workspace_id = 2;
+  string display_name = 3;
+  uint32 seat_cap = 4;
+  TenantStatus status = 5;
+  int64 provisioned_at_unix_seconds = 6;
+}
+
+enum TenantStatus {
+  TENANT_STATUS_UNSPECIFIED = 0;
+  TENANT_STATUS_ACTIVE = 1;
+  TENANT_STATUS_SUSPENDED = 2;
+  TENANT_STATUS_TOMBSTONED = 3;
+}
+
+message TenantBranding {
+  // Hex accent color (#AABBCC or #ABC). Empty resets to default.
+  string accent_color = 1;
+  // URL the operator console fetches the brand SVG from. Empty
+  // resets to default.
+  string brand_svg_url = 2;
+}
+
+message TelemetryEvent {
+  bytes tenant_id = 1;
+  int64 at_unix_seconds = 2;
+  // Aggregate counter / gauge name. Customer-private content (user
+  // names, query text, payload data) must never cross this boundary.
+  string metric = 3;
+  double value = 4;
+  // Free-form tags, kept opaque server-side.
+  map<string, string> tags = 5;
+}
+
+message TelemetryAcknowledgement {
+  uint64 accepted_count = 1;
+  // Empty when every event was accepted; populated with the indexes
+  // of rejected events when the customer's local pipeline includes
+  // anything classifier-flagged.
+  repeated uint64 rejected_indexes = 2;
+}

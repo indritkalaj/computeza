@@ -1,0 +1,36 @@
+[package]
+name = "computeza-channel-partner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Channel-partner gRPC API -- provisioning + telemetry surface for resellers and OEMs (mTLS)"
+
+[lints]
+workspace = true
+
+[dependencies]
+tonic = { version = "0.14", default-features = false, features = ["codegen", "server", "router", "transport", "tls-aws-lc"] }
+tonic-prost = "0.14"
+prost = "0.14"
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[build-dependencies]
+# tonic-build 0.14 codegen for the gRPC server/client stubs +
+# tonic-prost-build for the prost message codegen. We hand both a
+# FileDescriptorSet from protox (pure-Rust .proto compiler) so no
+# host protoc is needed -- the build works on a virgin CI runner
+# without `apt install protobuf-compiler`.
+tonic-build = "0.14"
+tonic-prost-build = "0.14"
+protox = "0.9"
+
+[dev-dependencies]
+tokio = { workspace = true }
