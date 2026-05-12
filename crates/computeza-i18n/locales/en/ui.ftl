@@ -92,6 +92,24 @@ ui-landing-audience-3-role  = Resellers and OEMs
 ui-landing-audience-3-title = Brand it, bill it, ship it as your data product.
 ui-landing-audience-3-body  = The console renders through CSS-variable theming and accepts a tenant-supplied SVG mark. The license envelope carries your tier; the channel-partner API drives provisioning at scale; downstream telemetry aggregates upward without exposing customer content.
 
+# --- Trust + compliance pillars (new section, between Features and Audiences) ---
+
+ui-landing-trust-eyebrow  = Trust
+ui-landing-trust-title    = Compliance evidence as a side-effect
+ui-landing-trust-subtitle = Four built-in surfaces that shorten the regulated-buyer evaluation cycle. Every primitive ships in the binary; activation is operator-driven, never bolted on.
+
+ui-landing-trust-1-title  = Signed license envelopes
+ui-landing-trust-1-body   = Ed25519-signed multi-tier resale chain. Seat caps + expiry kill-switch enforced offline; the activation handler verifies against the binary's trusted root before persisting. Replace, deactivate, and audit every change.
+
+ui-landing-trust-2-title  = Encrypted secrets at rest
+ui-landing-trust-2-body   = AES-256-GCM under an Argon2id-derived key (m=64 MiB, t=3, p=1 -- OWASP 2025 baseline). Zeroize-on-drop. First-boot wizard generates and templates the systemd drop-in for you.
+
+ui-landing-trust-3-title  = Post-quantum readiness
+ui-landing-trust-3-body   = TLS handshakes already offer the hybrid X25519MLKEM768 group via rustls + aws-lc-rs. License envelopes carry a dual-signature shape (Ed25519 + ML-DSA / FIPS 204) so a future quantum break of Ed25519 alone does not invalidate entitlements.
+
+ui-landing-trust-4-title  = EU AI Act deployer evidence
+ui-landing-trust-4-body   = Annex IV model cards, Article 5 prohibited-classification refusal, Article 9-15 evidence checklist, Article 50 transparency primitive. Designed to support deployer compliance with Regulation (EU) 2024/1689 (effective for high-risk systems on 2 August 2026).
+
 # --- Pricing ---
 
 ui-landing-pricing-eyebrow  = Pricing
@@ -109,13 +127,13 @@ ui-landing-pricing-1-feature-4 = Local-only deployment (single host)
 ui-landing-pricing-1-feature-5 = Community support via GitHub issues
 ui-landing-pricing-1-cta      = Download
 
-ui-landing-pricing-2-name     = Pro
-ui-landing-pricing-2-price    = $40
-ui-landing-pricing-2-unit     = / seat / month
-ui-landing-pricing-2-tagline  = For small platform teams putting Computeza into production.
+ui-landing-pricing-2-name     = Standard
+ui-landing-pricing-2-price    = 49.99 EUR
+ui-landing-pricing-2-unit     = / seat / month, up to 100 seats
+ui-landing-pricing-2-tagline  = For SMB platform teams putting Computeza into production -- seat-capped, self-service, signed license.
 ui-landing-pricing-2-feature-1 = Everything in Community
-ui-landing-pricing-2-feature-2 = Priority support (24h response)
-ui-landing-pricing-2-feature-3 = Multi-host orchestration
+ui-landing-pricing-2-feature-2 = Signed license envelope with seat cap + expiry kill-switch
+ui-landing-pricing-2-feature-3 = Priority support (24h response)
 ui-landing-pricing-2-feature-4 = Audit-log export to external SIEM
 ui-landing-pricing-2-feature-5 = Early access to v0.1 federation features
 ui-landing-pricing-2-cta      = Start free trial
@@ -125,11 +143,11 @@ ui-landing-pricing-3-name     = Enterprise
 ui-landing-pricing-3-price    = Custom
 ui-landing-pricing-3-unit     = annual contract
 ui-landing-pricing-3-tagline  = For regulated industries, sovereign workloads, and reseller chains.
-ui-landing-pricing-3-feature-1 = Everything in Pro
+ui-landing-pricing-3-feature-1 = Everything in Standard, no seat cap
 ui-landing-pricing-3-feature-2 = SLA-backed support (4h critical)
 ui-landing-pricing-3-feature-3 = White-label theming + brand SVG
 ui-landing-pricing-3-feature-4 = Multi-tier license chain + reseller billing
-ui-landing-pricing-3-feature-5 = Dedicated security review on every release
+ui-landing-pricing-3-feature-5 = EU AI Act compliance + dedicated security review
 ui-landing-pricing-3-feature-6 = Channel-partner gRPC API for provisioning
 ui-landing-pricing-3-cta      = Contact sales
 

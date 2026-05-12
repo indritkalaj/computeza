@@ -33,6 +33,7 @@ computeza-reconciler-postgres = { workspace = true }
 computeza-secrets = { workspace = true }
 computeza-audit = { workspace = true }
 computeza-license = { workspace = true }
+computeza-compliance = { workspace = true }
 secrecy = { workspace = true }
 chrono = { workspace = true }
 serde_json = { workspace = true }

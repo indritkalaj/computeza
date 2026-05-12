@@ -538,6 +538,7 @@ dependencies = [
  "chrono",
  "clap",
  "computeza-audit",
+ "computeza-compliance",
  "computeza-core",
  "computeza-driver-native",
  "computeza-i18n",
@@ -590,6 +591,19 @@ dependencies = [
  "tonic-build",
  "tonic-prost",
  "tonic-prost-build",
+ "tracing",
+]
+
+[[package]]
+name = "computeza-compliance"
+version = "0.0.1"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
  "tracing",
 ]
 
@@ -973,6 +987,7 @@ dependencies = [
  "chrono",
  "computeza-audit",
  "computeza-channel-partner",
+ "computeza-compliance",
  "computeza-core",
  "computeza-driver-native",
  "computeza-i18n",

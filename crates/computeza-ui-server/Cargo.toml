@@ -22,6 +22,7 @@ computeza-audit = { workspace = true }
 computeza-identity-federation = { workspace = true }
 computeza-license = { workspace = true }
 computeza-channel-partner = { workspace = true }
+computeza-compliance = { workspace = true }
 aes-gcm = { workspace = true }
 secrecy = { workspace = true }
 argon2 = { workspace = true }

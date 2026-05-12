@@ -215,6 +215,27 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
+                // EU AI Act model-card registry. JSONL next to the
+                // state DB. Failures here are non-fatal -- the
+                // operator can still use the rest of the console.
+                let model_cards_path = parent.join("model-cards.jsonl");
+                match computeza_compliance::ModelCardRegistry::open(&model_cards_path).await {
+                    Ok(registry) => {
+                        tracing::info!(
+                            path = %model_cards_path.display(),
+                            "model card registry attached"
+                        );
+                        state = state.with_model_cards(registry);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            path = %model_cards_path.display(),
+                            "could not open model-card registry; EU AI Act evidence pages will be unavailable"
+                        );
+                    }
+                }
+
                 // License envelope. Verified against the binary's
                 // baked-in trusted root + the current time at boot;
                 // failures fall back to Community mode (we log + keep

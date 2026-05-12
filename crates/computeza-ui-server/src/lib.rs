@@ -107,6 +107,10 @@ pub struct AppState {
     /// surface where there is no state directory; activation /
     /// deactivation is a no-op in that mode.
     pub license_path: Option<Arc<std::path::PathBuf>>,
+    /// EU AI Act model-card registry. `None` for the smoke-test
+    /// surface; the binary opens one at
+    /// `<state_db_parent>/model-cards.jsonl` at boot.
+    pub model_cards: Option<computeza_compliance::ModelCardRegistry>,
 }
 
 impl AppState {
@@ -122,6 +126,7 @@ impl AppState {
             audit: None,
             license: Arc::new(tokio::sync::RwLock::new(None)),
             license_path: None,
+            model_cards: None,
         }
     }
 
@@ -137,6 +142,7 @@ impl AppState {
             audit: None,
             license: Arc::new(tokio::sync::RwLock::new(None)),
             license_path: None,
+            model_cards: None,
         }
     }
 
@@ -168,6 +174,14 @@ impl AppState {
     #[must_use]
     pub fn with_license_path(mut self, path: std::path::PathBuf) -> Self {
         self.license_path = Some(Arc::new(path));
+        self
+    }
+
+    /// Attach the EU AI Act model-card registry. Typically opened
+    /// at `<state_db_parent>/model-cards.jsonl` at boot.
+    #[must_use]
+    pub fn with_model_cards(mut self, registry: computeza_compliance::ModelCardRegistry) -> Self {
+        self.model_cards = Some(registry);
         self
     }
 
@@ -765,6 +779,19 @@ pub fn router_with_state(state: AppState) -> Router {
             post(admin_license_deactivate_handler),
         )
         .route("/admin/pq-status", get(admin_pq_status_handler))
+        .route("/compliance/eu-ai-act", get(compliance_eu_ai_act_handler))
+        .route(
+            "/compliance/models",
+            get(compliance_models_list_handler).post(compliance_models_create_handler),
+        )
+        .route(
+            "/compliance/models/{id}",
+            get(compliance_models_detail_handler),
+        )
+        .route(
+            "/compliance/models/{id}/delete",
+            post(compliance_models_delete_handler),
+        )
         .route("/api/license/status", get(api_license_status_handler))
         .route("/healthz", get(healthz_handler))
         .route("/api/state/info", get(state_info_handler))
@@ -4621,6 +4648,195 @@ async fn admin_license_deactivate_handler(
     Redirect303("/admin/license".into()).into_response()
 }
 
+/// GET /compliance/eu-ai-act -- overview of the deployer's
+/// obligations under the EU AI Act (Regulation (EU) 2024/1689).
+/// Renders the Article 9-72 checklist; cross-links to the model
+/// card registry so the deployer can attach evidence per article.
+async fn compliance_eu_ai_act_handler() -> Html<String> {
+    let l = Localizer::english();
+    Html(render_compliance_eu_ai_act(&l))
+}
+
+/// GET /compliance/models -- list every registered model card.
+async fn compliance_models_list_handler(State(state): State<AppState>) -> Html<String> {
+    let l = Localizer::english();
+    let cards = match &state.model_cards {
+        Some(r) => r.list().await,
+        None => Vec::new(),
+    };
+    Html(render_compliance_models_list(
+        &l,
+        &cards,
+        state.model_cards.is_some(),
+        None,
+    ))
+}
+
+#[derive(serde::Deserialize)]
+struct CreateModelCardForm {
+    id: String,
+    name: String,
+    risk: String,
+    rationale: String,
+    intended_use: String,
+    training_data_summary: String,
+    limitations: String,
+    human_oversight_design: String,
+}
+
+/// POST /compliance/models -- register a fresh model card.
+async fn compliance_models_create_handler(
+    State(state): State<AppState>,
+    axum::Extension(session): axum::Extension<auth::Session>,
+    Form(form): Form<CreateModelCardForm>,
+) -> Response {
+    let l = Localizer::english();
+    let Some(registry) = &state.model_cards else {
+        return Html(render_compliance_models_list(
+            &l,
+            &[],
+            false,
+            Some(
+                "No model-card registry attached on this server. The smoke-test surface does not persist cards.",
+            ),
+        ))
+        .into_response();
+    };
+    let risk = match form.risk.as_str() {
+        "high-risk" => computeza_compliance::RiskClassification::HighRisk,
+        "limited-risk" => computeza_compliance::RiskClassification::LimitedRisk,
+        "minimal" => computeza_compliance::RiskClassification::Minimal,
+        "prohibited" => {
+            // Reject at the form-handler too -- the registry would
+            // reject anyway, this surfaces the message earlier.
+            let cards = registry.list().await;
+            return Html(render_compliance_models_list(
+                &l,
+                &cards,
+                true,
+                Some(
+                    "Prohibited classifications (Article 5 / Title II) cannot be registered. Remove the system from your AI workspace before continuing.",
+                ),
+            ))
+            .into_response();
+        }
+        other => {
+            let cards = registry.list().await;
+            return Html(render_compliance_models_list(
+                &l,
+                &cards,
+                true,
+                Some(&format!(
+                    "Unknown risk classification: {other}. Expected one of: high-risk / limited-risk / minimal."
+                )),
+            ))
+            .into_response();
+        }
+    };
+    let now = chrono::Utc::now();
+    let card = computeza_compliance::ModelCard {
+        id: form.id.trim().to_string(),
+        name: form.name.trim().to_string(),
+        risk,
+        risk_justification: computeza_compliance::RiskJustification {
+            rationale: form.rationale,
+            citations: Vec::new(),
+        },
+        intended_use: form.intended_use,
+        training_data_summary: form.training_data_summary,
+        limitations: form.limitations,
+        human_oversight_design: form.human_oversight_design,
+        evaluation_metrics: Vec::new(),
+        deployments: Vec::new(),
+        article_evidence: Vec::new(),
+        created_at: now,
+        updated_at: now,
+    };
+    if let Err(e) = registry.create(card.clone()).await {
+        let cards = registry.list().await;
+        return Html(render_compliance_models_list(
+            &l,
+            &cards,
+            true,
+            Some(&e.to_string()),
+        ))
+        .into_response();
+    }
+    if let Some(audit) = &state.audit {
+        let _ = audit
+            .append(
+                session.username.clone(),
+                computeza_audit::Action::UserAction,
+                Some(format!("model-card/{}", card.id)),
+                serde_json::json!({
+                    "action": "register_model_card",
+                    "id": card.id,
+                    "risk": card.risk.slug(),
+                }),
+            )
+            .await;
+    }
+    Redirect303(format!("/compliance/models/{}", urlencoding_min(&card.id))).into_response()
+}
+
+/// GET /compliance/models/{id} -- single model card view.
+async fn compliance_models_detail_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let l = Localizer::english();
+    let Some(registry) = &state.model_cards else {
+        return (
+            StatusCode::NOT_FOUND,
+            Html(render_compliance_models_list(
+                &l,
+                &[],
+                false,
+                Some("No model-card registry attached on this server."),
+            )),
+        )
+            .into_response();
+    };
+    match registry.get(&id).await {
+        Some(card) => Html(render_compliance_model_detail(&l, &card)).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Html(format!(
+                "<!DOCTYPE html><html><body style=\"font-family:sans-serif;padding:2rem;\"><h1>Model card not found</h1><p>No card registered with id <code>{}</code>.</p><p><a href=\"/compliance/models\">Back to registry</a></p></body></html>",
+                html_escape(&id),
+            )),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /compliance/models/{id}/delete -- remove a card from the
+/// registry. Audit-logged.
+async fn compliance_models_delete_handler(
+    State(state): State<AppState>,
+    axum::Extension(session): axum::Extension<auth::Session>,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(registry) = &state.model_cards else {
+        return Redirect303("/compliance/models".into()).into_response();
+    };
+    let _ = registry.delete(&id).await;
+    if let Some(audit) = &state.audit {
+        let _ = audit
+            .append(
+                session.username.clone(),
+                computeza_audit::Action::UserAction,
+                Some(format!("model-card/{id}")),
+                serde_json::json!({
+                    "action": "delete_model_card",
+                    "id": id,
+                }),
+            )
+            .await;
+    }
+    Redirect303("/compliance/models".into()).into_response()
+}
+
 /// GET /admin/pq-status -- read-only render of the binary's
 /// post-quantum posture. Tracks two surfaces independently:
 ///
@@ -4756,6 +4972,9 @@ pub enum NavLink {
     Branding,
     /// Admin license envelope viewer.
     License,
+    /// EU AI Act compliance evidence (model card registry +
+    /// Article checklist).
+    Compliance,
     /// No nav link highlighted (e.g. resource detail page).
     None,
 }
@@ -4823,6 +5042,7 @@ pub fn render_shell(
     <a href="/admin/workspaces" class="{nwsp}">{nav_admin_workspaces}</a>
     <a href="/admin/branding" class="{nbrd}">{nav_admin_branding}</a>
     <a href="/admin/license" class="{nlic}">{nav_admin_license}</a>
+    <a href="/compliance/eu-ai-act" class="{ncmp}">Compliance</a>
     <a href="/account" class="{nacc}">{nav_account}</a>
   </div>
 </nav>
@@ -4894,6 +5114,7 @@ pub fn render_shell(
         nwsp = nav_class(NavLink::Workspaces),
         nbrd = nav_class(NavLink::Branding),
         nlic = nav_class(NavLink::License),
+        ncmp = nav_class(NavLink::Compliance),
         nacc = nav_class(NavLink::Account),
     )
 }
@@ -5008,6 +5229,53 @@ pub fn render_landing_page(localizer: &Localizer) -> String {
                 icon = html_escape(icon),
                 t = html_escape(t),
                 b = html_escape(b),
+            )
+        })
+        .collect();
+
+    // Trust + compliance pillars
+    let trust_eyebrow = localizer.t("ui-landing-trust-eyebrow");
+    let trust_title = localizer.t("ui-landing-trust-title");
+    let trust_subtitle = localizer.t("ui-landing-trust-subtitle");
+    let trust_pillars = [
+        (
+            localizer.t("ui-landing-trust-1-title"),
+            localizer.t("ui-landing-trust-1-body"),
+            "/admin/license",
+            "License envelope",
+        ),
+        (
+            localizer.t("ui-landing-trust-2-title"),
+            localizer.t("ui-landing-trust-2-body"),
+            "/admin/secrets",
+            "Secrets setup",
+        ),
+        (
+            localizer.t("ui-landing-trust-3-title"),
+            localizer.t("ui-landing-trust-3-body"),
+            "/admin/pq-status",
+            "PQ readiness",
+        ),
+        (
+            localizer.t("ui-landing-trust-4-title"),
+            localizer.t("ui-landing-trust-4-body"),
+            "/compliance/eu-ai-act",
+            "EU AI Act",
+        ),
+    ];
+    let trust_cards: String = trust_pillars
+        .iter()
+        .map(|(t, b, href, link)| {
+            format!(
+                r#"<div class="cz-feature">
+<h3 class="cz-feature-title">{t}</h3>
+<p class="cz-feature-body">{b}</p>
+<p style="margin: 0.6rem 0 0; font-size: 0.85rem;"><a href="{href}">{link} -&gt;</a></p>
+</div>"#,
+                t = html_escape(t),
+                b = html_escape(b),
+                href = html_escape(href),
+                link = html_escape(link),
             )
         })
         .collect();
@@ -5150,6 +5418,15 @@ pub fn render_landing_page(localizer: &Localizer) -> String {
 
 <section class="cz-landing-section">
 <div class="cz-landing-section-head">
+<p class="cz-landing-section-eyebrow">{trust_eyebrow}</p>
+<h2 class="cz-landing-section-title">{trust_title}</h2>
+<p class="cz-landing-section-subtitle">{trust_subtitle}</p>
+</div>
+<div class="cz-feature-grid">{trust_cards}</div>
+</section>
+
+<section class="cz-landing-section">
+<div class="cz-landing-section-head">
 <p class="cz-landing-section-eyebrow">{audiences_eyebrow}</p>
 <h2 class="cz-landing-section-title">{audiences_title}</h2>
 <p class="cz-landing-section-subtitle">{audiences_subtitle}</p>
@@ -5202,6 +5479,10 @@ pub fn render_landing_page(localizer: &Localizer) -> String {
         features_title = html_escape(&features_title),
         features_subtitle = html_escape(&features_subtitle),
         feature_cards = feature_cards,
+        trust_eyebrow = html_escape(&trust_eyebrow),
+        trust_title = html_escape(&trust_title),
+        trust_subtitle = html_escape(&trust_subtitle),
+        trust_cards = trust_cards,
         audiences_eyebrow = html_escape(&audiences_eyebrow),
         audiences_title = html_escape(&audiences_title),
         audiences_subtitle = html_escape(&audiences_subtitle),
@@ -8436,6 +8717,299 @@ pub fn render_admin_branding(
     render_shell(localizer, &title, NavLink::Branding, &body)
 }
 
+/// Render `GET /compliance/eu-ai-act` -- overview of the deployer's
+/// obligations + Article 9-72 checklist.
+#[must_use]
+pub fn render_compliance_eu_ai_act(localizer: &Localizer) -> String {
+    let title = "EU AI Act compliance";
+    let intro = "Computeza supports deployer-side compliance with Regulation (EU) 2024/1689. \
+                 High-risk obligations take effect on 2 August 2026; the checklist below maps each \
+                 Article to the artefacts Computeza captures automatically and the ones the \
+                 deployer must produce.";
+    let positioning = "Important: Computeza is a tooling vendor, not a co-deployer. Activating \
+                       these features helps you produce evidence -- it does not by itself make \
+                       your AI system Act-compliant. Marketing language matters legally here.";
+    let articles = computeza_compliance::eu_ai_act_articles();
+    let rows: String = articles
+        .iter()
+        .map(|a| {
+            format!(
+                r#"<tr>
+<td><strong>Art {article}</strong></td>
+<td>{title}</td>
+<td class="cz-muted">{obligation}</td>
+<td class="cz-muted" style="font-size: 0.78rem;">{evidence}</td>
+</tr>"#,
+                article = html_escape(a.article),
+                title = html_escape(a.title),
+                obligation = html_escape(a.obligation),
+                evidence = html_escape(a.evidence_source),
+            )
+        })
+        .collect();
+    let body = format!(
+        r#"<section class="cz-hero">
+<h1>{title}</h1>
+<p>{intro}</p>
+</section>
+<section class="cz-section">
+<div class="cz-card" style="border-color: rgba(245, 181, 68, 0.55);">
+<p class="cz-card-body" style="margin: 0;">{positioning}</p>
+</div>
+</section>
+<section class="cz-section">
+<div class="cz-card">
+<h3 style="margin: 0 0 0.6rem;">Article checklist</h3>
+<table class="cz-table" style="width: 100%;">
+<thead><tr><th>Article</th><th>Title</th><th>Obligation</th><th>Evidence source</th></tr></thead>
+<tbody>
+{rows}
+</tbody>
+</table>
+</div>
+</section>
+<section class="cz-section">
+<div class="cz-card">
+<h3 style="margin: 0 0 0.4rem;">Next step</h3>
+<p class="cz-muted" style="margin: 0 0 0.8rem; font-size: 0.85rem;">Register a model card for each AI system in your workspace. The registry produces the Annex IV technical documentation per system, links it to the audit log, and flags Prohibited classifications before they can deploy.</p>
+<a href="/compliance/models" class="cz-btn cz-btn-primary">Open the model card registry</a>
+</div>
+</section>"#,
+        title = html_escape(title),
+        intro = html_escape(intro),
+        positioning = html_escape(positioning),
+        rows = rows,
+    );
+    render_shell(localizer, title, NavLink::Compliance, &body)
+}
+
+/// Render `GET /compliance/models` -- listing of all registered
+/// cards + a create form. When `registry_attached` is false, the
+/// page shows a smoke-test explanation card.
+#[must_use]
+pub fn render_compliance_models_list(
+    localizer: &Localizer,
+    cards: &[computeza_compliance::ModelCard],
+    registry_attached: bool,
+    error_message: Option<&str>,
+) -> String {
+    let title = "Model card registry";
+    let intro = "Annex IV technical documentation per AI system, persisted as JSONL next to the \
+                 state DB. One row per system; the deployer's classification cascades into the \
+                 Article 9-15 evidence checklist.";
+    let error_block = error_message
+        .map(|msg| {
+            format!(
+                r#"<div class="cz-card" style="border-color: rgba(255, 157, 166, 0.55); margin-bottom: 1rem;">
+<p class="cz-card-body" style="margin: 0; color: var(--fail);">{}</p>
+</div>"#,
+                html_escape(msg)
+            )
+        })
+        .unwrap_or_default();
+    if !registry_attached {
+        let body = format!(
+            r#"<section class="cz-hero">
+<h1>{title}</h1>
+<p>{intro}</p>
+</section>
+<section class="cz-section">
+<div class="cz-card" style="border-color: rgba(245, 181, 68, 0.55);">
+<p class="cz-card-body" style="margin: 0;">No model-card registry attached on this server. The real binary opens one at <code>&lt;state_db_parent&gt;/model-cards.jsonl</code> at boot.</p>
+</div>
+</section>"#,
+            title = html_escape(title),
+            intro = html_escape(intro),
+        );
+        return render_shell(localizer, title, NavLink::Compliance, &body);
+    }
+    let rows: String = if cards.is_empty() {
+        r#"<tr><td colspan="4" class="cz-muted" style="text-align: center; padding: 1.5rem;">No cards registered yet. Use the form below to register the first one.</td></tr>"#.into()
+    } else {
+        cards
+            .iter()
+            .map(|c| {
+                let badge_class = match c.risk {
+                    computeza_compliance::RiskClassification::HighRisk => "cz-badge cz-badge-warn",
+                    computeza_compliance::RiskClassification::LimitedRisk => "cz-badge",
+                    computeza_compliance::RiskClassification::Minimal => "cz-badge",
+                    computeza_compliance::RiskClassification::Prohibited => "cz-badge",
+                };
+                let complete = if matches!(c.risk, computeza_compliance::RiskClassification::HighRisk) {
+                    if c.high_risk_evidence_complete() {
+                        r#"<span class="cz-badge" style="background: rgba(95, 207, 156, 0.18);">Art 9-15 complete</span>"#
+                    } else {
+                        r#"<span class="cz-badge cz-badge-warn">Art 9-15 incomplete</span>"#
+                    }
+                } else {
+                    ""
+                };
+                format!(
+                    r#"<tr>
+<td><a href="/compliance/models/{id_enc}"><code>{id}</code></a></td>
+<td>{name}</td>
+<td><span class="{badge_class}">{risk}</span> {complete}</td>
+<td class="cz-cell-mono cz-cell-dim">{updated}</td>
+</tr>"#,
+                    id = html_escape(&c.id),
+                    id_enc = urlencoding_min(&c.id),
+                    name = html_escape(&c.name),
+                    risk = html_escape(c.risk.label()),
+                    badge_class = badge_class,
+                    complete = complete,
+                    updated = html_escape(&c.updated_at.to_rfc3339()),
+                )
+            })
+            .collect()
+    };
+    let body = format!(
+        r#"<section class="cz-hero">
+<h1>{title}</h1>
+<p>{intro}</p>
+</section>
+{error_block}
+<section class="cz-section">
+<div class="cz-card">
+<table class="cz-table" style="width: 100%;">
+<thead><tr><th>ID</th><th>Name</th><th>Risk</th><th>Updated</th></tr></thead>
+<tbody>
+{rows}
+</tbody>
+</table>
+</div>
+</section>
+<section class="cz-section">
+<div class="cz-card">
+<h3 style="margin: 0 0 0.4rem;">Register a model card</h3>
+<p class="cz-muted" style="margin: 0 0 0.85rem; font-size: 0.85rem;">Prohibited classifications (Article 5) are refused -- remove the system before registering. High-risk cards auto-surface the Article 9-15 evidence checklist on the detail page.</p>
+<form method="post" action="/compliance/models" class="cz-form" style="max-width: none;">
+<input type="hidden" name="csrf_token" value="" />
+<label for="card-id">ID (stable slug -- UUID, kebab-case slug, etc.)</label>
+<input id="card-id" name="id" class="cz-input" type="text" required pattern="[A-Za-z0-9_\-]+" maxlength="64" />
+<label for="card-name">Display name</label>
+<input id="card-name" name="name" class="cz-input" type="text" required maxlength="200" />
+<label for="card-risk">Risk classification</label>
+<select id="card-risk" name="risk" class="cz-input" required>
+<option value="">-- select --</option>
+<option value="high-risk">High-risk (Annex III)</option>
+<option value="limited-risk">Limited risk (Article 50)</option>
+<option value="minimal">Minimal risk</option>
+</select>
+<label for="card-rationale">Risk justification rationale</label>
+<textarea id="card-rationale" name="rationale" class="cz-input" rows="3" required></textarea>
+<label for="card-intended">Intended use (Article 13)</label>
+<textarea id="card-intended" name="intended_use" class="cz-input" rows="3" required></textarea>
+<label for="card-training">Training data summary (Article 10)</label>
+<textarea id="card-training" name="training_data_summary" class="cz-input" rows="3" required></textarea>
+<label for="card-limits">Known limitations (Article 13)</label>
+<textarea id="card-limits" name="limitations" class="cz-input" rows="3" required></textarea>
+<label for="card-oversight">Human oversight design (Article 14)</label>
+<textarea id="card-oversight" name="human_oversight_design" class="cz-input" rows="3" required></textarea>
+<button type="submit" class="cz-btn cz-btn-primary" style="margin-top: 0.5rem;">Register card</button>
+</form>
+</div>
+</section>"#,
+        title = html_escape(title),
+        intro = html_escape(intro),
+        error_block = error_block,
+        rows = rows,
+    );
+    render_shell(localizer, title, NavLink::Compliance, &body)
+}
+
+/// Render `GET /compliance/models/{id}` -- single card detail.
+#[must_use]
+pub fn render_compliance_model_detail(
+    localizer: &Localizer,
+    card: &computeza_compliance::ModelCard,
+) -> String {
+    let evidence_table = if matches!(
+        card.risk,
+        computeza_compliance::RiskClassification::HighRisk
+    ) {
+        let articles = computeza_compliance::eu_ai_act_articles();
+        let rows: String = articles
+            .iter()
+            .filter(|a| matches!(a.article, "9" | "10" | "11" | "12" | "13" | "14" | "15"))
+            .map(|a| {
+                let attached: Vec<_> = card
+                    .article_evidence
+                    .iter()
+                    .filter(|e| e.article == a.article)
+                    .collect();
+                let status = if attached.is_empty() {
+                    r#"<span class="cz-badge cz-badge-warn">No evidence yet</span>"#.to_string()
+                } else {
+                    format!(
+                        r#"<span class="cz-badge">{} artefact(s)</span>"#,
+                        attached.len()
+                    )
+                };
+                format!(
+                    r#"<tr><td><strong>Art {art}</strong></td><td>{title}</td><td>{status}</td></tr>"#,
+                    art = html_escape(a.article),
+                    title = html_escape(a.title),
+                    status = status,
+                )
+            })
+            .collect();
+        format!(
+            r#"<section class="cz-section">
+<div class="cz-card">
+<h3 style="margin: 0 0 0.5rem;">Article 9-15 evidence checklist</h3>
+<table class="cz-table" style="width: 100%;"><thead><tr><th>Article</th><th>Title</th><th>Evidence</th></tr></thead><tbody>{rows}</tbody></table>
+</div>
+</section>"#,
+            rows = rows,
+        )
+    } else {
+        String::new()
+    };
+    let title = format!("Model card: {}", card.name);
+    let body = format!(
+        r#"<section class="cz-hero">
+<h1>{name}</h1>
+<p><code>{id}</code> &middot; <span class="cz-badge">{risk}</span></p>
+</section>
+<section class="cz-section">
+<div class="cz-card">
+<dl class="cz-dl">
+<dt>Intended use (Art 13)</dt><dd>{intended}</dd>
+<dt>Training data summary (Art 10)</dt><dd>{training}</dd>
+<dt>Limitations (Art 13)</dt><dd>{limits}</dd>
+<dt>Human oversight design (Art 14)</dt><dd>{oversight}</dd>
+<dt>Risk justification</dt><dd>{rationale}</dd>
+<dt>Registered</dt><dd><code>{created}</code></dd>
+<dt>Last update</dt><dd><code>{updated}</code></dd>
+</dl>
+</div>
+</section>
+{evidence_table}
+<section class="cz-section">
+<form method="post" action="/compliance/models/{id_enc}/delete" onsubmit="return confirm('Delete this model card? The audit log retains the registration + deletion events.');" style="margin: 0;">
+<input type="hidden" name="csrf_token" value="" />
+<button type="submit" class="cz-btn cz-btn-danger">Delete card</button>
+</form>
+</section>
+<section class="cz-section">
+<a href="/compliance/models" class="cz-btn">Back to registry</a>
+</section>"#,
+        name = html_escape(&card.name),
+        id = html_escape(&card.id),
+        id_enc = urlencoding_min(&card.id),
+        risk = html_escape(card.risk.label()),
+        intended = html_escape(&card.intended_use),
+        training = html_escape(&card.training_data_summary),
+        limits = html_escape(&card.limitations),
+        oversight = html_escape(&card.human_oversight_design),
+        rationale = html_escape(&card.risk_justification.rationale),
+        created = html_escape(&card.created_at.to_rfc3339()),
+        updated = html_escape(&card.updated_at.to_rfc3339()),
+        evidence_table = evidence_table,
+    );
+    render_shell(localizer, &title, NavLink::Compliance, &body)
+}
+
 /// Render `GET /admin/pq-status` -- the post-quantum readiness
 /// dashboard. Pairs the transport-layer report from
 /// [`computeza_channel_partner::pq::tls_readiness`] with the license
@@ -9951,12 +10525,31 @@ mod tests {
         let l = Localizer::english();
         let html = render_home(&l, StoreSummary::Missing);
         assert!(html.contains("Community"));
-        assert!(html.contains("Pro"));
+        // Renamed from "Pro" to "Standard" to match the 49.99 EUR
+        // / 100-seat-cap shape the SMB tier actually ships.
+        assert!(html.contains("Standard"));
         assert!(html.contains("Enterprise"));
         assert!(
             html.contains(r#"data-badge="Most popular""#),
-            "Pro tier should carry the featured badge"
+            "Standard tier should carry the featured badge"
         );
+    }
+
+    #[test]
+    fn render_home_landing_surfaces_the_four_trust_pillars() {
+        let l = Localizer::english();
+        let html = render_home(&l, StoreSummary::Missing);
+        // Section + the four pillar titles must all be present.
+        assert!(html.contains("Compliance evidence as a side-effect"));
+        assert!(html.contains("Signed license envelopes"));
+        assert!(html.contains("Encrypted secrets"));
+        assert!(html.contains("Post-quantum readiness"));
+        assert!(html.contains("EU AI Act deployer evidence"));
+        // Each pillar links to the live admin page.
+        assert!(html.contains("/admin/license"));
+        assert!(html.contains("/admin/secrets"));
+        assert!(html.contains("/admin/pq-status"));
+        assert!(html.contains("/compliance/eu-ai-act"));
     }
 
     #[test]
@@ -10981,6 +11574,99 @@ mod tests {
         assert!(html.contains("Step 2"));
         assert!(html.contains("Step 3"));
         assert!(html.contains("/admin/secrets/setup/generate-passphrase"));
+    }
+
+    // ---- EU AI Act compliance ----
+
+    #[test]
+    fn render_compliance_eu_ai_act_lists_article_checklist_and_marketing_caveat() {
+        let l = Localizer::english();
+        let html = render_compliance_eu_ai_act(&l);
+        assert!(html.contains("EU AI Act compliance"));
+        assert!(html.contains("Art 9"));
+        assert!(html.contains("Art 50"));
+        // Marketing-language caveat is in the body.
+        assert!(html.contains("tooling vendor"));
+        // Cross-links to the model card registry.
+        assert!(html.contains("/compliance/models"));
+    }
+
+    #[test]
+    fn render_compliance_models_list_explains_smoke_test_when_registry_missing() {
+        let l = Localizer::english();
+        let html = render_compliance_models_list(&l, &[], false, None);
+        assert!(html.contains("No model-card registry"));
+    }
+
+    #[test]
+    fn render_compliance_models_list_renders_create_form_when_attached() {
+        let l = Localizer::english();
+        let html = render_compliance_models_list(&l, &[], true, None);
+        assert!(html.contains("Register a model card"));
+        assert!(html.contains(r#"name="risk""#));
+        assert!(html.contains("high-risk"));
+        assert!(html.contains("limited-risk"));
+        assert!(html.contains("minimal"));
+        // Prohibited is NOT a registerable option.
+        assert!(!html.contains(r#"<option value="prohibited">"#));
+    }
+
+    #[test]
+    fn render_compliance_models_list_renders_row_per_card() {
+        let l = Localizer::english();
+        let now = chrono::Utc::now();
+        let card = computeza_compliance::ModelCard {
+            id: "credit-risk-v3".into(),
+            name: "Credit risk v3".into(),
+            risk: computeza_compliance::RiskClassification::HighRisk,
+            risk_justification: computeza_compliance::RiskJustification {
+                rationale: "Annex III item 5(b).".into(),
+                citations: Vec::new(),
+            },
+            intended_use: "Score loans.".into(),
+            training_data_summary: "Internal data.".into(),
+            limitations: "Limits.".into(),
+            human_oversight_design: "Underwriter override.".into(),
+            evaluation_metrics: Vec::new(),
+            deployments: Vec::new(),
+            article_evidence: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        };
+        let html = render_compliance_models_list(&l, std::slice::from_ref(&card), true, None);
+        assert!(html.contains("credit-risk-v3"));
+        assert!(html.contains("Credit risk v3"));
+        assert!(html.contains("High-risk"));
+        // High-risk with no evidence yet => "incomplete" badge.
+        assert!(html.contains("Art 9-15 incomplete"));
+    }
+
+    #[test]
+    fn render_compliance_model_detail_renders_checklist_for_high_risk() {
+        let l = Localizer::english();
+        let now = chrono::Utc::now();
+        let card = computeza_compliance::ModelCard {
+            id: "bio-screen".into(),
+            name: "Biometric screening".into(),
+            risk: computeza_compliance::RiskClassification::HighRisk,
+            risk_justification: computeza_compliance::RiskJustification {
+                rationale: "Annex III item 1.".into(),
+                citations: Vec::new(),
+            },
+            intended_use: "Border screening assist.".into(),
+            training_data_summary: "Public benchmark.".into(),
+            limitations: "Not for autonomous decisions.".into(),
+            human_oversight_design: "Officer reviews every match.".into(),
+            evaluation_metrics: Vec::new(),
+            deployments: Vec::new(),
+            article_evidence: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        };
+        let html = render_compliance_model_detail(&l, &card);
+        assert!(html.contains("Article 9-15 evidence checklist"));
+        assert!(html.contains("Art 9"));
+        assert!(html.contains("Art 15"));
     }
 
     #[test]
