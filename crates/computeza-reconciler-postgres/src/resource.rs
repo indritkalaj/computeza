@@ -51,6 +51,16 @@ pub struct PostgresSpec {
     /// docs above for the secrets-store flow that hydrates this.
     #[serde(skip, default = "default_secret")]
     pub superuser_password: SecretString,
+    /// Optional reference into the encrypted secrets store
+    /// (e.g. `"postgres/admin-password"`). When set, the platform's
+    /// runtime layer resolves it via `computeza-secrets::SecretsStore::get`
+    /// and hydrates `superuser_password` before handing the spec to the
+    /// reconciler. When `None`, the spec must be constructed
+    /// programmatically with `superuser_password` populated -- or the
+    /// reconciler runs against a loopback-trust server where the
+    /// password is not consulted (v0.0.x default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superuser_password_ref: Option<String>,
     /// Databases that should exist on the server. Reconciler creates any
     /// missing entries and (when `prune` is true) drops any extras.
     pub databases: Vec<DatabaseSpec>,

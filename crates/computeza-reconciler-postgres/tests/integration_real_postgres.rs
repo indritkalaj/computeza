@@ -71,6 +71,7 @@ async fn end_to_end_create_then_drop() {
     let spec_create = PostgresSpec {
         endpoint: spec_endpoint,
         superuser_password: spec_password,
+        superuser_password_ref: None,
         databases: vec![DatabaseSpec {
             name: db_name.clone(),
             owner: None,

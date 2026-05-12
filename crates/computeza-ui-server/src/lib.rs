@@ -569,6 +569,7 @@ async fn dispatch_install(
                 "port": port,
                 "superuser": "postgres",
             },
+            "superuser_password_ref": "postgres/admin-password",
             "databases": [],
             "prune": false,
         }),
@@ -765,7 +766,10 @@ async fn install_postgres_handler(
                     // doesn't sit on the previous (likely failed) tick
                     // result for up to 30 seconds. Best-effort: the
                     // periodic tick will retry regardless.
-                    if let Err(e) = observe_postgres_instance_now(store.clone(), &spec).await {
+                    if let Err(e) =
+                        observe_postgres_instance_now(store.clone(), state.secrets.clone(), &spec)
+                            .await
+                    {
                         tracing::debug!(
                             error = %e,
                             "post-install observe attempt did not write a fresh status; \
@@ -2432,13 +2436,15 @@ async fn run_postgres_uninstall() -> Result<String, String> {
 /// interval. Non-fatal to the install.
 async fn observe_postgres_instance_now(
     store: Arc<SqliteStore>,
+    secrets: Option<Arc<SecretsStore>>,
     spec_json: &serde_json::Value,
 ) -> anyhow::Result<()> {
     use computeza_core::reconciler::Context;
     use computeza_core::{NoOpDriver, Reconciler};
     use computeza_reconciler_postgres::{PostgresReconciler, PostgresSpec};
 
-    let spec: PostgresSpec = serde_json::from_value(spec_json.clone())?;
+    let mut spec: PostgresSpec = serde_json::from_value(spec_json.clone())?;
+    hydrate_postgres_password(&mut spec, secrets.as_deref()).await;
     let reconciler: PostgresReconciler<NoOpDriver> =
         PostgresReconciler::new(spec.endpoint.clone(), spec.superuser_password)
             .with_state(store, "local");
@@ -2447,6 +2453,54 @@ async fn observe_postgres_instance_now(
     // failure, so the .await? here only propagates programming bugs.
     let _ = reconciler.observe(&Context::default()).await;
     Ok(())
+}
+
+/// Resolve `PostgresSpec::superuser_password_ref` against the secrets
+/// store, populating `superuser_password` in place when the ref is
+/// present and the lookup succeeds. Silently leaves the password as
+/// the (empty) `SecretString` default when:
+///
+/// - the spec has no `superuser_password_ref`, or
+/// - no secrets store is attached (operator hasn't set
+///   `COMPUTEZA_SECRETS_PASSPHRASE`), or
+/// - the lookup misses (the ref points at a name that doesn't exist
+///   in the store).
+///
+/// For v0.0.x the empty-password fallback is fine because every
+/// reconciler runs against a loopback-trust server. Once non-loopback
+/// auth lands the missing-secret case will surface as a connection
+/// error from the reconciler's own observe loop, not as a hard panic
+/// here.
+pub async fn hydrate_postgres_password(
+    spec: &mut computeza_reconciler_postgres::PostgresSpec,
+    secrets: Option<&SecretsStore>,
+) {
+    let Some(secrets) = secrets else { return };
+    let Some(name) = spec.superuser_password_ref.as_deref() else {
+        return;
+    };
+    match secrets.get(name).await {
+        Ok(Some(value)) => {
+            use secrecy::ExposeSecret;
+            spec.superuser_password = secrecy::SecretString::from(value.expose_secret().to_owned());
+            tracing::debug!(
+                ref_name = name,
+                "resolved postgres superuser_password_ref against secrets store"
+            );
+        }
+        Ok(None) => tracing::warn!(
+            ref_name = name,
+            "postgres superuser_password_ref points at a name that is not in the secrets store; \
+             falling back to empty password (loopback-trust default). Re-run the install or \
+             insert the secret manually via the rotate UI to fix."
+        ),
+        Err(e) => tracing::warn!(
+            error = %e,
+            ref_name = name,
+            "secrets store lookup failed for postgres superuser_password_ref; \
+             falling back to empty password"
+        ),
+    }
 }
 
 /// 303 See Other redirect helper. axum has `Redirect::to` but it

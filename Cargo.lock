@@ -908,6 +908,7 @@ dependencies = [
  "computeza-secrets",
  "computeza-state",
  "reqwest",
+ "secrecy",
  "serde",
  "serde_json",
  "thiserror",
