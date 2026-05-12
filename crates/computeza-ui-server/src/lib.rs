@@ -1566,7 +1566,7 @@ pub fn render_shell(
 {body}
 <footer class="cz-footer">
   <span>{version_label} {version}</span>
-  <span>Spec v1.5 -- AGPL stack</span>
+  <span>Computeza proprietary -- managed components retain upstream licenses (see /components)</span>
 </footer>
 </main>
 </body>
@@ -1700,33 +1700,44 @@ pub fn render_components(localizer: &Localizer) -> String {
     let col_name = localizer.t("ui-components-col-name");
     let col_kind = localizer.t("ui-components-col-kind");
     let col_role = localizer.t("ui-components-col-role");
+    let col_license = localizer.t("ui-components-col-license");
+    let license_intro = localizer.t("ui-components-license-intro");
 
-    let components: &[(&str, &str)] = &[
-        ("kanidm", "identity"),
-        ("garage", "object-storage"),
-        ("lakekeeper", "catalog"),
-        ("xtable", "format-translation"),
-        ("databend", "sql-engine"),
-        ("qdrant", "vector"),
-        ("restate", "workflows"),
-        ("greptime", "observability"),
-        ("grafana", "dashboards"),
-        ("postgres", "metadata-rdbms"),
-        ("openfga", "authorization"),
+    // Per-component license + risk classification. The risk class
+    // drives badge colour: permissive = ok (green), weak copyleft =
+    // info (lavender), restrictive (BSL / Elastic v2) = warn (peach),
+    // strong copyleft AGPL = fail (coral). Source of truth: docs/sbom.md
+    // and docs/licensing.md.
+    let components: &[(&str, &str, &str, &str)] = &[
+        // (slug, kind, license, risk_class)
+        ("kanidm", "identity", "MPL-2.0", "info"),
+        ("garage", "object-storage", "AGPL-3.0", "fail"),
+        ("lakekeeper", "catalog", "Apache-2.0", "ok"),
+        ("xtable", "format-translation", "Apache-2.0", "ok"),
+        ("databend", "sql-engine", "Elastic-2.0 / Apache-2.0", "warn"),
+        ("qdrant", "vector", "Apache-2.0", "ok"),
+        ("restate", "workflows", "BSL-1.1", "warn"),
+        ("greptime", "observability", "Apache-2.0", "ok"),
+        ("grafana", "dashboards", "AGPL-3.0", "fail"),
+        ("postgres", "metadata-rdbms", "PostgreSQL License", "ok"),
+        ("openfga", "authorization", "Apache-2.0", "ok"),
     ];
 
     let rows: String = components
         .iter()
-        .map(|(slug, kind)| {
+        .map(|(slug, kind, license, risk)| {
             let name = localizer.t(&format!("component-{slug}-name"));
             let role = localizer.t(&format!("component-{slug}-role"));
             format!(
                 "<tr><td class=\"cz-strong\">{name}</td>\
                  <td><span class=\"cz-badge cz-badge-info\">{kind}</span></td>\
-                 <td class=\"cz-cell-dim\">{role}</td></tr>",
+                 <td class=\"cz-cell-dim\">{role}</td>\
+                 <td><span class=\"cz-badge cz-badge-{risk}\">{license}</span></td></tr>",
                 name = html_escape(&name),
                 kind = html_escape(kind),
                 role = html_escape(&role),
+                risk = risk,
+                license = html_escape(license),
             )
         })
         .collect();
@@ -1743,16 +1754,20 @@ pub fn render_components(localizer: &Localizer) -> String {
 <th>{col_name}</th>
 <th>{col_kind}</th>
 <th>{col_role}</th>
+<th>{col_license}</th>
 </tr></thead>
 <tbody>{rows}</tbody>
 </table>
 </div>
+<p class="cz-muted" style="margin-top: 1rem; font-size: 0.85rem;">{license_intro}</p>
 </section>"#,
         title = html_escape(&title),
         intro = html_escape(&intro),
         col_name = html_escape(&col_name),
         col_kind = html_escape(&col_kind),
         col_role = html_escape(&col_role),
+        col_license = html_escape(&col_license),
+        license_intro = html_escape(&license_intro),
     );
 
     render_shell(localizer, &title, NavLink::Components, &body)

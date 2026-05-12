@@ -190,6 +190,8 @@ ui-components-intro       = The data-plane components Computeza installs and rec
 ui-components-col-name    = Name
 ui-components-col-kind    = Kind
 ui-components-col-role    = Role
+ui-components-col-license = License
+ui-components-license-intro = License badge colour reflects copyleft strength: green = permissive (Apache / MIT / PostgreSQL), lavender = weak copyleft (MPL), peach = restrictive (BSL / Elastic-2.0), coral = strong copyleft (AGPL). The Computeza control plane itself is proprietary; managed components retain their upstream licenses (see docs/sbom.md and docs/licensing.md for the full position).
 
 # Per spec section 2.2 component table
 component-kanidm-name     = Kanidm
