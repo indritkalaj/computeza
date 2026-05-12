@@ -41,3 +41,7 @@ serde = { workspace = true }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 chrono = { workspace = true }
 uuid = { workspace = true }
+# License-enforcement tests issue dev licenses via the same primitives
+# `computeza-license` uses internally.
+ed25519-dalek = { workspace = true }
+base64ct = { version = "1", features = ["alloc"] }

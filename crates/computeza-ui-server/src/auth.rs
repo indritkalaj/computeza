@@ -554,6 +554,10 @@ pub const PUBLIC_PATH_PREFIXES: &[&str] = &[
     "/static/",
     "/favicon.ico",
     "/components",
+    // License-status read endpoint feeding the banner JS injected
+    // into every page (including unauthenticated /login + landing).
+    // Returns coarse-grained status only; safe to expose unauth.
+    "/api/license/status",
 ];
 
 /// Whether a request path is in the public set. The single `/` is

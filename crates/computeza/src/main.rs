@@ -215,6 +215,62 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
+                // License envelope. Verified against the binary's
+                // baked-in trusted root + the current time at boot;
+                // failures fall back to Community mode (we log + keep
+                // serving rather than crashing -- the control plane
+                // must stay reachable so the operator can fix the
+                // envelope).
+                let license_path = parent.join("license.json");
+                state = state.with_license_path(license_path.clone());
+                match computeza_license::load_license_file(&license_path) {
+                    Ok(None) => {
+                        tracing::info!(
+                            "no license envelope at {path}; running in Community mode. \
+                             Activate one at /admin/license to unlock enterprise entitlements.",
+                            path = license_path.display(),
+                        );
+                    }
+                    Ok(Some(license)) => {
+                        let root = computeza_license::trusted_root();
+                        match license.verify(Some(&root), chrono::Utc::now()) {
+                            Ok(()) => {
+                                tracing::info!(
+                                    license_id = %license.payload.id,
+                                    tier = %license.payload.tier,
+                                    seats = ?license.payload.seats,
+                                    expires = %license.payload.not_after.to_rfc3339(),
+                                    "license envelope verified; entitlements active"
+                                );
+                                state.set_license(Some(license)).await;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    path = %license_path.display(),
+                                    "license envelope on disk failed verification; falling back to Community mode. \
+                                     Visit /admin/license to install a fresh envelope."
+                                );
+                                // Hold the license in state anyway so
+                                // the UI can surface why it's invalid
+                                // (the status helper returns an
+                                // Invalid status; the kill-switch
+                                // engages and the banner explains
+                                // what the operator needs to do).
+                                state.set_license(Some(license)).await;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            path = %license_path.display(),
+                            "could not read license envelope; running in Community mode. \
+                             Check filesystem permissions on the path."
+                        );
+                    }
+                }
+
                 let store_for_tick = state
                     .store
                     .clone()

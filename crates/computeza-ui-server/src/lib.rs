@@ -97,6 +97,16 @@ pub struct AppState {
     /// the smoke-test harness; the binary always attaches one.
     /// Login / logout / setup flows route through this when present.
     pub audit: Option<Arc<computeza_audit::AuditLog>>,
+    /// Loaded license envelope. `None` means community mode (no
+    /// envelope activated yet). The lock is taken briefly per
+    /// activation / deactivation; reads are uncontended in steady
+    /// state.
+    pub license: Arc<tokio::sync::RwLock<Option<computeza_license::License>>>,
+    /// On-disk path where the envelope is persisted (typically
+    /// `<state_db_parent>/license.json`). `None` on the smoke-test
+    /// surface where there is no state directory; activation /
+    /// deactivation is a no-op in that mode.
+    pub license_path: Option<Arc<std::path::PathBuf>>,
 }
 
 impl AppState {
@@ -110,6 +120,8 @@ impl AppState {
             operators: None,
             sessions: auth::SessionStore::new(),
             audit: None,
+            license: Arc::new(tokio::sync::RwLock::new(None)),
+            license_path: None,
         }
     }
 
@@ -123,6 +135,8 @@ impl AppState {
             operators: None,
             sessions: auth::SessionStore::new(),
             audit: None,
+            license: Arc::new(tokio::sync::RwLock::new(None)),
+            license_path: None,
         }
     }
 
@@ -147,6 +161,41 @@ impl AppState {
     pub fn with_operators(mut self, operators: auth::OperatorFile) -> Self {
         self.operators = Some(operators);
         self
+    }
+
+    /// Set the on-disk path the activation / deactivation handlers
+    /// persist to. Typically `<state_db_parent>/license.json`.
+    #[must_use]
+    pub fn with_license_path(mut self, path: std::path::PathBuf) -> Self {
+        self.license_path = Some(Arc::new(path));
+        self
+    }
+
+    /// Seed the loaded license. Used at boot after
+    /// [`computeza_license::load_license_file`] returns `Some`.
+    pub async fn set_license(&self, license: Option<computeza_license::License>) {
+        *self.license.write().await = license;
+    }
+
+    /// Snapshot the current license status against `now`. Returns
+    /// [`computeza_license::LicenseStatus::None`] when no envelope is
+    /// active (community mode). Used by the kill-switch middleware
+    /// and the banner injector.
+    pub async fn license_status(&self) -> computeza_license::LicenseStatus {
+        let guard = self.license.read().await;
+        match guard.as_ref() {
+            None => computeza_license::LicenseStatus::None,
+            Some(lic) => lic.status(Some(&computeza_license::trusted_root()), chrono::Utc::now()),
+        }
+    }
+
+    /// Count active operator accounts. Used by the seat-cap check on
+    /// `/admin/operators` create.
+    pub async fn operator_count(&self) -> usize {
+        match &self.operators {
+            Some(o) => o.list().await.len(),
+            None => 0,
+        }
     }
 }
 
@@ -485,6 +534,92 @@ fn render_csrf_failure() -> String {
         .to_string()
 }
 
+/// License kill-switch middleware -- runs after CSRF (so we know
+/// the request is genuine before we decide whether to honor it).
+///
+/// Reads [`AppState::license_status`]; when the status does not allow
+/// mutations (Expired / Invalid / NotYetValid), every non-public POST
+/// request returns 403 with a renewal page. GET requests flow through
+/// unchanged so the operator can still inspect state, sign out, and
+/// activate a fresh license. Two routes are always allowed through
+/// regardless of status: `/admin/license/activate` (so the operator
+/// can install a new envelope) and `/logout` (so they can step out
+/// of the console without dead-ending). The data plane is not
+/// touched -- services keep running; only the control plane goes
+/// read-only.
+async fn license_middleware(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    request: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    use axum::http::Method;
+
+    if request.method() != Method::POST {
+        return next.run(request).await;
+    }
+    let path = request.uri().path().to_string();
+    if auth::is_public_path(&path) {
+        return next.run(request).await;
+    }
+    // Always-allowed POST routes: license activation/deactivation
+    // (the operator must be able to fix an expired install) + logout
+    // (escape hatch).
+    if matches!(
+        path.as_str(),
+        "/admin/license/activate" | "/admin/license/deactivate" | "/logout"
+    ) {
+        return next.run(request).await;
+    }
+    let status = state.license_status().await;
+    if status.allow_mutations() {
+        return next.run(request).await;
+    }
+    tracing::warn!(
+        method = %request.method(),
+        path = %path,
+        status = ?status,
+        "license enforcement: rejecting mutating request in read-only mode (license status forbids mutations)"
+    );
+    (
+        StatusCode::FORBIDDEN,
+        Html(render_license_blocked(status, &path)),
+    )
+        .into_response()
+}
+
+fn render_license_blocked(status: computeza_license::LicenseStatus, path: &str) -> String {
+    let title = match status {
+        computeza_license::LicenseStatus::Expired { days_since_expiry } => {
+            format!("License expired {days_since_expiry} day(s) ago")
+        }
+        computeza_license::LicenseStatus::NotYetValid { days_until_valid } => {
+            format!("License not yet valid (effective in {days_until_valid} day(s))")
+        }
+        computeza_license::LicenseStatus::Invalid(reason) => {
+            format!("License invalid ({reason})")
+        }
+        _ => "License check failed".into(),
+    };
+    format!(
+        "<!DOCTYPE html><html><head><title>{title}</title>\
+         <link rel=\"stylesheet\" href=\"/static/computeza.css\" /></head>\
+         <body style=\"font-family:sans-serif;padding:2rem;max-width:48rem;margin:0 auto;\">\
+         <h1>{title}</h1>\
+         <p>The mutating request to <code>{path}</code> was rejected because \
+         the active Computeza license does not currently permit mutations. \
+         The data plane keeps running; only the control plane is read-only \
+         until a valid license is activated.</p>\
+         <p>To resolve: visit <a href=\"/admin/license\">/admin/license</a> \
+         to activate a fresh envelope, or contact your reseller / Computeza \
+         sales for a renewal.</p>\
+         <p><a href=\"/admin/license\">Activate or replace license</a> &middot; \
+         <a href=\"/\">Back to the landing page</a></p>\
+         </body></html>",
+        title = html_escape(&title),
+        path = html_escape(path),
+    )
+}
+
 /// Build the axum router with an `AppState` attached. Every handler that
 /// needs the store extracts it via `State<AppState>`.
 pub fn router_with_state(state: AppState) -> Router {
@@ -492,6 +627,7 @@ pub fn router_with_state(state: AppState) -> Router {
     let permission_layer =
         axum::middleware::from_fn_with_state(state.clone(), permission_middleware);
     let csrf_layer = axum::middleware::from_fn_with_state(state.clone(), csrf_middleware);
+    let license_layer = axum::middleware::from_fn_with_state(state.clone(), license_middleware);
     Router::new()
         .route("/", get(home_handler))
         .route("/components", get(components_handler))
@@ -616,6 +752,15 @@ pub fn router_with_state(state: AppState) -> Router {
             get(admin_branding_handler).post(admin_branding_save_handler),
         )
         .route("/admin/license", get(admin_license_handler))
+        .route(
+            "/admin/license/activate",
+            post(admin_license_activate_handler),
+        )
+        .route(
+            "/admin/license/deactivate",
+            post(admin_license_deactivate_handler),
+        )
+        .route("/api/license/status", get(api_license_status_handler))
         .route("/healthz", get(healthz_handler))
         .route("/api/state/info", get(state_info_handler))
         .route("/static/computeza.css", get(css_handler))
@@ -627,6 +772,7 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/static/brand/computeza-favicon.svg", get(favicon_handler))
         .route("/static/brand/computeza-pulse.json", get(lottie_handler))
         .route("/favicon.ico", get(favicon_handler))
+        .layer(license_layer)
         .layer(csrf_layer)
         .layer(permission_layer)
         .layer(auth_layer)
@@ -4022,6 +4168,29 @@ async fn admin_create_operator_handler(
     } else {
         groups
     };
+    // Seat-cap enforcement: when the active license carries a seat
+    // count, the live operator count must stay <= cap. We count
+    // BEFORE create so the limit holds even under rapid double-
+    // submits. Enterprise licenses (seats=None) always pass through.
+    if let Some(lic) = state.license.read().await.as_ref() {
+        if let Some(cap) = lic.payload.seats {
+            let current = operators.list().await.len() as u32;
+            if current >= cap {
+                let list = operators.list().await;
+                return Html(render_admin_operators(
+                    &l,
+                    &list,
+                    &session.username,
+                    Some(&format!(
+                        "Seat cap reached: this license entitles {cap} operator(s) and {current} \
+                         is/are already provisioned. Contact your reseller / Computeza sales to \
+                         expand the entitlement, or remove an existing operator first."
+                    )),
+                ))
+                .into_response();
+            }
+        }
+    }
     if let Err(e) = operators
         .create(&form.username, &form.password, &groups)
         .await
@@ -4260,13 +4429,201 @@ async fn current_accent_color(state: &AppState) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// GET /admin/license -- read-only render of the license envelope,
-/// including the resale chain. v0.0.x doesn't persist licenses yet;
-/// the page shows the Community-mode card when no envelope is
-/// attached.
-async fn admin_license_handler() -> Html<String> {
+/// GET /admin/license -- render the live license envelope (or the
+/// Community-mode card when none is activated). Includes the
+/// activation form so an operator can paste a freshly-issued envelope
+/// and the deactivation form when one is currently active.
+async fn admin_license_handler(State(state): State<AppState>) -> Html<String> {
     let l = Localizer::english();
-    Html(render_admin_license(&l, None))
+    let lic = state.license.read().await.clone();
+    let status = state.license_status().await;
+    let seat_usage = if matches!(lic, Some(ref l) if l.payload.seats.is_some()) {
+        Some(state.operator_count().await)
+    } else {
+        None
+    };
+    Html(render_admin_license_v2(
+        &l,
+        lic.as_ref(),
+        status,
+        seat_usage,
+        None,
+    ))
+}
+
+/// POST /admin/license/activate -- accept a pasted license envelope,
+/// verify against the trusted root + current time, persist to disk,
+/// and reload state.
+async fn admin_license_activate_handler(
+    State(state): State<AppState>,
+    axum::Extension(session): axum::Extension<auth::Session>,
+    Form(form): Form<ActivateLicenseForm>,
+) -> Response {
+    let l = Localizer::english();
+    let trimmed = form.envelope.trim();
+    if trimmed.is_empty() {
+        let lic = state.license.read().await.clone();
+        let status = state.license_status().await;
+        return Html(render_admin_license_v2(
+            &l,
+            lic.as_ref(),
+            status,
+            None,
+            Some("Paste a license envelope before submitting."),
+        ))
+        .into_response();
+    }
+    let license = match computeza_license::parse_envelope(trimmed) {
+        Ok(license) => license,
+        Err(e) => {
+            let lic = state.license.read().await.clone();
+            let status = state.license_status().await;
+            return Html(render_admin_license_v2(
+                &l,
+                lic.as_ref(),
+                status,
+                None,
+                Some(&format!("Envelope did not parse as JSON: {e}")),
+            ))
+            .into_response();
+        }
+    };
+    // Verify against the binary's trusted root + current time before
+    // persisting. We do NOT accept envelopes that fail verification --
+    // a bad license is worse than no license (operator thinks they
+    // have entitlements they don't).
+    let root = computeza_license::trusted_root();
+    if let Err(e) = license.verify(Some(&root), chrono::Utc::now()) {
+        let lic = state.license.read().await.clone();
+        let status = state.license_status().await;
+        return Html(render_admin_license_v2(
+            &l,
+            lic.as_ref(),
+            status,
+            None,
+            Some(&format!("License verification failed: {e}")),
+        ))
+        .into_response();
+    }
+    // Persist.
+    let Some(path) = state.license_path.clone() else {
+        // Smoke-test surface: no path configured. Store in memory
+        // only (won't survive restart but lets tests exercise the
+        // activation path).
+        *state.license.write().await = Some(license.clone());
+        return Redirect303("/admin/license".into()).into_response();
+    };
+    if let Err(e) = computeza_license::save_license_file(&path, &license) {
+        let lic = state.license.read().await.clone();
+        let status = state.license_status().await;
+        return Html(render_admin_license_v2(
+            &l,
+            lic.as_ref(),
+            status,
+            None,
+            Some(&format!("Could not write {}: {e}", path.display())),
+        ))
+        .into_response();
+    }
+    let license_id = license.payload.id.clone();
+    let tier = license.payload.tier.clone();
+    let seats = license.payload.seats;
+    *state.license.write().await = Some(license);
+    if let Some(audit) = &state.audit {
+        let _ = audit
+            .append(
+                session.username.clone(),
+                computeza_audit::Action::UserAction,
+                Some(format!("license/{license_id}")),
+                serde_json::json!({
+                    "action": "activate_license",
+                    "license_id": license_id,
+                    "tier": tier,
+                    "seats": seats,
+                }),
+            )
+            .await;
+    }
+    Redirect303("/admin/license".into()).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct ActivateLicenseForm {
+    envelope: String,
+}
+
+/// POST /admin/license/deactivate -- remove the on-disk envelope and
+/// fall back to Community mode. Idempotent.
+async fn admin_license_deactivate_handler(
+    State(state): State<AppState>,
+    axum::Extension(session): axum::Extension<auth::Session>,
+) -> Response {
+    let prior_id = state
+        .license
+        .read()
+        .await
+        .as_ref()
+        .map(|l| l.payload.id.clone());
+    if let Some(path) = state.license_path.clone() {
+        let _ = computeza_license::delete_license_file(&path);
+    }
+    *state.license.write().await = None;
+    if let Some(audit) = &state.audit {
+        let _ = audit
+            .append(
+                session.username.clone(),
+                computeza_audit::Action::UserAction,
+                prior_id.as_ref().map(|id| format!("license/{id}")),
+                serde_json::json!({
+                    "action": "deactivate_license",
+                    "license_id": prior_id,
+                }),
+            )
+            .await;
+    }
+    Redirect303("/admin/license".into()).into_response()
+}
+
+/// GET /api/license/status -- JSON status snapshot used by the banner
+/// JS injected on every shell. Returns the discriminated status plus
+/// a one-line message suitable for display.
+async fn api_license_status_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let status = state.license_status().await;
+    let (kind, message, severity) = match status {
+        computeza_license::LicenseStatus::Active { days_remaining } if days_remaining <= 30 => (
+            "expiring-soon",
+            format!("License expires in {days_remaining} day(s) -- renew soon."),
+            "warn",
+        ),
+        computeza_license::LicenseStatus::Active { .. } => ("active", String::new(), "ok"),
+        computeza_license::LicenseStatus::None => ("none", String::new(), "ok"),
+        computeza_license::LicenseStatus::Expired { days_since_expiry } => (
+            "expired",
+            format!(
+                "License expired {days_since_expiry} day(s) ago -- the console is read-only until a fresh envelope is activated."
+            ),
+            "error",
+        ),
+        computeza_license::LicenseStatus::NotYetValid { days_until_valid } => (
+            "not-yet-valid",
+            format!(
+                "License becomes effective in {days_until_valid} day(s) -- the console is read-only until then."
+            ),
+            "warn",
+        ),
+        computeza_license::LicenseStatus::Invalid(reason) => (
+            "invalid",
+            format!(
+                "License envelope failed verification ({reason}) -- falling back to Community mode."
+            ),
+            "error",
+        ),
+    };
+    Json(serde_json::json!({
+        "kind": kind,
+        "message": message,
+        "severity": severity,
+    }))
 }
 
 async fn healthz_handler() -> String {
@@ -4413,6 +4770,7 @@ pub fn render_shell(
     <a href="/account" class="{nacc}">{nav_account}</a>
   </div>
 </nav>
+<div id="cz-license-banner-mount"></div>
 <main class="cz-page">
 {body}
 <footer class="cz-footer">
@@ -4441,6 +4799,30 @@ pub fn render_shell(
     const inputs = e.target.querySelectorAll('input[name="csrf_token"]');
     inputs.forEach(function (i) {{ if (!i.value) i.value = token; }});
   }}, true);
+}})();
+
+// License-status banner. Fetches /api/license/status (a public
+// endpoint) and injects a renewal banner above the page container
+// when the active envelope is expiring, expired, invalid, or
+// not-yet-valid. No-ops for the active or community-mode states.
+(function () {{
+  fetch("/api/license/status", {{ headers: {{ "accept": "application/json" }} }})
+    .then(function (r) {{ return r.ok ? r.json() : null; }})
+    .then(function (s) {{
+      if (!s || s.severity === "ok" || !s.message) return;
+      var mount = document.getElementById("cz-license-banner-mount");
+      if (!mount) return;
+      var color = s.severity === "error"
+        ? "rgba(255, 157, 166, 0.55)"
+        : "rgba(255, 196, 87, 0.55)";
+      var fg = s.severity === "error" ? "var(--fail)" : "inherit";
+      mount.innerHTML =
+        '<div role="status" style="border:1px solid ' + color +
+        '; padding: 0.8rem 1.1rem; margin: 0.6rem 1.5rem 0; border-radius: 0.5rem; background: var(--surface-1, transparent); color: ' + fg + ';"><strong>License:</strong> ' +
+        s.message.replace(/</g, "&lt;") +
+        ' <a href="/admin/license" style="margin-left: 0.6rem;">Manage</a></div>';
+    }})
+    .catch(function () {{ /* swallow -- banner is best-effort */ }});
 }})();
 </script>
 </body>
@@ -7998,13 +8380,19 @@ pub fn render_admin_branding(
     render_shell(localizer, &title, NavLink::Branding, &body)
 }
 
-/// Render `GET /admin/license` -- read-only license envelope view.
-/// `license = None` indicates no license has been activated; the
-/// page surfaces a Community-mode card in that case.
+/// Render `GET /admin/license` -- live license envelope viewer +
+/// activation form. `status` is the live verification result; the
+/// page surfaces a renewal banner when `status.should_warn()` and
+/// switches the activate-form into a "Replace license" affordance
+/// when one is already active. `seat_usage` shows the live count of
+/// operator accounts (rendered when the license carries a seat cap).
 #[must_use]
-pub fn render_admin_license(
+pub fn render_admin_license_v2(
     localizer: &Localizer,
     license: Option<&computeza_license::License>,
+    status: computeza_license::LicenseStatus,
+    seat_usage: Option<usize>,
+    error_message: Option<&str>,
 ) -> String {
     let title = localizer.t("ui-admin-license-title");
     let intro = localizer.t("ui-admin-license-intro");
@@ -8015,18 +8403,49 @@ pub fn render_admin_license(
     let not_before_label = localizer.t("ui-admin-license-not-before");
     let not_after_label = localizer.t("ui-admin-license-not-after");
 
+    let status_banner = render_license_status_banner(&status);
+    let error_block = error_message
+        .map(|msg| {
+            format!(
+                r#"<div class="cz-card" style="border-color: rgba(255, 157, 166, 0.55); margin-bottom: 1rem;">
+<p class="cz-card-body" style="margin: 0; color: var(--fail);">{}</p>
+</div>"#,
+                html_escape(msg)
+            )
+        })
+        .unwrap_or_default();
+
+    let activation_form = render_license_activation_form(license.is_some());
+    let deactivation_form = if license.is_some() {
+        r#"<form method="post" action="/admin/license/deactivate" onsubmit="return confirm('Drop the active license and return to Community mode? Mutating routes will require a fresh envelope to re-enable.');" style="margin-top: 0.8rem;">
+<input type="hidden" name="csrf_token" value="" />
+<button type="submit" class="cz-btn cz-btn-danger">Deactivate license</button>
+</form>"#
+            .to_string()
+    } else {
+        String::new()
+    };
+
     let body = match license {
         None => format!(
             r#"<section class="cz-hero">
 <h1>{title}</h1>
 <p>{intro}</p>
 </section>
+{status_banner}
 <section class="cz-section">
 <div class="cz-card"><p class="cz-card-body" style="margin: 0;">{none}</p></div>
+</section>
+<section class="cz-section">
+{error_block}
+{activation_form}
 </section>"#,
             title = html_escape(&title),
             intro = html_escape(&intro),
             none = html_escape(&none),
+            status_banner = status_banner,
+            error_block = error_block,
+            activation_form = activation_form,
         ),
         Some(lic) => {
             let chain_rows: String = lic
@@ -8046,16 +8465,54 @@ pub fn render_admin_license(
                     )
                 })
                 .collect();
-            let seats = lic
-                .payload
-                .seats
-                .map(|n| format!("{n}"))
-                .unwrap_or_else(|| "unlimited".into());
+            let seats_value = match (lic.payload.seats, seat_usage) {
+                (Some(cap), Some(used)) => format!("{used} / {cap}"),
+                (Some(cap), None) => format!("{cap}"),
+                (None, _) => "unlimited".into(),
+            };
+            let features_block = if lic.payload.features.is_empty() {
+                String::new()
+            } else {
+                let chips: String = lic
+                    .payload
+                    .features
+                    .iter()
+                    .map(|f| {
+                        format!(
+                            r#"<span class="cz-badge" style="margin-right: 0.3rem;"><code>{}</code></span>"#,
+                            html_escape(f)
+                        )
+                    })
+                    .collect();
+                format!("<dt>Features</dt><dd>{chips}</dd>")
+            };
+            let billing_block = match &lic.payload.billing_metadata {
+                None => String::new(),
+                Some(b) => {
+                    let amount = match (b.annual_value, b.currency.as_deref()) {
+                        (Some(v), Some(cur)) => format!("{:.2} {cur} / year", (v as f64) / 100.0),
+                        _ => "(unspecified)".into(),
+                    };
+                    let contract = b
+                        .contract_id
+                        .as_deref()
+                        .map(|c| {
+                            format!("<dt>Contract</dt><dd><code>{}</code></dd>", html_escape(c))
+                        })
+                        .unwrap_or_default();
+                    format!(
+                        "<dt>Annual value</dt><dd>{amount}</dd>{contract}",
+                        amount = html_escape(&amount),
+                        contract = contract,
+                    )
+                }
+            };
             format!(
                 r#"<section class="cz-hero">
 <h1>{title}</h1>
 <p>{intro}</p>
 </section>
+{status_banner}
 <section class="cz-section">
 <div class="cz-card">
 <dl class="cz-dl">
@@ -8063,27 +8520,112 @@ pub fn render_admin_license(
 <dt>{seats}</dt><dd>{seats_value}</dd>
 <dt>{nb}</dt><dd><code>{nb_value}</code></dd>
 <dt>{na}</dt><dd><code>{na_value}</code></dd>
+{features_block}
+{billing_block}
 </dl>
 <h3 style="margin-top: 1rem;">{chain}</h3>
 <ol class="cz-muted" style="margin-top: 0.4rem; padding-left: 1.2rem;">{rows}</ol>
+{deactivation_form}
 </div>
+</section>
+<section class="cz-section">
+{error_block}
+{activation_form}
 </section>"#,
                 title = html_escape(&title),
                 intro = html_escape(&intro),
+                status_banner = status_banner,
                 tier = html_escape(&tier_label),
                 tier_value = html_escape(&lic.payload.tier),
                 seats = html_escape(&seats_label),
-                seats_value = html_escape(&seats),
+                seats_value = html_escape(&seats_value),
                 nb = html_escape(&not_before_label),
                 nb_value = html_escape(&lic.payload.not_before.to_rfc3339()),
                 na = html_escape(&not_after_label),
                 na_value = html_escape(&lic.payload.not_after.to_rfc3339()),
+                features_block = features_block,
+                billing_block = billing_block,
                 chain = html_escape(&chain_label),
                 rows = chain_rows,
+                deactivation_form = deactivation_form,
+                error_block = error_block,
+                activation_form = activation_form,
             )
         }
     };
     render_shell(localizer, &title, NavLink::License, &body)
+}
+
+/// Compatibility shim for callers that still want the legacy
+/// signature (tests, smoke router). Always shows community-mode card
+/// when `license = None`; rendered status defaults to `None`.
+#[must_use]
+pub fn render_admin_license(
+    localizer: &Localizer,
+    license: Option<&computeza_license::License>,
+) -> String {
+    let status = match license {
+        None => computeza_license::LicenseStatus::None,
+        Some(_) => computeza_license::LicenseStatus::Active {
+            days_remaining: i64::MAX / 86_400,
+        },
+    };
+    render_admin_license_v2(localizer, license, status, None, None)
+}
+
+fn render_license_activation_form(replacing: bool) -> String {
+    let heading = if replacing {
+        "Replace the active license"
+    } else {
+        "Activate a license"
+    };
+    let help = if replacing {
+        "Paste a freshly-issued envelope below. The new license is verified against the binary's trusted root + the current time before it replaces the active one; a bad envelope leaves the existing license in place."
+    } else {
+        "Paste the JSON envelope your reseller / Computeza sales issued for this install. The envelope is verified against the binary's trusted root + the current time before it is persisted."
+    };
+    let button = if replacing {
+        "Replace license"
+    } else {
+        "Activate license"
+    };
+    format!(
+        r#"<div class="cz-card">
+<h3 style="margin: 0 0 0.4rem;">{heading}</h3>
+<p class="cz-muted" style="margin: 0 0 0.85rem; font-size: 0.85rem;">{help}</p>
+<form method="post" action="/admin/license/activate" class="cz-form" style="max-width: none;">
+<input type="hidden" name="csrf_token" value="" />
+<label for="license-envelope">License envelope (JSON)</label>
+<textarea id="license-envelope" name="envelope" rows="10" class="cz-input" style="font-family: ui-monospace, monospace; font-size: 0.82rem;" required></textarea>
+<button type="submit" class="cz-btn cz-btn-primary" style="margin-top: 0.5rem;">{button}</button>
+</form>
+</div>"#,
+        heading = html_escape(heading),
+        help = html_escape(help),
+        button = html_escape(button),
+    )
+}
+
+fn render_license_status_banner(status: &computeza_license::LicenseStatus) -> String {
+    use computeza_license::LicenseStatus;
+    if !status.should_warn() {
+        return String::new();
+    }
+    match status {
+        LicenseStatus::None => String::new(),
+        LicenseStatus::Active { days_remaining } => format!(
+            r#"<section class="cz-section"><div class="cz-card" style="border-color: rgba(255, 196, 87, 0.55);"><p class="cz-card-body" style="margin: 0;"><strong>Renewal due:</strong> the active license expires in <code>{days_remaining}</code> day(s). Contact your reseller / Computeza sales for a fresh envelope.</p></div></section>"#
+        ),
+        LicenseStatus::Expired { days_since_expiry } => format!(
+            r#"<section class="cz-section"><div class="cz-card" style="border-color: rgba(255, 157, 166, 0.55);"><p class="cz-card-body" style="margin: 0; color: var(--fail);"><strong>License expired {days_since_expiry} day(s) ago.</strong> The control plane is in read-only mode; the data plane keeps running. Paste a fresh envelope below to re-enable mutations.</p></div></section>"#
+        ),
+        LicenseStatus::NotYetValid { days_until_valid } => format!(
+            r#"<section class="cz-section"><div class="cz-card" style="border-color: rgba(255, 196, 87, 0.55);"><p class="cz-card-body" style="margin: 0;"><strong>License not yet valid.</strong> Effective in {days_until_valid} day(s); the console is read-only until then.</p></div></section>"#
+        ),
+        LicenseStatus::Invalid(reason) => format!(
+            r#"<section class="cz-section"><div class="cz-card" style="border-color: rgba(255, 157, 166, 0.55);"><p class="cz-card-body" style="margin: 0; color: var(--fail);"><strong>License invalid ({reason}).</strong> The control plane has fallen back to Community mode. Activate a valid envelope to restore entitlements.</p></div></section>"#
+        ),
+    }
 }
 
 /// Render `GET /admin/groups` -- read-only listing of built-in groups
@@ -9932,5 +10474,231 @@ mod tests {
         hydrate_postgres_password(&mut spec, None).await;
         use secrecy::ExposeSecret;
         assert_eq!(spec.superuser_password.expose_secret(), "preset");
+    }
+
+    // ---- License enforcement ----
+
+    fn dev_signing_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+    }
+
+    fn issue_test_license(
+        not_before: chrono::DateTime<chrono::Utc>,
+        not_after: chrono::DateTime<chrono::Utc>,
+        seats: Option<u32>,
+    ) -> computeza_license::License {
+        let sk = dev_signing_key();
+        let vk = sk.verifying_key();
+        use base64ct::Encoding;
+        let payload = computeza_license::LicensePayload {
+            id: "test-license-0001".into(),
+            tier: "standard".into(),
+            seats,
+            not_before,
+            not_after,
+            features: Vec::new(),
+            billing_metadata: None,
+            chain: vec![
+                computeza_license::ChainEntry {
+                    name: "Computeza Inc.".into(),
+                    verifying_key: base64ct::Base64::encode_string(vk.as_bytes()),
+                    support_contact: None,
+                },
+                computeza_license::ChainEntry {
+                    name: "Test Customer".into(),
+                    verifying_key: base64ct::Base64::encode_string(vk.as_bytes()),
+                    support_contact: Some("ops@test.example".into()),
+                },
+            ],
+        };
+        computeza_license::issue(&sk, payload).expect("issue test license")
+    }
+
+    #[tokio::test]
+    async fn license_status_none_in_community_mode() {
+        let state = AppState::empty();
+        assert!(matches!(
+            state.license_status().await,
+            computeza_license::LicenseStatus::None
+        ));
+    }
+
+    #[tokio::test]
+    async fn license_status_active_when_envelope_loaded() {
+        let state = AppState::empty();
+        let now = chrono::Utc::now();
+        let lic = issue_test_license(
+            now - chrono::Duration::days(1),
+            now + chrono::Duration::days(180),
+            Some(100),
+        );
+        state.set_license(Some(lic)).await;
+        let status = state.license_status().await;
+        assert!(matches!(
+            status,
+            computeza_license::LicenseStatus::Active { .. }
+        ));
+        assert!(status.allow_mutations());
+    }
+
+    #[tokio::test]
+    async fn license_status_expired_blocks_mutations() {
+        let state = AppState::empty();
+        let now = chrono::Utc::now();
+        let lic = issue_test_license(
+            now - chrono::Duration::days(60),
+            now - chrono::Duration::days(2),
+            Some(50),
+        );
+        state.set_license(Some(lic)).await;
+        let status = state.license_status().await;
+        assert!(matches!(
+            status,
+            computeza_license::LicenseStatus::Expired { .. }
+        ));
+        assert!(!status.allow_mutations());
+    }
+
+    #[tokio::test]
+    async fn api_license_status_endpoint_returns_json() {
+        let state = AppState::empty();
+        let now = chrono::Utc::now();
+        let lic = issue_test_license(
+            now - chrono::Duration::days(1),
+            now + chrono::Duration::days(15), // <30 = expiring-soon
+            Some(10),
+        );
+        state.set_license(Some(lic)).await;
+        let json = api_license_status_handler(State(state)).await.0;
+        assert_eq!(json["kind"], "expiring-soon");
+        assert_eq!(json["severity"], "warn");
+        assert!(json["message"].as_str().unwrap().contains("expires in"));
+    }
+
+    #[tokio::test]
+    async fn api_license_status_reports_active_when_well_within_window() {
+        let state = AppState::empty();
+        let now = chrono::Utc::now();
+        let lic = issue_test_license(
+            now - chrono::Duration::days(1),
+            now + chrono::Duration::days(180),
+            None,
+        );
+        state.set_license(Some(lic)).await;
+        let json = api_license_status_handler(State(state)).await.0;
+        assert_eq!(json["kind"], "active");
+        assert_eq!(json["severity"], "ok");
+    }
+
+    #[tokio::test]
+    async fn api_license_status_reports_none_in_community_mode() {
+        let state = AppState::empty();
+        let json = api_license_status_handler(State(state)).await.0;
+        assert_eq!(json["kind"], "none");
+        assert_eq!(json["severity"], "ok");
+    }
+
+    #[test]
+    fn render_admin_license_v2_shows_seat_usage_when_capped() {
+        let now = chrono::Utc::now();
+        let lic = issue_test_license(
+            now - chrono::Duration::days(1),
+            now + chrono::Duration::days(365),
+            Some(10),
+        );
+        let l = Localizer::english();
+        let html = render_admin_license_v2(
+            &l,
+            Some(&lic),
+            computeza_license::LicenseStatus::Active {
+                days_remaining: 360,
+            },
+            Some(7),
+            None,
+        );
+        assert!(
+            html.contains("7 / 10"),
+            "seat usage should render as used/cap"
+        );
+    }
+
+    #[test]
+    fn render_admin_license_v2_renders_billing_metadata() {
+        let now = chrono::Utc::now();
+        let sk = dev_signing_key();
+        let vk = sk.verifying_key();
+        use base64ct::Encoding;
+        let payload = computeza_license::LicensePayload {
+            id: "billing-test".into(),
+            tier: "enterprise".into(),
+            seats: None,
+            not_before: now - chrono::Duration::days(1),
+            not_after: now + chrono::Duration::days(365),
+            features: vec!["ai-workspace".into()],
+            billing_metadata: Some(computeza_license::BillingNote {
+                annual_value: Some(499_900),
+                currency: Some("EUR".into()),
+                contract_id: Some("ACME-2026-001".into()),
+            }),
+            chain: vec![
+                computeza_license::ChainEntry {
+                    name: "Computeza Inc.".into(),
+                    verifying_key: base64ct::Base64::encode_string(vk.as_bytes()),
+                    support_contact: None,
+                },
+                computeza_license::ChainEntry {
+                    name: "Acme".into(),
+                    verifying_key: base64ct::Base64::encode_string(vk.as_bytes()),
+                    support_contact: None,
+                },
+            ],
+        };
+        let lic = computeza_license::issue(&sk, payload).unwrap();
+        let l = Localizer::english();
+        let html = render_admin_license_v2(
+            &l,
+            Some(&lic),
+            computeza_license::LicenseStatus::Active {
+                days_remaining: 360,
+            },
+            None,
+            None,
+        );
+        assert!(html.contains("ACME-2026-001"));
+        assert!(html.contains("EUR"));
+        assert!(html.contains("4999.00"));
+        assert!(html.contains("ai-workspace"));
+    }
+
+    #[test]
+    fn render_license_status_banner_silent_for_active_and_community() {
+        assert_eq!(
+            render_license_status_banner(&computeza_license::LicenseStatus::None),
+            ""
+        );
+        assert_eq!(
+            render_license_status_banner(&computeza_license::LicenseStatus::Active {
+                days_remaining: 100
+            }),
+            ""
+        );
+    }
+
+    #[test]
+    fn render_license_status_banner_warns_when_expiring_soon() {
+        let banner = render_license_status_banner(&computeza_license::LicenseStatus::Active {
+            days_remaining: 14,
+        });
+        assert!(banner.contains("Renewal due"));
+        assert!(banner.contains("14"));
+    }
+
+    #[test]
+    fn render_license_status_banner_flags_expired() {
+        let banner = render_license_status_banner(&computeza_license::LicenseStatus::Expired {
+            days_since_expiry: 3,
+        });
+        assert!(banner.contains("expired"));
+        assert!(banner.contains("3"));
     }
 }
