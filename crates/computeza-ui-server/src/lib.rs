@@ -764,6 +764,7 @@ pub fn router_with_state(state: AppState) -> Router {
             "/admin/license/deactivate",
             post(admin_license_deactivate_handler),
         )
+        .route("/admin/pq-status", get(admin_pq_status_handler))
         .route("/api/license/status", get(api_license_status_handler))
         .route("/healthz", get(healthz_handler))
         .route("/api/state/info", get(state_info_handler))
@@ -4620,6 +4621,25 @@ async fn admin_license_deactivate_handler(
     Redirect303("/admin/license".into()).into_response()
 }
 
+/// GET /admin/pq-status -- read-only render of the binary's
+/// post-quantum posture. Tracks two surfaces independently:
+///
+/// 1. TLS handshakes via [`computeza_channel_partner::pq::tls_readiness`].
+///    We ship rustls + aws-lc-rs which offers X25519MLKEM768 by
+///    default -- harvest-now-decrypt-later resistance is on as soon
+///    as the binary boots.
+///
+/// 2. License envelopes: the active license is either classical-only
+///    (Ed25519) or dual-signed (Ed25519 + ML-DSA). v0.0.x carries
+///    the dual-sig shape; v0.1 wires the actual cryptographic
+///    verification.
+async fn admin_pq_status_handler(State(state): State<AppState>) -> Html<String> {
+    let l = Localizer::english();
+    let pq = computeza_channel_partner::pq::tls_readiness();
+    let license = state.license.read().await.clone();
+    Html(render_admin_pq_status(&l, &pq, license.as_ref()))
+}
+
 /// GET /api/license/status -- JSON status snapshot used by the banner
 /// JS injected on every shell. Returns the discriminated status plus
 /// a one-line message suitable for display.
@@ -8416,6 +8436,91 @@ pub fn render_admin_branding(
     render_shell(localizer, &title, NavLink::Branding, &body)
 }
 
+/// Render `GET /admin/pq-status` -- the post-quantum readiness
+/// dashboard. Pairs the transport-layer report from
+/// [`computeza_channel_partner::pq::tls_readiness`] with the license
+/// envelope's PQ posture so the operator sees both surfaces in one
+/// place.
+#[must_use]
+pub fn render_admin_pq_status(
+    localizer: &Localizer,
+    pq: &computeza_channel_partner::pq::PqReadiness,
+    license: Option<&computeza_license::License>,
+) -> String {
+    let title = "Post-quantum readiness";
+    let intro = "Computeza tracks two independent post-quantum surfaces: the TLS transport \
+                 (handshakes today, harvest-now-decrypt-later resistance) and the license \
+                 envelope (dual-classical+ML-DSA signature shape, verified in v0.1).";
+    let yes = r#"<span class="cz-badge" style="background: rgba(95, 207, 156, 0.18); color: var(--ok, #5fcf9c);">Yes</span>"#;
+    let no = r#"<span class="cz-badge" style="background: rgba(255, 196, 87, 0.18); color: var(--warn);">No</span>"#;
+    let pq_pair = |b: bool| -> &'static str {
+        if b {
+            yes
+        } else {
+            no
+        }
+    };
+
+    let license_section = match license {
+        None => format!(
+            r#"<dt>License envelope</dt><dd>{no} (Community mode -- no envelope activated)</dd>"#,
+            no = no,
+        ),
+        Some(lic) => {
+            let dual = lic.is_pq_dual_signed();
+            format!(
+                r#"<dt>License envelope dual-signed</dt><dd>{badge}</dd>
+<dt>License id</dt><dd><code>{id}</code></dd>"#,
+                badge = pq_pair(dual),
+                id = html_escape(&lic.payload.id),
+            )
+        }
+    };
+
+    let body = format!(
+        r#"<section class="cz-hero">
+<h1>{title}</h1>
+<p>{intro}</p>
+</section>
+<section class="cz-section">
+<div class="cz-card">
+<h3 style="margin: 0 0 0.5rem;">Transport (TLS / mTLS)</h3>
+<p class="cz-muted" style="margin: 0 0 0.85rem; font-size: 0.85rem;">Hybrid key-exchange means the session key requires breaking BOTH X25519 and ML-KEM -- an attacker that records the handshake today cannot decrypt it after a quantum break of either primitive alone.</p>
+<dl class="cz-dl">
+<dt>Crypto provider</dt><dd><code>{provider}</code></dd>
+<dt>Hybrid KEX enabled</dt><dd>{kex_enabled}</dd>
+<dt>Hybrid group offered</dt><dd><code>{kex_group}</code></dd>
+</dl>
+</div>
+</section>
+<section class="cz-section">
+<div class="cz-card">
+<h3 style="margin: 0 0 0.5rem;">License signatures</h3>
+<p class="cz-muted" style="margin: 0 0 0.85rem; font-size: 0.85rem;">Dual-signature envelopes carry both Ed25519 (classical, today) and ML-DSA (FIPS 204 / Dilithium, post-quantum). v0.0.x verifies shape only; v0.1 wires the cryptographic ML-DSA verify alongside Ed25519.</p>
+<dl class="cz-dl">
+<dt>Dual-sig envelope shape supported</dt><dd>{dual_supported}</dd>
+<dt>ML-DSA cryptographic verification active</dt><dd>{dual_verified}</dd>
+{license_section}
+</dl>
+</div>
+</section>
+<section class="cz-section">
+<div class="cz-card" style="border-color: rgba(245, 181, 68, 0.55);">
+<p class="cz-card-body" style="margin: 0;"><strong>Roadmap:</strong> v0.1 brings (a) ML-DSA cryptographic verification on the license leg via a vetted pure-Rust crate, (b) dual-classical+ML-DSA X.509 issuance for the channel-partner mTLS material, and (c) explicit reporting in the audit log when a downgrade-to-classical handshake occurs.</p>
+</div>
+</section>"#,
+        title = html_escape(title),
+        intro = html_escape(intro),
+        provider = html_escape(pq.crypto_provider),
+        kex_enabled = pq_pair(pq.tls_hybrid_kex_enabled),
+        kex_group = html_escape(pq.tls_hybrid_kex_group),
+        dual_supported = pq_pair(pq.license_dual_sig_supported),
+        dual_verified = pq_pair(pq.license_dual_sig_verified),
+        license_section = license_section,
+    );
+    render_shell(localizer, title, NavLink::License, &body)
+}
+
 /// Render the one-time-view page produced by the
 /// "Generate passphrase" button on `/admin/secrets`. The passphrase
 /// is shown verbatim with copy-to-clipboard affordance and a ready-
@@ -8520,6 +8625,7 @@ pub fn render_admin_license_v2(
         .unwrap_or_default();
 
     let activation_form = render_license_activation_form(license.is_some());
+    let pq_link = r#"<p class="cz-muted" style="margin: 0.6rem 0 0; font-size: 0.85rem;"><a href="/admin/pq-status">View the post-quantum readiness dashboard -&gt;</a></p>"#;
     let deactivation_form = if license.is_some() {
         r#"<form method="post" action="/admin/license/deactivate" onsubmit="return confirm('Drop the active license and return to Community mode? Mutating routes will require a fresh envelope to re-enable.');" style="margin-top: 0.8rem;">
 <input type="hidden" name="csrf_token" value="" />
@@ -8543,6 +8649,7 @@ pub fn render_admin_license_v2(
 <section class="cz-section">
 {error_block}
 {activation_form}
+{pq_link}
 </section>"#,
             title = html_escape(&title),
             intro = html_escape(&intro),
@@ -8550,6 +8657,7 @@ pub fn render_admin_license_v2(
             status_banner = status_banner,
             error_block = error_block,
             activation_form = activation_form,
+            pq_link = pq_link,
         ),
         Some(lic) => {
             let chain_rows: String = lic
@@ -8635,6 +8743,7 @@ pub fn render_admin_license_v2(
 <section class="cz-section">
 {error_block}
 {activation_form}
+{pq_link}
 </section>"#,
                 title = html_escape(&title),
                 intro = html_escape(&intro),
@@ -10640,11 +10749,13 @@ mod tests {
                 computeza_license::ChainEntry {
                     name: "Computeza Inc.".into(),
                     verifying_key: base64ct::Base64::encode_string(vk.as_bytes()),
+                    pq_verifying_key: None,
                     support_contact: None,
                 },
                 computeza_license::ChainEntry {
                     name: "Test Customer".into(),
                     verifying_key: base64ct::Base64::encode_string(vk.as_bytes()),
+                    pq_verifying_key: None,
                     support_contact: Some("ops@test.example".into()),
                 },
             ],
@@ -10782,11 +10893,13 @@ mod tests {
                 computeza_license::ChainEntry {
                     name: "Computeza Inc.".into(),
                     verifying_key: base64ct::Base64::encode_string(vk.as_bytes()),
+                    pq_verifying_key: None,
                     support_contact: None,
                 },
                 computeza_license::ChainEntry {
                     name: "Acme".into(),
                     verifying_key: base64ct::Base64::encode_string(vk.as_bytes()),
+                    pq_verifying_key: None,
                     support_contact: None,
                 },
             ],
@@ -10868,6 +10981,40 @@ mod tests {
         assert!(html.contains("Step 2"));
         assert!(html.contains("Step 3"));
         assert!(html.contains("/admin/secrets/setup/generate-passphrase"));
+    }
+
+    #[test]
+    fn render_admin_pq_status_reports_hybrid_kex_and_community_mode() {
+        let l = Localizer::english();
+        let pq = computeza_channel_partner::pq::tls_readiness();
+        let html = render_admin_pq_status(&l, &pq, None);
+        assert!(html.contains("Post-quantum readiness"));
+        assert!(html.contains("X25519MLKEM768"));
+        assert!(html.contains("aws-lc-rs"));
+        assert!(html.contains("Community mode"));
+    }
+
+    #[test]
+    fn render_admin_pq_status_renders_license_section_when_active() {
+        let l = Localizer::english();
+        let now = chrono::Utc::now();
+        let lic = issue_test_license(
+            now - chrono::Duration::days(1),
+            now + chrono::Duration::days(180),
+            Some(50),
+        );
+        let pq = computeza_channel_partner::pq::tls_readiness();
+        let html = render_admin_pq_status(&l, &pq, Some(&lic));
+        assert!(html.contains(&lic.payload.id));
+        assert!(html.contains("Dual-sig envelope shape supported"));
+    }
+
+    #[test]
+    fn render_admin_license_v2_links_to_pq_status_dashboard() {
+        let l = Localizer::english();
+        let html =
+            render_admin_license_v2(&l, None, computeza_license::LicenseStatus::None, None, None);
+        assert!(html.contains("/admin/pq-status"));
     }
 
     #[test]

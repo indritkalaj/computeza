@@ -33,6 +33,7 @@
 
 #![warn(missing_docs)]
 
+pub mod pq;
 pub mod proto;
 pub mod tls;
 

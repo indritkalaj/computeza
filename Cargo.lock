@@ -972,6 +972,7 @@ dependencies = [
  "base64ct",
  "chrono",
  "computeza-audit",
+ "computeza-channel-partner",
  "computeza-core",
  "computeza-driver-native",
  "computeza-i18n",

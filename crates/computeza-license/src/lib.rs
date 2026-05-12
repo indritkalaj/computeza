@@ -106,6 +106,16 @@ pub struct ChainEntry {
     /// v0.1+ to verify per-tier counter-signatures on telemetry
     /// upload.
     pub verifying_key: String,
+    /// Optional base64-encoded ML-DSA (FIPS 204 / Dilithium)
+    /// verifying key for this tier. **Post-quantum readiness**: when
+    /// populated alongside the classical [`Self::verifying_key`], the
+    /// license is dual-signed and a future quantum break of Ed25519
+    /// does not invalidate this entitlement. v0.0.x carries the
+    /// field but does not verify -- the verification path lights up
+    /// in v0.1 once the issuance pipeline starts emitting dual-sig
+    /// envelopes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pq_verifying_key: Option<String>,
     /// Optional support-routing contact. When set, the operator
     /// console footer renders a link to this rather than the
     /// upstream tier's contact.
@@ -176,6 +186,18 @@ pub struct LicensePayload {
 
 /// Signed license envelope. Persisted at
 /// `<state_db_parent>/license.json` once the operator activates one.
+///
+/// # Post-quantum readiness
+///
+/// The envelope is **dual-signature-capable**: the classical
+/// [`Self::signature`] is mandatory, the optional
+/// [`Self::pq_signature`] carries an ML-DSA (FIPS 204 / Dilithium)
+/// signature alongside. When `pq_signature` is `Some` and
+/// `chain[0].pq_verifying_key` is `Some`, the verifier MUST check
+/// both signatures and reject if either fails. v0.0.x verifies the
+/// classical signature only -- the PQ branch is scaffolded but
+/// returns `Ok(())` until a vetted pure-Rust ML-DSA implementation
+/// lands in workspace. v0.1 wires the actual verify.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct License {
     /// The payload that was signed.
@@ -184,6 +206,14 @@ pub struct License {
     /// verifying key is `payload.chain[0].verifying_key` -- the
     /// issuer-of-record's key.
     pub signature: String,
+    /// Optional base64 ML-DSA signature over the same canonical
+    /// payload bytes. When present, the verifier checks this against
+    /// `chain[0].pq_verifying_key` IN ADDITION to the classical
+    /// signature -- harvest-now-decrypt-later attackers gain nothing
+    /// from a future quantum break of Ed25519 since the PQ leg still
+    /// holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pq_signature: Option<String>,
 }
 
 /// Live status of a loaded license, as the enforcement layer sees it.
@@ -302,6 +332,44 @@ impl License {
             .verify(&body, &sig)
             .map_err(|_| LicenseError::BadSignature)?;
 
+        // Post-quantum verification: when the envelope is dual-
+        // signed (both pq_signature and chain[0].pq_verifying_key
+        // populated), check the ML-DSA leg too. The actual ML-DSA
+        // verify lands in v0.1 with the vetted pure-Rust crate;
+        // until then we ENFORCE shape correctness so v0.0.x rejects
+        // malformed dual-sig envelopes loudly rather than letting
+        // them through unnoticed.
+        match (&self.pq_signature, &issuer.pq_verifying_key) {
+            (Some(sig), Some(vk)) => {
+                // Both halves present -- shape-check both, defer
+                // cryptographic verification to v0.1.
+                if Base64::decode_vec(sig).is_err() {
+                    return Err(LicenseError::Malformed(
+                        "pq_signature: invalid base64".into(),
+                    ));
+                }
+                if Base64::decode_vec(vk).is_err() {
+                    return Err(LicenseError::Malformed(
+                        "chain[0].pq_verifying_key: invalid base64".into(),
+                    ));
+                }
+                // v0.1 will perform the actual ML-DSA verification
+                // here; for now both legs being present + shape-
+                // valid is sufficient for round-trip + handoff to
+                // the dual-sign issuance pipeline.
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(LicenseError::Malformed(
+                    "PQ dual-sig envelope must carry both pq_signature AND chain[0].pq_verifying_key, or neither".into(),
+                ));
+            }
+            (None, None) => {
+                // Classical-only envelope. v0.0.x default; v0.1
+                // emission pipeline will start adding the PQ leg by
+                // default.
+            }
+        }
+
         // Time window.
         if now < self.payload.not_before {
             return Err(LicenseError::NotYetValid(self.payload.not_before));
@@ -310,6 +378,20 @@ impl License {
             return Err(LicenseError::Expired(self.payload.not_after));
         }
         Ok(())
+    }
+
+    /// `true` when this license carries both classical and PQ
+    /// signatures. Used by `/admin/license` and `/admin/pq-status`
+    /// to surface PQ posture per-license.
+    #[must_use]
+    pub fn is_pq_dual_signed(&self) -> bool {
+        self.pq_signature.is_some()
+            && self
+                .payload
+                .chain
+                .first()
+                .and_then(|e| e.pq_verifying_key.as_deref())
+                .is_some()
     }
 
     /// Combined verify-and-classify entry point used by the
@@ -355,6 +437,10 @@ pub fn issue(signing_key: &SigningKey, payload: LicensePayload) -> Result<Licens
     Ok(License {
         payload,
         signature: Base64::encode_string(&sig.to_bytes()),
+        // v0.0.x `issue` emits classical-only envelopes. The
+        // dual-sign issuance pipeline (v0.1) calls `issue` then
+        // appends an ML-DSA leg via a separate signer.
+        pq_signature: None,
     })
 }
 
@@ -445,11 +531,13 @@ mod tests {
                 ChainEntry {
                     name: "Computeza Inc.".into(),
                     verifying_key: Base64::encode_string(vk.as_bytes()),
+                    pq_verifying_key: None,
                     support_contact: None,
                 },
                 ChainEntry {
                     name: "Acme Corp.".into(),
                     verifying_key: Base64::encode_string(vk.as_bytes()),
+                    pq_verifying_key: None,
                     support_contact: Some("ops@acme.example".into()),
                 },
             ],
@@ -700,5 +788,78 @@ mod tests {
             parse_envelope("not json"),
             Err(LicenseError::Malformed(_))
         ));
+    }
+
+    // ---- Post-quantum readiness ----
+
+    #[test]
+    fn pq_dual_signed_round_trips_when_both_legs_present() {
+        let sk = fixed_key();
+        let vk = sk.verifying_key();
+        let now = Utc::now();
+        let mut payload = sample_payload(now, vk);
+        // Synthesize a base64-shaped (but cryptographically opaque)
+        // ML-DSA verifying key. v0.0.x only shape-checks; v0.1
+        // swaps in real ML-DSA verify.
+        payload.chain[0].pq_verifying_key = Some(Base64::encode_string(&[9u8; 100]));
+        let mut lic = issue(&sk, payload).unwrap();
+        lic.pq_signature = Some(Base64::encode_string(&[8u8; 200]));
+        assert!(lic.is_pq_dual_signed());
+        lic.verify(Some(&vk), now).unwrap();
+    }
+
+    #[test]
+    fn pq_envelope_rejects_lone_pq_signature_without_verifying_key() {
+        let sk = fixed_key();
+        let vk = sk.verifying_key();
+        let now = Utc::now();
+        let mut lic = issue(&sk, sample_payload(now, vk)).unwrap();
+        lic.pq_signature = Some(Base64::encode_string(&[1u8; 200]));
+        // chain[0].pq_verifying_key still None -- must be rejected.
+        let err = lic.verify(Some(&vk), now).expect_err("must reject half-PQ");
+        match err {
+            LicenseError::Malformed(s) => {
+                assert!(s.contains("PQ dual-sig envelope must carry both"));
+            }
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pq_envelope_rejects_lone_pq_verifying_key_without_signature() {
+        let sk = fixed_key();
+        let vk = sk.verifying_key();
+        let now = Utc::now();
+        let mut payload = sample_payload(now, vk);
+        payload.chain[0].pq_verifying_key = Some(Base64::encode_string(&[3u8; 100]));
+        let lic = issue(&sk, payload).unwrap();
+        // pq_signature still None.
+        let err = lic.verify(Some(&vk), now).expect_err("must reject half-PQ");
+        assert!(matches!(err, LicenseError::Malformed(_)));
+    }
+
+    #[test]
+    fn pq_envelope_rejects_malformed_base64_in_signature() {
+        let sk = fixed_key();
+        let vk = sk.verifying_key();
+        let now = Utc::now();
+        let mut payload = sample_payload(now, vk);
+        payload.chain[0].pq_verifying_key = Some(Base64::encode_string(&[9u8; 100]));
+        let mut lic = issue(&sk, payload).unwrap();
+        lic.pq_signature = Some("not valid base64 !!!".into());
+        let err = lic.verify(Some(&vk), now).expect_err("must reject garbage");
+        match err {
+            LicenseError::Malformed(s) => assert!(s.contains("pq_signature")),
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classical_only_envelope_is_not_dual_signed() {
+        let sk = fixed_key();
+        let vk = sk.verifying_key();
+        let now = Utc::now();
+        let lic = issue(&sk, sample_payload(now, vk)).unwrap();
+        assert!(!lic.is_pq_dual_signed());
     }
 }
