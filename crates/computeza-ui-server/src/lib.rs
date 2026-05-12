@@ -6553,6 +6553,25 @@ pub fn render_secrets_index(localizer: &Localizer, names: Option<&[String]>) -> 
     let col_action = localizer.t("ui-secrets-col-action");
     let rotate = localizer.t("ui-secrets-rotate-button");
     let note = localizer.t("ui-secrets-rotate-note");
+    let backup_warning = localizer.t("ui-secrets-backup-warning");
+
+    // Disaster-recovery reminder rendered whenever the secrets store
+    // IS attached -- losing the salt / passphrase / ciphertext is
+    // irreversible, so the warning gets prominent placement above
+    // the listing.
+    let backup_block = if names.is_some() {
+        format!(
+            r#"<section class="cz-section">
+<div class="cz-card" style="border-color: rgba(245, 181, 68, 0.55);">
+<p class="cz-card-body" style="margin: 0 0 0.5rem;"><span class="cz-badge cz-badge-warn">Backup required</span></p>
+<p class="cz-muted" style="margin: 0; font-size: 0.85rem;">{}</p>
+</div>
+</section>"#,
+            html_escape(&backup_warning)
+        )
+    } else {
+        String::new()
+    };
 
     let body = match names {
         Some([]) => format!(
@@ -6560,12 +6579,14 @@ pub fn render_secrets_index(localizer: &Localizer, names: Option<&[String]>) -> 
 <h1>{title}</h1>
 <p>{intro}</p>
 </section>
+{backup_block}
 <section class="cz-section">
 <div class="cz-card"><p class="cz-card-body" style="margin: 0;">{empty}</p></div>
 </section>"#,
             title = html_escape(&title),
             intro = html_escape(&intro),
             empty = html_escape(&empty),
+            backup_block = backup_block,
         ),
         None => format!(
             r#"<section class="cz-hero">
@@ -6604,6 +6625,7 @@ pub fn render_secrets_index(localizer: &Localizer, names: Option<&[String]>) -> 
 <h1>{title}</h1>
 <p>{intro}</p>
 </section>
+{backup_block}
 <section class="cz-section">
 <div class="cz-card">
 <table class="cz-table" style="width: 100%;">
@@ -6621,6 +6643,7 @@ pub fn render_secrets_index(localizer: &Localizer, names: Option<&[String]>) -> 
                 col_action = html_escape(&col_action),
                 rows = rows,
                 note = html_escape(&note),
+                backup_block = backup_block,
             )
         }
     };

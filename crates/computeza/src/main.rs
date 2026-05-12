@@ -461,9 +461,12 @@ async fn open_secrets_store(
 /// 16-byte random salt on first run. The salt is NOT secret on its own
 /// (it's only useful in combination with the passphrase) but it MUST
 /// be stable -- regenerating it would render every existing ciphertext
-/// unreadable.
+/// unreadable. First-time generation emits a prominent warn-level log
+/// listing the files an operator must back up to keep secrets
+/// recoverable.
 async fn ensure_secrets_salt(path: &std::path::Path) -> anyhow::Result<Vec<u8>> {
-    if tokio::fs::try_exists(path).await.unwrap_or(false) {
+    let salt_exists = tokio::fs::try_exists(path).await.unwrap_or(false);
+    if salt_exists {
         let s = tokio::fs::read(path).await?;
         if s.len() >= 16 {
             return Ok(s);
@@ -483,7 +486,21 @@ async fn ensure_secrets_salt(path: &std::path::Path) -> anyhow::Result<Vec<u8>> 
         tokio::fs::create_dir_all(parent).await?;
     }
     tokio::fs::write(path, salt).await?;
-    tracing::info!(path = %path.display(), "wrote new 16-byte secrets salt");
+
+    let store_path_hint = path.with_file_name("computeza-secrets.jsonl");
+    tracing::warn!(
+        salt = %path.display(),
+        ciphertext = %store_path_hint.display(),
+        "Generated a NEW 16-byte secrets salt -- this is a first-run event. \
+         To keep secrets recoverable across hardware migrations and disaster \
+         recovery you MUST back up THREE things together: \
+         (1) the salt file shown above, \
+         (2) the encrypted ciphertext file (computeza-secrets.jsonl in the same \
+         directory), and \
+         (3) the COMPUTEZA_SECRETS_PASSPHRASE value. \
+         Losing any one of these renders every stored secret permanently \
+         unrecoverable -- there is no master recovery path by design."
+    );
     Ok(salt.to_vec())
 }
 

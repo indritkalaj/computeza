@@ -150,6 +150,7 @@ ui-resource-repair-button  = Re-install
 
 ui-secrets-title         = Secrets
 ui-secrets-intro         = Encrypted secrets stored under the AES-256-GCM data-encryption key derived from `COMPUTEZA_SECRETS_PASSPHRASE`. Each entry's value never touches disk in plaintext; names are stored in clear so this page can list them.
+ui-secrets-backup-warning = Disaster-recovery reminder: to recover these secrets on another host you MUST back up THREE things together -- the COMPUTEZA_SECRETS_PASSPHRASE value, the salt file (computeza-secrets.salt next to your metadata store), and the encrypted ciphertext file (computeza-secrets.jsonl in the same directory). Lose any one of these and every value here becomes permanently unrecoverable. There is no master recovery path by design.
 ui-secrets-empty         = The secrets store is attached but no secrets are stored yet. New entries land here as soon as an install path generates them (e.g. initial admin passwords).
 ui-secrets-store-missing = No secrets store is attached on this server. Set `COMPUTEZA_SECRETS_PASSPHRASE` in the environment and restart `computeza serve` to enable encrypted secret storage; until then install paths surface generated credentials in-band on the result page only.
 ui-secrets-col-name      = Name
