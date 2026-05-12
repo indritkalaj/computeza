@@ -170,6 +170,11 @@ ui-install-grafana-intro  = Grafana is the BI and visualization layer. Install d
 ui-uninstall-grafana-title = Uninstall Grafana
 ui-uninstall-grafana-intro = Roll back the Grafana install: stop the service, remove the systemd unit, delete the data directory (dashboards, datasources). Drops grafana-instance/local from the metadata store.
 
+ui-install-restate-title  = Install Restate
+ui-install-restate-intro  = Restate is the durable-execution engine for stateful workflows + invocations. Install downloads the `restate-server` binary from the GitHub `.tar.xz` release (liblzma is statically linked so a virgin Linux host without xz-utils still works) and registers a systemd unit on the chosen ingress port.
+ui-uninstall-restate-title = Uninstall Restate
+ui-uninstall-restate-intro = Roll back the Restate install: stop the service, remove the systemd unit, delete the data directory (durable state). Drops restate-instance/local from the metadata store.
+
 ui-uninstall-title    = Uninstall PostgreSQL
 ui-uninstall-intro    = This rolls back the install: stops the Windows service, deletes the data directory, removes the psql shim from PATH, and drops postgres-instance/local from the metadata store. The cached binary bundle is preserved so re-install is fast.
 ui-uninstall-confirm  = This deletes the cluster's data directory. Any databases inside will be permanently lost. Make a backup first if you care about the data.

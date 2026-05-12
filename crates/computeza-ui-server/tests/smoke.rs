@@ -203,9 +203,22 @@ async fn server_serves_localized_home_and_healthz() {
     assert!(body.contains("Install Grafana"));
     assert!(body.contains(r#"action="/install/grafana""#));
 
+    // /install/restate -- restate has its own wizard now.
+    let resp = client
+        .get(format!("http://{addr}/install/restate"))
+        .send()
+        .await
+        .expect("GET /install/restate");
+    assert!(resp.status().is_success());
+    let body = resp.text().await.expect("body text");
+    assert!(body.contains("Install Restate"));
+    assert!(body.contains(r#"action="/install/restate""#));
+
     // /install/<still-planned> -- the CLI explainer page.
-    // Picked xtable as the assertion slot; if it ships, swap
-    // to restate (blocked on .tar.xz infrastructure).
+    // xtable is the only remaining unshipped component. Apache
+    // distributes source-only and Maven hosts only thin JARs that
+    // require a Maven dep resolve to actually run; blocked on a
+    // Computeza-side fat-JAR build pipeline (see AGENTS.md).
     let resp = client
         .get(format!("http://{addr}/install/xtable"))
         .send()

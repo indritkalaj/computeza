@@ -22,6 +22,7 @@
 pub mod detect;
 pub mod fetch;
 pub mod os_detect;
+pub mod prerequisites;
 pub mod progress;
 
 #[cfg(target_os = "linux")]

@@ -52,6 +52,9 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "j
 zip = { version = "2", default-features = false, features = ["deflate"] }
 tar = "0.4"
 flate2 = "1"
+# liblzma `static` feature compiles liblzma into the binary so virgin
+# Linux hosts don't need xz-utils to extract restate's .tar.xz bundles.
+liblzma = { version = "0.4", features = ["static"] }
 futures-util = "0.3"
 
 # --- UI framework (Leptos SSR) ---

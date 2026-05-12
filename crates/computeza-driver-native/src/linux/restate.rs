@@ -7,26 +7,38 @@ use crate::{
     progress::ProgressHandle,
 };
 
-use super::service::{
-    self, CliSymlink, InstalledService, ServiceError, ServiceInstall, Uninstalled,
-};
+use super::service::{self, InstalledService, ServiceError, ServiceInstall, Uninstalled};
 
 pub const UNIT_NAME: &str = "computeza-restate.service";
 pub const DEFAULT_INGRESS_PORT: u16 = 8080;
 
+// Verified May 2026 against the GitHub Releases API. Restate ships
+// three separate tarballs per release (restate-server, restate-cli,
+// restatectl); the driver installs only the server. The CLI tools
+// can be fetched separately by operators who need them.
+//
+// Format is .tar.xz -- handled by ArchiveKind::TarXz via liblzma
+// (statically linked, so virgin Linux hosts without xz-utils still
+// work).
 const RESTATE_BUNDLES: &[Bundle] = &[
     Bundle {
-        version: "1.4.0",
-        // TODO: verify against https://github.com/restatedev/restate/releases
-        url: "https://github.com/restatedev/restate/releases/download/v1.4.0/restate.x86_64-unknown-linux-musl.tar.gz",
-        kind: ArchiveKind::TarGz,
+        version: "1.6.2",
+        url: "https://github.com/restatedev/restate/releases/download/v1.6.2/restate-server-x86_64-unknown-linux-musl.tar.xz",
+        kind: ArchiveKind::TarXz,
         sha256: None,
         bin_subpath: "",
     },
     Bundle {
-        version: "1.3.0",
-        url: "https://github.com/restatedev/restate/releases/download/v1.3.0/restate.x86_64-unknown-linux-musl.tar.gz",
-        kind: ArchiveKind::TarGz,
+        version: "1.6.1",
+        url: "https://github.com/restatedev/restate/releases/download/v1.6.1/restate-server-x86_64-unknown-linux-musl.tar.xz",
+        kind: ArchiveKind::TarXz,
+        sha256: None,
+        bin_subpath: "",
+    },
+    Bundle {
+        version: "1.6.0",
+        url: "https://github.com/restatedev/restate/releases/download/v1.6.0/restate-server-x86_64-unknown-linux-musl.tar.xz",
+        kind: ArchiveKind::TarXz,
         sha256: None,
         bin_subpath: "",
     },
@@ -76,10 +88,8 @@ pub async fn install(
             port: opts.port,
             unit_name: opts.unit_name,
             config: None,
-            cli_symlink: Some(CliSymlink {
-                short_name: "restate",
-                binary_name: "restatectl",
-            }),
+            // restatectl ships in a separate tarball -- not bundled.
+            cli_symlink: None,
         },
         progress,
     )
@@ -102,7 +112,7 @@ impl Default for UninstallOptions {
 }
 
 pub async fn uninstall(opts: UninstallOptions) -> Result<Uninstalled, ServiceError> {
-    service::uninstall_service("restate", &opts.root_dir, &opts.unit_name, Some("restate")).await
+    service::uninstall_service("restate", &opts.root_dir, &opts.unit_name, None).await
 }
 
 pub async fn detect_installed() -> Vec<crate::detect::DetectedInstall> {

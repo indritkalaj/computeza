@@ -46,6 +46,10 @@ pub enum ArchiveKind {
     Zip,
     /// `.tar.gz` / `.tgz` (handled by `tar` over `flate2::GzDecoder`).
     TarGz,
+    /// `.tar.xz` (handled by `tar` over `liblzma::read::XzDecoder`).
+    /// liblzma is compiled in with `features = ["static"]` so a virgin
+    /// Linux host without xz-utils still works.
+    TarXz,
     /// A raw binary, not an archive. Saved verbatim to
     /// `<cache>/<version>/<bin_subpath>/<filename>` and chmod 0755 on
     /// Unix. `bin_subpath` typically points to a `bin/` directory and
@@ -291,6 +295,7 @@ fn extract(
     match kind {
         ArchiveKind::Zip => extract_zip(archive_path, dest),
         ArchiveKind::TarGz => extract_tar_gz(archive_path, dest),
+        ArchiveKind::TarXz => extract_tar_xz(archive_path, dest),
         ArchiveKind::Raw => place_raw(archive_path, dest, url, bin_subpath),
     }
 }
@@ -311,6 +316,17 @@ fn extract_zip(archive_path: &Path, dest: &Path) -> Result<(), FetchError> {
 fn extract_tar_gz(archive_path: &Path, dest: &Path) -> Result<(), FetchError> {
     let file = std::fs::File::open(archive_path)?;
     let decoder = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+    archive.unpack(dest).map_err(|e| FetchError::Extract {
+        path: archive_path.to_path_buf(),
+        message: e.to_string(),
+    })?;
+    Ok(())
+}
+
+fn extract_tar_xz(archive_path: &Path, dest: &Path) -> Result<(), FetchError> {
+    let file = std::fs::File::open(archive_path)?;
+    let decoder = liblzma::read::XzDecoder::new(file);
     let mut archive = tar::Archive::new(decoder);
     archive.unpack(dest).map_err(|e| FetchError::Extract {
         path: archive_path.to_path_buf(),

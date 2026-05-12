@@ -426,3 +426,81 @@ When adding a new component (kanidm, garage, lakekeeper, ...):
   operator console (`computeza serve`) itself remains cross-platform;
   only install actions are Linux-gated.
 - v1.0 GA target: Q2 2027 per spec section 13.
+
+## Host prerequisites
+
+The product owner's directive: "we also need to deliver the dependencies
+since the hosting OS might not have them installed". The framework
+lives at `computeza-driver-native::prerequisites`. Today's split:
+
+**Bundled in pure Rust (no host dep):**
+
+- Archive extraction -- zip, tar.gz, tar.xz (xz via `liblzma` with the
+  `static` feature so virgin Linux hosts without `xz-utils` still work),
+  raw binaries
+- HTTP fetch -- `reqwest`
+- SHA-256 verification -- `sha2`
+- Service registration -- `systemctl` shell wrapper (systemd is a
+  baseline assumption on every supported distro)
+
+**Host-installed (operator must provide):**
+
+- `openssl` -- kanidm install only, for self-signed TLS cert generation.
+  Wizard surfaces the per-distro install one-liner via
+  `prerequisites::SYSTEM_COMMANDS`.
+- `cargo` -- kanidm install only, for `cargo install kanidmd --locked`.
+  Wizard surfaces the rustup install one-liner.
+
+**Computeza-delivered (auto-installed into the component root):**
+
+- Adoptium Temurin JRE 21 (`prerequisites::TEMURIN_JRE_21_X86_64_LINUX`)
+  -- xtable install only. Drops into `<root_dir>/jre/` next to the
+  runner JAR, never touches system PATH, removed by uninstall. Designed
+  but not yet wired -- blocked on the xtable runner-JAR distribution
+  question (see below).
+
+Adding a new host dep:
+
+1. Add a `SystemCommand` entry to `prerequisites::SYSTEM_COMMANDS`.
+2. Have the install wizard call `prerequisites::which_on_path(name)` in
+   its form handler and surface a banner with `install_hint` when the
+   command is missing.
+3. Do NOT auto-`apt-get`/`dnf`/`pacman` install -- v0.0.x principle is
+   "detect + surface", not "detect + auto install on the operator's
+   box". Auto-installing into an isolated `<root_dir>/<tool>/` is fine
+   (that's the Temurin pattern).
+
+## xtable: open infrastructure question
+
+xtable is the 11th managed component. As of May 2026 it cannot be
+shipped from this repo because Apache distributes the runnable artifact
+in one of three forms, none of which is a turnkey download:
+
+1. **Apache dist** (`dist.apache.org/repos/dist/release/incubator/xtable/`)
+   -- source-only tarball (`apache-xtable-0.3.0-incubating.src.tgz`).
+   Requires JDK + Maven + a multi-minute `mvn package` build at install
+   time.
+2. **GitHub Releases** (`apache/incubator-xtable`) -- zero asset files.
+3. **Maven Central** (`org.apache.xtable/xtable-service/0.3.0-incubating`)
+   -- 28 KB thin JAR. Running it requires Maven to resolve and download
+   ~50-100 transitive deps at install time.
+
+Realistic paths for v0.1+:
+
+- (a) Computeza-side build pipeline that produces a fat JAR and hosts
+  it on a Computeza CDN. The driver then becomes a normal
+  `Bundle { kind: TarGz, ... }` + the Temurin JRE bootstrap. Cleanest
+  but requires release infrastructure that doesn't exist yet.
+- (b) Install-time Maven resolve. Driver invokes Maven to resolve
+  `xtable-service` + transitive deps into `<root_dir>/lib/`, registers
+  a systemd unit running `java -cp <root>/lib/*:<root>/jre/...`.
+  Workable but requires Maven on the host AND the JRE bootstrap.
+- (c) Install-time source build. Driver clones the Apache source
+  tarball, builds with `mvn package`, uses the resulting fat JAR.
+  Slowest path; useful only if the operator wants to track upstream
+  closely.
+
+Until one of (a)/(b)/(c) lands, xtable stays at `available: false` on
+the install hub and `/install/xtable` renders the CLI-explainer page.
+The reconciler crate is fully implemented and ready for the day the
+runner JAR is reachable.
