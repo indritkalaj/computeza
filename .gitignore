@@ -43,6 +43,15 @@ Thumbs.db
 *.sqlite-wal
 *.sqlite-shm
 
+# Auth + audit + secrets artifacts that runtime / tests may create
+# in the working directory. The audit.key file in particular is the
+# ed25519 signing secret -- never commit it.
+operators.jsonl
+audit.jsonl
+audit.key
+computeza-secrets.jsonl
+computeza-secrets.salt
+
 # Misc
 *.log
 *.pid
