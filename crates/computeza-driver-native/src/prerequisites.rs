@@ -87,6 +87,11 @@ pub const SYSTEM_COMMANDS: &[SystemCommand] = &[
         required_for: "xtable install (JRE runtime for the runner JAR)",
         install_hint: "Computeza will auto-install Adoptium Temurin JRE 21 into <root_dir>/jre during xtable install -- no operator action needed",
     },
+    SystemCommand {
+        name: "mvn",
+        required_for: "xtable install (Maven resolves the runner JAR + its ~50 transitive deps from Maven Central at install time)",
+        install_hint: "apt-get install -y maven  (Debian/Ubuntu) | dnf install -y maven (RHEL family) | zypper install -y maven (SUSE) | pacman -S --noconfirm maven (Arch)",
+    },
 ];
 
 /// Adoptium Temurin JRE 21 (LTS) bundle. Used by the xtable install
@@ -344,6 +349,93 @@ pub async fn ensure_rust_toolchain(
     Err(std::io::Error::other(
         "ensure_rust_toolchain: bundled Rust toolchain is x86_64-linux-only in v0.0.x; \
          macOS and Windows install paths are not reachable through the wizard",
+    ))
+}
+
+/// Ensure a usable JRE 21 is available under `<component_root>/jre`,
+/// returning the absolute path to the bundled `java` binary.
+///
+/// Mirrors the [`ensure_rust_toolchain`] pattern but with key
+/// differences:
+///
+/// - **Sandboxed, not system-wide.** The JRE is internal plumbing for
+///   one component (xtable, today) -- not a tool the operator runs
+///   themselves -- so we drop it under the component root and never
+///   register it on `$PATH`. Removing the component root removes the
+///   JRE with it.
+/// - **No host-PATH fallback.** Detecting a usable host JRE (parsing
+///   `java -version` and version-comparing) is fragile across distros;
+///   we always use the bundled copy to keep the version exactly
+///   pinned and the install reproducible.
+///
+/// Idempotent: re-running on an existing install is a no-op (the
+/// presence of `<root>/jre/.../bin/java` is the cache marker).
+#[cfg(target_os = "linux")]
+pub async fn ensure_bundled_temurin_jre(
+    component_root: &std::path::Path,
+    progress: &crate::progress::ProgressHandle,
+) -> Result<PathBuf, std::io::Error> {
+    let jre_root = component_root.join("jre");
+    let expected_bin = jre_root
+        .join(TEMURIN_JRE_21_X86_64_LINUX.bin_subpath)
+        .join("java");
+    if expected_bin.is_file() {
+        tracing::info!(
+            java = %expected_bin.display(),
+            "temurin bootstrap: using previously-bundled JRE at <root>/jre"
+        );
+        return Ok(expected_bin);
+    }
+
+    tokio::fs::create_dir_all(&jre_root).await?;
+    progress.set_message(
+        "Bundling Adoptium Temurin JRE 21 into <component-root>/jre \
+         (one-time download, ~50MB, sandboxed -- not registered on system PATH)",
+    );
+
+    // Stream-download the tarball.
+    let tarball_path = jre_root.join("temurin-jre.tar.gz");
+    download_to(TEMURIN_JRE_21_X86_64_LINUX.url, &tarball_path).await?;
+
+    // Extract using the existing fetch infrastructure. We can't reuse
+    // `fetch_and_extract` directly because that does a verify pass
+    // against `sha256` (None here) + writes a `.computeza-extracted`
+    // sentinel that's keyed against a Bundle. Inline the extraction.
+    let bytes = tokio::fs::read(&tarball_path).await?;
+    let cursor = std::io::Cursor::new(&bytes[..]);
+    let gz = flate2::read::GzDecoder::new(cursor);
+    let mut archive = tar::Archive::new(gz);
+    archive.unpack(&jre_root).map_err(|e| {
+        std::io::Error::other(format!(
+            "unpacking Temurin JRE tarball into {}: {e}",
+            jre_root.display()
+        ))
+    })?;
+    // Drop the tarball -- the unpacked tree is what we keep.
+    let _ = tokio::fs::remove_file(&tarball_path).await;
+
+    if !expected_bin.is_file() {
+        return Err(std::io::Error::other(format!(
+            "Temurin JRE extracted but java binary missing at {}. \
+             Inspect <root>/jre for partial state; delete it and re-run install to retry.",
+            expected_bin.display()
+        )));
+    }
+    tracing::info!(
+        java = %expected_bin.display(),
+        "temurin bootstrap: JRE 21 ready"
+    );
+    Ok(expected_bin)
+}
+
+/// Non-Linux stub.
+#[cfg(not(target_os = "linux"))]
+pub async fn ensure_bundled_temurin_jre(
+    _component_root: &std::path::Path,
+    _progress: &crate::progress::ProgressHandle,
+) -> Result<PathBuf, std::io::Error> {
+    Err(std::io::Error::other(
+        "ensure_bundled_temurin_jre: bundled Temurin JRE is x86_64-linux-only in v0.0.x",
     ))
 }
 

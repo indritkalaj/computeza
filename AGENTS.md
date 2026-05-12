@@ -708,37 +708,33 @@ Adding a new host dep:
    box". Auto-installing into an isolated `<root_dir>/<tool>/` is fine
    (that's the Temurin pattern).
 
-## xtable: open infrastructure question
+## xtable: install path (Maven Central + bundled JRE)
 
-xtable is the 11th managed component. As of May 2026 it cannot be
-shipped from this repo because Apache distributes the runnable artifact
-in one of three forms, none of which is a turnkey download:
+The 11th managed component ships via path (b) from the original
+infrastructure question -- install-time Maven resolve against Maven
+Central. The driver at `crates/computeza-driver-native/src/linux/xtable.rs`:
 
-1. **Apache dist** (`dist.apache.org/repos/dist/release/incubator/xtable/`)
-   -- source-only tarball (`apache-xtable-0.3.0-incubating.src.tgz`).
-   Requires JDK + Maven + a multi-minute `mvn package` build at install
-   time.
-2. **GitHub Releases** (`apache/incubator-xtable`) -- zero asset files.
-3. **Maven Central** (`org.apache.xtable/xtable-service/0.3.0-incubating`)
-   -- 28 KB thin JAR. Running it requires Maven to resolve and download
-   ~50-100 transitive deps at install time.
+1. Verifies `mvn` is on host `$PATH` (detect-and-surface via
+   `prerequisites::SYSTEM_COMMANDS`).
+2. Calls `prerequisites::ensure_bundled_temurin_jre(<root_dir>)` to
+   drop Adoptium Temurin JRE 21 sandboxed under `<root>/jre/`.
+3. Writes a one-off `pom.xml` under `<root>/build/` declaring the
+   `org.apache.xtable:xtable-utilities` dependency.
+4. Shells to `mvn -f <root>/build/pom.xml dependency:copy-dependencies
+   -DoutputDirectory=<root>/lib -DincludeScope=runtime`. Maven
+   resolves the ~50 transitive deps from Maven Central into
+   `<root>/lib/`.
+5. Registers a systemd unit that runs `<root>/jre/.../bin/java
+   -cp <root>/lib/* org.apache.xtable.utilities.RunSync
+   --datasetConfig <root>/datasets.yaml`. The operator supplies
+   `datasets.yaml` after first start (a v0.1 form will generate it
+   from the spec).
 
-Realistic paths for v0.1+:
+v0.1+ alternative: a Computeza-built fat JAR served from a CDN
+removes the Maven host-prereq. The driver shape stays compatible --
+swap the Maven dispatch step for a `Bundle` fetch.
 
-- (a) Computeza-side build pipeline that produces a fat JAR and hosts
-  it on a Computeza CDN. The driver then becomes a normal
-  `Bundle { kind: TarGz, ... }` + the Temurin JRE bootstrap. Cleanest
-  but requires release infrastructure that doesn't exist yet.
-- (b) Install-time Maven resolve. Driver invokes Maven to resolve
-  `xtable-service` + transitive deps into `<root_dir>/lib/`, registers
-  a systemd unit running `java -cp <root>/lib/*:<root>/jre/...`.
-  Workable but requires Maven on the host AND the JRE bootstrap.
-- (c) Install-time source build. Driver clones the Apache source
-  tarball, builds with `mvn package`, uses the resulting fat JAR.
-  Slowest path; useful only if the operator wants to track upstream
-  closely.
-
-Until one of (a)/(b)/(c) lands, xtable stays at `available: false` on
-the install hub and `/install/xtable` renders the CLI-explainer page.
-The reconciler crate is fully implemented and ready for the day the
-runner JAR is reachable.
+xtable is `available: true` on the hub and the last entry in
+`INSTALL_ORDER` (because its dataset config typically references
+upstream sources living in earlier components like garage /
+lakekeeper).

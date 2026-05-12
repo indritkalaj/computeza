@@ -1229,6 +1229,14 @@ async fn dispatch_uninstall_with_config(
                     .map(|r| format_uninstall_summary(&r.steps, &r.warnings))
                     .map_err(|e| format!("{e}"))
             }
+            "xtable" => {
+                let mut opts = linux::xtable::UninstallOptions::default();
+                apply_uninstall_config_overrides(config, &mut opts.unit_name, &mut opts.root_dir);
+                linux::xtable::uninstall(opts)
+                    .await
+                    .map(|r| format_uninstall_summary(&r.steps, &r.warnings))
+                    .map_err(|e| format!("{e}"))
+            }
             other => Err(format!(
                 "dispatch_uninstall_with_config: unknown component slug {other:?}"
             )),
@@ -1266,6 +1274,7 @@ async fn dispatch_install(
         "grafana" => run_grafana_install_with_progress(progress, config).await?,
         "restate" => run_restate_install_with_progress(progress, config).await?,
         "databend" => run_databend_install_with_progress(progress, config).await?,
+        "xtable" => run_xtable_install_with_progress(progress, config).await?,
         other => {
             return Err(format!(
                 "dispatch_install: unknown component slug {other:?}"
@@ -2494,6 +2503,54 @@ async fn run_databend_install_with_progress(
     _config: &InstallConfig,
 ) -> Result<(String, u16), String> {
     Err("Databend install requires a supported Linux host.".into())
+}
+
+// ============================================================
+// xtable install path -- Maven-resolve + bundled Temurin JRE
+// ============================================================
+
+#[cfg(target_os = "linux")]
+async fn run_xtable_install_with_progress(
+    progress: &ProgressHandle,
+    config: &InstallConfig,
+) -> Result<(String, u16), String> {
+    use computeza_driver_native::linux::xtable;
+    let mut opts = xtable::InstallOptions::default();
+    if let Some(p) = config.port {
+        opts.port = p;
+    }
+    if let Some(d) = &config.root_dir {
+        opts.root_dir = std::path::PathBuf::from(d);
+    }
+    if let Some(s) = &config.service_name {
+        opts.unit_name = format!("{s}.service");
+    }
+    if let Some(v) = &config.version {
+        opts.version = Some(v.clone());
+    }
+    match xtable::install(opts, progress).await {
+        Ok(r) => Ok((
+            format!(
+                "lib_dir: {}\nunit_path: {}\ndatasets.yaml (operator-supplied at next start): {}/datasets.yaml",
+                r.bin_dir.display(),
+                r.unit_path.display(),
+                r.bin_dir
+                    .parent()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(unknown)".into()),
+            ),
+            r.port,
+        )),
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn run_xtable_install_with_progress(
+    _progress: &ProgressHandle,
+    _config: &InstallConfig,
+) -> Result<(String, u16), String> {
+    Err("xtable install requires a supported Linux host.".into())
 }
 
 // ============================================================
@@ -4859,7 +4916,13 @@ const COMPONENTS: &[ComponentEntry] = &[
         slug: "xtable",
         name_key: "component-xtable-name",
         role_key: "component-xtable-role",
-        available: false,
+        // Linux install live: bundles Adoptium Temurin JRE 21 into
+        // <root>/jre via ensure_bundled_temurin_jre, shells to Maven
+        // (mvn on host) to resolve org.apache.xtable:xtable-utilities
+        // + transitive deps from Maven Central into <root>/lib,
+        // registers a systemd unit running `java -cp <root>/lib/* ...`.
+        // Linux only for v0.0.x. Apache 2.0 licensed.
+        available: true,
     },
     ComponentEntry {
         slug: "databend",
@@ -4954,6 +5017,10 @@ const INSTALL_ORDER: &[&str] = &[
     "grafana",
     "restate",
     "databend",
+    // xtable goes last because the dataset config it eventually
+    // reads (datasets.yaml under <root>) typically references
+    // upstream sources living in other components (garage / lakekeeper).
+    "xtable",
 ];
 
 /// Per-component canonical defaults shown as `placeholder=` text in the
@@ -4975,6 +5042,7 @@ fn canonical_defaults_for(slug: &str) -> (u16, String) {
         "databend" => 8000,
         "grafana" => 3000,
         "restate" => 8081,
+        "xtable" => 8090,
         _ => 0,
     };
     (port, format!("computeza-{slug}"))
