@@ -79,6 +79,14 @@ impl InstallPhase {
 /// Current snapshot of an in-flight install. Serialised verbatim by
 /// the UI server's `/api/install/job/{id}` endpoint and polled by the
 /// wizard's JS.
+///
+/// The `phase` / `bytes_*` / `message` fields always reflect the
+/// *currently-running component*. For a single-component install
+/// (the per-component pages at `/install/<slug>`) that's the whole
+/// story. For a multi-component install (the unified `/install`
+/// flow) `components` carries the per-slug breakdown -- pending /
+/// running / done / failed -- and the top-level fields track the
+/// component whose `state == Running`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct InstallProgress {
     /// Which coarse step the installer is on.
@@ -111,6 +119,49 @@ pub struct InstallProgress {
     pub started_at: Option<DateTime<Utc>>,
     /// Wall-clock when the task completed (success or failure).
     pub finished_at: Option<DateTime<Utc>>,
+    /// Per-component state for a multi-component install (the unified
+    /// `/install` flow). Empty for single-component installs. Order
+    /// matches the install dispatch order so the wizard renders a
+    /// stable top-to-bottom checklist.
+    #[serde(default)]
+    pub components: Vec<ComponentProgress>,
+}
+
+/// Per-component progress entry inside [`InstallProgress::components`]
+/// for a multi-component install. The wizard renders one row per
+/// entry, highlighting whichever is currently `Running`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ComponentProgress {
+    /// Component slug (e.g. "postgres", "kanidm") -- matches the
+    /// dispatch table in the UI server's `install_all_handler`.
+    pub slug: String,
+    /// Coarse state: pending, running, done, or failed.
+    pub state: ComponentState,
+    /// Multi-line success summary for this component (set when
+    /// transitioning to `Done`).
+    pub summary: Option<String>,
+    /// Error chain for this component (set when transitioning to
+    /// `Failed`). Other components after this one stay `Pending`.
+    pub error: Option<String>,
+}
+
+/// Per-component state inside a multi-component install. Values are
+/// kebab-case in JSON so the front-end can use them as CSS classes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ComponentState {
+    /// Not started yet -- the dispatcher hasn't reached this slug.
+    #[default]
+    Pending,
+    /// Currently installing; the parent [`InstallProgress`]'s
+    /// `phase`, `bytes_*`, `message` reflect this component's
+    /// step-by-step progress.
+    Running,
+    /// Install finished successfully; `summary` is populated.
+    Done,
+    /// Install failed; `error` is populated and no further
+    /// components were attempted.
+    Failed,
 }
 
 impl InstallProgress {
@@ -229,6 +280,73 @@ impl ProgressHandle {
             g.log.push(format!("Failed: {err}"));
         }
     }
+
+    // -- multi-component helpers (unified install) --
+    //
+    // The unified `/install` POST runs N installs sequentially. Each
+    // calls into a per-component driver that uses the same handle.
+    // These helpers track per-component status so the wizard can
+    // render a stable N-row checklist with the current one highlighted.
+
+    /// Initialize the per-component checklist for a multi-component
+    /// install. Every slug starts in `Pending`. Idempotent: calling
+    /// twice replaces the list.
+    pub fn init_components(&self, slugs: &[&str]) {
+        if let Some(m) = &self.inner {
+            let mut g = m.lock().unwrap();
+            g.components = slugs
+                .iter()
+                .map(|s| ComponentProgress {
+                    slug: (*s).to_string(),
+                    state: ComponentState::Pending,
+                    summary: None,
+                    error: None,
+                })
+                .collect();
+        }
+    }
+
+    /// Mark the given slug as the currently-running component. Resets
+    /// the per-current-component bytes counter so a previous
+    /// component's tail-end download counters don't bleed into the
+    /// next one's view.
+    pub fn start_component(&self, slug: &str) {
+        if let Some(m) = &self.inner {
+            let mut g = m.lock().unwrap();
+            if let Some(c) = g.components.iter_mut().find(|c| c.slug == slug) {
+                c.state = ComponentState::Running;
+            }
+            g.bytes_downloaded = 0;
+            g.total_bytes = None;
+        }
+    }
+
+    /// Mark the given slug as finished with the given summary. Does
+    /// NOT mark the whole job complete -- the orchestrator decides
+    /// when to call [`finish_success`] / [`finish_failure`] for the
+    /// run as a whole.
+    pub fn finish_component(&self, slug: &str, summary: impl Into<String>) {
+        if let Some(m) = &self.inner {
+            let mut g = m.lock().unwrap();
+            if let Some(c) = g.components.iter_mut().find(|c| c.slug == slug) {
+                c.state = ComponentState::Done;
+                c.summary = Some(summary.into());
+            }
+        }
+    }
+
+    /// Mark the given slug as failed with the given error chain. The
+    /// orchestrator typically calls this and then [`finish_failure`]
+    /// to mark the whole run failed.
+    pub fn fail_component(&self, slug: &str, error: impl Into<String>) {
+        if let Some(m) = &self.inner {
+            let mut g = m.lock().unwrap();
+            if let Some(c) = g.components.iter_mut().find(|c| c.slug == slug) {
+                c.state = ComponentState::Failed;
+                c.error = Some(error.into());
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -271,6 +389,44 @@ mod tests {
         assert!((p.phase_ratio() - 0.25).abs() < 1e-9);
         p.bytes_downloaded = 1500;
         assert_eq!(p.phase_ratio(), 1.0); // clamped
+    }
+
+    #[test]
+    fn multi_component_lifecycle_records_per_slug_state() {
+        let state = Arc::new(Mutex::new(InstallProgress::default()));
+        let h = ProgressHandle::new(state);
+
+        h.init_components(&["postgres", "openfga", "kanidm"]);
+        let snap = h.snapshot().unwrap();
+        assert_eq!(snap.components.len(), 3);
+        assert!(snap
+            .components
+            .iter()
+            .all(|c| c.state == ComponentState::Pending));
+
+        h.start_component("postgres");
+        h.set_bytes(50, Some(100));
+        let snap = h.snapshot().unwrap();
+        assert_eq!(snap.components[0].state, ComponentState::Running);
+        assert_eq!(snap.components[1].state, ComponentState::Pending);
+        assert_eq!(snap.bytes_downloaded, 50);
+
+        h.finish_component("postgres", "bin_dir: /var/lib/computeza/postgres/bin");
+        // start_component resets the byte counters so a stale value
+        // from the previous component doesn't leak.
+        h.start_component("openfga");
+        let snap = h.snapshot().unwrap();
+        assert_eq!(snap.components[0].state, ComponentState::Done);
+        assert!(snap.components[0].summary.is_some());
+        assert_eq!(snap.components[1].state, ComponentState::Running);
+        assert_eq!(snap.bytes_downloaded, 0);
+        assert!(snap.total_bytes.is_none());
+
+        h.fail_component("openfga", "boom");
+        let snap = h.snapshot().unwrap();
+        assert_eq!(snap.components[1].state, ComponentState::Failed);
+        assert_eq!(snap.components[1].error.as_deref(), Some("boom"));
+        assert_eq!(snap.components[2].state, ComponentState::Pending);
     }
 
     #[test]

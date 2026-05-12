@@ -278,14 +278,22 @@ async fn install_all_handler(
 
     let store = state.store.clone();
     let progress = ProgressHandle::new(progress_state);
+
+    // Seed the per-component checklist up front so the wizard can
+    // render the full N-row list with everything Pending immediately.
+    let slugs: Vec<&'static str> = planned.iter().map(|(s, _)| *s).collect();
+    progress.init_components(&slugs);
+
     tokio::spawn(async move {
         let mut overall = String::new();
         let total = planned.len();
         for (idx, (slug, config)) in planned.into_iter().enumerate() {
+            progress.start_component(slug);
             let banner = format!("[{}/{}] Installing {slug}...", idx + 1, total);
             progress.set_message(banner);
             match dispatch_install(slug, &progress, &config).await {
                 Ok((summary, _port, spec)) => {
+                    progress.finish_component(slug, &summary);
                     overall.push_str(&format!("=== {slug} ===\n{summary}\n\n"));
                     if let Some(store) = &store {
                         let kind = format!("{slug}-instance");
@@ -309,6 +317,7 @@ async fn install_all_handler(
                     }
                 }
                 Err(detail) => {
+                    progress.fail_component(slug, &detail);
                     progress.finish_failure(format!(
                         "{slug} install failed: {detail}\n\nProgress before the failure:\n{overall}\n\
                          Fix the underlying issue (see the log panel above) and re-submit the install form. \
