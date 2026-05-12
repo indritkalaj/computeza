@@ -540,6 +540,54 @@ async fn delete_install_config(store: &SqliteStore, slug: &str) {
     }
 }
 
+/// Shared teardown for the per-component uninstall handlers. Loads
+/// the persisted `InstallConfig` so the uninstall targets the
+/// operator's chosen service name + root dir (instead of falling back
+/// to driver defaults), then drops the `<slug>-instance/local` row,
+/// the `install-config/<slug>-local` row, and the
+/// `<slug>/admin-password` secret. Pairs with the unified install's
+/// `finalize_managed_install` pattern.
+///
+/// Returns the uninstall summary (or the dispatcher error) so the
+/// caller can render the result page.
+async fn teardown_managed_uninstall(
+    slug: &str,
+    store: Option<&SqliteStore>,
+    secrets: Option<&SecretsStore>,
+) -> Result<String, String> {
+    let config = match store {
+        Some(s) => load_install_config(s, slug).await.unwrap_or_default(),
+        None => InstallConfig::default(),
+    };
+    let result = dispatch_uninstall_with_config(slug, &config).await;
+
+    if let Some(store) = store {
+        let kind = format!("{slug}-instance");
+        let key = ResourceKey::cluster_scoped(&kind, "local");
+        if let Err(e) = store.delete(&key, None).await {
+            tracing::warn!(
+                error = %e,
+                component = slug,
+                "uninstall: store.delete({slug}-instance/local) failed; \
+                 row may linger -- inspect via /resource and clean up manually"
+            );
+        }
+        delete_install_config(store, slug).await;
+    }
+    if let Some(secrets) = secrets {
+        let secret_ref = format!("{slug}/admin-password");
+        if let Err(e) = secrets.delete(&secret_ref).await {
+            tracing::debug!(
+                error = %e,
+                component = slug,
+                "uninstall: secrets.delete({secret_ref}) failed; \
+                 ignoring -- the entry may not have existed"
+            );
+        }
+    }
+    result
+}
+
 /// Generate a 96-bit random password rendered as a 24-character hex
 /// string. Hex avoids alphabet-modulo bias and is safe to paste into
 /// shell prompts / config files (no quoting / escaping needed).
@@ -1023,23 +1071,15 @@ async fn uninstall_confirm_handler() -> Html<String> {
 
 async fn uninstall_postgres_handler(State(state): State<AppState>) -> Response {
     let l = Localizer::english();
-    let result = run_postgres_uninstall().await;
-
-    // Best-effort: also drop the metadata row so /status doesn't
-    // keep reporting a now-deleted instance. We do this regardless
-    // of whether the driver-side uninstall succeeded -- the operator
-    // explicitly asked for a rollback.
-    if let Some(store) = &state.store {
-        let key = ResourceKey::cluster_scoped("postgres-instance", "local");
-        if let Err(e) = store.delete(&key, None).await {
-            tracing::warn!(
-                error = %e,
-                "uninstall: store.delete(postgres-instance/local) failed; \
-                 manually delete the row via the /resource page if it lingers"
-            );
-        }
-    }
-
+    // teardown_managed_uninstall loads install-config/postgres-local
+    // (when one was persisted by the unified install) and uses it to
+    // build UninstallOptions so the teardown targets the operator's
+    // chosen service name + root dir. It also drops the
+    // postgres-instance/local row, the install-config row, and the
+    // postgres/admin-password secret.
+    let result =
+        teardown_managed_uninstall("postgres", state.store.as_deref(), state.secrets.as_deref())
+            .await;
     let body = match result {
         Ok(summary) => render_install_result(&l, true, &summary),
         Err(detail) => render_install_result(&l, false, &detail),
@@ -1136,17 +1176,9 @@ async fn uninstall_kanidm_confirm_handler() -> Html<String> {
 
 async fn uninstall_kanidm_handler(State(state): State<AppState>) -> Response {
     let l = Localizer::english();
-    let result = run_kanidm_uninstall().await;
-    if let Some(store) = &state.store {
-        let key = ResourceKey::cluster_scoped("kanidm-instance", "local");
-        if let Err(e) = store.delete(&key, None).await {
-            tracing::warn!(
-                error = %e,
-                "uninstall: store.delete(kanidm-instance/local) failed; \
-                 manually delete the row via the /resource page if it lingers"
-            );
-        }
-    }
+    let result =
+        teardown_managed_uninstall("kanidm", state.store.as_deref(), state.secrets.as_deref())
+            .await;
     let body = match result {
         Ok(summary) => render_install_result(&l, true, &summary),
         Err(detail) => render_install_result(&l, false, &detail),
@@ -1248,38 +1280,6 @@ async fn run_kanidm_install_with_progress(
     Err("install is supported on Linux, macOS, and Windows only".into())
 }
 
-#[cfg(target_os = "linux")]
-async fn run_kanidm_uninstall() -> Result<String, String> {
-    use computeza_driver_native::linux::kanidm;
-    match kanidm::uninstall(kanidm::UninstallOptions::default()).await {
-        Ok(r) => Ok(format_uninstall_summary(&r.steps, &r.warnings)),
-        Err(e) => Err(format!("{e}")),
-    }
-}
-
-#[cfg(target_os = "macos")]
-async fn run_kanidm_uninstall() -> Result<String, String> {
-    use computeza_driver_native::macos::kanidm;
-    match kanidm::uninstall(kanidm::UninstallOptions::default()).await {
-        Ok(r) => Ok(format_uninstall_summary(&r.steps, &r.warnings)),
-        Err(e) => Err(format!("{e}")),
-    }
-}
-
-#[cfg(target_os = "windows")]
-async fn run_kanidm_uninstall() -> Result<String, String> {
-    use computeza_driver_native::windows::kanidm;
-    match kanidm::uninstall(kanidm::UninstallOptions::default()).await {
-        Ok(r) => Ok(format_uninstall_summary(&r.steps, &r.warnings)),
-        Err(e) => Err(format!("{e}")),
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-async fn run_kanidm_uninstall() -> Result<String, String> {
-    Err("uninstall is supported on Linux, macOS, and Windows only".into())
-}
-
 // ============================================================
 // Garage install path
 // ============================================================
@@ -1371,17 +1371,9 @@ async fn uninstall_garage_confirm_handler() -> Html<String> {
 
 async fn uninstall_garage_handler(State(state): State<AppState>) -> Response {
     let l = Localizer::english();
-    let result = run_garage_uninstall().await;
-    if let Some(store) = &state.store {
-        let key = ResourceKey::cluster_scoped("garage-instance", "local");
-        if let Err(e) = store.delete(&key, None).await {
-            tracing::warn!(
-                error = %e,
-                "uninstall: store.delete(garage-instance/local) failed; \
-                 manually delete the row via the /resource page if it lingers"
-            );
-        }
-    }
+    let result =
+        teardown_managed_uninstall("garage", state.store.as_deref(), state.secrets.as_deref())
+            .await;
     let body = match result {
         Ok(summary) => render_install_result(&l, true, &summary),
         Err(detail) => render_install_result(&l, false, &detail),
@@ -1433,20 +1425,6 @@ async fn run_garage_install_with_progress(
     _config: &InstallConfig,
 ) -> Result<(String, u16), String> {
     Err("Garage install requires a supported Linux host. v0.0.x does not yet ship a macOS or Windows driver for this component.".into())
-}
-
-#[cfg(target_os = "linux")]
-async fn run_garage_uninstall() -> Result<String, String> {
-    use computeza_driver_native::linux::garage;
-    match garage::uninstall(garage::UninstallOptions::default()).await {
-        Ok(r) => Ok(format_uninstall_summary(&r.steps, &r.warnings)),
-        Err(e) => Err(format!("{e}")),
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-async fn run_garage_uninstall() -> Result<String, String> {
-    Err("Garage uninstall requires a supported Linux host.".into())
 }
 
 // ============================================================
@@ -1536,16 +1514,9 @@ async fn uninstall_openfga_confirm_handler() -> Html<String> {
 
 async fn uninstall_openfga_handler(State(state): State<AppState>) -> Response {
     let l = Localizer::english();
-    let result = run_openfga_uninstall().await;
-    if let Some(store) = &state.store {
-        let key = ResourceKey::cluster_scoped("openfga-instance", "local");
-        if let Err(e) = store.delete(&key, None).await {
-            tracing::warn!(
-                error = %e,
-                "uninstall: store.delete(openfga-instance/local) failed"
-            );
-        }
-    }
+    let result =
+        teardown_managed_uninstall("openfga", state.store.as_deref(), state.secrets.as_deref())
+            .await;
     let body = match result {
         Ok(summary) => render_install_result(&l, true, &summary),
         Err(detail) => render_install_result(&l, false, &detail),
@@ -1596,20 +1567,6 @@ async fn run_openfga_install_with_progress(
         "OpenFGA install requires a supported Linux host. v0.0.x ships only the Linux driver."
             .into(),
     )
-}
-
-#[cfg(target_os = "linux")]
-async fn run_openfga_uninstall() -> Result<String, String> {
-    use computeza_driver_native::linux::openfga;
-    match openfga::uninstall(openfga::UninstallOptions::default()).await {
-        Ok(r) => Ok(format_uninstall_summary(&r.steps, &r.warnings)),
-        Err(e) => Err(format!("{e}")),
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-async fn run_openfga_uninstall() -> Result<String, String> {
-    Err("OpenFGA uninstall requires a supported Linux host.".into())
 }
 
 // ============================================================
@@ -1699,16 +1656,9 @@ async fn uninstall_qdrant_confirm_handler() -> Html<String> {
 
 async fn uninstall_qdrant_handler(State(state): State<AppState>) -> Response {
     let l = Localizer::english();
-    let result = run_qdrant_uninstall().await;
-    if let Some(store) = &state.store {
-        let key = ResourceKey::cluster_scoped("qdrant-instance", "local");
-        if let Err(e) = store.delete(&key, None).await {
-            tracing::warn!(
-                error = %e,
-                "uninstall: store.delete(qdrant-instance/local) failed"
-            );
-        }
-    }
+    let result =
+        teardown_managed_uninstall("qdrant", state.store.as_deref(), state.secrets.as_deref())
+            .await;
     let body = match result {
         Ok(summary) => render_install_result(&l, true, &summary),
         Err(detail) => render_install_result(&l, false, &detail),
@@ -1759,20 +1709,6 @@ async fn run_qdrant_install_with_progress(
         "Qdrant install requires a supported Linux host. v0.0.x ships only the Linux driver."
             .into(),
     )
-}
-
-#[cfg(target_os = "linux")]
-async fn run_qdrant_uninstall() -> Result<String, String> {
-    use computeza_driver_native::linux::qdrant;
-    match qdrant::uninstall(qdrant::UninstallOptions::default()).await {
-        Ok(r) => Ok(format_uninstall_summary(&r.steps, &r.warnings)),
-        Err(e) => Err(format!("{e}")),
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-async fn run_qdrant_uninstall() -> Result<String, String> {
-    Err("Qdrant uninstall requires a supported Linux host.".into())
 }
 
 // ============================================================
@@ -1859,13 +1795,9 @@ async fn uninstall_greptime_confirm_handler() -> Html<String> {
 
 async fn uninstall_greptime_handler(State(state): State<AppState>) -> Response {
     let l = Localizer::english();
-    let result = run_greptime_uninstall().await;
-    if let Some(store) = &state.store {
-        let key = ResourceKey::cluster_scoped("greptime-instance", "local");
-        if let Err(e) = store.delete(&key, None).await {
-            tracing::warn!(error = %e, "uninstall: store.delete(greptime-instance/local) failed");
-        }
-    }
+    let result =
+        teardown_managed_uninstall("greptime", state.store.as_deref(), state.secrets.as_deref())
+            .await;
     let body = match result {
         Ok(summary) => render_install_result(&l, true, &summary),
         Err(detail) => render_install_result(&l, false, &detail),
@@ -1912,20 +1844,6 @@ async fn run_greptime_install_with_progress(
     _config: &InstallConfig,
 ) -> Result<(String, u16), String> {
     Err("GreptimeDB install requires a supported Linux host.".into())
-}
-
-#[cfg(target_os = "linux")]
-async fn run_greptime_uninstall() -> Result<String, String> {
-    use computeza_driver_native::linux::greptime;
-    match greptime::uninstall(greptime::UninstallOptions::default()).await {
-        Ok(r) => Ok(format_uninstall_summary(&r.steps, &r.warnings)),
-        Err(e) => Err(format!("{e}")),
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-async fn run_greptime_uninstall() -> Result<String, String> {
-    Err("GreptimeDB uninstall requires a supported Linux host.".into())
 }
 
 // ============================================================
@@ -2012,13 +1930,12 @@ async fn uninstall_lakekeeper_confirm_handler() -> Html<String> {
 
 async fn uninstall_lakekeeper_handler(State(state): State<AppState>) -> Response {
     let l = Localizer::english();
-    let result = run_lakekeeper_uninstall().await;
-    if let Some(store) = &state.store {
-        let key = ResourceKey::cluster_scoped("lakekeeper-instance", "local");
-        if let Err(e) = store.delete(&key, None).await {
-            tracing::warn!(error = %e, "uninstall: store.delete(lakekeeper-instance/local) failed");
-        }
-    }
+    let result = teardown_managed_uninstall(
+        "lakekeeper",
+        state.store.as_deref(),
+        state.secrets.as_deref(),
+    )
+    .await;
     let body = match result {
         Ok(summary) => render_install_result(&l, true, &summary),
         Err(detail) => render_install_result(&l, false, &detail),
@@ -2065,20 +1982,6 @@ async fn run_lakekeeper_install_with_progress(
     _config: &InstallConfig,
 ) -> Result<(String, u16), String> {
     Err("Lakekeeper install requires a supported Linux host.".into())
-}
-
-#[cfg(target_os = "linux")]
-async fn run_lakekeeper_uninstall() -> Result<String, String> {
-    use computeza_driver_native::linux::lakekeeper;
-    match lakekeeper::uninstall(lakekeeper::UninstallOptions::default()).await {
-        Ok(r) => Ok(format_uninstall_summary(&r.steps, &r.warnings)),
-        Err(e) => Err(format!("{e}")),
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-async fn run_lakekeeper_uninstall() -> Result<String, String> {
-    Err("Lakekeeper uninstall requires a supported Linux host.".into())
 }
 
 // ============================================================
@@ -2165,13 +2068,9 @@ async fn uninstall_databend_confirm_handler() -> Html<String> {
 
 async fn uninstall_databend_handler(State(state): State<AppState>) -> Response {
     let l = Localizer::english();
-    let result = run_databend_uninstall().await;
-    if let Some(store) = &state.store {
-        let key = ResourceKey::cluster_scoped("databend-instance", "local");
-        if let Err(e) = store.delete(&key, None).await {
-            tracing::warn!(error = %e, "uninstall: store.delete(databend-instance/local) failed");
-        }
-    }
+    let result =
+        teardown_managed_uninstall("databend", state.store.as_deref(), state.secrets.as_deref())
+            .await;
     let body = match result {
         Ok(summary) => render_install_result(&l, true, &summary),
         Err(detail) => render_install_result(&l, false, &detail),
@@ -2218,20 +2117,6 @@ async fn run_databend_install_with_progress(
     _config: &InstallConfig,
 ) -> Result<(String, u16), String> {
     Err("Databend install requires a supported Linux host.".into())
-}
-
-#[cfg(target_os = "linux")]
-async fn run_databend_uninstall() -> Result<String, String> {
-    use computeza_driver_native::linux::databend;
-    match databend::uninstall(databend::UninstallOptions::default()).await {
-        Ok(r) => Ok(format_uninstall_summary(&r.steps, &r.warnings)),
-        Err(e) => Err(format!("{e}")),
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-async fn run_databend_uninstall() -> Result<String, String> {
-    Err("Databend uninstall requires a supported Linux host.".into())
 }
 
 // ============================================================
@@ -2318,13 +2203,9 @@ async fn uninstall_grafana_confirm_handler() -> Html<String> {
 
 async fn uninstall_grafana_handler(State(state): State<AppState>) -> Response {
     let l = Localizer::english();
-    let result = run_grafana_uninstall().await;
-    if let Some(store) = &state.store {
-        let key = ResourceKey::cluster_scoped("grafana-instance", "local");
-        if let Err(e) = store.delete(&key, None).await {
-            tracing::warn!(error = %e, "uninstall: store.delete(grafana-instance/local) failed");
-        }
-    }
+    let result =
+        teardown_managed_uninstall("grafana", state.store.as_deref(), state.secrets.as_deref())
+            .await;
     let body = match result {
         Ok(summary) => render_install_result(&l, true, &summary),
         Err(detail) => render_install_result(&l, false, &detail),
@@ -2371,20 +2252,6 @@ async fn run_grafana_install_with_progress(
     _config: &InstallConfig,
 ) -> Result<(String, u16), String> {
     Err("Grafana install requires a supported Linux host.".into())
-}
-
-#[cfg(target_os = "linux")]
-async fn run_grafana_uninstall() -> Result<String, String> {
-    use computeza_driver_native::linux::grafana;
-    match grafana::uninstall(grafana::UninstallOptions::default()).await {
-        Ok(r) => Ok(format_uninstall_summary(&r.steps, &r.warnings)),
-        Err(e) => Err(format!("{e}")),
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-async fn run_grafana_uninstall() -> Result<String, String> {
-    Err("Grafana uninstall requires a supported Linux host.".into())
 }
 
 // ============================================================
@@ -2471,13 +2338,9 @@ async fn uninstall_restate_confirm_handler() -> Html<String> {
 
 async fn uninstall_restate_handler(State(state): State<AppState>) -> Response {
     let l = Localizer::english();
-    let result = run_restate_uninstall().await;
-    if let Some(store) = &state.store {
-        let key = ResourceKey::cluster_scoped("restate-instance", "local");
-        if let Err(e) = store.delete(&key, None).await {
-            tracing::warn!(error = %e, "uninstall: store.delete(restate-instance/local) failed");
-        }
-    }
+    let result =
+        teardown_managed_uninstall("restate", state.store.as_deref(), state.secrets.as_deref())
+            .await;
     let body = match result {
         Ok(summary) => render_install_result(&l, true, &summary),
         Err(detail) => render_install_result(&l, false, &detail),
@@ -2524,20 +2387,6 @@ async fn run_restate_install_with_progress(
     _config: &InstallConfig,
 ) -> Result<(String, u16), String> {
     Err("Restate install requires a supported Linux host.".into())
-}
-
-#[cfg(target_os = "linux")]
-async fn run_restate_uninstall() -> Result<String, String> {
-    use computeza_driver_native::linux::restate;
-    match restate::uninstall(restate::UninstallOptions::default()).await {
-        Ok(r) => Ok(format_uninstall_summary(&r.steps, &r.warnings)),
-        Err(e) => Err(format!("{e}")),
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-async fn run_restate_uninstall() -> Result<String, String> {
-    Err("Restate uninstall requires a supported Linux host.".into())
 }
 
 /// Build the data-dir placeholder for the form. Suffixes the leaf
@@ -2600,7 +2449,11 @@ fn postgres_version_options() -> Vec<VersionOption> {
 
 /// Format an `Uninstalled`-shaped result (steps + warnings vecs) into
 /// the text block shown on the install-result page. Per-OS variants
-/// all converge on this format so the UI is OS-agnostic.
+/// all converge on this format so the UI is OS-agnostic. Used by the
+/// Linux-only `dispatch_uninstall_with_config` -- gated cfg-wise so
+/// non-Linux builds (which don't have that dispatch) don't see this
+/// as dead code.
+#[cfg(target_os = "linux")]
 fn format_uninstall_summary(steps: &[String], warnings: &[String]) -> String {
     let mut out = String::new();
     for s in steps {
@@ -2619,38 +2472,6 @@ fn format_uninstall_summary(steps: &[String], warnings: &[String]) -> String {
         );
     }
     out
-}
-
-#[cfg(target_os = "windows")]
-async fn run_postgres_uninstall() -> Result<String, String> {
-    use computeza_driver_native::windows::postgres;
-    match postgres::uninstall(postgres::UninstallOptions::default()).await {
-        Ok(r) => Ok(format_uninstall_summary(&r.steps, &r.warnings)),
-        Err(e) => Err(format!("{e}")),
-    }
-}
-
-#[cfg(target_os = "linux")]
-async fn run_postgres_uninstall() -> Result<String, String> {
-    use computeza_driver_native::linux::postgres;
-    match postgres::uninstall(postgres::UninstallOptions::default()).await {
-        Ok(r) => Ok(format_uninstall_summary(&r.steps, &r.warnings)),
-        Err(e) => Err(format!("{e}")),
-    }
-}
-
-#[cfg(target_os = "macos")]
-async fn run_postgres_uninstall() -> Result<String, String> {
-    use computeza_driver_native::macos::postgres;
-    match postgres::uninstall(postgres::UninstallOptions::default()).await {
-        Ok(r) => Ok(format_uninstall_summary(&r.steps, &r.warnings)),
-        Err(e) => Err(format!("{e}")),
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-async fn run_postgres_uninstall() -> Result<String, String> {
-    Err("uninstall is supported on Linux, macOS, and Windows only".into())
 }
 
 /// Construct a postgres reconciler for the freshly-installed instance
