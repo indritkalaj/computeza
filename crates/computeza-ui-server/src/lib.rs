@@ -649,6 +649,10 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/workspace", get(workspace_handler))
         .route("/workspace/sql/execute", post(workspace_sql_execute_handler))
         .route(
+            "/workspace/catalog/namespace/create",
+            post(workspace_create_namespace_handler),
+        )
+        .route(
             "/install",
             get(install_hub_handler).post(install_all_handler),
         )
@@ -1020,6 +1024,67 @@ struct WorkspaceSqlForm {
     sql: String,
 }
 
+/// Form body for `POST /workspace/catalog/namespace/create`. The
+/// `name` field accepts dotted notation (`finance.raw`) which gets
+/// split into Iceberg-REST path segments (`["finance", "raw"]`).
+#[derive(serde::Deserialize)]
+struct WorkspaceCreateNamespaceForm {
+    name: String,
+}
+
+async fn workspace_create_namespace_handler(
+    State(state): State<AppState>,
+    axum::extract::Form(form): axum::extract::Form<WorkspaceCreateNamespaceForm>,
+) -> axum::response::Redirect {
+    // Best-effort: a failure here is logged but we redirect back to
+    // /workspace regardless so the operator sees the updated catalog
+    // state (and an empty namespace listing if the create silently
+    // failed). The next iteration can surface the error inline; for
+    // phase 1 we keep it simple.
+    let Some(base_url) = discover_lakekeeper_endpoint(state.store.as_deref()).await else {
+        return axum::response::Redirect::to("/workspace");
+    };
+    let segments: Vec<&str> = form
+        .name
+        .split('.')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if segments.is_empty() {
+        return axum::response::Redirect::to("/workspace");
+    }
+    let url = format!("{}/catalog/v1/namespaces", base_url.trim_end_matches('/'));
+    if let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        let body = serde_json::json!({
+            "namespace": segments,
+            "properties": {},
+        });
+        match client.post(&url).json(&body).send().await {
+            Ok(r) if r.status().is_success() => {
+                tracing::info!(namespace = %form.name, "lakekeeper namespace created");
+            }
+            Ok(r) => {
+                tracing::warn!(
+                    namespace = %form.name,
+                    status = r.status().as_u16(),
+                    "lakekeeper namespace create returned non-2xx"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    namespace = %form.name,
+                    error = %e,
+                    "lakekeeper namespace create failed"
+                );
+            }
+        }
+    }
+    axum::response::Redirect::to("/workspace")
+}
+
 async fn workspace_sql_execute_handler(
     State(state): State<AppState>,
     axum::extract::Form(form): axum::extract::Form<WorkspaceSqlForm>,
@@ -1078,9 +1143,13 @@ async fn execute_sql_against_databend(base_url: &str, sql: &str) -> SqlOutcome {
         Err(e) => return SqlOutcome::Err(format!("building HTTP client: {e}")),
     };
     let url = format!("{}/v1/query", base_url.trim_end_matches('/'));
+    // Databend's `[[query.users]]` block (installed by databend.rs)
+    // defines `root` with `no_password` auth scoped to 127.0.0.1.
+    // HTTP basic auth still needs the username to identify the user;
+    // the password field is ignored by `no_password` so we pass `None`.
     let resp = match client
         .post(&url)
-        .basic_auth("root", Some("root"))
+        .basic_auth("root", None::<&str>)
         .json(&serde_json::json!({ "sql": sql }))
         .send()
         .await
@@ -1172,13 +1241,44 @@ fn render_workspace_page(
     let err_no_databend = localizer.t("ui-workspace-error-no-databend");
     let csrf = auth::csrf_input();
 
+    // The "Create namespace" form lives in the catalog pane
+    // whenever Lakekeeper is installed -- both for empty catalogs
+    // (so the operator's first action is obvious) and non-empty
+    // ones (so subsequent namespaces can be added in-place).
+    let create_label = localizer.t("ui-workspace-catalog-create-label");
+    let create_placeholder = localizer.t("ui-workspace-catalog-create-placeholder");
+    let create_button = localizer.t("ui-workspace-catalog-create-button");
+    let create_help = localizer.t("ui-workspace-catalog-create-help");
+    let create_namespace_form = if has_lakekeeper {
+        format!(
+            r#"<form method="post" action="/workspace/catalog/namespace/create" style="margin-top: 1rem; padding-top: 1rem; border-top: 1px solid rgba(255,255,255,0.06);">
+{csrf}
+<label for="ws-create-ns" style="font-size: 0.82rem; display: block; margin-bottom: 0.25rem;">{label}</label>
+<input id="ws-create-ns" name="name" class="cz-input" type="text" placeholder="{placeholder}" required style="width: 100%; font-family: ui-monospace, monospace; font-size: 0.85rem; margin-bottom: 0.5rem;" />
+<button type="submit" class="cz-btn">{button}</button>
+<p class="cz-muted" style="margin: 0.5rem 0 0; font-size: 0.75rem;">{help}</p>
+</form>"#,
+            csrf = csrf,
+            label = html_escape(&create_label),
+            placeholder = html_escape(&create_placeholder),
+            button = html_escape(&create_button),
+            help = html_escape(&create_help),
+        )
+    } else {
+        String::new()
+    };
+
     let catalog_block = if !has_lakekeeper {
         format!(
             r#"<p class="cz-muted">{}</p>"#,
             html_escape(&err_no_lakekeeper)
         )
     } else if catalog.is_empty() {
-        format!(r#"<p class="cz-muted">{}</p>"#, html_escape(&catalog_empty))
+        format!(
+            r#"<p class="cz-muted">{}</p>{form}"#,
+            html_escape(&catalog_empty),
+            form = create_namespace_form
+        )
     } else {
         let items: String = catalog
             .iter()
@@ -1207,7 +1307,10 @@ fn render_workspace_page(
                 )
             })
             .collect();
-        format!(r#"<ul style="list-style: none; padding: 0; margin: 0;">{items}</ul>"#)
+        format!(
+            r#"<ul style="list-style: none; padding: 0; margin: 0;">{items}</ul>{form}"#,
+            form = create_namespace_form
+        )
     };
 
     let results_block = match (has_databend, result) {

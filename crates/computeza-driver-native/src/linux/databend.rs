@@ -179,6 +179,28 @@ pub async fn install(
              tenant_id = \"computeza\"\n\
              cluster_id = \"local\"\n\
              \n\
+             # v0.0.x: define a `root` user with no_password auth,
+             # accessible only from 127.0.0.1. Required because\n\
+             # Databend's HTTP query handler ships with NO built-in\n\
+             # users -- the `[meta]` block below configures meta-service\n\
+             # auth, not the query-user database. Without an explicit\n\
+             # `[[query.users]]` entry, every HTTP basic-auth attempt\n\
+             # 401s with `User 'root'@'%' does not exist.`\n\
+             #\n\
+             # `no_password` is a v0.0.x trade-off:\n\
+             #   - localhost-only (hostname = 127.0.0.1) so external\n\
+             #     callers can't authenticate without their own\n\
+             #     `[[query.users]]` block + sha256 hash.\n\
+             #   - The operator console runs on the same host as\n\
+             #     Databend in v0.0.x, so localhost is the only\n\
+             #     legitimate caller anyway.\n\
+             # v0.1 switches to `auth_type = sha256_password` with a\n\
+             # vault-stored secret (see AGENTS.md \"Deferred work\").\n\
+             [[query.users]]\n\
+             name = \"root\"\n\
+             hostname = \"127.0.0.1\"\n\
+             auth_type = \"no_password\"\n\
+             \n\
              [meta]\n\
              endpoints = [\"127.0.0.1:{meta_grpc}\"]\n\
              username = \"root\"\n\
