@@ -32,7 +32,11 @@
 //!   Argon2id parameters from the crate (m=19MiB, t=2, p=1 in 0.5.x;
 //!   matches OWASP 2025 baseline).
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
@@ -214,6 +218,19 @@ impl OperatorFile {
                     serde_json::from_slice(line).map_err(|e| AuthError::BadFile(e.to_string()))?;
                 out.push(rec);
             }
+            // Self-heal: if a previous version wrote the file with a
+            // permissive mode (e.g. before the 0600 tightening or via
+            // a process whose umask leaked), correct it on every
+            // open. The intent is that no operator ever observes a
+            // world-readable hash file, even after upgrading from a
+            // build that left one behind.
+            if let Err(e) = set_unix_perms_owner_only(&path).await {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "could not tighten operators.jsonl perms to 0600; review host filesystem"
+                );
+            }
             out
         } else {
             Vec::new()
@@ -378,9 +395,38 @@ impl OperatorFile {
             buf.push(b'\n');
         }
         tokio::fs::write(&tmp, &buf).await?;
+        // Tighten the perms BEFORE the rename so there is no
+        // intermediate window where a world-readable file exists
+        // under the live name. argon2id password hashes don't
+        // disclose plaintext, but a permissive mode invites a
+        // tamper attack (write a known hash to log in as anyone).
+        // On non-Unix platforms set_unix_perms is a no-op.
+        set_unix_perms_owner_only(&tmp).await?;
         tokio::fs::rename(&tmp, self.path.as_ref()).await?;
         Ok(())
     }
+}
+
+/// Set a file's Unix permission bits to 0600 (owner read/write
+/// only). No-op on non-Unix platforms.
+///
+/// Used for files carrying authentication material: operator
+/// password hashes, audit signing key, secrets ciphertext. We
+/// don't rely on the surrounding directory's perms because the
+/// directory is often shared (`/var/lib/computeza` is 0755) --
+/// each sensitive file tightens itself.
+async fn set_unix_perms_owner_only(path: &Path) -> Result<(), AuthError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        tokio::fs::set_permissions(path, perms).await?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
 
 /// Validation rule for new operator usernames. ASCII alphanumeric,
@@ -717,6 +763,68 @@ mod tests {
         assert!(!is_public_path("/resource/postgres-instance/local"));
         // / does NOT prefix-match other paths because of the special-case.
         assert!(!is_public_path("/install/postgres"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn operator_file_lands_at_mode_0600_after_create() {
+        // Password hashes are not plaintext but a world-writable
+        // file lets an unprivileged process replace them with hashes
+        // of known passwords -- privilege escalation. The file MUST
+        // be 0600 once we have written to it.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "computeza-test-perms-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("operators.jsonl");
+        let store = OperatorFile::open(&path).await.unwrap();
+        store
+            .create("admin", "hunter2hunter2", &["admins".to_string()])
+            .await
+            .unwrap();
+        let meta = std::fs::metadata(&path).expect("operators.jsonl must exist after create");
+        // Mask off everything except the low 9 bits so a sticky /
+        // setuid bit doesn't perturb the assertion.
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "operators.jsonl should be owner-only (0600); was {mode:o}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn operator_file_open_self_heals_permissive_existing_file() {
+        // When upgrading from an older build that wrote the file
+        // with the user's umask (often 0644 or 0666), every fresh
+        // `open` should tighten it back down to 0600.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "computeza-test-perms-heal-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("operators.jsonl");
+        // Plant a file with permissive perms, mimicking a legacy
+        // install. Content can be empty; the heal runs on open
+        // regardless of content.
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let _ = OperatorFile::open(&path).await.unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "open() should self-heal permissive perms to 0600; was {mode:o}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
