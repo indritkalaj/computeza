@@ -457,18 +457,34 @@ fn systemd_unit(
 ///    misconfigured bundle and should fail loudly rather than be
 ///    silently auto-detected.
 async fn locate_binary_dir(start: &Path, binary_name: &str) -> Option<PathBuf> {
-    if fs::try_exists(start.join(binary_name))
+    // Walk up until we find an existing directory. Mis-pinned
+    // bin_subpaths land us in a non-existent path; the parent
+    // (the extraction root) always exists post-fetch_and_extract,
+    // so we recover by scanning from the closest existing
+    // ancestor. This makes the scanner self-healing against
+    // future tarball-layout drift (e.g. grafana renamed
+    // `grafana-v13.0.1/` to `grafana-13.0.1/` between our pin
+    // and the actual upstream release).
+    let mut effective_start = start.to_path_buf();
+    while !fs::try_exists(&effective_start).await.unwrap_or(false) {
+        match effective_start.parent() {
+            Some(p) if p != effective_start => effective_start = p.to_path_buf(),
+            _ => return None,
+        }
+    }
+
+    if fs::try_exists(effective_start.join(binary_name))
         .await
         .unwrap_or(false)
     {
-        return Some(start.to_path_buf());
+        return Some(effective_start);
     }
     // Scan one level deep.
-    if let Some(level1) = single_subdir_containing(start, binary_name).await {
+    if let Some(level1) = single_subdir_containing(&effective_start, binary_name).await {
         return Some(level1);
     }
     // Scan two levels deep -- check each direct subdir.
-    let mut entries = fs::read_dir(start).await.ok()?;
+    let mut entries = fs::read_dir(&effective_start).await.ok()?;
     while let Ok(Some(entry)) = entries.next_entry().await {
         if !entry.file_type().await.ok()?.is_dir() {
             continue;

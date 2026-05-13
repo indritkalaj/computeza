@@ -15,20 +15,27 @@ pub const DEFAULT_PORT: u16 = 3000;
 // Verified May 2026. Grafana doesn't publish on GitHub releases;
 // it has its own CDN at dl.grafana.com. The archive root directory
 // is `grafana-vX.Y.Z/` with `bin/`, `conf/`, etc. inside.
+// Tarballs from dl.grafana.com unpack to `grafana-<version>/`
+// (no `v` prefix on the directory). The driver's
+// `locate_binary_dir` scanner backstops bin_subpath drift across
+// versions, but hardcoding the right relative path here lets
+// fetch_and_extract return the correct sentinel directory
+// directly and keeps the install fast (no scan needed on the
+// happy path).
 const GRAFANA_BUNDLES: &[Bundle] = &[
     Bundle {
         version: "13.0.1",
         url: "https://dl.grafana.com/oss/release/grafana-13.0.1.linux-amd64.tar.gz",
         kind: ArchiveKind::TarGz,
         sha256: None,
-        bin_subpath: "grafana-v13.0.1/bin",
+        bin_subpath: "grafana-13.0.1/bin",
     },
     Bundle {
         version: "12.4.3",
         url: "https://dl.grafana.com/oss/release/grafana-12.4.3.linux-amd64.tar.gz",
         kind: ArchiveKind::TarGz,
         sha256: None,
-        bin_subpath: "grafana-v12.4.3/bin",
+        bin_subpath: "grafana-12.4.3/bin",
     },
 ];
 
