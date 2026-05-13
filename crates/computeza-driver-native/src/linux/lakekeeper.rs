@@ -140,28 +140,36 @@ pub async fn install(
         port = opts.pg_port,
         db = opts.pg_database,
     );
-    // Lakekeeper accepts either the full `ICEBERG_REST__PG_DATABASE_URL`
-    // OR the individual field set. We pass BOTH for belt-and-braces:
-    // URL parsers can be picky about special chars in passwords; the
-    // individual fields avoid that entire class of bug. If lakekeeper
-    // reads one form and ignores the other, either works -- the
-    // duplication is harmless because both forms agree on the
-    // connection target.
-    let env: Vec<(String, String)> = vec![
-        ("ICEBERG_REST__PG_DATABASE_URL".into(), pg_url),
-        ("ICEBERG_REST__PG_HOST".into(), opts.pg_host.clone()),
-        ("ICEBERG_REST__PG_PORT".into(), opts.pg_port.to_string()),
-        ("ICEBERG_REST__PG_USER".into(), opts.pg_user.clone()),
-        (
-            "ICEBERG_REST__PG_PASSWORD".into(),
-            creds.db_password.clone(),
-        ),
-        ("ICEBERG_REST__PG_DATABASE".into(), opts.pg_database.clone()),
-        (
-            "ICEBERG_REST__PG_ENCRYPTION_KEY".into(),
-            creds.encryption_key.clone(),
-        ),
+    // Lakekeeper's config-loader has gone through two env-var
+    // prefix generations: `ICEBERG_REST__` (legacy, from when the
+    // project was a fork of iceberg-rest-image) and `LAKEKEEPER__`
+    // (current). 0.12.2 sits on the cutover and -- per direct
+    // operator-side debugging -- the database fields require the
+    // new prefix even though the encryption key still accepts the
+    // legacy one. The migration matrix on a given release is
+    // fiddly to pin down from the README alone.
+    //
+    // We emit BOTH prefixes AND both URL + individual-field forms.
+    // 14 env vars total; whichever prefix lakekeeper happens to
+    // honour on this release lands a complete connection target.
+    // Duplication is harmless because every variant carries the
+    // same values.
+    let port_str = opts.pg_port.to_string();
+    let fields: &[(&str, &str)] = &[
+        ("PG_DATABASE_URL", &pg_url),
+        ("PG_HOST", &opts.pg_host),
+        ("PG_PORT", &port_str),
+        ("PG_USER", &opts.pg_user),
+        ("PG_PASSWORD", &creds.db_password),
+        ("PG_DATABASE", &opts.pg_database),
+        ("PG_ENCRYPTION_KEY", &creds.encryption_key),
     ];
+    let mut env: Vec<(String, String)> = Vec::with_capacity(fields.len() * 2);
+    for prefix in ["ICEBERG_REST", "LAKEKEEPER"] {
+        for (key, value) in fields {
+            env.push((format!("{prefix}__{key}"), (*value).to_string()));
+        }
+    }
 
     // Surface the credentials on the install-result page (+ the
     // one-shot JSON download). The encryption key is the more
