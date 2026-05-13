@@ -185,11 +185,18 @@ pub async fn install(
         .map_err(|e| ServiceError::Io(std::io::Error::other(e.to_string())))??;
 
     // Pre-flight: confirm the freshly-built binary at least
-    // executes `--version` before we swap it in. Catches glibc /
-    // sqlite / linker problems BEFORE the running daemon is
-    // disrupted.
-    progress.set_message("Pre-flighting the new kanidmd binary (--version probe)");
-    release::preflight_probe(&new_release, "kanidmd", &["--version"])
+    // loads its dynamic libraries before we swap it in. Catches
+    // glibc / sqlite / linker problems BEFORE the running daemon
+    // is disrupted.
+    //
+    // We use `--help` rather than `--version` because kanidmd's
+    // top-level clap parser requires a subcommand and rejects
+    // bare `--version` as "unexpected argument". `--help` is
+    // intercepted by clap before subcommand validation and
+    // exits 0 universally; it's the canonical "does this binary
+    // run at all" probe.
+    progress.set_message("Pre-flighting the new kanidmd binary (--help probe)");
+    release::preflight_probe(&new_release, "kanidmd", &["--help"])
         .await
         .map_err(release_error_to_service)?;
 
