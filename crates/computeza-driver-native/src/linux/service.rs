@@ -54,12 +54,27 @@ pub struct ServiceInstall {
     /// Environment variables to set on the service's systemd unit via
     /// `Environment=` lines. Used by components that consume their
     /// configuration through env vars rather than (or in addition to)
-    /// a config file -- e.g. lakekeeper's `ICEBERG_REST__PG_DATABASE_URL`.
+    /// a config file -- e.g. lakekeeper's `LAKEKEEPER__PG_DATABASE_URL`.
     /// Values are written verbatim into the unit; the driver is
     /// responsible for shell-safe quoting if needed (typically not
     /// needed because systemd parses Environment= line-by-line and
     /// double-quotes inside values are literal).
     pub env: Vec<(String, String)>,
+    /// Pre-start commands to run before ExecStart. Each entry is an
+    /// argv tail (without the binary path) that systemd executes
+    /// sequentially in its own `ExecStartPre=` line. Used by
+    /// components that need a first-time setup step before serving
+    /// -- e.g. lakekeeper's `migrate` (schema creation) before
+    /// `serve`. The same binary as ExecStart is used for each
+    /// pre-start; pass a different one by including it as args[0]
+    /// in the entry's vec if needed (uncommon).
+    ///
+    /// systemd's semantics: any non-zero exit aborts the unit
+    /// startup, so a failing migrate will surface as a clean
+    /// "service failed to start" with the migrate stderr in the
+    /// journal (and our journal-tail enrichment relays it to the
+    /// install-result page).
+    pub exec_start_pre_args: Vec<Vec<String>>,
 }
 
 /// One config file laid down before service start.
@@ -162,6 +177,7 @@ pub async fn install_service(
         &args_str,
         &opts.root_dir,
         &opts.env,
+        &opts.exec_start_pre_args,
     );
     let unit_path = PathBuf::from("/etc/systemd/system").join(&opts.unit_name);
     fs::write(&unit_path, &unit_body).await?;
@@ -328,6 +344,7 @@ fn systemd_unit(
     args: &str,
     root_dir: &Path,
     env: &[(String, String)],
+    exec_start_pre_args: &[Vec<String>],
 ) -> String {
     // WorkingDirectory=<root>: many daemons (qdrant, kanidm,
     // probably others) resolve runtime paths -- snapshot temp
@@ -378,6 +395,15 @@ fn systemd_unit(
             format!("Environment=\"{k}={v}\"\n")
         })
         .collect();
+
+    // ExecStartPre block: one line per pre-step. systemd runs them
+    // sequentially before ExecStart; any non-zero exit aborts the
+    // unit startup. Same flush-left rule as Environment= (leading
+    // whitespace would fold into the previous directive).
+    let pre_block: String = exec_start_pre_args
+        .iter()
+        .map(|args| format!("ExecStartPre={} {}\n", bin_path.display(), args.join(" ")))
+        .collect();
     format!(
         "[Unit]\n\
          Description=Computeza-managed {component}\n\
@@ -389,7 +415,7 @@ fn systemd_unit(
          WorkingDirectory={root}\n\
          RuntimeDirectory={component}\n\
          RuntimeDirectoryMode=0755\n\
-         {env_block}ExecStart={bin} {args}\n\
+         {env_block}{pre_block}ExecStart={bin} {args}\n\
          Restart=on-failure\n\
          RestartSec=5\n\
          NoNewPrivileges=yes\n\
@@ -405,6 +431,7 @@ fn systemd_unit(
         args = args,
         root = root_dir.display(),
         env_block = env_block,
+        pre_block = pre_block,
     )
 }
 
@@ -458,7 +485,7 @@ mod tests {
                 "deadbeef".to_string(),
             ),
         ];
-        let unit = systemd_unit("lakekeeper", &bin, "serve", &root, &env);
+        let unit = systemd_unit("lakekeeper", &bin, "serve", &root, &env, &[]);
         // Each Environment= line must start in column 0 (no
         // leading whitespace). We split on \n and look for any
         // line that starts with whitespace AND contains
@@ -498,10 +525,36 @@ mod tests {
     fn systemd_unit_with_empty_env_omits_environment_lines() {
         let bin = PathBuf::from("/var/lib/computeza/openfga/binaries/1.15.1/openfga");
         let root = PathBuf::from("/var/lib/computeza/openfga");
-        let unit = systemd_unit("openfga", &bin, "run --inmem", &root, &[]);
+        let unit = systemd_unit("openfga", &bin, "run --inmem", &root, &[], &[]);
         assert!(!unit.contains("Environment="));
         assert!(unit.contains(
             "\nExecStart=/var/lib/computeza/openfga/binaries/1.15.1/openfga run --inmem\n"
         ));
+        assert!(!unit.contains("ExecStartPre="));
+    }
+
+    #[test]
+    fn systemd_unit_emits_exec_start_pre_lines_flush_left_before_execstart() {
+        // Lakekeeper-shaped regression: migrate must run before
+        // serve. Each ExecStartPre= line must (a) be flush-left
+        // and (b) appear in the unit BEFORE ExecStart= so systemd
+        // sequences them correctly.
+        let bin = PathBuf::from("/var/lib/computeza/lakekeeper/binaries/0.12.2/lakekeeper");
+        let root = PathBuf::from("/var/lib/computeza/lakekeeper");
+        let pre: &[Vec<String>] = &[vec!["migrate".to_string()]];
+        let unit = systemd_unit("lakekeeper", &bin, "serve", &root, &[], pre);
+        assert!(
+            unit.contains(
+                "\nExecStartPre=/var/lib/computeza/lakekeeper/binaries/0.12.2/lakekeeper migrate\n"
+            ),
+            "ExecStartPre line must render flush-left with the full bin path + args.\nUnit:\n{unit}"
+        );
+        // Order check: ExecStartPre must come before ExecStart.
+        let pre_idx = unit.find("ExecStartPre=").expect("ExecStartPre missing");
+        let start_idx = unit.find("ExecStart=").expect("ExecStart missing");
+        assert!(
+            pre_idx < start_idx,
+            "ExecStartPre must appear before ExecStart in the unit (systemd sequences them in declaration order)"
+        );
     }
 }

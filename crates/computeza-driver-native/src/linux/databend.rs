@@ -97,6 +97,7 @@ pub async fn install(
             config: Some(config),
             cli_symlink: None,
             env: Vec::new(),
+            exec_start_pre_args: Vec::new(),
         },
         progress,
     )

@@ -140,20 +140,19 @@ pub async fn install(
         port = opts.pg_port,
         db = opts.pg_database,
     );
-    // Lakekeeper's config-loader has gone through two env-var
-    // prefix generations: `ICEBERG_REST__` (legacy, from when the
-    // project was a fork of iceberg-rest-image) and `LAKEKEEPER__`
-    // (current). 0.12.2 sits on the cutover and -- per direct
-    // operator-side debugging -- the database fields require the
-    // new prefix even though the encryption key still accepts the
-    // legacy one. The migration matrix on a given release is
-    // fiddly to pin down from the README alone.
+    // Lakekeeper 0.12.2's config-loader reads the `LAKEKEEPER__`
+    // env-var prefix. (Earlier versions used `ICEBERG_REST__`,
+    // inherited from the iceberg-rest-image fork; that prefix was
+    // dropped during the rename. Empirically confirmed on the
+    // 0.12.2 build: a manual `LAKEKEEPER__PG_DATABASE_URL=...
+    // lakekeeper serve` clears the "connection string must be
+    // provided" check, while the legacy prefix does not.)
     //
-    // We emit BOTH prefixes AND both URL + individual-field forms.
-    // 14 env vars total; whichever prefix lakekeeper happens to
-    // honour on this release lands a complete connection target.
-    // Duplication is harmless because every variant carries the
-    // same values.
+    // We pass BOTH the URL form AND the individual-field form
+    // (PG_HOST / _PORT / _USER / _PASSWORD / _DATABASE). The
+    // config-loader accepts either; the duplication is harmless
+    // and immune to URL-parsing quirks (special chars in passwords,
+    // postgres:// vs postgresql:// scheme).
     let port_str = opts.pg_port.to_string();
     let fields: &[(&str, &str)] = &[
         ("PG_DATABASE_URL", &pg_url),
@@ -164,12 +163,10 @@ pub async fn install(
         ("PG_DATABASE", &opts.pg_database),
         ("PG_ENCRYPTION_KEY", &creds.encryption_key),
     ];
-    let mut env: Vec<(String, String)> = Vec::with_capacity(fields.len() * 2);
-    for prefix in ["ICEBERG_REST", "LAKEKEEPER"] {
-        for (key, value) in fields {
-            env.push((format!("{prefix}__{key}"), (*value).to_string()));
-        }
-    }
+    let env: Vec<(String, String)> = fields
+        .iter()
+        .map(|(k, v)| (format!("LAKEKEEPER__{k}"), (*v).to_string()))
+        .collect();
 
     // Surface the credentials on the install-result page (+ the
     // one-shot JSON download). The encryption key is the more
@@ -204,6 +201,16 @@ pub async fn install(
             config: None,
             cli_symlink: None,
             env,
+            // `lakekeeper serve --help` explicitly states "The
+            // database must be migrated before running the
+            // server". systemd's ExecStartPre runs migrate
+            // before serve every time the unit starts;
+            // lakekeeper's migrate command is idempotent so
+            // re-runs are no-ops once the schema is in place.
+            // A failed migrate aborts the unit cleanly and our
+            // journal-tail enrichment surfaces the cause inline
+            // on the install-result page.
+            exec_start_pre_args: vec![vec!["migrate".to_string()]],
         },
         progress,
     )

@@ -84,6 +84,7 @@ pub async fn install(
                 binary_name: "openfga",
             }),
             env: Vec::new(),
+            exec_start_pre_args: Vec::new(),
         },
         progress,
     )
