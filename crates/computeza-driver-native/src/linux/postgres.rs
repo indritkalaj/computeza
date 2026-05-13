@@ -618,17 +618,19 @@ async fn auto_install_via_package_manager(
     // surfaces a cryptic permission-denied error from the package
     // manager; we'd rather tell the operator the actionable thing
     // up front.
-    #[cfg(unix)]
-    {
-        // SAFETY: getuid() is always safe and always returns; it
-        // is one of the small set of libc calls Rust marks unsafe
-        // for ABI reasons rather than memory-safety reasons.
-        let euid = unsafe { libc::geteuid() };
-        if euid != 0 {
-            return Err(InstallError::AutoInstall(format!(
-                "no host postgres found, and the auto-install fallback needs root to drive the host package manager. The process is running as uid {euid} (non-root). Stop the operator console (Ctrl-C) and restart it under sudo, preserving your environment:\n\n    sudo -E ./target/release/computeza serve --addr 127.0.0.1:8400 --state-db /var/lib/computeza/computeza-state.db\n\nThe `-E` flag preserves COMPUTEZA_SECRETS_PASSPHRASE across the sudo boundary so the encrypted secrets store stays attached. Alternatively, install postgres manually (`sudo apt install postgresql postgresql-contrib`) and re-submit the install form -- the driver will detect the distro binaries and skip this fallback."
-            )));
-        }
+    //
+    // We shell out to `id -u` rather than libc::geteuid() because
+    // the workspace forbids `unsafe` (see Cargo.toml workspace
+    // lints). `id` is in coreutils on every supported distro;
+    // failure to find it implies a host so broken we shouldn't
+    // try to autorun apt-get on it anyway.
+    let euid_out = Command::new("id").arg("-u").output().await?;
+    let euid_str = String::from_utf8_lossy(&euid_out.stdout).trim().to_string();
+    let euid: u32 = euid_str.parse().unwrap_or(u32::MAX);
+    if euid != 0 {
+        return Err(InstallError::AutoInstall(format!(
+            "no host postgres found, and the auto-install fallback needs root to drive the host package manager. The process is running as uid {euid} (non-root). Stop the operator console (Ctrl-C) and restart it under sudo, preserving your environment:\n\n    sudo -E ./target/release/computeza serve --addr 127.0.0.1:8400 --state-db /var/lib/computeza/computeza-state.db\n\nThe `-E` flag preserves COMPUTEZA_SECRETS_PASSPHRASE across the sudo boundary so the encrypted secrets store stays attached. Alternatively, install postgres manually (`sudo apt install postgresql postgresql-contrib`) and re-submit the install form -- the driver will detect the distro binaries and skip this fallback."
+        )));
     }
 
     let pm = detect_package_manager().await.ok_or_else(|| {
