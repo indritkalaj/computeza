@@ -102,41 +102,51 @@ sqlx = { version = "0.8", default-features = false, features = [
 ] }
 
 # --- Internal crates ---
+#
+# Single source of truth for the crate version is `[workspace.package].version`
+# (line 6 above). Each crate inherits via `version.workspace = true` in its own
+# Cargo.toml's [package] section, and the binary reads it via
+# `env!("CARGO_PKG_VERSION")` for UI rendering. Path-dep entries below
+# intentionally OMIT the `version = "..."` field so editing the workspace
+# version doesn't require touching every dependency declaration -- bumping
+# line 6 is sufficient. (Version backstops are only required for publish-time
+# resolution; v0.0.x doesn't publish internal crates to crates.io.)
+#
 # Tier 1 -- Core Engine
-computeza-core      = { path = "crates/computeza-core",      version = "0.0.1" }
-computeza-state     = { path = "crates/computeza-state",     version = "0.0.1" }
-computeza-audit     = { path = "crates/computeza-audit",     version = "0.0.1" }
-computeza-secrets   = { path = "crates/computeza-secrets",   version = "0.0.1" }
-computeza-driver    = { path = "crates/computeza-driver",    version = "0.0.1" }
-computeza-tenancy   = { path = "crates/computeza-tenancy",   version = "0.0.1" }
-computeza-pipelines = { path = "crates/computeza-pipelines", version = "0.0.1" }
-computeza-identity-federation = { path = "crates/computeza-identity-federation", version = "0.0.1" }
-computeza-license = { path = "crates/computeza-license", version = "0.0.1" }
-computeza-channel-partner = { path = "crates/computeza-channel-partner", version = "0.0.1" }
-computeza-compliance = { path = "crates/computeza-compliance", version = "0.0.1" }
+computeza-core      = { path = "crates/computeza-core" }
+computeza-state     = { path = "crates/computeza-state" }
+computeza-audit     = { path = "crates/computeza-audit" }
+computeza-secrets   = { path = "crates/computeza-secrets" }
+computeza-driver    = { path = "crates/computeza-driver" }
+computeza-tenancy   = { path = "crates/computeza-tenancy" }
+computeza-pipelines = { path = "crates/computeza-pipelines" }
+computeza-identity-federation = { path = "crates/computeza-identity-federation" }
+computeza-license = { path = "crates/computeza-license" }
+computeza-channel-partner = { path = "crates/computeza-channel-partner" }
+computeza-compliance = { path = "crates/computeza-compliance" }
 
 # Tier 2 -- Drivers
-computeza-driver-native = { path = "crates/computeza-driver-native", version = "0.0.1" }
+computeza-driver-native = { path = "crates/computeza-driver-native" }
 
 # Tier 3 -- Reconcilers (all wired into the binary's observe loop;
 # observe() best-effort runs every 30s for each registered resource).
-computeza-reconciler-postgres   = { path = "crates/computeza-reconciler-postgres",   version = "0.0.1" }
-computeza-reconciler-kanidm     = { path = "crates/computeza-reconciler-kanidm",     version = "0.0.1" }
-computeza-reconciler-garage     = { path = "crates/computeza-reconciler-garage",     version = "0.0.1" }
-computeza-reconciler-lakekeeper = { path = "crates/computeza-reconciler-lakekeeper", version = "0.0.1" }
-computeza-reconciler-databend   = { path = "crates/computeza-reconciler-databend",   version = "0.0.1" }
-computeza-reconciler-qdrant     = { path = "crates/computeza-reconciler-qdrant",     version = "0.0.1" }
-computeza-reconciler-restate    = { path = "crates/computeza-reconciler-restate",    version = "0.0.1" }
-computeza-reconciler-greptime   = { path = "crates/computeza-reconciler-greptime",   version = "0.0.1" }
-computeza-reconciler-grafana    = { path = "crates/computeza-reconciler-grafana",    version = "0.0.1" }
-computeza-reconciler-openfga    = { path = "crates/computeza-reconciler-openfga",    version = "0.0.1" }
+computeza-reconciler-postgres   = { path = "crates/computeza-reconciler-postgres" }
+computeza-reconciler-kanidm     = { path = "crates/computeza-reconciler-kanidm" }
+computeza-reconciler-garage     = { path = "crates/computeza-reconciler-garage" }
+computeza-reconciler-lakekeeper = { path = "crates/computeza-reconciler-lakekeeper" }
+computeza-reconciler-databend   = { path = "crates/computeza-reconciler-databend" }
+computeza-reconciler-qdrant     = { path = "crates/computeza-reconciler-qdrant" }
+computeza-reconciler-restate    = { path = "crates/computeza-reconciler-restate" }
+computeza-reconciler-greptime   = { path = "crates/computeza-reconciler-greptime" }
+computeza-reconciler-grafana    = { path = "crates/computeza-reconciler-grafana" }
+computeza-reconciler-openfga    = { path = "crates/computeza-reconciler-openfga" }
 
 # Tier 4 -- Web Console (i18n is shared, so placed at workspace level)
-computeza-i18n          = { path = "crates/computeza-i18n",          version = "0.0.1" }
-computeza-ui-server     = { path = "crates/computeza-ui-server",     version = "0.0.1" }
-computeza-ui-components = { path = "crates/computeza-ui-components", version = "0.0.1" }
-computeza-ui-pages      = { path = "crates/computeza-ui-pages",      version = "0.0.1" }
-computeza-ui-pipelines  = { path = "crates/computeza-ui-pipelines",  version = "0.0.1" }
+computeza-i18n          = { path = "crates/computeza-i18n" }
+computeza-ui-server     = { path = "crates/computeza-ui-server" }
+computeza-ui-components = { path = "crates/computeza-ui-components" }
+computeza-ui-pages      = { path = "crates/computeza-ui-pages" }
+computeza-ui-pipelines  = { path = "crates/computeza-ui-pipelines" }
 computeza-ui-themes     = { path = "crates/computeza-ui-themes",     version = "0.0.1" }
 
 [workspace.lints.rust]

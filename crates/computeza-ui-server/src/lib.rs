@@ -3607,6 +3607,38 @@ async fn secrets_rotate_handler(
         Ok(Some(_)) => {}
     }
     let new_value = generate_random_password();
+
+    // If this secret is a managed-component admin password
+    // (`{slug}/admin-password` where slug is in
+    // COMPONENTS_WITH_ADMIN_CREDENTIAL), apply the new value to the
+    // running component BEFORE persisting it to the vault. Mirrors the
+    // install path's apply-then-persist ordering so a rotation failure
+    // leaves the vault and the live component in agreement (vault keeps
+    // the old value, component keeps the old value). If we persisted
+    // first and the apply failed, the next reconciler observe would
+    // start failing -- exactly the bug postgres just hit after the
+    // unguarded rotate that motivated this fix.
+    if let Some((slug, username, _label)) = COMPONENTS_WITH_ADMIN_CREDENTIAL
+        .iter()
+        .find(|(s, _, _)| name == format!("{s}/admin-password"))
+        .copied()
+    {
+        if let Err(e) = apply_admin_password(slug, username, &new_value).await {
+            return Html(render_install_result(
+                &l,
+                false,
+                &format!(
+                    "Rotating {name}: generated a new password but FAILED to apply it to \
+                     the running {slug} component ({e}). Vault still holds the previous \
+                     value; the live component is unchanged. Investigate the error above \
+                     (typically: the component is not running, sudo is unavailable, or \
+                     the component's CLI changed). Re-run rotation after fixing."
+                ),
+            ))
+            .into_response();
+        }
+    }
+
     if let Err(e) = secrets.put(&name, &new_value).await {
         return Html(render_install_result(
             &l,
