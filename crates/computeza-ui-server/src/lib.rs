@@ -653,6 +653,10 @@ pub fn router_with_state(state: AppState) -> Router {
             get(workspace_completions_handler),
         )
         .route(
+            "/workspace/bootstrap",
+            get(workspace_bootstrap_form_handler).post(workspace_bootstrap_submit_handler),
+        )
+        .route(
             "/install",
             get(install_hub_handler).post(install_all_handler),
         )
@@ -1505,10 +1509,15 @@ fn render_workspace_page(
                 r#"<p class="cz-muted">{}</p>"#,
                 html_escape(&lk_unreachable)
             ),
-            LakekeeperState::NoWarehouses => format!(
-                r#"<p class="cz-muted">{}</p>"#,
-                html_escape(&lk_no_warehouses)
-            ),
+            LakekeeperState::NoWarehouses => {
+                let bootstrap_link = localizer.t("ui-workspace-bootstrap-link");
+                format!(
+                    r#"<p class="cz-muted">{}</p>
+<p style="margin-top: 0.75rem;"><a href="/workspace/bootstrap" class="cz-btn cz-btn-primary">{}</a></p>"#,
+                    html_escape(&lk_no_warehouses),
+                    html_escape(&bootstrap_link),
+                )
+            }
             LakekeeperState::HasWarehouses(names) => {
                 let items: String = names
                     .iter()
@@ -1804,6 +1813,300 @@ fn url_encode(s: &str) -> String {
         }
     }
     out
+}
+
+// ============================================================
+// Lakekeeper bootstrap wizard (creates the project + warehouse +
+// storage credentials so the catalog browser stops returning "no
+// warehouses configured").
+//
+// This v0.0.x wizard is operator-driven (the form takes S3
+// credentials by hand). v0.1 will auto-mint Garage credentials via
+// the Garage admin API + auto-populate this same form. The shape
+// here is forward-compatible: the POST handler is the only piece
+// that needs to change, the form fields stay the same.
+//
+// IMPORTANT: the exact Lakekeeper management API field names
+// (`project-name` vs `name`, `storage-profile` vs `storage_profile`,
+// etc.) drift across Lakekeeper releases. We try a sensible default
+// and surface the API response verbatim on failure so the operator
+// can adjust the form values (or so we can iterate the field names
+// in the driver).
+// ============================================================
+
+/// Form body for `POST /workspace/bootstrap`.
+#[derive(serde::Deserialize)]
+struct WorkspaceBootstrapForm {
+    project_name: String,
+    warehouse_name: String,
+    s3_endpoint: String,
+    s3_region: String,
+    s3_bucket: String,
+    s3_access_key: String,
+    s3_secret_access_key: String,
+}
+
+async fn workspace_bootstrap_form_handler(
+    State(state): State<AppState>,
+) -> Html<String> {
+    let l = Localizer::english();
+    let lakekeeper = discover_lakekeeper_endpoint(state.store.as_deref()).await;
+    let garage = discover_garage_endpoint(state.store.as_deref()).await;
+    // Garage's S3 API typically lives on a different port from the
+    // admin endpoint; substitute :3900 for the admin :3903 if we
+    // can't tell. Operator can edit before submitting.
+    let suggested_s3 = garage
+        .as_ref()
+        .map(|u| u.replace(":3903", ":3900"))
+        .unwrap_or_else(|| "http://127.0.0.1:3900".to_string());
+    Html(render_workspace_bootstrap_form(
+        &l,
+        lakekeeper.is_some(),
+        &suggested_s3,
+        None,
+    ))
+}
+
+async fn workspace_bootstrap_submit_handler(
+    State(state): State<AppState>,
+    axum::extract::Form(form): axum::extract::Form<WorkspaceBootstrapForm>,
+) -> Html<String> {
+    let l = Localizer::english();
+    let Some(lakekeeper_url) = discover_lakekeeper_endpoint(state.store.as_deref()).await else {
+        return Html(render_workspace_bootstrap_form(
+            &l,
+            false,
+            &form.s3_endpoint,
+            Some(Err(
+                "Lakekeeper is not installed; bootstrap cannot proceed. Install Lakekeeper from /install first.".to_string(),
+            )),
+        ));
+    };
+    let outcome = run_lakekeeper_bootstrap(&lakekeeper_url, &form).await;
+    Html(render_workspace_bootstrap_form(
+        &l,
+        true,
+        &form.s3_endpoint,
+        Some(outcome),
+    ))
+}
+
+/// Same shape as the lakekeeper / databend discovery helpers, for
+/// Garage. The bootstrap form pre-fills the S3 endpoint from this.
+async fn discover_garage_endpoint(
+    store: Option<&computeza_state::SqliteStore>,
+) -> Option<String> {
+    use computeza_state::Store;
+    let store = store?;
+    let rows = store.list("garage-instance", None).await.ok()?;
+    let sr = rows.into_iter().next()?;
+    let spec: WorkspaceEndpointSpec = serde_json::from_value(sr.spec).ok()?;
+    Some(spec.endpoint.base_url)
+}
+
+/// Run the two-step bootstrap against a live Lakekeeper. Returns
+/// either a success message (with the warehouse name confirmed) or
+/// a detailed error string the operator can use to adjust the
+/// form. Best-effort: never panics, surfaces HTTP body verbatim on
+/// non-2xx.
+async fn run_lakekeeper_bootstrap(
+    base_url: &str,
+    form: &WorkspaceBootstrapForm,
+) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("building HTTP client: {e}"))?;
+
+    // --- Step 1: create project (idempotent-ish: if a project of
+    // the same name exists, Lakekeeper typically returns 409; we
+    // treat 409 as success and continue with the warehouse step).
+    let project_url = format!("{}/management/v1/project", base_url.trim_end_matches('/'));
+    let project_body = serde_json::json!({
+        "project-name": form.project_name,
+    });
+    let project_resp = client
+        .post(&project_url)
+        .json(&project_body)
+        .send()
+        .await
+        .map_err(|e| format!("POST {project_url}: {e}"))?;
+    let project_status = project_resp.status();
+    let project_text = project_resp
+        .text()
+        .await
+        .unwrap_or_else(|e| format!("(could not read body: {e})"));
+    let project_existed = project_status.as_u16() == 409;
+    if !project_status.is_success() && !project_existed {
+        return Err(format!(
+            "POST {project_url} returned {}:\n{project_text}\n\n\
+             If Lakekeeper has a different field-name expectation \
+             (e.g. `name` instead of `project-name`), adjust \
+             run_lakekeeper_bootstrap() in ui-server/src/lib.rs.",
+            project_status.as_u16()
+        ));
+    }
+
+    // --- Step 2: create warehouse with S3 storage profile +
+    // credentials pointing at Garage.
+    let warehouse_url = format!("{}/management/v1/warehouse", base_url.trim_end_matches('/'));
+    let warehouse_body = serde_json::json!({
+        "warehouse-name": form.warehouse_name,
+        "project-name": form.project_name,
+        "storage-profile": {
+            "type": "s3",
+            "bucket": form.s3_bucket,
+            "endpoint": form.s3_endpoint,
+            "region": form.s3_region,
+            "path-style-access": true,
+        },
+        "storage-credential": {
+            "type": "s3",
+            "credential-type": "access-key",
+            "aws-access-key-id": form.s3_access_key,
+            "aws-secret-access-key": form.s3_secret_access_key,
+        },
+    });
+    let warehouse_resp = client
+        .post(&warehouse_url)
+        .json(&warehouse_body)
+        .send()
+        .await
+        .map_err(|e| format!("POST {warehouse_url}: {e}"))?;
+    let warehouse_status = warehouse_resp.status();
+    let warehouse_text = warehouse_resp
+        .text()
+        .await
+        .unwrap_or_else(|e| format!("(could not read body: {e})"));
+    if !warehouse_status.is_success() {
+        return Err(format!(
+            "POST {warehouse_url} returned {}:\n{warehouse_text}\n\n\
+             (Project step: {}.) Adjust storage-profile / \
+             storage-credential field names in \
+             run_lakekeeper_bootstrap() if Lakekeeper expects a \
+             different shape for this release.",
+            warehouse_status.as_u16(),
+            if project_existed {
+                "project already existed; reused".to_string()
+            } else {
+                format!("project created (HTTP {})", project_status.as_u16())
+            }
+        ));
+    }
+
+    Ok(format!(
+        "Lakekeeper bootstrap succeeded:\n\
+         - Project: `{}` ({})\n\
+         - Warehouse: `{}` -> S3 bucket `{}` at {}\n\
+         \n\
+         The /workspace catalog pane will now show this warehouse. \
+         Drilling into namespaces + tables inside it lands in \
+         phase 1.5 (the Iceberg-REST drill-down URLs depend on the \
+         Lakekeeper release; deferred until empirically verified).",
+        form.project_name,
+        if project_existed { "already existed; reused" } else { "created" },
+        form.warehouse_name,
+        form.s3_bucket,
+        form.s3_endpoint,
+    ))
+}
+
+fn render_workspace_bootstrap_form(
+    localizer: &Localizer,
+    has_lakekeeper: bool,
+    suggested_s3_endpoint: &str,
+    result: Option<Result<String, String>>,
+) -> String {
+    let title = localizer.t("ui-workspace-bootstrap-title");
+    let intro = localizer.t("ui-workspace-bootstrap-intro");
+    let no_lakekeeper = localizer.t("ui-workspace-error-no-lakekeeper");
+    let csrf = auth::csrf_input();
+
+    let result_block = match result {
+        None => String::new(),
+        Some(Ok(msg)) => format!(
+            r#"<div class="cz-card" style="background: rgba(80, 220, 120, 0.06); border: 1px solid rgba(80, 220, 120, 0.3); margin-bottom: 1rem;">
+<h3 style="margin-top: 0;">Bootstrap succeeded</h3>
+<pre style="white-space: pre-wrap; margin: 0; font-size: 0.85rem;">{}</pre>
+</div>"#,
+            html_escape(&msg)
+        ),
+        Some(Err(msg)) => format!(
+            r#"<div class="cz-card" style="background: rgba(255, 99, 99, 0.06); border: 1px solid rgba(255, 99, 99, 0.3); margin-bottom: 1rem;">
+<h3 style="margin-top: 0;">Bootstrap failed</h3>
+<pre style="white-space: pre-wrap; margin: 0; font-size: 0.85rem;">{}</pre>
+</div>"#,
+            html_escape(&msg)
+        ),
+    };
+
+    if !has_lakekeeper {
+        let body = format!(
+            r#"<section class="cz-hero"><h1>{title}</h1></section>
+<section class="cz-section" style="max-width: 50rem;">
+<div class="cz-card"><p>{}</p></div>
+</section>"#,
+            html_escape(&no_lakekeeper)
+        );
+        return render_shell(localizer, &title, NavLink::Workspace, &body);
+    }
+
+    let body = format!(
+        r#"<section class="cz-hero">
+<h1>{title}</h1>
+<p>{intro}</p>
+</section>
+<section class="cz-section" style="max-width: 50rem;">
+{result_block}
+<div class="cz-card">
+<form method="post" action="/workspace/bootstrap" style="display: flex; flex-direction: column; gap: 0.85rem;">
+{csrf}
+<div>
+<label for="bs-project" style="font-size: 0.85rem;">Project name</label>
+<input id="bs-project" name="project_name" class="cz-input" type="text" value="computeza-default" required style="width: 100%; font-family: ui-monospace, monospace;" />
+</div>
+<div>
+<label for="bs-warehouse" style="font-size: 0.85rem;">Warehouse name</label>
+<input id="bs-warehouse" name="warehouse_name" class="cz-input" type="text" value="default" required style="width: 100%; font-family: ui-monospace, monospace;" />
+</div>
+<hr style="border: none; border-top: 1px solid rgba(255,255,255,0.06); margin: 0.25rem 0;" />
+<p class="cz-muted" style="margin: 0; font-size: 0.78rem;">S3 storage (point at the local Garage instance, or any S3-compatible endpoint).</p>
+<div>
+<label for="bs-s3-endpoint" style="font-size: 0.85rem;">S3 endpoint</label>
+<input id="bs-s3-endpoint" name="s3_endpoint" class="cz-input" type="text" value="{s3_endpoint}" required style="width: 100%; font-family: ui-monospace, monospace;" />
+</div>
+<div>
+<label for="bs-s3-region" style="font-size: 0.85rem;">Region</label>
+<input id="bs-s3-region" name="s3_region" class="cz-input" type="text" value="us-east-1" required style="width: 100%; font-family: ui-monospace, monospace;" />
+</div>
+<div>
+<label for="bs-s3-bucket" style="font-size: 0.85rem;">Bucket</label>
+<input id="bs-s3-bucket" name="s3_bucket" class="cz-input" type="text" value="lakekeeper-default" required style="width: 100%; font-family: ui-monospace, monospace;" />
+</div>
+<div>
+<label for="bs-s3-ak" style="font-size: 0.85rem;">Access key ID</label>
+<input id="bs-s3-ak" name="s3_access_key" class="cz-input" type="text" required style="width: 100%; font-family: ui-monospace, monospace;" />
+<p class="cz-muted" style="margin: 0.3rem 0 0; font-size: 0.72rem;">Mint from Garage with <code>garage key new --name lakekeeper</code> + <code>garage bucket allow lakekeeper-default --read --write --owner --key &lt;keyid&gt;</code>. v0.1 will auto-mint this through Garage's admin API.</p>
+</div>
+<div>
+<label for="bs-s3-sk" style="font-size: 0.85rem;">Secret access key</label>
+<input id="bs-s3-sk" name="s3_secret_access_key" class="cz-input" type="password" required style="width: 100%; font-family: ui-monospace, monospace;" />
+</div>
+<div>
+<button type="submit" class="cz-btn cz-btn-primary">Run bootstrap</button>
+<a href="/workspace" class="cz-btn" style="margin-left: 0.5rem;">Cancel</a>
+</div>
+</form>
+</div>
+</section>"#,
+        title = html_escape(&title),
+        intro = html_escape(&intro),
+        s3_endpoint = html_escape(suggested_s3_endpoint),
+        csrf = csrf,
+        result_block = result_block,
+    );
+
+    render_shell(localizer, &title, NavLink::Workspace, &body)
 }
 
 async fn install_hub_handler(State(state): State<AppState>) -> Html<String> {
