@@ -2103,10 +2103,15 @@ fn render_workspace_bootstrap_form(
 <label for="bs-s3-ak" style="font-size: 0.85rem;">Access key ID</label>
 <input id="bs-s3-ak" name="s3_access_key" class="cz-input" type="text" required placeholder="GK..." style="width: 100%; font-family: ui-monospace, monospace;" />
 <p class="cz-muted" style="margin: 0.3rem 0 0; font-size: 0.72rem;"><strong>This is the auto-generated Access Key ID from Garage</strong> (looks like <code>GK4cf9b7d2e9a4b78...</code>), NOT the human-friendly alias you chose. Get it by running these commands on the Garage host in order:</p>
-<pre style="margin: 0.3rem 0 0; padding: 0.4rem 0.6rem; background: rgba(0,0,0,0.25); border-radius: 0.3rem; font-size: 0.72rem; overflow-x: auto;">sudo garage key create --name lakekeeper
-sudo garage bucket create lakekeeper-default
-sudo garage bucket allow lakekeeper-default --read --write --owner --key lakekeeper
-sudo garage key info lakekeeper        # &lt;-- copy &quot;Key ID&quot; + &quot;Secret key&quot; from this output</pre>
+<pre style="margin: 0.3rem 0 0; padding: 0.4rem 0.6rem; background: rgba(0,0,0,0.25); border-radius: 0.3rem; font-size: 0.72rem; overflow-x: auto;"># Set an alias once -- our installer ships `garage` as `computeza-garage`
+# to avoid clashing with distro packages of the same name. The CLI also
+# needs `-c &lt;config&gt;` to find the running daemon&apos;s admin endpoint + token.
+alias gg=&quot;sudo /usr/local/bin/computeza-garage -c /var/lib/computeza/garage/garage.toml&quot;
+
+gg key create --name lakekeeper
+gg bucket create lakekeeper-default
+gg bucket allow lakekeeper-default --read --write --owner --key lakekeeper
+gg key info lakekeeper        # &lt;-- copy &quot;Key ID&quot; + &quot;Secret key&quot; from this output</pre>
 <p class="cz-muted" style="margin: 0.3rem 0 0; font-size: 0.72rem;">The last command prints two opaque strings. Paste the <strong>Key ID</strong> here and the <strong>Secret key</strong> below. The alias <code>lakekeeper</code> is only for your records on the Garage side; Lakekeeper signs requests with the generated Key ID. v0.1 will auto-mint these via Garage's admin API.</p>
 </div>
 <div>
