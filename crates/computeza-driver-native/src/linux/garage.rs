@@ -209,24 +209,30 @@ pub async fn detect_installed() -> Vec<crate::detect::DetectedInstall> {
 }
 
 /// Download + extract the upstream source tarball under
-/// `<src_root>/garage-<version>/`. Cached: if the directory already
-/// exists and contains a `Cargo.toml`, returns the path without
+/// `<src_root>/`. Cached: if any subdirectory under `src_root`
+/// already contains a `Cargo.toml`, returns that path without
 /// re-downloading. Failure to extract surfaces as a `ServiceError`.
+///
+/// We don't assume a specific top-level directory name inside the
+/// tarball because Gitea, GitHub, and GitLab all use different
+/// conventions:
+///   - GitHub: `<repo>-<version-without-v>/`
+///   - Gitea: `<repo>/` (no version suffix)
+///   - GitLab: `<repo>-<sha>-<version>/`
+///
+/// Instead, we list `src_root`'s direct children after extraction
+/// and pick whichever one has a Cargo.toml at the top.
 async fn ensure_source_extracted(
     src_root: &Path,
     version: &str,
     _progress: &ProgressHandle,
 ) -> Result<PathBuf, ServiceError> {
-    let extracted = src_root.join(format!("garage-{version}"));
-    if fs::try_exists(extracted.join("Cargo.toml"))
-        .await
-        .unwrap_or(false)
-    {
+    if let Some(existing) = find_cargo_root(src_root).await {
         info!(
-            extracted = %extracted.display(),
+            extracted = %existing.display(),
             "garage source already extracted; skipping download"
         );
-        return Ok(extracted);
+        return Ok(existing);
     }
 
     let url = format!("{GARAGE_ARCHIVE_BASE}/v{version}.tar.gz");
@@ -268,16 +274,35 @@ async fn ensure_source_extracted(
     // Best-effort cleanup of the tarball after extraction.
     let _ = fs::remove_file(&tarball).await;
 
-    if !fs::try_exists(extracted.join("Cargo.toml"))
-        .await
-        .unwrap_or(false)
-    {
-        return Err(ServiceError::Io(std::io::Error::other(format!(
-            "extracted {} but no Cargo.toml inside -- the tag's archive layout may have changed; expected garage-<version>/Cargo.toml",
-            extracted.display()
-        ))));
+    find_cargo_root(src_root).await.ok_or_else(|| {
+        ServiceError::Io(std::io::Error::other(format!(
+            "extracted under {} but no subdirectory contains a Cargo.toml at its root. The downloaded archive may be incomplete, or the tag may use a non-standard layout. Run `ls {}` to inspect what was unpacked.",
+            src_root.display(),
+            src_root.display()
+        )))
+    })
+}
+
+/// Scan `src_root`'s direct children for the first subdirectory
+/// that has a Cargo.toml at its root. Returns `None` if no such
+/// directory exists. Used to be tolerant of Gitea / GitHub /
+/// GitLab archive naming differences without hardcoding the
+/// expected layout per source.
+async fn find_cargo_root(src_root: &Path) -> Option<PathBuf> {
+    let mut entries = fs::read_dir(src_root).await.ok()?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if !entry.file_type().await.ok()?.is_dir() {
+            continue;
+        }
+        if fs::try_exists(path.join("Cargo.toml"))
+            .await
+            .unwrap_or(false)
+        {
+            return Some(path);
+        }
     }
-    Ok(extracted)
+    None
 }
 
 /// Run `cargo build --release` against the unpacked source tree.
