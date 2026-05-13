@@ -7290,13 +7290,9 @@ fn garage_version_options() -> Vec<VersionOption> {
         garage::available_versions()
             .iter()
             .enumerate()
-            .map(|(i, b)| VersionOption {
-                value: b.version.into(),
-                label: format!(
-                    "Garage {}{}",
-                    b.version,
-                    if i == 0 { " (latest)" } else { "" }
-                ),
+            .map(|(i, v)| VersionOption {
+                value: (*v).into(),
+                label: format!("Garage {}{}", v, if i == 0 { " (latest)" } else { "" }),
             })
             .collect()
     }

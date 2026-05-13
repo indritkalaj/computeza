@@ -1,39 +1,61 @@
 //! Garage S3-compatible object storage. Linux install path.
+//!
+//! Garage's distribution story has shifted over time. The project
+//! used to publish pre-built `x86_64-unknown-linux-musl/garage`
+//! binaries on `garagehq.deuxfleurs.fr/_releases/`, but those URLs
+//! aren't kept current for every tag. The canonical source is
+//! Deuxfleurs' self-hosted Gitea at `git.deuxfleurs.fr` -- they tag
+//! every release there and the archive endpoint serves a tarball of
+//! the source tree.
+//!
+//! So this driver mirrors the kanidm pattern: source-build from an
+//! upstream-pinned tag rather than depend on a pre-built binary.
+//!
+//! Flow on a fresh host:
+//!
+//! 1. Resolve `cargo` (auto-install Rust toolchain into
+//!    `/var/lib/computeza/toolchain/rust` if missing).
+//! 2. Download `git.deuxfleurs.fr/Deuxfleurs/garage/archive/v<version>.tar.gz`,
+//!    extract under `<root_dir>/src/garage-<version>/`. Cached:
+//!    re-runs hit the existing extraction.
+//! 3. `cargo build --release` against the unpacked source. Slow
+//!    (15-30 minutes on a 4-core box); progress messages communicate
+//!    this. The build output lands at `<root_dir>/src/.../target/release/garage`.
+//! 4. Copy the binary into `<root_dir>/bin/garage` so the rest of
+//!    the pipeline (systemd unit, PATH shim) targets a stable path.
+//! 5. Write `garage.toml` + systemd unit, daemon-reload, enable --now.
+//! 6. Wait for the S3 API port.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use crate::{
-    fetch::{ArchiveKind, Bundle},
-    progress::ProgressHandle,
-};
+use tokio::{fs, io::AsyncWriteExt, process::Command};
+use tracing::info;
 
-use super::service::{
-    self, CliSymlink, ConfigFile, InstalledService, ServiceError, ServiceInstall, Uninstalled,
-};
+use crate::progress::{InstallPhase, ProgressHandle};
+
+use super::service::{InstalledService, ServiceError, Uninstalled};
 
 pub const UNIT_NAME: &str = "computeza-garage.service";
 pub const DEFAULT_S3_PORT: u16 = 3900;
 
-// Verified May 2026 -- the deuxfleurs CDN serves these URLs.
-const GARAGE_BUNDLES: &[Bundle] = &[
-    Bundle {
-        version: "2.0.0",
-        url: "https://garagehq.deuxfleurs.fr/_releases/v2.0.0/x86_64-unknown-linux-musl/garage",
-        kind: ArchiveKind::Raw,
-        sha256: None,
-        bin_subpath: "bin",
-    },
-    Bundle {
-        version: "1.1.0",
-        url: "https://garagehq.deuxfleurs.fr/_releases/v1.1.0/x86_64-unknown-linux-musl/garage",
-        kind: ArchiveKind::Raw,
-        sha256: None,
-        bin_subpath: "bin",
-    },
-];
+/// Pinned Garage versions. These map to git tags on
+/// `git.deuxfleurs.fr/Deuxfleurs/garage`. First entry is the
+/// default ("latest"). The driver prepends `v` to form the tag.
+///
+/// When bumping: verify the tag exists at
+/// <https://git.deuxfleurs.fr/Deuxfleurs/garage/tags> and that the
+/// build still compiles against the Rust toolchain that
+/// `prerequisites::ensure_rust_toolchain` installs.
+const GARAGE_VERSIONS: &[&str] = &["2.3.0", "1.1.0"];
 
-pub fn available_versions() -> &'static [Bundle] {
-    GARAGE_BUNDLES
+/// Upstream source archive endpoint. The Gitea instance serves
+/// `archive/v<tag>.tar.gz` for every tag; the resulting tarball
+/// unpacks to a `garage-<tag>/` directory.
+const GARAGE_ARCHIVE_BASE: &str = "https://git.deuxfleurs.fr/Deuxfleurs/garage/archive";
+
+#[must_use]
+pub fn available_versions() -> &'static [&'static str] {
+    GARAGE_VERSIONS
 }
 
 #[derive(Clone, Debug)]
@@ -59,73 +81,96 @@ pub async fn install(
     opts: InstallOptions,
     progress: &ProgressHandle,
 ) -> Result<InstalledService, ServiceError> {
-    let bundle = pick_bundle(opts.version.as_deref()).clone();
-    // Garage binds four ports. The wizard collects the S3 API port
-    // and we derive the others by adding small offsets so re-runs
-    // with `port = 4000` don't collide with the canonical 3900-3903
-    // range either.
+    let version = opts.version.as_deref().unwrap_or(GARAGE_VERSIONS[0]);
+    fs::create_dir_all(&opts.root_dir).await?;
+
+    // 1. Toolchain resolution (matches the kanidm flow).
+    progress.set_phase(InstallPhase::DetectingBinaries);
+    progress.set_message("Ensuring Rust toolchain is installed for the garage source build");
+    let cargo_path = crate::prerequisites::ensure_rust_toolchain(progress).await?;
+
+    // 2. Fetch + extract the source tarball.
+    progress.set_phase(InstallPhase::Downloading);
+    progress.set_message(format!(
+        "Downloading Garage v{version} source tarball from git.deuxfleurs.fr (one-time)"
+    ));
+    let src_root = opts.root_dir.join("src");
+    fs::create_dir_all(&src_root).await?;
+    let src_dir = ensure_source_extracted(&src_root, version, progress).await?;
+
+    // 3. cargo build --release.
+    progress.set_phase(InstallPhase::Extracting);
+    progress.set_message(format!(
+        "cargo build --release Garage v{version} -- 15-30 min on a 4-core host"
+    ));
+    cargo_build_release(&cargo_path, &src_dir).await?;
+
+    // 4. Stable binary path under <root>/bin/garage.
+    let bin_dir = opts.root_dir.join("bin");
+    fs::create_dir_all(&bin_dir).await?;
+    let built = src_dir.join("target").join("release").join("garage");
+    if !fs::try_exists(&built).await.unwrap_or(false) {
+        return Err(ServiceError::BinaryMissing {
+            binary: "garage".into(),
+            bin_dir: src_dir.join("target").join("release"),
+        });
+    }
+    let final_binary = bin_dir.join("garage");
+    fs::copy(&built, &final_binary).await?;
+    // Ensure executable.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o755);
+        let _ = tokio::fs::set_permissions(&final_binary, perms).await;
+    }
+
+    // 5. Config + systemd unit.
     let s3_port = opts.port;
     let rpc_port = s3_port + 1;
     let web_port = s3_port + 2;
     let admin_port = s3_port + 3;
-    let config = ConfigFile {
-        filename: "garage.toml".into(),
-        contents: format!(
-            "metadata_dir = \"{root}/data/meta\"\n\
-             data_dir = \"{root}/data/data\"\n\
-             db_engine = \"sqlite\"\n\
-             replication_factor = 1\n\
-             rpc_bind_addr = \"127.0.0.1:{rpc}\"\n\
-             rpc_public_addr = \"127.0.0.1:{rpc}\"\n\
-             rpc_secret = \"0000000000000000000000000000000000000000000000000000000000000000\"\n\
-             \n\
-             [s3_api]\n\
-             api_bind_addr = \"127.0.0.1:{s3}\"\n\
-             s3_region = \"garage\"\n\
-             root_domain = \".s3.garage.local\"\n\
-             \n\
-             [s3_web]\n\
-             bind_addr = \"127.0.0.1:{web}\"\n\
-             root_domain = \".web.garage.local\"\n\
-             index = \"index.html\"\n\
-             \n\
-             [admin]\n\
-             api_bind_addr = \"127.0.0.1:{admin}\"\n\
-             admin_token = \"change-me\"\n\
-             metrics_token = \"change-me\"\n",
-            root = opts.root_dir.display(),
-            s3 = s3_port,
-            rpc = rpc_port,
-            web = web_port,
-            admin = admin_port,
-        ),
+    let config_path = opts.root_dir.join("garage.toml");
+    let config = garage_toml(&opts.root_dir, s3_port, rpc_port, web_port, admin_port);
+    let mut f = fs::File::create(&config_path).await?;
+    f.write_all(config.as_bytes()).await?;
+    f.sync_all().await?;
+    info!(config = %config_path.display(), "wrote garage.toml");
+
+    let unit_path = PathBuf::from("/etc/systemd/system").join(&opts.unit_name);
+    let unit = systemd_unit(&final_binary, &config_path, &opts.root_dir);
+    let mut f = fs::File::create(&unit_path).await?;
+    f.write_all(unit.as_bytes()).await?;
+    f.sync_all().await?;
+    info!(unit = %unit_path.display(), "wrote garage systemd unit");
+    super::systemctl::daemon_reload().await?;
+
+    // 6. Start + wait.
+    progress.set_phase(InstallPhase::StartingService);
+    progress.set_message(format!("Starting {}", opts.unit_name));
+    super::systemctl::enable_now(&opts.unit_name).await?;
+
+    progress.set_phase(InstallPhase::WaitingForReady);
+    progress.set_message(format!(
+        "Waiting for port {s3_port} to accept S3 API connections"
+    ));
+    wait_for_port("127.0.0.1", s3_port, std::time::Duration::from_secs(60)).await?;
+
+    // PATH shim.
+    let cli_symlink = match super::path::register("garage", &final_binary).await {
+        Ok(p) => Some(p),
+        Err(e) => {
+            tracing::warn!(error = %e, "registering garage symlink failed; non-fatal");
+            None
+        }
     };
-    let args = vec![
-        "-c".into(),
-        opts.root_dir
-            .join("garage.toml")
-            .to_string_lossy()
-            .into_owned(),
-        "server".into(),
-    ];
-    service::install_service(
-        ServiceInstall {
-            component: "garage",
-            root_dir: opts.root_dir,
-            bundle,
-            binary_name: "garage",
-            args,
-            port: opts.port,
-            unit_name: opts.unit_name,
-            config: Some(config),
-            cli_symlink: Some(CliSymlink {
-                short_name: "garage",
-                binary_name: "garage",
-            }),
-        },
-        progress,
-    )
-    .await
+
+    Ok(InstalledService {
+        bin_dir,
+        unit_path,
+        port: opts.port,
+        cli_symlink,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -144,15 +189,13 @@ impl Default for UninstallOptions {
 }
 
 pub async fn uninstall(opts: UninstallOptions) -> Result<Uninstalled, ServiceError> {
-    service::uninstall_service("garage", &opts.root_dir, &opts.unit_name, Some("garage")).await
+    super::service::uninstall_service("garage", &opts.root_dir, &opts.unit_name, Some("garage"))
+        .await
 }
 
 pub async fn detect_installed() -> Vec<crate::detect::DetectedInstall> {
     let root = PathBuf::from("/var/lib/computeza/garage");
-    if !tokio::fs::try_exists(root.join("data"))
-        .await
-        .unwrap_or(false)
-    {
+    if !fs::try_exists(root.join("data")).await.unwrap_or(false) {
         return Vec::new();
     }
     vec![crate::detect::DetectedInstall {
@@ -161,16 +204,185 @@ pub async fn detect_installed() -> Vec<crate::detect::DetectedInstall> {
         version: None,
         port: Some(DEFAULT_S3_PORT),
         data_dir: Some(root.join("data")),
-        bin_dir: None,
+        bin_dir: Some(root.join("bin")),
     }]
 }
 
-fn pick_bundle(requested: Option<&str>) -> &'static Bundle {
-    match requested {
-        Some(v) => GARAGE_BUNDLES
-            .iter()
-            .find(|b| b.version == v)
-            .unwrap_or(&GARAGE_BUNDLES[0]),
-        None => &GARAGE_BUNDLES[0],
+/// Download + extract the upstream source tarball under
+/// `<src_root>/garage-<version>/`. Cached: if the directory already
+/// exists and contains a `Cargo.toml`, returns the path without
+/// re-downloading. Failure to extract surfaces as a `ServiceError`.
+async fn ensure_source_extracted(
+    src_root: &Path,
+    version: &str,
+    _progress: &ProgressHandle,
+) -> Result<PathBuf, ServiceError> {
+    let extracted = src_root.join(format!("garage-{version}"));
+    if fs::try_exists(extracted.join("Cargo.toml"))
+        .await
+        .unwrap_or(false)
+    {
+        info!(
+            extracted = %extracted.display(),
+            "garage source already extracted; skipping download"
+        );
+        return Ok(extracted);
+    }
+
+    let url = format!("{GARAGE_ARCHIVE_BASE}/v{version}.tar.gz");
+    let tarball = src_root.join(format!("garage-{version}.tar.gz"));
+    let resp = reqwest::get(&url)
+        .await
+        .map_err(|e| ServiceError::Io(std::io::Error::other(format!("GET {url}: {e}"))))?;
+    if !resp.status().is_success() {
+        return Err(ServiceError::Io(std::io::Error::other(format!(
+            "GET {url} returned HTTP {}; verify the tag exists at https://git.deuxfleurs.fr/Deuxfleurs/garage/tags",
+            resp.status().as_u16()
+        ))));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| ServiceError::Io(std::io::Error::other(format!("reading body: {e}"))))?;
+    let mut f = fs::File::create(&tarball).await?;
+    f.write_all(&bytes).await?;
+    f.sync_all().await?;
+    drop(f);
+
+    // Extract via tar -- shell out rather than pull in another
+    // archive crate. `tar` is in coreutils everywhere we run.
+    let status = Command::new("tar")
+        .arg("-xzf")
+        .arg(&tarball)
+        .arg("-C")
+        .arg(src_root)
+        .status()
+        .await?;
+    if !status.success() {
+        return Err(ServiceError::Io(std::io::Error::other(format!(
+            "tar -xzf {} failed (exit {:?}); the downloaded archive may be incomplete or the tag may not exist",
+            tarball.display(),
+            status.code()
+        ))));
+    }
+    // Best-effort cleanup of the tarball after extraction.
+    let _ = fs::remove_file(&tarball).await;
+
+    if !fs::try_exists(extracted.join("Cargo.toml"))
+        .await
+        .unwrap_or(false)
+    {
+        return Err(ServiceError::Io(std::io::Error::other(format!(
+            "extracted {} but no Cargo.toml inside -- the tag's archive layout may have changed; expected garage-<version>/Cargo.toml",
+            extracted.display()
+        ))));
+    }
+    Ok(extracted)
+}
+
+/// Run `cargo build --release` against the unpacked source tree.
+/// Surfaces stderr verbatim on failure so the operator sees which
+/// crate failed to compile.
+async fn cargo_build_release(cargo_bin: &Path, src_dir: &Path) -> Result<(), ServiceError> {
+    let out = Command::new(cargo_bin)
+        .arg("build")
+        .arg("--release")
+        .arg("--bin")
+        .arg("garage")
+        .arg("--manifest-path")
+        .arg(src_dir.join("Cargo.toml"))
+        .output()
+        .await?;
+    if !out.status.success() {
+        return Err(ServiceError::Io(std::io::Error::other(format!(
+            "cargo build --release for garage failed (cargo={}, src={}). Full stderr:\n{}",
+            cargo_bin.display(),
+            src_dir.display(),
+            String::from_utf8_lossy(&out.stderr)
+        ))));
+    }
+    Ok(())
+}
+
+fn garage_toml(
+    root_dir: &Path,
+    s3_port: u16,
+    rpc_port: u16,
+    web_port: u16,
+    admin_port: u16,
+) -> String {
+    format!(
+        "metadata_dir = \"{root}/data/meta\"\n\
+         data_dir = \"{root}/data/data\"\n\
+         db_engine = \"sqlite\"\n\
+         replication_factor = 1\n\
+         rpc_bind_addr = \"127.0.0.1:{rpc_port}\"\n\
+         rpc_public_addr = \"127.0.0.1:{rpc_port}\"\n\
+         rpc_secret = \"0000000000000000000000000000000000000000000000000000000000000000\"\n\
+         \n\
+         [s3_api]\n\
+         api_bind_addr = \"127.0.0.1:{s3_port}\"\n\
+         s3_region = \"garage\"\n\
+         root_domain = \".s3.garage.local\"\n\
+         \n\
+         [s3_web]\n\
+         bind_addr = \"127.0.0.1:{web_port}\"\n\
+         root_domain = \".web.garage.local\"\n\
+         index = \"index.html\"\n\
+         \n\
+         [admin]\n\
+         api_bind_addr = \"127.0.0.1:{admin_port}\"\n\
+         admin_token = \"change-me\"\n\
+         metrics_token = \"change-me\"\n",
+        root = root_dir.display(),
+    )
+}
+
+fn systemd_unit(binary: &Path, config: &Path, root_dir: &Path) -> String {
+    format!(
+        "[Unit]\n\
+         Description=Computeza-managed Garage (S3-compatible object storage)\n\
+         After=network-online.target\n\
+         Wants=network-online.target\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         RuntimeDirectory=garage\n\
+         RuntimeDirectoryMode=0755\n\
+         ExecStart={bin} -c {conf} server\n\
+         Restart=on-failure\n\
+         RestartSec=5\n\
+         NoNewPrivileges=yes\n\
+         PrivateTmp=yes\n\
+         ProtectSystem=strict\n\
+         ProtectHome=yes\n\
+         ReadWritePaths={root}\n\
+         \n\
+         [Install]\n\
+         WantedBy=multi-user.target\n",
+        bin = binary.display(),
+        conf = config.display(),
+        root = root_dir.display(),
+    )
+}
+
+async fn wait_for_port(
+    host: &str,
+    port: u16,
+    timeout: std::time::Duration,
+) -> Result<(), ServiceError> {
+    let deadline = std::time::Instant::now() + timeout;
+    let addr = format!("{host}:{port}");
+    loop {
+        if tokio::net::TcpStream::connect(&addr).await.is_ok() {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(ServiceError::NotReady {
+                port,
+                timeout_secs: timeout.as_secs(),
+            });
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 }
