@@ -645,6 +645,7 @@ pub fn router_with_state(state: AppState) -> Router {
     Router::new()
         .route("/", get(home_handler))
         .route("/components", get(components_handler))
+        .route("/install-guide", get(install_guide_handler))
         .route(
             "/install",
             get(install_hub_handler).post(install_all_handler),
@@ -3700,6 +3701,14 @@ async fn components_handler() -> Html<String> {
     Html(render_components(&l))
 }
 
+/// GET /install-guide -- public step-by-step setup reference. Public
+/// so a prospective buyer can read the prereqs + commands before
+/// signing in. Static content; no per-tenant data touched.
+async fn install_guide_handler() -> Html<String> {
+    let l = Localizer::english();
+    Html(render_install_guide(&l))
+}
+
 async fn state_page_handler(State(state): State<AppState>) -> Html<String> {
     let l = Localizer::english();
     let Some(store) = &state.store else {
@@ -4963,6 +4972,8 @@ pub enum NavLink {
     Home,
     /// Managed components reference.
     Components,
+    /// Public install guide (prereqs + step-by-step setup).
+    InstallGuide,
     /// Install wizard.
     Install,
     /// Live reconciler status dashboard.
@@ -5045,6 +5056,7 @@ pub fn render_shell(
   </a>
   <div class="cz-navlinks">
     <a href="/components" class="{nc}">{nav_components}</a>
+    <a href="/install-guide" class="{nig}">Install guide</a>
     <a href="/install" class="{ni}">{nav_install}</a>
     <a href="/status" class="{ns}">{nav_status}</a>
     <a href="/state" class="{nm}">{nav_state}</a>
@@ -5117,6 +5129,7 @@ pub fn render_shell(
 </body>
 </html>"#,
         nc = nav_class(NavLink::Components),
+        nig = nav_class(NavLink::InstallGuide),
         ni = nav_class(NavLink::Install),
         ns = nav_class(NavLink::Status),
         nm = nav_class(NavLink::State),
@@ -5402,6 +5415,7 @@ pub fn render_landing_page(localizer: &Localizer) -> String {
 <p class="cz-landing-subtitle">{hero_subtitle}</p>
 <div class="cz-cta-row">
 <a class="cz-btn cz-btn-primary cz-btn-lg" href="/login">{hero_cta_primary}</a>
+<a class="cz-btn cz-btn-lg" href="/install-guide">Install guide</a>
 <a class="cz-btn cz-btn-lg" href="/components">{hero_cta_secondary}</a>
 </div>
 <div class="cz-stat-strip">
@@ -5650,6 +5664,207 @@ pub fn render_components(localizer: &Localizer) -> String {
     );
 
     render_shell(localizer, &title, NavLink::Components, &body)
+}
+
+/// Render the public `/install-guide` page -- the operator-facing
+/// step-by-step setup reference. Linked from the top nav + landing
+/// CTAs.
+///
+/// Content scope:
+/// 1. Prerequisites table (OS, hardware, network, ports, user).
+/// 2. Step 1: build (from source for v0.0.x; signed releases land
+///    in v0.1+).
+/// 3. Step 2: first run + secrets passphrase.
+/// 4. Step 3: install components from `/install`.
+/// 5. Step 4: optional license activation.
+/// 6. WSL2-specific notes (systemd toggle, port forwarding, ext4-
+///    vs-NTFS guidance).
+/// 7. Production hardening checklist.
+/// 8. Troubleshooting common errors.
+/// 9. Where to get help.
+///
+/// The content is largely inlined rather than fully tokenised
+/// through the i18n bundle so the page reads coherently to a human
+/// drafting it; the high-frequency strings (section headers, code
+/// fences) can move into ui.ftl in a follow-up without touching the
+/// page structure.
+#[must_use]
+pub fn render_install_guide(localizer: &Localizer) -> String {
+    let title = "Install guide";
+
+    let body = format!(
+        r#"<section class="cz-hero">
+<h1>{title}</h1>
+<p>Step-by-step setup for the Computeza operator console and the managed-component data plane. v0.0.x ships a single binary that installs, configures, and supervises every component natively on the host operating system. The list below is the canonical path from a fresh machine to a running stack.</p>
+<p class="cz-muted">Estimated time: <strong>10-20 minutes</strong> on a typical workstation (Rust toolchain warm + 1 Gbps network); add 5-10 minutes per managed component the first time it pulls binaries.</p>
+</section>
+
+<section class="cz-section" id="prereqs">
+<h2>Prerequisites</h2>
+<p class="cz-muted">Verify each row before proceeding. v0.0.x targets Linux x86_64 for the full 11-component data plane; macOS and Windows ship a Postgres + Kanidm subset and gain the remaining components in v0.1+.</p>
+<div class="cz-table-wrap">
+<table class="cz-table">
+<thead><tr><th>Requirement</th><th>Minimum</th><th>Recommended</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td class="cz-strong">Operating system</td><td>Ubuntu 22.04 / Debian 12 / Fedora 39 / RHEL 9</td><td>Ubuntu 24.04 LTS</td><td>Any systemd-based distro works. macOS 13+ and Windows 11 supported for a partial stack (see <a href="/components">/components</a>).</td></tr>
+<tr><td class="cz-strong">Architecture</td><td>x86_64</td><td>x86_64</td><td>ARM64 lands in v0.1+ (spec section 10).</td></tr>
+<tr><td class="cz-strong">CPU</td><td>2 vCPU</td><td>4 vCPU</td><td>Postgres + Restate + Greptime are the heaviest co-residents.</td></tr>
+<tr><td class="cz-strong">RAM</td><td>4 GiB</td><td>8 GiB+</td><td>Per-component RAM dominated by Postgres shared_buffers + Greptime + Databend caches.</td></tr>
+<tr><td class="cz-strong">Disk</td><td>20 GiB free under /var</td><td>100 GiB SSD</td><td>Object storage (Garage) and Iceberg data dirs dominate footprint. Mount /var/lib/computeza on a fast disk.</td></tr>
+<tr><td class="cz-strong">User account</td><td>Operator with <code>sudo</code></td><td>Same</td><td>The install path writes /var/lib/computeza, /etc/systemd/system, and /usr/local/bin. The wrapping binary re-execs itself with sudo when needed.</td></tr>
+<tr><td class="cz-strong">systemd</td><td>active</td><td>active</td><td><code>systemctl is-system-running</code> must report <code>running</code> or <code>degraded</code>. WSL2 users: enable via <code>/etc/wsl.conf</code> (see WSL section below).</td></tr>
+<tr><td class="cz-strong">Network egress</td><td>HTTPS to <code>get.enterprisedb.com</code>, <code>github.com</code>, upstream component sites</td><td>Same + local mirror</td><td>The drivers download binaries on first install. Air-gapped operators can pre-stage tarballs under <code>&lt;root_dir&gt;/binaries/&lt;version&gt;/</code> and the install detects them.</td></tr>
+<tr><td class="cz-strong">Inbound ports</td><td>8400 (console)</td><td>8400 + per-component</td><td>Component defaults: Postgres 5432, Garage 3900, OpenFGA 8080, Qdrant 6333, Restate 9070, GreptimeDB 4000, Grafana 3000, Lakekeeper 8181, Kanidm 8443, Databend 8000, XTable 8090. Bind 127.0.0.1 for local-only.</td></tr>
+<tr><td class="cz-strong">Rust toolchain</td><td>1.83+</td><td>Latest stable</td><td>Required only to build from source. Pre-built signed releases ship in v0.1.</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section class="cz-section" id="step-1-build">
+<h2>Step 1 -- get the binary</h2>
+<p>v0.0.x is build-from-source. Signed pre-built releases land in v0.1+ (spec section 13).</p>
+<ol class="cz-ol">
+<li>Install the build toolchain:
+<pre><code>sudo apt update
+sudo apt install -y build-essential pkg-config libssl-dev git curl
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"</code></pre>
+</li>
+<li>Clone the repository:
+<pre><code>cd ~
+git clone https://github.com/indritkalaj/computeza
+cd computeza</code></pre>
+</li>
+<li>Build the binary in release mode (the dev profile works for kicking tires but boots slower):
+<pre><code>cargo build --release --bin computeza
+./target/release/computeza --version</code></pre>
+</li>
+</ol>
+<p class="cz-muted">First build takes 5-10 minutes on a modern laptop. Subsequent builds reuse the cache and finish in seconds.</p>
+</section>
+
+<section class="cz-section" id="step-2-first-run">
+<h2>Step 2 -- first run + the secrets passphrase</h2>
+<p>The operator console encrypts every generated credential under a single passphrase that you supply via the <code>COMPUTEZA_SECRETS_PASSPHRASE</code> environment variable. Without it, the console still runs but credentials are surfaced on a one-time view page only -- not persisted.</p>
+<ol class="cz-ol">
+<li>Generate a strong passphrase and store it where you keep the rest of your infrastructure secrets:
+<pre><code>openssl rand -hex 32</code></pre>
+</li>
+<li>Boot the console with the passphrase exported. The default <code>127.0.0.1:8400</code> binding keeps the console reachable only from the host (recommended until you put a reverse proxy in front):
+<pre><code>export COMPUTEZA_SECRETS_PASSPHRASE='&lt;the-string-from-step-1&gt;'
+sudo -E ./target/release/computeza serve --addr 127.0.0.1:8400 \
+    --state-db /var/lib/computeza/computeza-state.db</code></pre>
+The <code>-E</code> flag preserves the env var across the sudo boundary.
+</li>
+<li>Open <a href="/">http://localhost:8400</a> in a browser. The first request lands on <code>/setup</code> where you mint the initial admin account -- the only unauthenticated form on the console after first boot.</li>
+<li><strong>Back up three things together</strong> -- losing any one renders every stored secret permanently unrecoverable, by design:
+<ul>
+<li>The passphrase you generated (e.g. in a password manager).</li>
+<li><code>/var/lib/computeza/computeza-secrets.salt</code> (16 random bytes; generated on first run).</li>
+<li><code>/var/lib/computeza/computeza-secrets.jsonl</code> (the AES-256-GCM ciphertext, grows over time).</li>
+</ul>
+</li>
+</ol>
+</section>
+
+<section class="cz-section" id="step-3-components">
+<h2>Step 3 -- install managed components</h2>
+<p>Once signed in, the <a href="/install">/install</a> page is the one-screen hub: every managed component is listed as an accordion row with a per-component form for port + data-directory overrides. Each driver:</p>
+<ul>
+<li>Downloads its binaries from the upstream's CDN (SHA-verified where pinned), or uses a distro package when present.</li>
+<li>Drops a data directory under <code>/var/lib/computeza/&lt;component&gt;/</code> (or your override).</li>
+<li>Writes a systemd unit named <code>computeza-&lt;component&gt;.service</code> and <code>enable --now</code>'s it.</li>
+<li>Waits for the service's health probe to succeed before reporting "installed".</li>
+</ul>
+<p>No per-component apt / yum installs needed. The Linux Postgres driver also auto-fetches an EnterpriseDB binary tarball when no distro Postgres is present, so even Postgres is no-prereqs.</p>
+<p class="cz-muted">Re-running an install for an already-installed component is idempotent: the driver detects the existing data directory, leaves it untouched, and re-renders the unit file. Use <a href="/install">/install</a> -> <em>Uninstall</em> to tear a component down cleanly (drops the systemd unit + data dir).</p>
+</section>
+
+<section class="cz-section" id="step-4-license">
+<h2>Step 4 -- activate a license (optional)</h2>
+<p>Computeza runs in <strong>Community mode</strong> without a license attached -- all 11 components install and run; the operator console is fully functional. License activation is what turns on tier-gated features (seat caps, expiry kill-switch, channel-partner gRPC API) and shows the entitlement chain to your reseller.</p>
+<ol class="cz-ol">
+<li>Get a license envelope from your reseller (or from <a href="mailto:hello@computeza.eu">hello@computeza.eu</a> for direct deals).</li>
+<li>In the console, navigate to <a href="/admin/license">/admin/license</a> and paste the envelope JSON into the <em>Activate</em> form.</li>
+<li>The binary verifies the Ed25519 signature against the baked-in trusted-root key + checks the validity window + persists the envelope at <code>&lt;state_db_parent&gt;/license.json</code>. A success page lists tier, seats, and the resale chain.</li>
+</ol>
+<p class="cz-muted">License files are tamper-evident: any edit to the JSON breaks the signature and the binary refuses to load it on the next restart. The dual-signature PQ envelope (Ed25519 + ML-DSA) ships in v0.1; envelopes signed only with Ed25519 stay valid through the transition.</p>
+</section>
+
+<section class="cz-section" id="wsl">
+<h2>WSL2 specifics (Windows 11)</h2>
+<p>WSL2 is a fully supported development target. Two settings make the difference between "kicks tires" and "behaves like bare-metal Linux":</p>
+<ol class="cz-ol">
+<li><strong>Enable systemd.</strong> WSL2 ships with systemd support but it's off by default. Inside the Ubuntu shell:
+<pre><code>sudo tee /etc/wsl.conf &gt;/dev/null &lt;&lt;'EOF'
+[boot]
+systemd=true
+EOF</code></pre>
+Then from Windows CMD / PowerShell: <code>wsl --shutdown</code>, re-open Ubuntu, verify with <code>systemctl is-system-running</code>.
+</li>
+<li><strong>Build inside the Linux filesystem, not <code>/mnt/c/...</code>.</strong> Cargo + rust-analyzer perform 5-10x faster on ext4 than on the SMB bridge into NTFS. Clone the repo under <code>~/computeza</code>, not <code>/mnt/c/Users/&lt;you&gt;/computeza</code>.</li>
+<li><strong>Localhost forwarding.</strong> WSL2 auto-forwards <code>127.0.0.1</code> bindings to the Windows host, so the console at <code>localhost:8400</code> reaches Edge / Chrome on Windows without any port mapping.</li>
+<li><strong>VS Code WSL extension.</strong> Install via <code>code --install-extension ms-vscode-remote.remote-wsl</code> in CMD / PowerShell. Once installed, run <code>code .</code> from your WSL shell inside <code>~/computeza</code> -- VS Code keeps its UI on Windows but runs rust-analyzer, the terminal, and the debugger inside Linux.</li>
+</ol>
+</section>
+
+<section class="cz-section" id="hardening">
+<h2>Production hardening checklist</h2>
+<p>For an internet-reachable deployment, work through this list before exposing the console publicly. Each item maps onto a specific spec section (referenced in the in-repo AGENTS.md audit trail).</p>
+<ul>
+<li><strong>Run <code>computeza serve</code> as a systemd unit.</strong> The install wizard at <a href="/install">/install</a> ships a <em>Self-install</em> button (v0.0.x landing) that drops a unit at <code>/etc/systemd/system/computeza.service</code> with hardened defaults (<code>NoNewPrivileges</code>, <code>ProtectSystem=strict</code>, <code>PrivateTmp</code>, <code>ReadWritePaths=/var/lib/computeza</code>).</li>
+<li><strong>Put a reverse proxy + TLS cert in front.</strong> The console binds plain HTTP on 127.0.0.1; the canonical pattern is Caddy / nginx / haproxy fronting it on 443 with Let's Encrypt or your enterprise CA. v0.1 ships an in-tree TLS terminator with a hybrid X25519+ML-KEM cipher for PQ readiness.</li>
+<li><strong>Move the secrets passphrase out of the environment.</strong> v0.0.x reads <code>COMPUTEZA_SECRETS_PASSPHRASE</code> from the environment. v0.1 plugs in a <code>KeyProvider</code> trait with implementations for HashiCorp Vault, AWS KMS, GCP KMS, PKCS#11, and TPM -- the binary asks the provider for the master key at boot instead of deriving from a passphrase.</li>
+<li><strong>Bind the console to a non-routed interface.</strong> Even with a reverse proxy, keep <code>--addr 127.0.0.1:8400</code> and let the proxy be the only thing on a routable port. Defense-in-depth.</li>
+<li><strong>Configure RBAC.</strong> The default operator account is in the <code>admins</code> group. Create per-team accounts under <a href="/admin/operators">/admin/operators</a> with narrower group memberships (<code>operators</code> can install but not manage other operators; <code>viewers</code> have read-only access to <a href="/status">/status</a> + <a href="/audit">/audit</a>).</li>
+<li><strong>Pin license + audit-log keys offline.</strong> Back up <code>&lt;state_db_parent&gt;/audit.key</code> and the operator account file (<code>operators.jsonl</code>) alongside the secrets bundle. Without the audit key, the signed log cannot be re-verified by an external auditor.</li>
+<li><strong>Subscribe to security advisories.</strong> Watch <a href="https://github.com/indritkalaj/computeza/security/advisories">github.com/indritkalaj/computeza/security/advisories</a>. CVEs in the managed-component upstreams (Postgres, Restate, etc.) flow into Computeza's release notes within 48 hours.</li>
+</ul>
+</section>
+
+<section class="cz-section" id="troubleshooting">
+<h2>Troubleshooting</h2>
+<dl class="cz-dl">
+<dt>"Permission denied (os error 13)" during a component install</dt>
+<dd>The install path writes <code>/var/lib/computeza/*</code> and <code>/etc/systemd/system/*</code> -- both require root. Re-run with <code>sudo -E ./target/release/computeza serve ...</code>. The <code>-E</code> preserves <code>COMPUTEZA_SECRETS_PASSPHRASE</code> across the sudo boundary.</dd>
+
+<dt>"postgres binaries not found"</dt>
+<dd>The Linux Postgres driver searches <code>/usr/lib/postgresql/&lt;v&gt;/bin</code>, <code>/usr/pgsql-&lt;v&gt;/bin</code>, and <code>/usr/{{,local/}}bin</code> for majors 13-18. When none match, it falls through to downloading the EnterpriseDB tarball under <code>&lt;root_dir&gt;/binaries/&lt;version&gt;/</code>. If both paths fail, check egress to <code>get.enterprisedb.com</code> or supply a custom <code>bin_dir</code> on the install form.</dd>
+
+<dt>"Failed to connect to bus" during systemd registration</dt>
+<dd>systemd isn't running. On WSL2, enable it via <code>/etc/wsl.conf</code> and <code>wsl --shutdown</code> (see WSL section above). On a minimal LXC container, ensure the container template has systemd as PID 1.</dd>
+
+<dt>License banner reads "Not yet valid" or "Signature failed"</dt>
+<dd>The envelope's <code>not_before</code> is in the future, the chain anchor doesn't match the baked-in trusted-root key, or the JSON was edited after signing. Re-request a fresh envelope from your reseller; the binary refuses tampered envelopes by design.</dd>
+
+<dt>Secrets warning banner reads "No secrets store is attached"</dt>
+<dd><code>COMPUTEZA_SECRETS_PASSPHRASE</code> is unset. The first-boot wizard at <a href="/setup">/setup</a> walks you through generating a passphrase + writing a systemd drop-in; manual setup is <code>export COMPUTEZA_SECRETS_PASSPHRASE=...</code> + restart.</dd>
+
+<dt>Console boots but pages return 502 / connection refused from the reverse proxy</dt>
+<dd>Check the bind address: if you set <code>--addr 0.0.0.0:8400</code> the reverse proxy reaches it on the public interface; for the recommended 127.0.0.1 binding, both the proxy and the console must be on the same host.</dd>
+
+<dt>An installed component shows "Failed" on /status</dt>
+<dd>Check the per-component systemd log: <code>journalctl -u computeza-&lt;component&gt; -n 200 --no-pager</code>. The most common cause is a port conflict with a pre-existing service on the same host (e.g. apt-installed Postgres on 5432 while the Computeza-managed Postgres tries to claim it). Disable the conflicting service with <code>sudo systemctl stop &lt;name&gt; &amp;&amp; sudo systemctl disable &lt;name&gt;</code>.</dd>
+
+<dt>Forensics: who did what, and when?</dt>
+<dd>Every state change is appended to <code>&lt;state_db_parent&gt;/audit.jsonl</code> with an Ed25519 chained signature. View it under <a href="/audit">/audit</a>. The verifying key is at <code>audit.key</code>; back this up so an external auditor can verify the chain independently.</dd>
+</dl>
+</section>
+
+<section class="cz-section" id="help">
+<h2>Where to get help</h2>
+<ul>
+<li><strong>Open an issue:</strong> <a href="https://github.com/indritkalaj/computeza/issues">github.com/indritkalaj/computeza/issues</a> -- bug reports, feature requests, and questions about the spec.</li>
+<li><strong>Security disclosures:</strong> private vulnerability reports through GitHub's security advisories tab on the same repo.</li>
+<li><strong>Commercial inquiries:</strong> <a href="mailto:hello@computeza.eu">hello@computeza.eu</a> for reseller / channel-partner agreements + enterprise tier negotiation.</li>
+<li><strong>Component upstreams:</strong> bugs in a managed component itself (Postgres core, Restate runtime, etc.) belong upstream. See <a href="/components">/components</a> for project links + licenses.</li>
+</ul>
+</section>"#,
+        title = html_escape(title),
+    );
+
+    render_shell(localizer, title, NavLink::InstallGuide, &body)
 }
 
 /// Minimal percent-encoder for a single URL path segment. Encodes
@@ -10384,6 +10599,47 @@ pub fn render_resource_deleted(localizer: &Localizer, kind: &str, name: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_install_guide_covers_all_sections() {
+        // The install guide is the primary onboarding surface; the
+        // sections below are the contract with operators arriving
+        // from the marketing landing. If any one regresses, the
+        // operator hits a half-documented onboarding path.
+        let l = Localizer::english();
+        let html = render_install_guide(&l);
+        for marker in [
+            "Install guide",
+            r#"id="prereqs""#,
+            r#"id="step-1-build""#,
+            r#"id="step-2-first-run""#,
+            r#"id="step-3-components""#,
+            r#"id="step-4-license""#,
+            r#"id="wsl""#,
+            r#"id="hardening""#,
+            r#"id="troubleshooting""#,
+            r#"id="help""#,
+            "COMPUTEZA_SECRETS_PASSPHRASE",
+            "systemctl is-system-running",
+            "get.enterprisedb.com",
+            "/admin/license",
+            "/install",
+        ] {
+            assert!(
+                html.contains(marker),
+                "install-guide page should contain {marker:?}; first 2 KiB of HTML:\n{}",
+                &html[..html.len().min(2048)]
+            );
+        }
+    }
+
+    #[test]
+    fn install_guide_is_reachable_via_router_unauthenticated() {
+        // The route MUST be in PUBLIC_PATH_PREFIXES so a prospect
+        // browsing the marketing site can read prereqs before
+        // committing to signing up.
+        assert!(crate::auth::is_public_path("/install-guide"));
+    }
 
     #[test]
     fn render_components_lists_every_spec_component() {

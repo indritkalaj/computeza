@@ -554,6 +554,11 @@ pub const PUBLIC_PATH_PREFIXES: &[&str] = &[
     "/static/",
     "/favicon.ico",
     "/components",
+    // Operator install guide -- public so prospective buyers / new
+    // operators can read prereqs + step-by-step setup before signing
+    // in to anything. Content is reference material; no per-tenant
+    // state leaks.
+    "/install-guide",
     // License-status read endpoint feeding the banner JS injected
     // into every page (including unauthenticated /login + landing).
     // Returns coarse-grained status only; safe to expose unauth.
@@ -704,6 +709,7 @@ mod tests {
         assert!(is_public_path("/static/computeza.css"));
         assert!(is_public_path("/favicon.ico"));
         assert!(is_public_path("/components"));
+        assert!(is_public_path("/install-guide"));
         assert!(!is_public_path("/install"));
         assert!(!is_public_path("/status"));
         assert!(!is_public_path("/state"));
