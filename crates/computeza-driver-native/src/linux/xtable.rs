@@ -223,6 +223,15 @@ pub async fn install(
         let jdk11_bin = jdk11_home.join("bin");
         let path_var = std::env::var("PATH").unwrap_or_default();
         let augmented_path = format!("{}:{}", jdk11_bin.display(), path_var);
+        // -Dmaven.build.cache.enabled=false disables the
+        // maven-build-cache-plugin XTable wires into its parent
+        // pom. The cache plugin treats `mvn clean package` as
+        // "phases cached, skip" without re-running the package
+        // phase, so `target/` ends up empty after the `clean` wipe
+        // and no JAR is written. For an installer that runs once
+        // and discards intermediate state, a real rebuild every
+        // time is cheap and reliable; the cache is a
+        // developer-ergonomic feature we don't need.
         let out = Command::new("mvn")
             .current_dir(&src_dir)
             .env("JAVA_HOME", &jdk11_home)
@@ -230,6 +239,7 @@ pub async fn install(
             .arg("clean")
             .arg("package")
             .arg("-DskipTests")
+            .arg("-Dmaven.build.cache.enabled=false")
             .arg("-B")
             .arg("-e")
             .output()
@@ -558,6 +568,47 @@ async fn locate_bundled_jar(src_dir: &Path, _version: &str) -> Result<PathBuf, S
     }
     if let Some(jar) = candidates.first() {
         return Ok(jar.clone());
+    }
+
+    // No `*-bundled.jar` anywhere. maven-shade-plugin may be
+    // configured to replace the main jar in place (no -bundled
+    // classifier). Fall back to the largest jar under a
+    // `*utilities*` target/: a shaded fat jar contains every
+    // transitive dep so it's an order of magnitude larger than the
+    // un-shaded jar. The "biggest jar in utilities" heuristic
+    // reliably finds the runnable one.
+    let utilities_jars_out = Command::new("find")
+        .arg(src_dir)
+        .arg("-path")
+        .arg("*utilities*/target/*.jar")
+        .arg("-not")
+        .arg("-name")
+        .arg("*sources.jar")
+        .arg("-not")
+        .arg("-name")
+        .arg("*javadoc.jar")
+        .arg("-not")
+        .arg("-name")
+        .arg("*tests.jar")
+        .output()
+        .await?;
+    if utilities_jars_out.status.success() {
+        let mut best: Option<(u64, PathBuf)> = None;
+        for line in String::from_utf8_lossy(&utilities_jars_out.stdout).lines() {
+            let p = PathBuf::from(line.trim());
+            if p.as_os_str().is_empty() {
+                continue;
+            }
+            if let Ok(meta) = fs::metadata(&p).await {
+                let size = meta.len();
+                if best.as_ref().is_none_or(|(s, _)| size > *s) {
+                    best = Some((size, p));
+                }
+            }
+        }
+        if let Some((_, jar)) = best {
+            return Ok(jar);
+        }
     }
 
     // Diagnostic fallback: surface what JARs the build actually
