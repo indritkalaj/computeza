@@ -134,33 +134,39 @@ pub async fn install(
             dest_jar.display()
         ));
     } else {
-        // 3. Need Maven AND a JDK 17. XTable's parent pom pins
-        //    lombok-maven-plugin:1.18.20.0, which uses
-        //    com.sun.tools.javac internals removed in JDK 21+
-        //    (`com.sun.tools.javac.code.TypeTag :: UNKNOWN`). apt's
-        //    `maven` package pulls `default-jdk-headless` which on
-        //    Ubuntu 24.04 is JDK 21 -- that breaks delombok. We
-        //    explicitly install `openjdk-17-jdk-headless` alongside
-        //    and run mvn under JDK 17. The resulting JARs run fine
-        //    on our Temurin JRE 21 (Java is forward-compatible).
+        // 3. Need Maven AND a JDK 11. XTable's parent pom pins
+        //    lombok-maven-plugin:1.18.20.0, which bundles lombok
+        //    1.18.20 (released March 2021). That lombok release was
+        //    tested against JDK 8-16; JDK 17+ hits two separate bugs:
+        //      - JDK 21: `com.sun.tools.javac.code.TypeTag :: UNKNOWN`
+        //        (internals removed in JDK 21)
+        //      - JDK 17.0.7+: `Cannot read field "bindingsWhenTrue"
+        //        because "currentBindings" is null` (Flow analyzer
+        //        internals changed in a point release)
+        //        -- fixed upstream in lombok 1.18.30 (issue #3361).
+        //    Both are inaccessible without patching XTable's pom.
+        //    JDK 11 is the sweet spot: was the current LTS when
+        //    lombok 1.18.20 shipped, satisfies XTable's enforcer
+        //    rule, and avoids both lombok bugs. The resulting JARs
+        //    run fine on our Temurin JRE 21 (Java is
+        //    forward-compatible: compile-target 11 + runtime 21 OK).
         progress.set_phase(InstallPhase::DetectingBinaries);
-        progress
-            .set_message("Verifying Maven + JDK 17 are present for the xtable source build");
-        let need_install = require_on_path("mvn").await.is_err()
-            || locate_jdk17().await.is_err();
+        progress.set_message("Verifying Maven + JDK 11 are present for the xtable source build");
+        let need_install =
+            require_on_path("mvn").await.is_err() || locate_jdk11().await.is_err();
         if need_install {
             progress.set_phase(InstallPhase::Downloading);
             progress.set_message(
-                "Auto-installing Maven + JDK 17 via apt (one-time; required to build xtable from source)",
+                "Auto-installing Maven + JDK 11 via apt (one-time; required to build xtable from source under a lombok-1.18.20-compatible JDK)",
             );
-            auto_install_maven_and_jdk17().await?;
+            auto_install_maven_and_jdk11().await?;
             require_on_path("mvn").await?;
         }
-        let jdk17_home = locate_jdk17().await.map_err(|e| {
+        let jdk11_home = locate_jdk11().await.map_err(|e| {
             ServiceError::Io(std::io::Error::other(format!(
-                "could not locate a JDK 17 on the host even after `apt install openjdk-17-jdk-headless`. \
-                 lombok-maven-plugin 1.18.20.0 (pinned by xtable's parent pom) doesn't work on JDK 21+. \
-                 Manual fix: `sudo apt install -y openjdk-17-jdk-headless`. Underlying: {e}"
+                "could not locate a JDK 11 on the host even after `apt install openjdk-11-jdk-headless`. \
+                 lombok-maven-plugin 1.18.20.0 (pinned by xtable's parent pom) doesn't work on JDK 17+. \
+                 Manual fix: `sudo apt install -y openjdk-11-jdk-headless`. Underlying: {e}"
             )))
         })?;
 
@@ -197,15 +203,15 @@ pub async fn install(
         // per-module error live on stdout; suppressing them leaves
         // the operator with only the irrelevant JVM `sun.misc.Unsafe`
         // warnings on stderr.
-        // Build under JDK 17. JAVA_HOME drives Maven's toolchain;
-        // prepending JDK 17's bin to PATH makes any plugins that
+        // Build under JDK 11. JAVA_HOME drives Maven's toolchain;
+        // prepending JDK 11's bin to PATH makes any plugins that
         // shell out to `javac` also pick up the right compiler.
-        let jdk17_bin = jdk17_home.join("bin");
+        let jdk11_bin = jdk11_home.join("bin");
         let path_var = std::env::var("PATH").unwrap_or_default();
-        let augmented_path = format!("{}:{}", jdk17_bin.display(), path_var);
+        let augmented_path = format!("{}:{}", jdk11_bin.display(), path_var);
         let out = Command::new("mvn")
             .current_dir(&src_dir)
-            .env("JAVA_HOME", &jdk17_home)
+            .env("JAVA_HOME", &jdk11_home)
             .env("PATH", &augmented_path)
             .arg("clean")
             .arg("package")
@@ -326,29 +332,31 @@ async fn require_on_path(cmd: &str) -> Result<(), ServiceError> {
             "`{cmd}` not found on PATH. xtable install requires Maven to build the \
              upstream source tree (XTable's incubating releases are source-only; no \
              prebuilt JARs are published to Maven Central). \
-             Debian / Ubuntu: `apt install maven openjdk-17-jdk-headless`. \
-             Fedora / RHEL: `dnf install maven java-17-openjdk-devel`. \
-             OpenSUSE: `zypper install maven java-17-openjdk-devel`. \
-             Arch: `pacman -S maven jdk17-openjdk`. \
-             JDK 17 (not the default JDK 21) is required because XTable's parent pom \
-             pins lombok-maven-plugin:1.18.20.0 which breaks on JDK 21+."
+             Debian / Ubuntu: `apt install maven openjdk-11-jdk-headless`. \
+             Fedora / RHEL: `dnf install maven java-11-openjdk-devel`. \
+             OpenSUSE: `zypper install maven java-11-openjdk-devel`. \
+             Arch: `pacman -S maven jdk11-openjdk`. \
+             JDK 11 (not the system default JDK) is required because XTable's parent pom \
+             pins lombok-maven-plugin:1.18.20.0 which breaks on JDK 17+."
         ))))
     }
 }
 
-/// Drive apt to install Maven + JDK 17. Mirrors the postgres
+/// Drive apt to install Maven + JDK 11. Mirrors the postgres
 /// driver's auto-install pattern: requires root, surfaces stderr
 /// verbatim on failure. Ubuntu-only (matches v0.0.x's supported
 /// platform).
 ///
-/// Why JDK 17 specifically: XTable's parent pom pins
-/// `lombok-maven-plugin:1.18.20.0`, which uses
-/// `com.sun.tools.javac` internals that were removed in JDK 21.
-/// Building under Ubuntu 24.04's default JDK 21 produces
-/// `com.sun.tools.javac.code.TypeTag :: UNKNOWN` from delombok.
-/// Forcing JDK 17 sidesteps the lombok-vs-modern-JDK incompatibility
-/// without patching upstream pom.xml.
-async fn auto_install_maven_and_jdk17() -> Result<(), ServiceError> {
+/// Why JDK 11 specifically: XTable's parent pom pins
+/// `lombok-maven-plugin:1.18.20.0`, which bundles lombok 1.18.20
+/// (March 2021). That lombok release was tested against JDK 8-16;
+/// JDK 17+ hits separate bugs (`TypeTag :: UNKNOWN` on JDK 21,
+/// `currentBindings is null` on JDK 17.0.7+) that are inaccessible
+/// without patching XTable's pom. JDK 11 was the current LTS when
+/// lombok 1.18.20 shipped, satisfies XTable's enforcer rule, and
+/// avoids the lombok bugs. The resulting JARs run fine on our
+/// Temurin JRE 21 (Java is forward-compatible).
+async fn auto_install_maven_and_jdk11() -> Result<(), ServiceError> {
     let euid_out = Command::new("id").arg("-u").output().await?;
     let euid: u32 = String::from_utf8_lossy(&euid_out.stdout)
         .trim()
@@ -356,9 +364,9 @@ async fn auto_install_maven_and_jdk17() -> Result<(), ServiceError> {
         .unwrap_or(u32::MAX);
     if euid != 0 {
         return Err(ServiceError::Io(std::io::Error::other(format!(
-            "auto-installing Maven + JDK 17 requires root (process is uid {euid}). \
+            "auto-installing Maven + JDK 11 requires root (process is uid {euid}). \
              Restart the operator console under `sudo -E ./target/release/computeza serve ...` \
-             OR install manually with `sudo apt install -y maven openjdk-17-jdk-headless` \
+             OR install manually with `sudo apt install -y maven openjdk-11-jdk-headless` \
              and re-submit the install form."
         ))));
     }
@@ -376,33 +384,33 @@ async fn auto_install_maven_and_jdk17() -> Result<(), ServiceError> {
         .arg("install")
         .arg("-y")
         .arg("maven")
-        .arg("openjdk-17-jdk-headless")
+        .arg("openjdk-11-jdk-headless")
         .output()
         .await?;
     if !out.status.success() {
         return Err(ServiceError::Io(std::io::Error::other(format!(
-            "`apt-get install -y maven openjdk-17-jdk-headless` failed (exit {:?}): {}",
+            "`apt-get install -y maven openjdk-11-jdk-headless` failed (exit {:?}): {}",
             out.status.code(),
             String::from_utf8_lossy(&out.stderr).trim()
         ))));
     }
-    info!("apt-get install -y maven openjdk-17-jdk-headless completed");
+    info!("apt-get install -y maven openjdk-11-jdk-headless completed");
     Ok(())
 }
 
-/// Locate JAVA_HOME for the host's JDK 17. Probes the canonical
+/// Locate JAVA_HOME for the host's JDK 11. Probes the canonical
 /// `update-alternatives`-style paths Debian / Ubuntu uses for
-/// openjdk-17. Returns the directory that contains `bin/javac`.
-async fn locate_jdk17() -> Result<PathBuf, ServiceError> {
-    // Standard Debian/Ubuntu layout for openjdk-17-jdk-headless on
+/// openjdk-11. Returns the directory that contains `bin/javac`.
+async fn locate_jdk11() -> Result<PathBuf, ServiceError> {
+    // Standard Debian/Ubuntu layout for openjdk-11-jdk-headless on
     // amd64. The `.0` suffix variant shows up on some older point
     // releases; the temurin path covers operators who installed
     // Eclipse Temurin via their own apt repo before computeza ran.
     const CANDIDATES: &[&str] = &[
-        "/usr/lib/jvm/java-17-openjdk-amd64",
-        "/usr/lib/jvm/java-1.17.0-openjdk-amd64",
-        "/usr/lib/jvm/temurin-17-jdk-amd64",
-        "/usr/lib/jvm/openjdk-17",
+        "/usr/lib/jvm/java-11-openjdk-amd64",
+        "/usr/lib/jvm/java-1.11.0-openjdk-amd64",
+        "/usr/lib/jvm/temurin-11-jdk-amd64",
+        "/usr/lib/jvm/openjdk-11",
     ];
     for c in CANDIDATES {
         let p = PathBuf::from(c);
@@ -411,7 +419,7 @@ async fn locate_jdk17() -> Result<PathBuf, ServiceError> {
         }
     }
     Err(ServiceError::Io(std::io::Error::other(
-        "no JDK 17 found under /usr/lib/jvm/. Install with `sudo apt install -y openjdk-17-jdk-headless`.",
+        "no JDK 11 found under /usr/lib/jvm/. Install with `sudo apt install -y openjdk-11-jdk-headless`.",
     )))
 }
 
