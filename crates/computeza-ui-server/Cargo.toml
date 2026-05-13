@@ -29,6 +29,15 @@ argon2 = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 axum = { workspace = true }
+# HTTP client used by the /workspace handlers to talk to the local
+# Lakekeeper REST catalog + Databend HTTP query handler. The
+# reconciler crates have their own HTTP clients but only expose
+# health-probe shapes; the workspace UI needs catalog browse and
+# SQL execute, which are direct passthroughs to each component's
+# API. Defining the JSON envelopes inline here keeps the ui-server
+# crate from depending on every reconciler crate just for spec
+# deserialization.
+reqwest = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 # Tower middleware glue for the session-cookie auth layer.

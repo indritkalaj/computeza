@@ -288,7 +288,23 @@ ui-footer-version     = Version
 # --- Navigation ---
 
 ui-nav-components     = Components
+ui-nav-workspace      = Workspace
 ui-nav-install        = Install
+
+# --- Workspace (catalog browser + SQL editor) ---
+ui-workspace-title              = Workspace
+ui-workspace-intro              = Browse the Iceberg catalog (Lakekeeper) and run SQL against the lakehouse engine (Databend). Phase 1 v0.0.x scope: catalog read + SQL execution against the local installation. Drag-and-drop pipelines, notebooks, and dedicated compute groups land in subsequent phases.
+ui-workspace-catalog-heading    = Catalog
+ui-workspace-catalog-empty      = No namespaces found. Either the Lakekeeper instance is unreachable or the catalog is empty -- try `CREATE NAMESPACE` from the SQL editor on the right, or check /status for the Lakekeeper reconciler.
+ui-workspace-catalog-fill-link  = Pre-fill SELECT *
+ui-workspace-sql-heading        = SQL
+ui-workspace-sql-placeholder    = SELECT 1
+ui-workspace-sql-run            = Run query
+ui-workspace-sql-help           = Hits Databend's HTTP query handler. Reads + writes from this editor are unrestricted in v0.0.x; per-user RLS lands in the Functions milestone (see AGENTS.md "Deferred work").
+ui-workspace-results-heading    = Results
+ui-workspace-results-empty      = Run a query above to see results.
+ui-workspace-error-no-lakekeeper = No Lakekeeper instance is registered. Install Lakekeeper from /install before using the catalog browser.
+ui-workspace-error-no-databend   = No Databend instance is registered. Install Databend from /install before running SQL.
 ui-nav-status         = Status
 ui-nav-state          = Metadata store
 

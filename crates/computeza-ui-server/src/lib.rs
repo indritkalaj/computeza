@@ -646,6 +646,8 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/", get(home_handler))
         .route("/components", get(components_handler))
         .route("/install-guide", get(install_guide_handler))
+        .route("/workspace", get(workspace_handler))
+        .route("/workspace/sql/execute", post(workspace_sql_execute_handler))
         .route(
             "/install",
             get(install_hub_handler).post(install_all_handler),
@@ -815,6 +817,495 @@ pub fn router_with_state(state: AppState) -> Router {
         .layer(auth_layer)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+// ============================================================
+// Workspace surface (phase 1: catalog browser + SQL editor)
+// ============================================================
+//
+// The /workspace page exposes two side-by-side pieces of the
+// installed lakehouse:
+//
+//   1. Catalog browser (left) -- lists Iceberg namespaces + tables
+//      by hitting the local Lakekeeper REST catalog. Each table
+//      surfaces a "Pre-fill SELECT *" link that bounces back to
+//      /workspace with `?sql=...` so the editor on the right loads
+//      with a starter query. No client-side JS required.
+//
+//   2. SQL editor (right) -- POSTs the query to
+//      /workspace/sql/execute which forwards to Databend's HTTP
+//      query handler and renders the response as an HTML table
+//      below the editor.
+//
+// Phase 1 deliberately uses a textarea (not Monaco) and full-page
+// form submits (no HTMX/JS). Each piece is independently useful and
+// the architecture stays inside the existing SSR pattern. Monaco /
+// inline result streaming / catalog tree-view are follow-up work
+// once the roundtrip is proven.
+//
+// Endpoint discovery: both Lakekeeper and Databend get their URLs
+// from the metadata store's `{slug}-instance/local` row spec --
+// same pattern reconcile_tick uses. No hardcoded 127.0.0.1:* here;
+// if the operator changed the port at install time the workspace
+// follows.
+
+/// Minimal shape of `LakekeeperSpec` / `DatabendSpec` we need to
+/// pull the endpoint URL out. Defining inline avoids dragging the
+/// full reconciler crates into ui-server just for one field.
+#[derive(serde::Deserialize)]
+struct WorkspaceEndpointSpec {
+    endpoint: WorkspaceEndpointUrl,
+}
+
+#[derive(serde::Deserialize)]
+struct WorkspaceEndpointUrl {
+    base_url: String,
+}
+
+/// Look up the base URL of the locally-installed Lakekeeper.
+/// Returns `None` when no `lakekeeper-instance/local` row exists in
+/// the store (component not installed) or the spec doesn't
+/// deserialize (operator hand-edited the row to something
+/// incompatible -- corner case worth handling without panicking).
+async fn discover_lakekeeper_endpoint(
+    store: Option<&computeza_state::SqliteStore>,
+) -> Option<String> {
+    use computeza_state::Store;
+    let store = store?;
+    let rows = store.list("lakekeeper-instance", None).await.ok()?;
+    let sr = rows.into_iter().next()?;
+    let spec: WorkspaceEndpointSpec = serde_json::from_value(sr.spec).ok()?;
+    Some(spec.endpoint.base_url)
+}
+
+/// Same shape as `discover_lakekeeper_endpoint`, for Databend.
+/// Phase 1 hits the HTTP query handler directly; multi-tenant
+/// dispatch (one databend per workspace group) lands in phase B
+/// of the workspace roadmap.
+async fn discover_databend_endpoint(
+    store: Option<&computeza_state::SqliteStore>,
+) -> Option<String> {
+    use computeza_state::Store;
+    let store = store?;
+    let rows = store.list("databend-instance", None).await.ok()?;
+    let sr = rows.into_iter().next()?;
+    let spec: WorkspaceEndpointSpec = serde_json::from_value(sr.spec).ok()?;
+    Some(spec.endpoint.base_url)
+}
+
+/// One namespace + its tables, as the Lakekeeper Iceberg REST
+/// catalog returns them. Both Vec<Vec<String>> shapes come straight
+/// out of the spec: a namespace is a list of path segments
+/// (`["finance", "raw"]` -> "finance.raw") and tables are
+/// `{namespace: [...], name: "..."}`.
+#[derive(Debug, Clone)]
+struct CatalogNamespace {
+    /// Path segments joined as "a.b.c" for display + SELECT.
+    qualified: String,
+    /// Tables under this namespace.
+    tables: Vec<String>,
+}
+
+/// Fetch the namespace + table list from Lakekeeper. Best-effort:
+/// on any failure (timeout, 404, malformed JSON) returns an empty
+/// list so the page still renders with the SQL editor usable. The
+/// reason is shown to the operator via the empty-state copy.
+async fn fetch_catalog(base_url: &str) -> Vec<CatalogNamespace> {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    // Lakekeeper exposes the Iceberg REST catalog under
+    // `/catalog/v1/...`. The standard list-namespaces endpoint
+    // returns `{"namespaces": [["finance"], ["finance","raw"], ...]}`.
+    let ns_url = format!("{}/catalog/v1/namespaces", base_url.trim_end_matches('/'));
+    let resp = match client.get(&ns_url).send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return Vec::new(),
+    };
+    let body: serde_json::Value = match resp.json().await {
+        Ok(b) => b,
+        Err(_) => return Vec::new(),
+    };
+    let namespaces = body
+        .get("namespaces")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut out = Vec::new();
+    for ns in namespaces {
+        let segments: Vec<String> = ns
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if segments.is_empty() {
+            continue;
+        }
+        let qualified = segments.join(".");
+        // Iceberg REST encodes nested namespaces with `%1F` (unit
+        // separator) between segments in the URL path.
+        let encoded = segments.join("%1F");
+        let tables_url = format!(
+            "{}/catalog/v1/namespaces/{}/tables",
+            base_url.trim_end_matches('/'),
+            encoded
+        );
+        let tables = match client.get(&tables_url).send().await {
+            Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
+                Ok(b) => b
+                    .get("identifiers")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|t| {
+                                t.get("name").and_then(|n| n.as_str()).map(str::to_string)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default(),
+                Err(_) => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+        out.push(CatalogNamespace { qualified, tables });
+    }
+    out
+}
+
+/// Query parameters accepted by the workspace page. `sql` lets the
+/// catalog browser's "Pre-fill SELECT *" link populate the editor
+/// without JavaScript -- the link hits `/workspace?sql=...` and the
+/// renderer drops the value into the textarea.
+#[derive(serde::Deserialize, Default)]
+struct WorkspaceQuery {
+    sql: Option<String>,
+}
+
+async fn workspace_handler(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<WorkspaceQuery>,
+) -> Html<String> {
+    let l = Localizer::english();
+    let lakekeeper = discover_lakekeeper_endpoint(state.store.as_deref()).await;
+    let databend = discover_databend_endpoint(state.store.as_deref()).await;
+    let catalog = match &lakekeeper {
+        Some(url) => fetch_catalog(url).await,
+        None => Vec::new(),
+    };
+    let sql_prefill = q.sql.unwrap_or_default();
+    Html(render_workspace_page(
+        &l,
+        lakekeeper.is_some(),
+        databend.is_some(),
+        &catalog,
+        &sql_prefill,
+        None,
+    ))
+}
+
+/// Form body for `POST /workspace/sql/execute`. Plain
+/// `application/x-www-form-urlencoded` so the bare HTML form works
+/// without JS.
+#[derive(serde::Deserialize)]
+struct WorkspaceSqlForm {
+    sql: String,
+}
+
+async fn workspace_sql_execute_handler(
+    State(state): State<AppState>,
+    axum::extract::Form(form): axum::extract::Form<WorkspaceSqlForm>,
+) -> Html<String> {
+    let l = Localizer::english();
+    let lakekeeper = discover_lakekeeper_endpoint(state.store.as_deref()).await;
+    let databend = discover_databend_endpoint(state.store.as_deref()).await;
+    let result = match &databend {
+        Some(url) => Some(execute_sql_against_databend(url, &form.sql).await),
+        None => None,
+    };
+    let catalog = match &lakekeeper {
+        Some(url) => fetch_catalog(url).await,
+        None => Vec::new(),
+    };
+    Html(render_workspace_page(
+        &l,
+        lakekeeper.is_some(),
+        databend.is_some(),
+        &catalog,
+        &form.sql,
+        result,
+    ))
+}
+
+/// Outcome of forwarding a SQL query to Databend. Either a
+/// successful result set (columns + rows of stringified values) or
+/// an error message we can render verbatim.
+enum SqlOutcome {
+    Ok {
+        columns: Vec<String>,
+        rows: Vec<Vec<String>>,
+    },
+    Err(String),
+}
+
+/// POST to Databend's `/v1/query` HTTP handler with HTTP basic auth
+/// `root:root` (the credentials the install path provisions via
+/// `databend-query.toml`'s `[meta]` block). Returns either the
+/// parsed result or a stringified error for direct render.
+///
+/// Databend's response shape (relevant subset):
+/// ```json
+/// {
+///   "schema": [{"name": "col", "type": "..."}, ...],
+///   "data":   [["v1", "v2"], ["v3", "v4"]],
+///   "error":  null | {"message": "..."}
+/// }
+/// ```
+async fn execute_sql_against_databend(base_url: &str, sql: &str) -> SqlOutcome {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return SqlOutcome::Err(format!("building HTTP client: {e}")),
+    };
+    let url = format!("{}/v1/query", base_url.trim_end_matches('/'));
+    let resp = match client
+        .post(&url)
+        .basic_auth("root", Some("root"))
+        .json(&serde_json::json!({ "sql": sql }))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return SqlOutcome::Err(format!(
+                "could not reach Databend at {url}: {e}. Check /status -- the databend reconciler will show FAILED if the service is down."
+            ));
+        }
+    };
+    let status = resp.status();
+    let body: serde_json::Value = match resp.json().await {
+        Ok(b) => b,
+        Err(e) => {
+            return SqlOutcome::Err(format!(
+                "Databend returned HTTP {} but the body was not JSON: {e}",
+                status.as_u16()
+            ));
+        }
+    };
+    if let Some(err) = body.get("error") {
+        // Databend's error shape varies across versions: sometimes
+        // `{"message": "..."}`, sometimes just a string, sometimes
+        // null. Stringify whatever's there so the operator sees it.
+        if !err.is_null() {
+            let msg = err
+                .get("message")
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| err.to_string());
+            return SqlOutcome::Err(format!("Databend error: {msg}"));
+        }
+    }
+    let columns: Vec<String> = body
+        .get("schema")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|c| c.get("name").and_then(|n| n.as_str()).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let rows: Vec<Vec<String>> = body
+        .get("data")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|row| row.as_array())
+                .map(|row| {
+                    row.iter()
+                        .map(|cell| {
+                            cell.as_str()
+                                .map(str::to_string)
+                                .unwrap_or_else(|| cell.to_string())
+                        })
+                        .collect()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    SqlOutcome::Ok { columns, rows }
+}
+
+/// Render the two-pane workspace page. Pure-server template; the
+/// only JS on the page is the existing CSRF auto-fill from
+/// render_shell. The catalog list renders on the left, the SQL
+/// editor and results render on the right.
+fn render_workspace_page(
+    localizer: &Localizer,
+    has_lakekeeper: bool,
+    has_databend: bool,
+    catalog: &[CatalogNamespace],
+    sql_prefill: &str,
+    result: Option<SqlOutcome>,
+) -> String {
+    let title = localizer.t("ui-workspace-title");
+    let intro = localizer.t("ui-workspace-intro");
+    let catalog_heading = localizer.t("ui-workspace-catalog-heading");
+    let catalog_empty = localizer.t("ui-workspace-catalog-empty");
+    let prefill_link = localizer.t("ui-workspace-catalog-fill-link");
+    let sql_heading = localizer.t("ui-workspace-sql-heading");
+    let sql_placeholder = localizer.t("ui-workspace-sql-placeholder");
+    let sql_run = localizer.t("ui-workspace-sql-run");
+    let sql_help = localizer.t("ui-workspace-sql-help");
+    let results_heading = localizer.t("ui-workspace-results-heading");
+    let results_empty = localizer.t("ui-workspace-results-empty");
+    let err_no_lakekeeper = localizer.t("ui-workspace-error-no-lakekeeper");
+    let err_no_databend = localizer.t("ui-workspace-error-no-databend");
+    let csrf = auth::csrf_input();
+
+    let catalog_block = if !has_lakekeeper {
+        format!(
+            r#"<p class="cz-muted">{}</p>"#,
+            html_escape(&err_no_lakekeeper)
+        )
+    } else if catalog.is_empty() {
+        format!(r#"<p class="cz-muted">{}</p>"#, html_escape(&catalog_empty))
+    } else {
+        let items: String = catalog
+            .iter()
+            .map(|ns| {
+                let tables: String = ns
+                    .tables
+                    .iter()
+                    .map(|t| {
+                        let qualified_table = format!("{}.{}", ns.qualified, t);
+                        let prefill_sql = format!("SELECT * FROM {qualified_table} LIMIT 100");
+                        format!(
+                            r#"<li style="padding: 0.15rem 0;"><a href="/workspace?sql={enc}" style="text-decoration: none;"><code>{tbl}</code></a> <a href="/workspace?sql={enc}" class="cz-muted" style="font-size: 0.78rem; margin-left: 0.5rem;">{prefill}</a></li>"#,
+                            enc = url_encode(&prefill_sql),
+                            tbl = html_escape(&qualified_table),
+                            prefill = html_escape(&prefill_link),
+                        )
+                    })
+                    .collect();
+                format!(
+                    r#"<li style="padding: 0.4rem 0;">
+<div style="font-weight: 600; font-size: 0.9rem;">{ns}</div>
+<ul style="list-style: none; padding-left: 1rem; margin: 0.25rem 0 0;">{tables}</ul>
+</li>"#,
+                    ns = html_escape(&ns.qualified),
+                    tables = tables,
+                )
+            })
+            .collect();
+        format!(r#"<ul style="list-style: none; padding: 0; margin: 0;">{items}</ul>"#)
+    };
+
+    let results_block = match (has_databend, result) {
+        (false, _) => format!(
+            r#"<p class="cz-muted">{}</p>"#,
+            html_escape(&err_no_databend)
+        ),
+        (true, None) => format!(r#"<p class="cz-muted">{}</p>"#, html_escape(&results_empty)),
+        (true, Some(SqlOutcome::Err(msg))) => format!(
+            r#"<pre style="background: rgba(255,99,99,0.08); border: 1px solid rgba(255,99,99,0.25); border-radius: 0.4rem; padding: 0.75rem; overflow-x: auto; white-space: pre-wrap; font-size: 0.85rem;">{}</pre>"#,
+            html_escape(&msg)
+        ),
+        (true, Some(SqlOutcome::Ok { columns, rows })) => {
+            let header: String = columns
+                .iter()
+                .map(|c| format!("<th>{}</th>", html_escape(c)))
+                .collect();
+            let body_rows: String = rows
+                .iter()
+                .map(|row| {
+                    let cells: String = row
+                        .iter()
+                        .map(|c| format!("<td>{}</td>", html_escape(c)))
+                        .collect();
+                    format!("<tr>{cells}</tr>")
+                })
+                .collect();
+            let row_count = rows.len();
+            format!(
+                r#"<p class="cz-muted" style="font-size: 0.82rem; margin: 0 0 0.5rem;">{row_count} row(s)</p>
+<div style="overflow-x: auto;">
+<table class="cz-table" style="width: 100%; border-collapse: collapse; font-size: 0.85rem;">
+<thead><tr>{header}</tr></thead>
+<tbody>{body_rows}</tbody>
+</table>
+</div>"#
+            )
+        }
+    };
+
+    let body = format!(
+        r#"<section class="cz-hero">
+<h1>{title}</h1>
+<p>{intro}</p>
+</section>
+<section class="cz-section" style="max-width: 80rem;">
+<div style="display: grid; grid-template-columns: 18rem 1fr; gap: 1rem;">
+<div class="cz-card">
+<h2 style="margin-top: 0;">{catalog_heading}</h2>
+{catalog_block}
+</div>
+<div class="cz-card">
+<h2 style="margin-top: 0;">{sql_heading}</h2>
+<form method="post" action="/workspace/sql/execute">
+{csrf}
+<textarea name="sql" rows="8" class="cz-input" style="font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.9rem; width: 100%;" placeholder="{sql_placeholder}">{sql_value}</textarea>
+<p class="cz-muted" style="margin: 0.4rem 0 0.6rem; font-size: 0.78rem;">{sql_help}</p>
+<button type="submit" class="cz-btn cz-btn-primary">{sql_run}</button>
+</form>
+<h3 style="margin-top: 1.5rem;">{results_heading}</h3>
+{results_block}
+</div>
+</div>
+</section>"#,
+        title = html_escape(&title),
+        intro = html_escape(&intro),
+        catalog_heading = html_escape(&catalog_heading),
+        catalog_block = catalog_block,
+        sql_heading = html_escape(&sql_heading),
+        sql_placeholder = html_escape(&sql_placeholder),
+        sql_value = html_escape(sql_prefill),
+        sql_help = html_escape(&sql_help),
+        sql_run = html_escape(&sql_run),
+        results_heading = html_escape(&results_heading),
+        results_block = results_block,
+        csrf = csrf,
+    );
+
+    render_shell(localizer, &title, NavLink::Workspace, &body)
+}
+
+/// Minimal percent-encoder used to pass the prefill-SQL through the
+/// query string. The set of unsafe characters here is conservative
+/// (anything not unreserved-per-RFC-3986 gets `%XX`-encoded). We
+/// pull this in inline rather than depending on the `urlencoding`
+/// crate because the workspace surface is the only caller; a
+/// general-purpose helper would land in a util crate when the
+/// second caller shows up.
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 async fn install_hub_handler(State(state): State<AppState>) -> Html<String> {
@@ -5322,6 +5813,8 @@ pub enum NavLink {
     Groups,
     /// Admin workspaces page.
     Workspaces,
+    /// Operator workspace (catalog browser + SQL editor).
+    Workspace,
     /// Admin branding / white-labeling page.
     Branding,
     /// Admin license envelope viewer.
@@ -5346,6 +5839,7 @@ pub fn render_shell(
 ) -> String {
     let app_title = localizer.t("ui-app-title");
     let nav_components = localizer.t("ui-nav-components");
+    let nav_workspace = localizer.t("ui-nav-workspace");
     let nav_install = localizer.t("ui-nav-install");
     let nav_status = localizer.t("ui-nav-status");
     let nav_state = localizer.t("ui-nav-state");
@@ -5388,6 +5882,7 @@ pub fn render_shell(
     <a href="/components" class="{nc}">{nav_components}</a>
     <a href="/install-guide" class="{nig}">Install guide</a>
     <a href="/install" class="{ni}">{nav_install}</a>
+    <a href="/workspace" class="{nwks}">{nav_workspace}</a>
     <a href="/status" class="{ns}">{nav_status}</a>
     <a href="/state" class="{nm}">{nav_state}</a>
     <a href="/admin/secrets" class="{na}">{nav_secrets}</a>
@@ -5518,6 +6013,7 @@ pub fn render_shell(
         nc = nav_class(NavLink::Components),
         nig = nav_class(NavLink::InstallGuide),
         ni = nav_class(NavLink::Install),
+        nwks = nav_class(NavLink::Workspace),
         ns = nav_class(NavLink::Status),
         nm = nav_class(NavLink::State),
         na = nav_class(NavLink::Secrets),
