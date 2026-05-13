@@ -144,7 +144,27 @@ pub async fn install_service(
         "Waiting for port {} to accept connections",
         opts.port
     ));
-    wait_for_port("127.0.0.1", opts.port, Duration::from_secs(30)).await?;
+    // On timeout, splice the systemd journal tail into the error
+    // so the install-result page surfaces the actual daemon-side
+    // failure (config-schema mismatch, missing native lib, port
+    // collision, ...) instead of the generic "did not become
+    // ready" string. Every driver that goes through
+    // install_service benefits without per-driver wiring.
+    if let Err(e) = wait_for_port("127.0.0.1", opts.port, Duration::from_secs(30)).await {
+        if matches!(e, ServiceError::NotReady { .. }) {
+            let tail = systemctl::journal_tail(&opts.unit_name, 60).await;
+            if !tail.is_empty() {
+                return Err(ServiceError::Io(io::Error::other(format!(
+                    "{} did not bind 127.0.0.1:{} within 30s. Journal tail (most recent {} lines from `journalctl -u {}`):\n\n{tail}",
+                    opts.component,
+                    opts.port,
+                    tail.lines().count(),
+                    opts.unit_name,
+                ))));
+            }
+        }
+        return Err(e);
+    }
 
     let cli_symlink = if let Some(cli) = &opts.cli_symlink {
         progress.set_phase(InstallPhase::RegisteringPath);
