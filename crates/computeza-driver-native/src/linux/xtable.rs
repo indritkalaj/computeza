@@ -2,33 +2,51 @@
 //!
 //! # Distribution channel
 //!
-//! Two paths land xtable's runner JAR; the driver tries them in
-//! order:
+//! Apache XTable is an Apache Incubator podling. **Its releases ship
+//! source-only** -- no prebuilt JARs land on Maven Central, and no
+//! binary release-assets ship on the GitHub release page. The
+//! published "releases" are PGP-signed source tarballs intended to be
+//! built locally per the standard Apache release model. Both
+//! 0.2.0-incubating and 0.3.0-incubating exhibit this: the git tags
+//! exist on `github.com/apache/incubator-xtable`, but
+//! `repo.maven.apache.org/maven2/org/apache/xtable/xtable-utilities/`
+//! returns 404 for every version. Earlier attempts to resolve via
+//! `mvn dependency:copy-dependencies` against Maven Central therefore
+//! failed for every version we tried -- the artifact simply isn't
+//! there.
 //!
-//! 1. **Computeza-bundled fat JAR** (preferred). Built by
-//!    `.github/workflows/build-xtable-fat-jar.yml` and attached to a
-//!    GitHub release on this repo (GitHub-fronted CDN). Single JAR
-//!    with every transitive dep baked in via maven-shade-plugin; the
-//!    driver downloads + verifies SHA-256 + drops it under
-//!    `<root>/lib/xtable-fat.jar`. No host Maven required.
+//! Driver flow on a fresh host:
 //!
-//! 2. **Maven Central resolve** (fallback). When the operator's
-//!    network can't reach our release URL, the driver writes a
-//!    one-off `pom.xml` and shells to
-//!    `mvn dependency:copy-dependencies`. Requires `mvn` on host
-//!    `$PATH`; the [`crate::prerequisites::SYSTEM_COMMANDS`] table
-//!    surfaces the install hint.
-//!
-//! Both paths bundle Adoptium Temurin JRE 21 sandboxed under
-//! `<root>/jre/` via [`crate::prerequisites::ensure_bundled_temurin_jre`],
-//! and both register the same systemd unit running
-//! `<root>/jre/.../bin/java -cp ...`.
+//! 1. Bundle Adoptium Temurin JRE 21 under `<root>/jre/` via
+//!    [`crate::prerequisites::ensure_bundled_temurin_jre`] -- used at
+//!    *runtime* to execute the fat JAR.
+//! 2. Ensure Maven on `$PATH` (auto-installs via `apt` on Ubuntu
+//!    when missing). The `maven` apt package pulls
+//!    `default-jdk-headless` as a hard dependency, which provides
+//!    the `javac` Maven needs at build time. Our bundled Temurin
+//!    JRE is only for runtime.
+//! 3. Download source tarball
+//!    `github.com/apache/incubator-xtable/archive/refs/tags/<v>.tar.gz`,
+//!    extract under `<root>/src/incubator-xtable-<v>/` (cached on
+//!    re-run).
+//! 4. Run `mvn clean package -DskipTests -B -e` against the source
+//!    tree. XTable's `xtable-utilities` module uses
+//!    `maven-shade-plugin` to produce a self-contained fat JAR at
+//!    `xtable-utilities/target/xtable-utilities-<v>-bundled.jar`
+//!    with every transitive dep (iceberg, hudi, delta-core,
+//!    parquet, hadoop, aws-sdk, ...) baked in. The build is slow
+//!    on first run (5-15 min depending on network -- ~500MB of
+//!    transitive Maven Central downloads); progress messages
+//!    communicate this.
+//! 5. Copy the bundled JAR to `<root>/lib/xtable-utilities-<v>-bundled.jar`
+//!    so the rest of the pipeline targets a stable path. The full
+//!    source tree stays on disk under `<root>/src/` so a re-install
+//!    with the same version short-circuits before mvn runs again.
+//! 6. Register a systemd unit running
+//!    `<root>/jre/.../bin/java -jar <bundled.jar> --datasetConfig <root>/datasets.yaml`.
 
-use std::io;
 use std::path::{Path, PathBuf};
 
-use futures_util::StreamExt;
-use sha2::{Digest, Sha256};
 use tokio::{fs, io::AsyncWriteExt, process::Command};
 use tracing::info;
 
@@ -40,52 +58,20 @@ pub const SERVICE_NAME: &str = "computeza-xtable";
 pub const UNIT_NAME: &str = "computeza-xtable.service";
 pub const DEFAULT_PORT: u16 = 8090;
 
-/// Pinned versions of `org.apache.xtable:xtable-utilities`. First
-/// entry is the default ("latest"). Versions correspond to Apache
-/// XTable release tags **that are also published to Maven Central**
-/// -- the project's release cadence sometimes lands a git tag
-/// without the corresponding Maven artifact (incubating projects
-/// require IPMC sign-off for each release publication). Verify on
-/// <https://repo.maven.apache.org/maven2/org/apache/xtable/xtable-utilities/>
-/// before adding a new entry.
+/// Pinned versions of Apache XTable (source git tags on
+/// `github.com/apache/incubator-xtable`). First entry is the default
+/// ("latest"). Source-only -- we build locally with Maven; see the
+/// module doc for why Maven Central resolution doesn't work.
 ///
-/// 0.3.0-incubating has a git tag but no Maven Central artifact as
-/// of May 2026 -- listed here as historical reference of a version
-/// we intentionally don't pin.
-pub const XTABLE_VERSIONS: &[&str] = &["0.2.0-incubating"];
+/// Verify a tag exists at
+/// <https://github.com/apache/incubator-xtable/releases> before adding
+/// it. The URL pattern is
+/// `github.com/apache/incubator-xtable/archive/refs/tags/<tag>.tar.gz`.
+pub const XTABLE_VERSIONS: &[&str] = &["0.3.0-incubating", "0.2.0-incubating"];
 
 #[must_use]
 pub fn available_versions() -> &'static [&'static str] {
     XTABLE_VERSIONS
-}
-
-/// Per-version Computeza-bundled fat JAR. URL is a GitHub release
-/// asset hosted on this repo; the build pipeline is in
-/// `.github/workflows/build-xtable-fat-jar.yml`. The SHA-256 is
-/// pinned so a swapped JAR fails the install loudly. `None` for a
-/// version means the fat JAR is not yet published -- the driver
-/// falls through to the Maven-resolve path automatically.
-const FAT_JAR_PINS: &[(&str, &str, &str)] = &[
-    // (xtable_version, fat-jar URL, expected SHA-256)
-    //
-    // 0.3.0-incubating + 0.2.0-incubating: the fat JAR has NOT yet
-    // been built (the workflow ships in this commit; first build
-    // attaches the asset). Until then both entries below pin `""`
-    // as the SHA, which the driver treats as "fat-JAR path
-    // disabled, use Maven fallback". An operator running an
-    // already-built fat JAR locally can sideload it into
-    // `<root>/lib/xtable-fat.jar` and the install detects + uses
-    // it.
-];
-
-/// Look up the fat-JAR pin for a given xtable version, if any.
-fn fat_jar_pin(version: &str) -> Option<(&'static str, &'static str)> {
-    for (v, url, sha) in FAT_JAR_PINS {
-        if *v == version && !sha.is_empty() && !url.is_empty() {
-            return Some((url, sha));
-        }
-    }
-    None
 }
 
 /// Install-options shape mirroring the other component drivers so
@@ -94,7 +80,9 @@ fn fat_jar_pin(version: &str) -> Option<(&'static str, &'static str)> {
 #[derive(Clone, Debug)]
 pub struct InstallOptions {
     /// Root directory the install owns. Receives `jre/` (Temurin),
-    /// `build/pom.xml` (Maven dispatch), `lib/` (resolved classpath).
+    /// `src/incubator-xtable-<v>/` (extracted source tree),
+    /// `lib/xtable-utilities-<v>-bundled.jar` (built fat JAR),
+    /// `datasets.yaml` (operator-owned sync spec).
     pub root_dir: PathBuf,
     /// TCP port the runner binds. Currently informational --
     /// xtable's RunSync doesn't open a port; the field exists for
@@ -102,8 +90,7 @@ pub struct InstallOptions {
     pub port: u16,
     /// systemd unit name.
     pub unit_name: String,
-    /// xtable-utilities version. `None` resolves to
-    /// `XTABLE_VERSIONS[0]`.
+    /// xtable version tag. `None` resolves to `XTABLE_VERSIONS[0]`.
     pub version: Option<String>,
 }
 
@@ -118,26 +105,13 @@ impl Default for InstallOptions {
     }
 }
 
-/// Install path:
-///
-/// 1. Resolve `mvn` on `$PATH` (operator must have Maven). The
-///    [`crate::prerequisites::SYSTEM_COMMANDS`] table surfaces the
-///    install hint in the wizard banner.
-/// 2. Bundle Temurin JRE 21 into `<root>/jre/`.
-/// 3. Write a one-off `pom.xml` under `<root>/build/` declaring the
-///    `xtable-utilities` dep.
-/// 4. Shell to `mvn dependency:copy-dependencies` with
-///    `<root>/lib` as the output directory. Maven resolves the deps
-///    against Maven Central + downloads each into `<root>/lib/`.
-/// 5. Register a systemd unit that runs the bundled JRE against the
-///    resulting classpath.
 pub async fn install(
     opts: InstallOptions,
     progress: &ProgressHandle,
 ) -> Result<InstalledService, ServiceError> {
     let version = opts.version.as_deref().unwrap_or(XTABLE_VERSIONS[0]);
 
-    // 1. JRE bootstrap is shared between both classpath paths.
+    // 1. Runtime JRE for systemd to launch the fat JAR with.
     fs::create_dir_all(&opts.root_dir).await?;
     let java_bin = crate::prerequisites::ensure_bundled_temurin_jre(&opts.root_dir, progress)
         .await
@@ -145,127 +119,115 @@ pub async fn install(
 
     let lib_dir = opts.root_dir.join("lib");
     fs::create_dir_all(&lib_dir).await?;
+    let dest_jar = lib_dir.join(format!("xtable-utilities-{version}-bundled.jar"));
 
-    // 2. Try the Computeza-bundled fat JAR first when a pin is
-    //    available for this version. Falls through to the Maven
-    //    resolve on network failure / SHA mismatch.
-    let classpath_path = if let Some((url, sha256)) = fat_jar_pin(version) {
-        progress.set_phase(InstallPhase::Downloading);
+    // 2. Short-circuit on re-install. If the bundled JAR for this
+    //    exact version is already on disk we skip the multi-minute
+    //    source-build step.
+    if fs::try_exists(&dest_jar).await.unwrap_or(false) {
+        info!(
+            jar = %dest_jar.display(),
+            "xtable bundled JAR already present; skipping source build"
+        );
         progress.set_message(format!(
-            "Downloading the Computeza-bundled xtable fat JAR for {version} from {url} \
-             (single-file install path; no host Maven required)"
+            "Using cached xtable-utilities-{version}-bundled.jar at {}",
+            dest_jar.display()
         ));
-        match fetch_fat_jar(url, sha256, &lib_dir, progress).await {
-            Ok(path) => Some(path),
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    version = %version,
-                    "xtable fat-JAR download failed; falling back to Maven-resolve. \
-                     Operator: install `mvn` on the host so the fallback succeeds."
-                );
-                None
-            }
-        }
     } else {
-        None
-    };
-
-    if classpath_path.is_none() {
-        // 3. Maven fallback: needs mvn on $PATH. Auto-install via
-        //    apt when missing AND we're root (same pattern the
-        //    postgres driver uses for `postgresql` on Ubuntu).
-        //    Operators on a non-Ubuntu distro see the actionable
-        //    error from `require_on_path` listing the right
-        //    package-manager invocation.
+        // 3. Need Maven (which pulls a JDK as a hard apt dep so we
+        //    get javac for free). Auto-install on Ubuntu when
+        //    missing, mirroring the postgres driver pattern.
         progress.set_phase(InstallPhase::DetectingBinaries);
-        progress
-            .set_message("Verifying Maven (mvn) is on PATH for the xtable dep-resolve fallback");
+        progress.set_message("Verifying Maven (mvn) is on PATH for the xtable source build");
         if let Err(e) = require_on_path("mvn").await {
             progress.set_phase(InstallPhase::Downloading);
             progress.set_message(
-                "Auto-installing Maven via apt (one-time; required for the xtable dep-resolve)",
+                "Auto-installing Maven via apt (one-time; required to build xtable from source)",
             );
             if let Err(install_err) = auto_install_maven().await {
-                // Surface BOTH errors so the operator sees the
-                // original "not on PATH" message + why the
-                // auto-install fallback didn't work.
                 return Err(ServiceError::Io(std::io::Error::other(format!(
                     "{e}\n\nAuto-install fallback also failed: {install_err}"
                 ))));
             }
-            // Re-check after install -- guards against `apt`
-            // succeeding without putting mvn on PATH (highly
-            // unusual but worth a probe).
             require_on_path("mvn").await?;
         }
 
-        progress.set_phase(InstallPhase::Extracting);
-        progress.set_message(format!(
-            "Writing build/pom.xml for xtable-utilities@{version} (Maven-resolve path)"
-        ));
-        let build_dir = opts.root_dir.join("build");
-        fs::create_dir_all(&build_dir).await?;
-        let pom = pom_xml(version);
-        let pom_path = build_dir.join("pom.xml");
-        let mut f = fs::File::create(&pom_path).await?;
-        f.write_all(pom.as_bytes()).await?;
-        f.sync_all().await?;
-
+        // 4. Download + extract the source tarball.
+        let src_root = opts.root_dir.join("src");
+        fs::create_dir_all(&src_root).await?;
         progress.set_phase(InstallPhase::Downloading);
         progress.set_message(format!(
-            "Running mvn dependency:copy-dependencies (resolves ~50 transitive deps of xtable-utilities@{version} \
-             into {} -- 3-5 min depending on network and the local ~/.m2 cache state)",
-            lib_dir.display()
+            "Downloading Apache XTable source tarball for {version} from \
+             github.com/apache/incubator-xtable"
         ));
-        // Drop the `-q` quiet flag: when mvn fails, the actually-
-        // diagnostic output (BUILD FAILURE banner, the per-goal
-        // error, the offending artifact coordinates) goes to
-        // stdout, and `-q` suppresses all of it. The harmless JVM
-        // warnings about `sun.misc.Unsafe` go to stderr regardless.
-        // Without stdout the operator sees only the warnings and
-        // can't diagnose the failure.
-        //
-        // `-U` forces mvn to re-attempt artifact resolution for
-        // anything that previously failed. Without this, a
-        // prior failed install (e.g. trying a version not on
-        // Maven Central) leaves a negative cache that suppresses
-        // resolution attempts for hours -- so even after switching
-        // the version pin, mvn would still claim the version is
-        // unresolvable until the cache TTL expires.
+        let src_dir = ensure_xtable_source_extracted(&src_root, version).await?;
+
+        // 5. Build with mvn. xtable-utilities' shade plugin produces
+        //    the bundled fat JAR. We invoke from inside the source
+        //    tree because xtable's parent pom carries the version
+        //    + module wiring; `mvn -f <pom> package` against the
+        //    parent works the same way as `cd <src> && mvn package`,
+        //    but the latter is closer to how operators reproduce
+        //    the build by hand if they need to debug.
+        progress.set_phase(InstallPhase::Extracting);
+        progress.set_message(format!(
+            "Building xtable-utilities@{version} with mvn clean package -DskipTests \
+             ({}). First-run downloads ~500MB of transitive Maven Central deps; \
+             expect 5-15 min on a fresh ~/.m2 cache.",
+            src_dir.display()
+        ));
+        // -B (batch mode) drops the interactive download progress
+        // bar so the captured output is parseable on failure.
+        // -e adds the stack trace location to error reports so the
+        // diagnostic surface contains enough to act on without
+        // re-running with -X.
+        // No -q: when the build fails, the BUILD FAILURE banner and
+        // per-module error live on stdout; suppressing them leaves
+        // the operator with only the irrelevant JVM `sun.misc.Unsafe`
+        // warnings on stderr.
         let out = Command::new("mvn")
-            .arg("-f")
-            .arg(&pom_path)
-            .arg("dependency:copy-dependencies")
-            .arg(format!("-DoutputDirectory={}", lib_dir.display()))
-            .arg("-DincludeScope=runtime")
-            // Batch mode (-B) keeps output non-interactive and
-            // drops the download progress bar; -e adds the
-            // stack trace location to error reports; -U forces
-            // re-attempting cached resolution failures.
+            .current_dir(&src_dir)
+            .arg("clean")
+            .arg("package")
+            .arg("-DskipTests")
             .arg("-B")
             .arg("-e")
-            .arg("-U")
             .output()
             .await?;
         if !out.status.success() {
             return Err(ServiceError::Io(std::io::Error::other(format!(
-                "mvn dependency:copy-dependencies for xtable-utilities@{version} failed (exit {:?}).\n\n--- mvn stdout (the diagnostic surface) ---\n{}\n--- mvn stderr (mostly JVM warnings) ---\n{}",
+                "mvn clean package for xtable@{version} failed (exit {:?}). \
+                 Source tree at {}.\n\n--- mvn stdout (the diagnostic surface) ---\n{}\n--- mvn stderr (mostly JVM warnings) ---\n{}",
                 out.status.code(),
+                src_dir.display(),
                 String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr),
             ))));
         }
+
+        // 6. Locate the freshly-built bundled JAR and copy into lib/.
+        //    Path is `<src>/xtable-utilities/target/xtable-utilities-<v>-bundled.jar`
+        //    on Apache XTable's current module layout. If the build
+        //    succeeded but the JAR isn't where we expect, the
+        //    project's shade-plugin output naming has changed --
+        //    fall back to a glob to keep working through their
+        //    naming variance.
+        let built_jar = locate_bundled_jar(&src_dir, version).await?;
+        fs::copy(&built_jar, &dest_jar).await?;
+        info!(
+            from = %built_jar.display(),
+            to = %dest_jar.display(),
+            "xtable bundled JAR copied into lib/"
+        );
     }
 
-    // 4b. Stub datasets.yaml. xtable's RunSync requires
-    //     `--datasetConfig <file>`; on a fresh install the operator
-    //     hasn't supplied one yet, so write an empty stub. The
-    //     daemon will sync nothing until the operator replaces this
-    //     with a real spec, which is the v0.0.x behaviour we want
-    //     (install plumbing today, real sync later). Skip if the
-    //     operator has already laid one down to avoid clobbering
-    //     their work.
+    // 7. Stub datasets.yaml. xtable's RunSync requires
+    //    `--datasetConfig <file>`; on a fresh install the operator
+    //    hasn't supplied one yet, so write an empty stub. The daemon
+    //    syncs nothing until the operator replaces this with a real
+    //    spec, which is the v0.0.x behaviour we want (install
+    //    plumbing today, real sync later). Skip if the operator has
+    //    already laid one down to avoid clobbering their work.
     let datasets_path = opts.root_dir.join("datasets.yaml");
     if !fs::try_exists(&datasets_path).await.unwrap_or(false) {
         let stub = "# Apache XTable dataset sync spec. Generated on install.\n\
@@ -276,17 +238,13 @@ pub async fn install(
         info!(path = %datasets_path.display(), "wrote stub datasets.yaml");
     }
 
-    // 5. systemd unit. ExecStart shape depends on which classpath
-    //    path won: a fat JAR launches with `java -jar`, a Maven-
-    //    resolved lib dir launches with `java -cp lib/* RunSync`.
-    let classpath = match classpath_path {
-        Some(jar) => XtableClasspath::FatJar(jar),
-        None => XtableClasspath::LibDir(lib_dir.clone()),
-    };
+    // 8. systemd unit. Uses the bundled fat JAR's embedded Main-Class
+    //    manifest, so the ExecStart is `java -jar <jar>` with no
+    //    explicit class name.
     progress.set_phase(InstallPhase::RegisteringService);
     progress.set_message(format!("Registering systemd unit {}", opts.unit_name));
     let unit_path = PathBuf::from("/etc/systemd/system").join(&opts.unit_name);
-    let unit_body = systemd_unit(&java_bin, &classpath, &opts.root_dir);
+    let unit_body = systemd_unit(&java_bin, &dest_jar, &opts.root_dir);
     let mut f = fs::File::create(&unit_path).await?;
     f.write_all(unit_body.as_bytes()).await?;
     f.sync_all().await?;
@@ -345,9 +303,9 @@ async fn require_on_path(cmd: &str) -> Result<(), ServiceError> {
         Ok(())
     } else {
         Err(ServiceError::Io(std::io::Error::other(format!(
-            "`{cmd}` not found on PATH. xtable install requires Maven for the dep-resolve step \
-             (`org.apache.xtable:xtable-utilities` ships as a thin JAR on Maven Central; Maven \
-             resolves the ~50 transitive deps at install time). \
+            "`{cmd}` not found on PATH. xtable install requires Maven to build the \
+             upstream source tree (XTable's incubating releases are source-only; no \
+             prebuilt JARs are published to Maven Central). \
              Debian / Ubuntu: `apt install maven`. Fedora / RHEL: `dnf install maven`. \
              OpenSUSE: `zypper install maven`. Arch: `pacman -S maven`."
         ))))
@@ -357,11 +315,10 @@ async fn require_on_path(cmd: &str) -> Result<(), ServiceError> {
 /// Drive apt to install Maven. Mirrors the postgres driver's
 /// auto-install pattern: requires root, surfaces stderr verbatim
 /// on failure. Ubuntu-only (matches v0.0.x's supported platform).
+/// The `maven` apt package pulls `default-jdk-headless` as a hard
+/// dependency, so installing Maven also gives us the javac that
+/// `mvn package` needs at build time.
 async fn auto_install_maven() -> Result<(), ServiceError> {
-    // Pre-flight: must be root for apt to write
-    // /var/lib/apt/lists. The userland error from apt itself is
-    // cryptic ("could not open lock file"); fail-fast with a
-    // clear message instead.
     let euid_out = Command::new("id").arg("-u").output().await?;
     let euid: u32 = String::from_utf8_lossy(&euid_out.stdout)
         .trim()
@@ -376,8 +333,6 @@ async fn auto_install_maven() -> Result<(), ServiceError> {
         ))));
     }
 
-    // apt-get update first (needed on a fresh container/VM where
-    // the apt cache is stale; harmless otherwise).
     let upd = Command::new("apt-get").arg("update").output().await?;
     if !upd.status.success() {
         return Err(ServiceError::Io(std::io::Error::other(format!(
@@ -404,43 +359,117 @@ async fn auto_install_maven() -> Result<(), ServiceError> {
     Ok(())
 }
 
-fn pom_xml(version: &str) -> String {
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<project xmlns="http://maven.apache.org/POM/4.0.0">
-  <modelVersion>4.0.0</modelVersion>
-  <groupId>local.computeza</groupId>
-  <artifactId>xtable-runtime</artifactId>
-  <version>1.0.0</version>
-  <packaging>pom</packaging>
-  <dependencies>
-    <dependency>
-      <groupId>org.apache.xtable</groupId>
-      <artifactId>xtable-utilities</artifactId>
-      <version>{version}</version>
-    </dependency>
-  </dependencies>
-</project>
-"#
-    )
+/// Download + extract the xtable source tarball into `<src_root>`,
+/// returning the path to the extracted source tree
+/// (`<src_root>/incubator-xtable-<version>/`). Cached: a re-run that
+/// finds an extracted tree with a `pom.xml` reuses it without
+/// re-downloading.
+async fn ensure_xtable_source_extracted(
+    src_root: &Path,
+    version: &str,
+) -> Result<PathBuf, ServiceError> {
+    let extracted = src_root.join(format!("incubator-xtable-{version}"));
+    if fs::try_exists(extracted.join("pom.xml"))
+        .await
+        .unwrap_or(false)
+    {
+        info!(
+            extracted = %extracted.display(),
+            "xtable source already extracted; skipping download"
+        );
+        return Ok(extracted);
+    }
+
+    let url = format!(
+        "https://github.com/apache/incubator-xtable/archive/refs/tags/{version}.tar.gz"
+    );
+    let tarball = src_root.join(format!("xtable-{version}.tar.gz"));
+    let resp = reqwest::get(&url)
+        .await
+        .map_err(|e| ServiceError::Io(std::io::Error::other(format!("GET {url}: {e}"))))?;
+    if !resp.status().is_success() {
+        return Err(ServiceError::Io(std::io::Error::other(format!(
+            "GET {url} returned HTTP {}; verify the tag exists at \
+             https://github.com/apache/incubator-xtable/tags",
+            resp.status().as_u16()
+        ))));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| ServiceError::Io(std::io::Error::other(format!("reading body: {e}"))))?;
+    let mut f = fs::File::create(&tarball).await?;
+    f.write_all(&bytes).await?;
+    f.sync_all().await?;
+    drop(f);
+
+    let status = Command::new("tar")
+        .arg("-xzf")
+        .arg(&tarball)
+        .arg("-C")
+        .arg(src_root)
+        .status()
+        .await?;
+    if !status.success() {
+        return Err(ServiceError::Io(std::io::Error::other(format!(
+            "tar -xzf {} failed (exit {:?}); the downloaded archive may be \
+             incomplete or the tag may not exist",
+            tarball.display(),
+            status.code()
+        ))));
+    }
+    let _ = fs::remove_file(&tarball).await;
+
+    if !fs::try_exists(extracted.join("pom.xml"))
+        .await
+        .unwrap_or(false)
+    {
+        return Err(ServiceError::Io(std::io::Error::other(format!(
+            "extracted {} but no pom.xml inside -- GitHub's archive layout may have \
+             changed; expected incubator-xtable-<version>/pom.xml",
+            extracted.display()
+        ))));
+    }
+    Ok(extracted)
 }
 
-/// Which classpath shape the install resolved to. Drives the
-/// ExecStart line; everything else in the unit is shared.
-enum XtableClasspath {
-    /// Single Computeza-bundled fat JAR with embedded Main-Class
-    /// manifest. Launches via `java -jar <jar>`.
-    FatJar(PathBuf),
-    /// Maven-resolved directory of JARs. Launches via
-    /// `java -cp <lib>/* org.apache.xtable.utilities.RunSync`.
-    LibDir(PathBuf),
+/// Locate the shade-plugin bundled JAR after a successful build.
+/// Apache XTable's current module layout places it at
+/// `<src>/xtable-utilities/target/xtable-utilities-<v>-bundled.jar`,
+/// but if the project renames its shade output we fall back to a
+/// glob over `<src>/xtable-utilities/target/*-bundled.jar` so a
+/// minor upstream rename doesn't break the install.
+async fn locate_bundled_jar(src_dir: &Path, version: &str) -> Result<PathBuf, ServiceError> {
+    let target_dir = src_dir.join("xtable-utilities").join("target");
+    let expected = target_dir.join(format!("xtable-utilities-{version}-bundled.jar"));
+    if fs::try_exists(&expected).await.unwrap_or(false) {
+        return Ok(expected);
+    }
+
+    // Fallback: scan target/ for any *-bundled.jar.
+    if let Ok(mut rd) = fs::read_dir(&target_dir).await {
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.ends_with("-bundled.jar") {
+                return Ok(entry.path());
+            }
+        }
+    }
+
+    Err(ServiceError::Io(std::io::Error::other(format!(
+        "mvn build succeeded but no bundled JAR found under {} (expected \
+         xtable-utilities-{version}-bundled.jar). XTable's shade-plugin output \
+         naming may have changed at this version.",
+        target_dir.display()
+    ))))
 }
 
-fn systemd_unit(java_bin: &Path, classpath: &XtableClasspath, root_dir: &Path) -> String {
-    // xtable's RunSync exits after one sync cycle. With
-    // Type=simple + Restart=on-failure, systemd would re-launch
-    // immediately and we'd be in a tight CPU loop. The correct
-    // shape is Type=oneshot + RemainAfterExit=yes so:
+fn systemd_unit(java_bin: &Path, jar: &Path, root_dir: &Path) -> String {
+    // xtable's RunSync exits after one sync cycle. With Type=simple
+    // + Restart=on-failure systemd would re-launch immediately and
+    // we'd be in a tight CPU loop. The correct shape is
+    // Type=oneshot + RemainAfterExit=yes so:
     //   - systemd waits for ExecStart to return (this is what
     //     `systemctl start` expects to complete).
     //   - The unit is considered "active" after a successful exit
@@ -449,29 +478,15 @@ fn systemd_unit(java_bin: &Path, classpath: &XtableClasspath, root_dir: &Path) -
     //     subsequent syncs via a systemd timer (v0.1+) or by
     //     re-running `systemctl start computeza-xtable`.
     //
-    // The default JVM heap is too generous for a sync-only batch
-    // job; cap at 512 MiB so the host doesn't OOM when a colocated
-    // postgres or qdrant is also live. Operators with very large
-    // tables override via a systemd drop-in.
-    let exec_start = match classpath {
-        XtableClasspath::FatJar(jar) => format!(
-            "{java} $JAVA_OPTS -jar {jar} --datasetConfig {root}/datasets.yaml",
-            java = java_bin.display(),
-            jar = jar.display(),
-            root = root_dir.display(),
-        ),
-        XtableClasspath::LibDir(lib) => format!(
-            "{java} $JAVA_OPTS -cp {lib}/* org.apache.xtable.utilities.RunSync --datasetConfig {root}/datasets.yaml",
-            java = java_bin.display(),
-            lib = lib.display(),
-            root = root_dir.display(),
-        ),
-    };
-    // RuntimeDirectory=xtable: forward-compat for v0.1+ when the
-    // unit becomes long-running (a daemon polling the dataset
-    // spec). v0.0.x runs as a one-shot batch job that doesn't
-    // need /run/xtable/, but the directive is free if unused --
-    // systemd mints the dir on start and tears it down on stop.
+    // Cap the JVM heap at 512 MiB so a colocated postgres or qdrant
+    // doesn't OOM. Operators with very large tables override via a
+    // systemd drop-in.
+    let exec_start = format!(
+        "{java} $JAVA_OPTS -jar {jar} --datasetConfig {root}/datasets.yaml",
+        java = java_bin.display(),
+        jar = jar.display(),
+        root = root_dir.display(),
+    );
     format!(
         "[Unit]\n\
          Description=Computeza-managed Apache XTable runner\n\
@@ -497,103 +512,18 @@ fn systemd_unit(java_bin: &Path, classpath: &XtableClasspath, root_dir: &Path) -
     )
 }
 
-/// Stream-download the Computeza-bundled xtable fat JAR, verify
-/// SHA-256 on the fly, and drop it under `<lib_dir>/xtable-fat.jar`.
-///
-/// Streaming + hashing in one pass avoids a second read of the
-/// downloaded file from disk. We write to `<lib>/xtable-fat.jar.partial`
-/// and rename on success so a torn download never lingers under the
-/// expected name (which would cause the install to skip the next try).
-async fn fetch_fat_jar(
-    url: &str,
-    expected_sha256: &str,
-    lib_dir: &Path,
-    progress: &ProgressHandle,
-) -> io::Result<PathBuf> {
-    let dest = lib_dir.join("xtable-fat.jar");
-    let tmp = lib_dir.join("xtable-fat.jar.partial");
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60 * 30))
-        .build()
-        .map_err(io::Error::other)?;
-    let resp = client.get(url).send().await.map_err(io::Error::other)?;
-    if !resp.status().is_success() {
-        return Err(io::Error::other(format!(
-            "GET {url} returned HTTP {}",
-            resp.status().as_u16()
-        )));
-    }
-
-    let total = resp.content_length();
-    progress.set_bytes(0, total);
-
-    let mut file = fs::File::create(&tmp).await?;
-    let mut stream = resp.bytes_stream();
-    let mut downloaded: u64 = 0;
-    let mut hasher = Sha256::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(io::Error::other)?;
-        hasher.update(&chunk);
-        file.write_all(&chunk).await?;
-        downloaded += chunk.len() as u64;
-        progress.set_bytes(downloaded, total);
-    }
-    file.flush().await?;
-    file.sync_all().await?;
-    drop(file);
-
-    progress.set_phase(InstallPhase::Verifying);
-    progress.set_message("Verifying xtable fat JAR SHA-256");
-    let actual = hex::encode(hasher.finalize());
-    if !actual.eq_ignore_ascii_case(expected_sha256) {
-        let _ = fs::remove_file(&tmp).await;
-        return Err(io::Error::other(format!(
-            "xtable fat-JAR SHA-256 mismatch (url: {url}): expected {expected_sha256}, got {actual}"
-        )));
-    }
-
-    fs::rename(&tmp, &dest).await?;
-    info!(path = %dest.display(), "xtable fat JAR downloaded + verified");
-    Ok(dest)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn fat_jar_pin_empty_table_returns_none() {
-        // With FAT_JAR_PINS empty (no fat JAR shipped yet) every
-        // version must resolve to None so the install falls through
-        // to the Maven path.
-        assert!(fat_jar_pin("0.3.0-incubating").is_none());
-        assert!(fat_jar_pin("0.2.0-incubating").is_none());
-        assert!(fat_jar_pin("does-not-exist").is_none());
-    }
-
-    #[test]
-    fn fat_jar_pin_rejects_blank_sha_or_url() {
-        // Same guard as fat_jar_pin's internal check: an entry with
-        // an empty url or sha is treated as "no pin" so a half-
-        // populated row in FAT_JAR_PINS doesn't trip a broken
-        // install. We can't mutate the const at runtime, so this
-        // exercises the helper with the empty-table case as a stand
-        // in. (The non-empty case will be covered by an integration
-        // test when the first fat JAR ships.)
-        for (v, _, _) in FAT_JAR_PINS {
-            // If any pre-populated row violates the invariant the
-            // test fails loudly.
-            assert!(!v.is_empty(), "FAT_JAR_PINS row has empty version");
-        }
-    }
-
-    #[test]
-    fn systemd_unit_fatjar_variant_uses_jar_flag() {
+    fn systemd_unit_uses_jar_flag() {
         let java = PathBuf::from("/var/lib/computeza/xtable/jre/bin/java");
-        let jar = PathBuf::from("/var/lib/computeza/xtable/lib/xtable-fat.jar");
+        let jar = PathBuf::from(
+            "/var/lib/computeza/xtable/lib/xtable-utilities-0.3.0-incubating-bundled.jar",
+        );
         let root = PathBuf::from("/var/lib/computeza/xtable");
-        let unit = systemd_unit(&java, &XtableClasspath::FatJar(jar.clone()), &root);
+        let unit = systemd_unit(&java, &jar, &root);
         assert!(
             unit.contains(&format!(
                 "-jar {} --datasetConfig {}/datasets.yaml",
@@ -619,23 +549,10 @@ mod tests {
     }
 
     #[test]
-    fn systemd_unit_libdir_variant_uses_classpath_glob() {
-        let java = PathBuf::from("/var/lib/computeza/xtable/jre/bin/java");
-        let lib = PathBuf::from("/var/lib/computeza/xtable/lib");
-        let root = PathBuf::from("/var/lib/computeza/xtable");
-        let unit = systemd_unit(&java, &XtableClasspath::LibDir(lib.clone()), &root);
-        assert!(unit.contains(&format!(
-            "-cp {}/* org.apache.xtable.utilities.RunSync --datasetConfig {}/datasets.yaml",
-            lib.display(),
-            root.display()
-        )));
-    }
-
-    #[test]
-    fn pom_xml_includes_requested_version() {
-        let pom = pom_xml("0.3.0-incubating");
-        assert!(pom.contains("<artifactId>xtable-utilities</artifactId>"));
-        assert!(pom.contains("<version>0.3.0-incubating</version>"));
-        assert!(pom.contains("<groupId>org.apache.xtable</groupId>"));
+    fn xtable_versions_default_is_latest() {
+        assert_eq!(
+            XTABLE_VERSIONS[0], "0.3.0-incubating",
+            "default version pin should be the latest published Apache XTable tag"
+        );
     }
 }
