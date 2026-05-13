@@ -209,20 +209,32 @@ pub async fn install(
              into {} -- 3-5 min depending on network and the local ~/.m2 cache state)",
             lib_dir.display()
         ));
+        // Drop the `-q` quiet flag: when mvn fails, the actually-
+        // diagnostic output (BUILD FAILURE banner, the per-goal
+        // error, the offending artifact coordinates) goes to
+        // stdout, and `-q` suppresses all of it. The harmless JVM
+        // warnings about `sun.misc.Unsafe` go to stderr regardless.
+        // Without stdout the operator sees only the warnings and
+        // can't diagnose the failure.
         let out = Command::new("mvn")
             .arg("-f")
             .arg(&pom_path)
             .arg("dependency:copy-dependencies")
             .arg(format!("-DoutputDirectory={}", lib_dir.display()))
             .arg("-DincludeScope=runtime")
-            .arg("-q")
+            // Batch mode (-B) keeps output non-interactive and
+            // drops the download progress bar; -e adds the
+            // stack trace location to error reports.
+            .arg("-B")
+            .arg("-e")
             .output()
             .await?;
         if !out.status.success() {
             return Err(ServiceError::Io(std::io::Error::other(format!(
-                "mvn dependency:copy-dependencies for xtable-utilities@{version} failed (exit {:?}): {}",
+                "mvn dependency:copy-dependencies for xtable-utilities@{version} failed (exit {:?}).\n\n--- mvn stdout (the diagnostic surface) ---\n{}\n--- mvn stderr (mostly JVM warnings) ---\n{}",
                 out.status.code(),
-                String::from_utf8_lossy(&out.stderr)
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr),
             ))));
         }
     }
