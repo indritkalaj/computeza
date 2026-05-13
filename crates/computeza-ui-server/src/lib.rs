@@ -3528,13 +3528,12 @@ async fn install_job_api_handler(
 /// register a `postgres-instance/local` resource in the state store
 /// reflecting where the freshly-installed server is listening.
 ///
-/// `_progress` is used on Windows where the install path streams a
-/// large binary bundle and benefits from a live wizard. Linux + macOS
-/// installs are fast enough that they don't need a progress bar yet
-/// (the wizard will still show the final result page).
+/// `progress` streams per-phase status on every platform. The Linux
+/// path uses it for the EDB-tarball fetch + the subsequent initdb /
+/// systemd phases; macOS still passes `_progress` as a no-op handle.
 #[cfg(target_os = "linux")]
 async fn run_postgres_install_with_progress(
-    _progress: &ProgressHandle,
+    progress: &ProgressHandle,
     config: &InstallConfig,
 ) -> Result<(String, u16), String> {
     use computeza_driver_native::linux::postgres;
