@@ -118,10 +118,18 @@ computeza-compliance = { path = "crates/computeza-compliance", version = "0.0.1"
 # Tier 2 -- Drivers
 computeza-driver-native = { path = "crates/computeza-driver-native", version = "0.0.1" }
 
-# Tier 3 -- Reconcilers (only the ones currently wired into the binary's
-# observe loop; others are members of the workspace but not depended on
-# until they're integrated).
-computeza-reconciler-postgres = { path = "crates/computeza-reconciler-postgres", version = "0.0.1" }
+# Tier 3 -- Reconcilers (all wired into the binary's observe loop;
+# observe() best-effort runs every 30s for each registered resource).
+computeza-reconciler-postgres   = { path = "crates/computeza-reconciler-postgres",   version = "0.0.1" }
+computeza-reconciler-kanidm     = { path = "crates/computeza-reconciler-kanidm",     version = "0.0.1" }
+computeza-reconciler-garage     = { path = "crates/computeza-reconciler-garage",     version = "0.0.1" }
+computeza-reconciler-lakekeeper = { path = "crates/computeza-reconciler-lakekeeper", version = "0.0.1" }
+computeza-reconciler-databend   = { path = "crates/computeza-reconciler-databend",   version = "0.0.1" }
+computeza-reconciler-qdrant     = { path = "crates/computeza-reconciler-qdrant",     version = "0.0.1" }
+computeza-reconciler-restate    = { path = "crates/computeza-reconciler-restate",    version = "0.0.1" }
+computeza-reconciler-greptime   = { path = "crates/computeza-reconciler-greptime",   version = "0.0.1" }
+computeza-reconciler-grafana    = { path = "crates/computeza-reconciler-grafana",    version = "0.0.1" }
+computeza-reconciler-openfga    = { path = "crates/computeza-reconciler-openfga",    version = "0.0.1" }
 
 # Tier 4 -- Web Console (i18n is shared, so placed at workspace level)
 computeza-i18n          = { path = "crates/computeza-i18n",          version = "0.0.1" }

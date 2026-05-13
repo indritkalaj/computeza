@@ -30,6 +30,15 @@ computeza-state = { workspace = true }
 computeza-ui-server = { workspace = true }
 computeza-driver-native = { workspace = true }
 computeza-reconciler-postgres = { workspace = true }
+computeza-reconciler-kanidm = { workspace = true }
+computeza-reconciler-garage = { workspace = true }
+computeza-reconciler-lakekeeper = { workspace = true }
+computeza-reconciler-databend = { workspace = true }
+computeza-reconciler-qdrant = { workspace = true }
+computeza-reconciler-restate = { workspace = true }
+computeza-reconciler-greptime = { workspace = true }
+computeza-reconciler-grafana = { workspace = true }
+computeza-reconciler-openfga = { workspace = true }
 computeza-secrets = { workspace = true }
 computeza-audit = { workspace = true }
 computeza-license = { workspace = true }

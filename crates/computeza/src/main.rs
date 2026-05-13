@@ -484,69 +484,236 @@ fn install_postgres(_l: &Localizer) -> anyhow::Result<()> {
     )
 }
 
-/// Periodic in-process reconcile tick. Reads every `postgres-instance`
-/// row from the metadata store and runs `observe()` against it,
-/// persisting the result back via `with_state(store, name)`. The UI's
-/// `/status` page then surfaces the live server version, last-observed
-/// timestamp, and the green "Observing" badge.
+/// Periodic in-process reconcile tick. Iterates every supported
+/// `{slug}-instance` row in the metadata store and runs `observe()`
+/// against each, persisting the result back via
+/// `with_state(store, name)`. The UI's `/status` page then surfaces
+/// the live server version, last-observed timestamp, and the green
+/// "Observing" badge (or orange "Failed" if observe errored).
 ///
-/// v0.0.x only covers postgres-instance; the HTTP reconcilers
-/// (kanidm/garage/lakekeeper/...) will join this loop once their
-/// resource types are populated through the apply flow.
+/// All 10 component reconcilers dispatch from this loop in v0.0.x.
+/// Each block follows the same shape: list rows -> deserialize spec
+/// -> hydrate any secret refs -> instantiate reconciler -> observe.
+/// Repetitive because each reconciler has its own spec type;
+/// extracting a macro is a follow-up cleanup, kept verbatim for now
+/// so each component's reconciler is obvious at the dispatch site.
+///
+/// Components without an admin-credential applier wired through the
+/// install path (everything except postgres -- kanidm + grafana
+/// applier paths land in follow-up commits, the others authenticate
+/// against unauth'd local endpoints) will observe with an empty
+/// `admin_token`; their reconcilers either accept that (qdrant,
+/// garage, etc. against local no-auth setups) or surface a clean
+/// FAILED state, which is better signal than UNKNOWN-forever.
 async fn reconcile_tick(
     store: std::sync::Arc<computeza_state::SqliteStore>,
     secrets: Option<std::sync::Arc<computeza_secrets::SecretsStore>>,
 ) {
     use computeza_core::reconciler::Context;
     use computeza_core::{NoOpDriver, Reconciler};
-    use computeza_reconciler_postgres::{PostgresReconciler, PostgresSpec};
     use computeza_state::Store;
 
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
-    // Don't fire immediately on startup -- give the install path or the
-    // operator time to write the first row.
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let ctx = Context::default();
     loop {
         tick.tick().await;
-        let rows = match store.list("postgres-instance", None).await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "reconcile_tick: failed to list postgres-instance resources; \
-                     skipping this tick. Will retry on the next 30s interval."
-                );
-                continue;
-            }
-        };
-        for sr in rows {
-            let mut spec: PostgresSpec = match serde_json::from_value(sr.spec.clone()) {
-                Ok(s) => s,
+
+        // ---- postgres-instance ----
+        {
+            use computeza_reconciler_postgres::{PostgresReconciler, PostgresSpec};
+            let rows = match store.list("postgres-instance", None).await {
+                Ok(v) => v,
                 Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        kind = %sr.key.kind,
-                        name = %sr.key.name,
-                        "reconcile_tick: spec did not deserialize as PostgresSpec; \
-                         leaving status as Unknown. Inspect /resource/{}/{} and fix the spec.",
-                        sr.key.kind, sr.key.name,
-                    );
-                    continue;
+                    tracing::warn!(error = %e, "reconcile_tick: list postgres-instance failed");
+                    Vec::new()
                 }
             };
-            // Resolve superuser_password_ref against the secrets store
-            // before constructing the reconciler. Mirrors the
-            // post-install observe path in ui-server so periodic and
-            // post-install observations see the same password.
-            computeza_ui_server::hydrate_postgres_password(&mut spec, secrets.as_deref()).await;
-            let reconciler: PostgresReconciler<NoOpDriver> =
-                PostgresReconciler::new(spec.endpoint.clone(), spec.superuser_password)
-                    .with_state(store.clone(), &sr.key.name);
-            // Observe is best-effort; the reconciler itself logs failures
-            // and writes a `last_observe_failed=true` sentinel to the
-            // store so the UI can render the orange "Failed" badge.
-            let _ = reconciler.observe(&ctx).await;
+            for sr in rows {
+                let mut spec: PostgresSpec = match serde_json::from_value(sr.spec.clone()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(error = %e, name = %sr.key.name, "postgres spec deserialize failed");
+                        continue;
+                    }
+                };
+                computeza_ui_server::hydrate_postgres_password(&mut spec, secrets.as_deref()).await;
+                let reconciler: PostgresReconciler<NoOpDriver> =
+                    PostgresReconciler::new(spec.endpoint.clone(), spec.superuser_password)
+                        .with_state(store.clone(), &sr.key.name);
+                let _ = reconciler.observe(&ctx).await;
+            }
+        }
+
+        // ---- kanidm-instance ----
+        {
+            use computeza_reconciler_kanidm::{KanidmReconciler, KanidmSpec};
+            let rows = store.list("kanidm-instance", None).await.unwrap_or_default();
+            for sr in rows {
+                let spec: KanidmSpec = match serde_json::from_value(sr.spec.clone()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(error = %e, name = %sr.key.name, "kanidm spec deserialize failed");
+                        continue;
+                    }
+                };
+                let reconciler: KanidmReconciler<NoOpDriver> =
+                    KanidmReconciler::new(spec.endpoint.clone(), spec.admin_token)
+                        .with_state(store.clone(), &sr.key.name);
+                let _ = reconciler.observe(&ctx).await;
+            }
+        }
+
+        // ---- garage-instance ----
+        {
+            use computeza_reconciler_garage::{GarageReconciler, GarageSpec};
+            let rows = store.list("garage-instance", None).await.unwrap_or_default();
+            for sr in rows {
+                let spec: GarageSpec = match serde_json::from_value(sr.spec.clone()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(error = %e, name = %sr.key.name, "garage spec deserialize failed");
+                        continue;
+                    }
+                };
+                let reconciler: GarageReconciler<NoOpDriver> =
+                    GarageReconciler::new(spec.endpoint.clone(), spec.admin_token)
+                        .with_state(store.clone(), &sr.key.name);
+                let _ = reconciler.observe(&ctx).await;
+            }
+        }
+
+        // ---- lakekeeper-instance ----
+        {
+            use computeza_reconciler_lakekeeper::{LakekeeperReconciler, LakekeeperSpec};
+            let rows = store.list("lakekeeper-instance", None).await.unwrap_or_default();
+            for sr in rows {
+                let spec: LakekeeperSpec = match serde_json::from_value(sr.spec.clone()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(error = %e, name = %sr.key.name, "lakekeeper spec deserialize failed");
+                        continue;
+                    }
+                };
+                let reconciler: LakekeeperReconciler<NoOpDriver> =
+                    LakekeeperReconciler::new(spec.endpoint.clone(), spec.admin_token)
+                        .with_state(store.clone(), &sr.key.name);
+                let _ = reconciler.observe(&ctx).await;
+            }
+        }
+
+        // ---- databend-instance ----
+        {
+            use computeza_reconciler_databend::{DatabendReconciler, DatabendSpec};
+            let rows = store.list("databend-instance", None).await.unwrap_or_default();
+            for sr in rows {
+                let spec: DatabendSpec = match serde_json::from_value(sr.spec.clone()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(error = %e, name = %sr.key.name, "databend spec deserialize failed");
+                        continue;
+                    }
+                };
+                let reconciler: DatabendReconciler<NoOpDriver> =
+                    DatabendReconciler::new(spec.endpoint.clone(), spec.admin_token)
+                        .with_state(store.clone(), &sr.key.name);
+                let _ = reconciler.observe(&ctx).await;
+            }
+        }
+
+        // ---- qdrant-instance ----
+        {
+            use computeza_reconciler_qdrant::{QdrantReconciler, QdrantSpec};
+            let rows = store.list("qdrant-instance", None).await.unwrap_or_default();
+            for sr in rows {
+                let spec: QdrantSpec = match serde_json::from_value(sr.spec.clone()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(error = %e, name = %sr.key.name, "qdrant spec deserialize failed");
+                        continue;
+                    }
+                };
+                let reconciler: QdrantReconciler<NoOpDriver> =
+                    QdrantReconciler::new(spec.endpoint.clone(), spec.admin_token)
+                        .with_state(store.clone(), &sr.key.name);
+                let _ = reconciler.observe(&ctx).await;
+            }
+        }
+
+        // ---- restate-instance ----
+        {
+            use computeza_reconciler_restate::{RestateReconciler, RestateSpec};
+            let rows = store.list("restate-instance", None).await.unwrap_or_default();
+            for sr in rows {
+                let spec: RestateSpec = match serde_json::from_value(sr.spec.clone()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(error = %e, name = %sr.key.name, "restate spec deserialize failed");
+                        continue;
+                    }
+                };
+                let reconciler: RestateReconciler<NoOpDriver> =
+                    RestateReconciler::new(spec.endpoint.clone(), spec.admin_token)
+                        .with_state(store.clone(), &sr.key.name);
+                let _ = reconciler.observe(&ctx).await;
+            }
+        }
+
+        // ---- greptime-instance ----
+        {
+            use computeza_reconciler_greptime::{GreptimeReconciler, GreptimeSpec};
+            let rows = store.list("greptime-instance", None).await.unwrap_or_default();
+            for sr in rows {
+                let spec: GreptimeSpec = match serde_json::from_value(sr.spec.clone()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(error = %e, name = %sr.key.name, "greptime spec deserialize failed");
+                        continue;
+                    }
+                };
+                let reconciler: GreptimeReconciler<NoOpDriver> =
+                    GreptimeReconciler::new(spec.endpoint.clone(), spec.admin_token)
+                        .with_state(store.clone(), &sr.key.name);
+                let _ = reconciler.observe(&ctx).await;
+            }
+        }
+
+        // ---- grafana-instance ----
+        {
+            use computeza_reconciler_grafana::{GrafanaReconciler, GrafanaSpec};
+            let rows = store.list("grafana-instance", None).await.unwrap_or_default();
+            for sr in rows {
+                let spec: GrafanaSpec = match serde_json::from_value(sr.spec.clone()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(error = %e, name = %sr.key.name, "grafana spec deserialize failed");
+                        continue;
+                    }
+                };
+                let reconciler: GrafanaReconciler<NoOpDriver> =
+                    GrafanaReconciler::new(spec.endpoint.clone(), spec.admin_token)
+                        .with_state(store.clone(), &sr.key.name);
+                let _ = reconciler.observe(&ctx).await;
+            }
+        }
+
+        // ---- openfga-instance ----
+        {
+            use computeza_reconciler_openfga::{OpenFgaReconciler, OpenFgaSpec};
+            let rows = store.list("openfga-instance", None).await.unwrap_or_default();
+            for sr in rows {
+                let spec: OpenFgaSpec = match serde_json::from_value(sr.spec.clone()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(error = %e, name = %sr.key.name, "openfga spec deserialize failed");
+                        continue;
+                    }
+                };
+                let reconciler: OpenFgaReconciler<NoOpDriver> =
+                    OpenFgaReconciler::new(spec.endpoint.clone(), spec.admin_token)
+                        .with_state(store.clone(), &sr.key.name);
+                let _ = reconciler.observe(&ctx).await;
+            }
         }
     }
 }
