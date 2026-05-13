@@ -637,6 +637,14 @@ async fn locate_bundled_jar(src_dir: &Path, _version: &str) -> Result<PathBuf, S
     ))))
 }
 
+/// Fully-qualified class name of XTable's RunSync entry point.
+/// Stable across 0.2.0 and 0.3.0-incubating; only used because the
+/// shade-plugin config in `xtable-utilities` doesn't write a
+/// Main-Class manifest entry, so `java -jar` fails with `no main
+/// manifest attribute`. `java -cp <jar> <classname>` is the
+/// upstream-documented invocation (see xtable.apache.org/docs/setup).
+const RUN_SYNC_CLASS: &str = "org.apache.xtable.utilities.RunSync";
+
 fn systemd_unit(java_bin: &Path, jar: &Path, root_dir: &Path) -> String {
     // xtable's RunSync exits after one sync cycle. With Type=simple
     // + Restart=on-failure systemd would re-launch immediately and
@@ -653,10 +661,16 @@ fn systemd_unit(java_bin: &Path, jar: &Path, root_dir: &Path) -> String {
     // Cap the JVM heap at 512 MiB so a colocated postgres or qdrant
     // doesn't OOM. Operators with very large tables override via a
     // systemd drop-in.
+    //
+    // `-cp <jar> <classname>` not `-jar <jar>`: xtable's shade-plugin
+    // doesn't write a Main-Class manifest entry, so `java -jar`
+    // fails with "no main manifest attribute". Naming RunSync
+    // explicitly matches the upstream-documented invocation.
     let exec_start = format!(
-        "{java} $JAVA_OPTS -jar {jar} --datasetConfig {root}/datasets.yaml",
+        "{java} $JAVA_OPTS -cp {jar} {cls} --datasetConfig {root}/datasets.yaml",
         java = java_bin.display(),
         jar = jar.display(),
+        cls = RUN_SYNC_CLASS,
         root = root_dir.display(),
     );
     format!(
@@ -689,20 +703,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn systemd_unit_uses_jar_flag() {
+    fn systemd_unit_uses_cp_with_runsync_class() {
         let java = PathBuf::from("/var/lib/computeza/xtable/jre/bin/java");
         let jar = PathBuf::from(
-            "/var/lib/computeza/xtable/lib/xtable-utilities-0.3.0-incubating-bundled.jar",
+            "/var/lib/computeza/xtable/lib/xtable-utilities-0.2.0-incubating-bundled.jar",
         );
         let root = PathBuf::from("/var/lib/computeza/xtable");
         let unit = systemd_unit(&java, &jar, &root);
         assert!(
             unit.contains(&format!(
-                "-jar {} --datasetConfig {}/datasets.yaml",
+                "-cp {} org.apache.xtable.utilities.RunSync --datasetConfig {}/datasets.yaml",
                 jar.display(),
                 root.display()
             )),
-            "ExecStart should invoke `java -jar <jar> --datasetConfig <root>/datasets.yaml`"
+            "ExecStart should invoke `java -cp <jar> RunSync ...` -- xtable's \
+             shade-plugin omits Main-Class so `java -jar` won't work"
+        );
+        assert!(
+            !unit.contains(&format!("-jar {}", jar.display())),
+            "must NOT use -jar -- the shaded jar lacks a Main-Class manifest entry"
         );
         assert!(unit.contains("ReadWritePaths=/var/lib/computeza/xtable"));
         assert!(
