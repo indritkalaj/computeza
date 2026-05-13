@@ -49,7 +49,7 @@ ui-landing-stat-4-label = Open license
 
 ui-landing-about-eyebrow   = What it is
 ui-landing-about-title     = An operator console for the lakehouse stack you already understand.
-ui-landing-about-subtitle  = Computeza is not a new database, not a new query engine, and not a new ML framework. It is the missing operator layer that turns eleven best-in-class open-source projects into one production-shaped data plane -- installed natively, observed continuously, and torn down cleanly when you no longer need them.
+ui-landing-about-subtitle  = Computeza is not a new database, not a new query engine, and not a new ML framework. It is also not a hosted service, a managed cloud, or a compute provider -- we ship software, you run it. Computeza is the missing operator layer that turns eleven best-in-class open-source projects into one production-shaped data plane: installed natively on your hardware, observed continuously, and torn down cleanly when you no longer need them.
 
 # --- Features ---
 
@@ -113,43 +113,33 @@ ui-landing-trust-4-body   = Annex IV model cards, Article 5 prohibited-classific
 # --- Pricing ---
 
 ui-landing-pricing-eyebrow  = Pricing
-ui-landing-pricing-title    = Self-host on us. Pay only when you need the lift.
-ui-landing-pricing-subtitle = Computeza is free to use, fork, and resell. The paid tiers add SLA-backed support, security review, and the reseller-chain primitives an OEM needs to put their name on the console.
+ui-landing-pricing-title    = Per-seat, paid-only. No free tier. No usage metering.
+ui-landing-pricing-subtitle = Computeza is commercial software you install on your own hardware. We charge per operator seat; we never charge for compute, storage, query volume, or hosting -- because we never run any of those for you. Pricing scales linearly from small teams to multi-tier resale chains.
 
-ui-landing-pricing-1-name     = Community
-ui-landing-pricing-1-price    = $0
-ui-landing-pricing-1-unit     = / forever
-ui-landing-pricing-1-tagline  = For individual operators, homelabs, and zero-budget pilots.
+ui-landing-pricing-1-name     = Standard
+ui-landing-pricing-1-price    = 49.99 EUR
+ui-landing-pricing-1-unit     = / seat / month, up to 100 seats
+ui-landing-pricing-1-tagline  = For SMB platform teams putting Computeza into production -- seat-capped, self-service, signed license.
 ui-landing-pricing-1-feature-1 = Every one of the 11 managed components
 ui-landing-pricing-1-feature-2 = Unified install + rollback + repair
 ui-landing-pricing-1-feature-3 = Encrypted secrets store + rotate UI
-ui-landing-pricing-1-feature-4 = Local-only deployment (single host)
-ui-landing-pricing-1-feature-5 = Community support via GitHub issues
-ui-landing-pricing-1-cta      = Download
+ui-landing-pricing-1-feature-4 = Signed license envelope with seat cap + expiry kill-switch
+ui-landing-pricing-1-feature-5 = Priority support (24h response)
+ui-landing-pricing-1-feature-6 = Audit-log export to external SIEM
+ui-landing-pricing-1-cta      = Talk to sales
+ui-landing-pricing-1-badge    = Most popular
 
-ui-landing-pricing-2-name     = Standard
-ui-landing-pricing-2-price    = 49.99 EUR
-ui-landing-pricing-2-unit     = / seat / month, up to 100 seats
-ui-landing-pricing-2-tagline  = For SMB platform teams putting Computeza into production -- seat-capped, self-service, signed license.
-ui-landing-pricing-2-feature-1 = Everything in Community
-ui-landing-pricing-2-feature-2 = Signed license envelope with seat cap + expiry kill-switch
-ui-landing-pricing-2-feature-3 = Priority support (24h response)
-ui-landing-pricing-2-feature-4 = Audit-log export to external SIEM
-ui-landing-pricing-2-feature-5 = Early access to v0.1 federation features
-ui-landing-pricing-2-cta      = Start free trial
-ui-landing-pricing-2-badge    = Most popular
-
-ui-landing-pricing-3-name     = Enterprise
-ui-landing-pricing-3-price    = Custom
-ui-landing-pricing-3-unit     = annual contract
-ui-landing-pricing-3-tagline  = For regulated industries, sovereign workloads, and reseller chains.
-ui-landing-pricing-3-feature-1 = Everything in Standard, no seat cap
-ui-landing-pricing-3-feature-2 = SLA-backed support (4h critical)
-ui-landing-pricing-3-feature-3 = White-label theming + brand SVG
-ui-landing-pricing-3-feature-4 = Multi-tier license chain + reseller billing
-ui-landing-pricing-3-feature-5 = EU AI Act compliance + dedicated security review
-ui-landing-pricing-3-feature-6 = Channel-partner gRPC API for provisioning
-ui-landing-pricing-3-cta      = Contact sales
+ui-landing-pricing-2-name     = Enterprise
+ui-landing-pricing-2-price    = Custom
+ui-landing-pricing-2-unit     = annual contract
+ui-landing-pricing-2-tagline  = For regulated industries, sovereign workloads, and reseller chains. Personalised per-seat pricing negotiated on contract.
+ui-landing-pricing-2-feature-1 = Everything in Standard, no seat cap
+ui-landing-pricing-2-feature-2 = SLA-backed support (4h critical)
+ui-landing-pricing-2-feature-3 = White-label theming + brand SVG
+ui-landing-pricing-2-feature-4 = Multi-tier license chain + reseller billing
+ui-landing-pricing-2-feature-5 = EU AI Act compliance + dedicated security review
+ui-landing-pricing-2-feature-6 = Channel-partner gRPC API for provisioning
+ui-landing-pricing-2-cta      = Contact sales
 
 # --- Final CTA ---
 
@@ -253,7 +243,7 @@ ui-admin-branding-reset = Reset to default
 
 ui-admin-license-title = License
 ui-admin-license-intro = Entitlement envelope for this Computeza install. v0.0.x renders the reseller chain + validity window read-only; v0.1+ adds the activation form and seat enforcement.
-ui-admin-license-none = No license has been activated on this install. Computeza runs in Community mode (unlimited seats, no SLA, community support only).
+ui-admin-license-none = No license has been activated on this install. Computeza is paid-only commercial software. Contact your reseller, or hello@computeza.eu for direct deals, to obtain a signed license envelope; until one is activated, install paths still work but features that depend on entitlements (seat caps, tier gates, expiry kill-switch, channel-partner API) remain dormant.
 ui-admin-license-tier = Tier
 ui-admin-license-seats = Seat cap
 ui-admin-license-chain = Resale chain

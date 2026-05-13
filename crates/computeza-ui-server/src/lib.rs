@@ -5375,6 +5375,9 @@ pub fn render_landing_page(localizer: &Localizer) -> String {
     let pricing_title = localizer.t("ui-landing-pricing-title");
     let pricing_subtitle = localizer.t("ui-landing-pricing-subtitle");
 
+    // Two-tier pricing: Standard (seat-capped per-seat) and
+    // Enterprise (custom). No free / Community tier -- Computeza
+    // is paid-only commercial software.
     let tier1 = render_pricing_card(
         &localizer.t("ui-landing-pricing-1-name"),
         &localizer.t("ui-landing-pricing-1-price"),
@@ -5386,11 +5389,12 @@ pub fn render_landing_page(localizer: &Localizer) -> String {
             localizer.t("ui-landing-pricing-1-feature-3"),
             localizer.t("ui-landing-pricing-1-feature-4"),
             localizer.t("ui-landing-pricing-1-feature-5"),
+            localizer.t("ui-landing-pricing-1-feature-6"),
         ],
         &localizer.t("ui-landing-pricing-1-cta"),
-        "/install",
-        None,
-        false,
+        "mailto:hello@computeza.eu?subject=Computeza%20Standard%20-%20seat%20pricing",
+        Some(&localizer.t("ui-landing-pricing-1-badge")),
+        true,
     );
     let tier2 = render_pricing_card(
         &localizer.t("ui-landing-pricing-2-name"),
@@ -5403,27 +5407,10 @@ pub fn render_landing_page(localizer: &Localizer) -> String {
             localizer.t("ui-landing-pricing-2-feature-3"),
             localizer.t("ui-landing-pricing-2-feature-4"),
             localizer.t("ui-landing-pricing-2-feature-5"),
+            localizer.t("ui-landing-pricing-2-feature-6"),
         ],
         &localizer.t("ui-landing-pricing-2-cta"),
-        "/login",
-        Some(&localizer.t("ui-landing-pricing-2-badge")),
-        true,
-    );
-    let tier3 = render_pricing_card(
-        &localizer.t("ui-landing-pricing-3-name"),
-        &localizer.t("ui-landing-pricing-3-price"),
-        &localizer.t("ui-landing-pricing-3-unit"),
-        &localizer.t("ui-landing-pricing-3-tagline"),
-        &[
-            localizer.t("ui-landing-pricing-3-feature-1"),
-            localizer.t("ui-landing-pricing-3-feature-2"),
-            localizer.t("ui-landing-pricing-3-feature-3"),
-            localizer.t("ui-landing-pricing-3-feature-4"),
-            localizer.t("ui-landing-pricing-3-feature-5"),
-            localizer.t("ui-landing-pricing-3-feature-6"),
-        ],
-        &localizer.t("ui-landing-pricing-3-cta"),
-        "/login",
+        "mailto:hello@computeza.eu?subject=Computeza%20Enterprise%20-%20contract%20pricing",
         None,
         false,
     );
@@ -5494,10 +5481,9 @@ pub fn render_landing_page(localizer: &Localizer) -> String {
 <h2 class="cz-landing-section-title">{pricing_title}</h2>
 <p class="cz-landing-section-subtitle">{pricing_subtitle}</p>
 </div>
-<div class="cz-pricing-grid">
+<div class="cz-pricing-grid cz-pricing-grid-2col">
 {tier1}
 {tier2}
-{tier3}
 </div>
 </section>
 
@@ -5546,7 +5532,6 @@ pub fn render_landing_page(localizer: &Localizer) -> String {
         pricing_subtitle = html_escape(&pricing_subtitle),
         tier1 = tier1,
         tier2 = tier2,
-        tier3 = tier3,
         final_title = html_escape(&final_title),
         final_subtitle = html_escape(&final_subtitle),
         final_primary = html_escape(&final_primary),
@@ -10855,17 +10840,33 @@ mod tests {
     }
 
     #[test]
-    fn render_home_landing_renders_all_three_pricing_tiers() {
+    fn render_home_landing_renders_paid_only_two_tier_pricing() {
+        // The landing pricing collapsed from three tiers to two
+        // when the product went paid-only: Standard (49.99 EUR /
+        // seat, capped at 100 seats) and Enterprise (custom). The
+        // Community $0 tier no longer exists.
         let l = Localizer::english();
         let html = render_home(&l, StoreSummary::Missing);
-        assert!(html.contains("Community"));
-        // Renamed from "Pro" to "Standard" to match the 49.99 EUR
-        // / 100-seat-cap shape the SMB tier actually ships.
         assert!(html.contains("Standard"));
         assert!(html.contains("Enterprise"));
         assert!(
+            !html.contains("Community"),
+            "landing should NOT advertise a Community / free tier; the product is paid-only"
+        );
+        assert!(
+            !html.contains("$0"),
+            "landing should NOT advertise a $0 price point"
+        );
+        assert!(
             html.contains(r#"data-badge="Most popular""#),
             "Standard tier should carry the featured badge"
+        );
+        // The pricing subtitle must be unambiguous about the
+        // software-only stance (no hosting, no compute resale).
+        assert!(html.contains("software"));
+        assert!(
+            html.contains("never charge"),
+            "pricing subtitle should explicitly disclaim usage / compute fees"
         );
     }
 
