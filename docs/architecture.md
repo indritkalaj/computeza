@@ -105,10 +105,16 @@ indicator.
 ## The driver pattern
 
 Drivers abstract the deployment target. The same reconciler logic
-produces a Garage cluster on native Linux, native macOS, native Windows,
-on Kubernetes, or on AWS EC2 -- only the driver differs. The `Driver`
-trait is intentionally narrow (spec section 3.4); see
-`crates/computeza-core/src/driver.rs`.
+will eventually produce a Garage cluster on Ubuntu, on other Linux
+distros, on macOS, on Windows, on Kubernetes, or on AWS EC2 -- only
+the driver differs. The `Driver` trait is intentionally narrow (spec
+section 3.4); see `crates/computeza-core/src/driver.rs`.
+
+**v0.0.x supports Ubuntu Linux x86_64 only.** Databend's binary
+release is verified only against Ubuntu's glibc + systemd userspace,
+and the end-to-end install pipeline is tested only there. macOS +
+Windows native drivers and broader Linux-distro support land in v0.1+.
+See README.md "Platform support" for the full matrix.
 
 ## See also
 

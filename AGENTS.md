@@ -414,17 +414,24 @@ When adding a new component (kanidm, garage, lakekeeper, ...):
   and the `computeza` binary have real implementations.
 - `cargo run --bin computeza -- serve` boots the operator console at
   `127.0.0.1:8400` (default per spec section 10.6).
-- **v0.0.x is Linux-only for the data-plane install path -- every
-  component, including postgres.** The 11 managed components target
-  systemd-based Linux on x86_64. macOS + Windows native install drivers
-  ship in v0.1+. The wizard explicitly refuses installs on non-Linux
-  hosts via `guard_supported_os` (which calls into
+- **v0.0.x supports Ubuntu Linux x86_64 only -- every component,
+  including postgres.** This is narrower than the "any systemd-based
+  Linux" target in earlier drafts: Databend's official binary release
+  has been verified only against Ubuntu's glibc + systemd userspace,
+  and the install pipeline as a whole is end-to-end tested only on
+  Ubuntu 22.04 LTS and 24.04 LTS. Other systemd-based distros (Debian,
+  Fedora, RHEL, openSUSE, Arch) may install most components but
+  Databend is unreliable -- broadening the matrix is a v0.1+ task once
+  Databend's release-engineering catches up or we ship a source-build
+  fallback. macOS + Windows native install drivers move to v0.1+. The
+  wizard explicitly refuses installs on non-Linux hosts via
+  `guard_supported_os` (which calls into
   `computeza-driver-native::os_detect`). The macOS + Windows postgres
   driver modules at `crates/computeza-driver-native/src/{macos,windows}/postgres.rs`
   are reference code from earlier iterations and are no longer reachable
   through the wizard -- do NOT extend them for new components. The
   operator console (`computeza serve`) itself remains cross-platform;
-  only install actions are Linux-gated.
+  only install actions are Ubuntu-gated.
 - v1.0 GA target: Q2 2027 per spec section 13.
 
 ## Unified install (`/install`)

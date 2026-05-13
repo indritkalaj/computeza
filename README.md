@@ -19,29 +19,42 @@ per spec section 13.
 
 ## Platform support
 
-**v0.0.x is Linux-only for the data-plane install path.** Every one of
-the 11 managed components (PostgreSQL, Kanidm, Garage, OpenFGA, ...)
-installs only on systemd-based Linux on x86_64. macOS + Windows native
-install drivers move to v0.1+; the operator console's install hub
-explicitly refuses to run an install when it detects a non-Linux host
-(via `computeza-driver-native::os_detect`).
+**v0.0.x supports Ubuntu Linux x86_64 only.** This is a hard
+constraint of the current release, not a recommendation: Databend's
+official binary release (a glibc-linked tarball at
+`github.com/databendlabs/databend`) has been verified only against
+Ubuntu's glibc + systemd userspace, and the other 10 managed
+components are end-to-end tested only on the same target. We will
+broaden the matrix in v0.1+ once Databend's release-engineering
+catches up (or once we ship a source-build fallback for Databend
+analogous to what kanidm and garage already use).
+
+**Supported today:**
+
+- Ubuntu 22.04 LTS (minimum) on x86_64
+- Ubuntu 24.04 LTS (recommended) on x86_64
+- WSL2 (Ubuntu) with `systemd=true` enabled in `/etc/wsl.conf`
+
+**Best-effort, unverified end-to-end:** Debian 12+, Fedora 39+,
+RHEL / Rocky / AlmaLinux 9+, openSUSE, Arch. Ten of the eleven
+components install on these; Databend is the binding constraint.
+
+**Not supported in v0.0.x:** macOS, Windows, ARM64, Alpine
+(musl libc), Gentoo, any container-image base without systemd
+as PID 1.
 
 The macOS + Windows PostgreSQL driver modules under
-`crates/computeza-driver-native/src/{macos,windows}/postgres.rs` exist
-as reference code from an earlier iteration but are no longer reachable
-through the wizard. They are not extended for new components.
+`crates/computeza-driver-native/src/{macos,windows}/postgres.rs`
+exist as reference code from an earlier iteration but are no
+longer reachable through the wizard. They are not extended for
+new components.
 
-The operator console itself (`computeza serve`) runs on any OS that
-builds Rust. You can run the web UI on Windows pointing at remote Linux
-hosts that own the actual installs once the multi-host install path
-lands in v0.1+; today the install actions are local-only and need a
-Linux host. Spec section 10 documents the multi-OS roadmap.
-
-**Supported Linux distros:** Ubuntu 22.04 LTS+, Debian 12+, Fedora 38+,
-RHEL / CentOS Stream 9, Rocky Linux 9, AlmaLinux 9, OpenSUSE Leap 15.6
-or Tumbleweed, SLES 15, Arch Linux (rolling), Manjaro (rolling).
-**Not supported:** Alpine (musl + OpenRC), Gentoo (OpenRC default),
-container-image base distros without an init.
+The operator console itself (`computeza serve`) compiles and
+runs on any OS that builds Rust. You can run the web UI on
+Windows pointing at remote Ubuntu hosts that own the actual
+installs once the multi-host install path lands in v0.1+; today
+the install actions are local-only and need an Ubuntu host. Spec
+section 10 documents the multi-OS roadmap.
 
 ## Core principles
 

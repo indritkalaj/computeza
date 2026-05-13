@@ -25,8 +25,8 @@ cmd-license-todo = `computeza license` -- show license tier, seat usage, activat
 
 # --- Install errors / platform gates ---
 
-install-postgres-linux-only = `computeza install postgres` is only supported on Linux in v0.0.x. macOS (launchd) and Windows (Services) variants ship in a follow-up release.
-install-postgres-unsupported-os = `computeza install postgres` only supports Linux (systemd) and macOS (launchd) in v0.0.x. Windows (Services) ships in a follow-up release.
+install-postgres-linux-only = `computeza install postgres` is only supported on Ubuntu Linux (22.04 LTS or 24.04 LTS) in v0.0.x. macOS, Windows, and non-Ubuntu Linux distros (Debian / Fedora / RHEL / openSUSE / Arch) move to v0.1+; the binding constraint is Databend's Ubuntu-only verified binary release.
+install-postgres-unsupported-os = `computeza install postgres` only supports Ubuntu Linux x86_64 (22.04 LTS or 24.04 LTS) in v0.0.x. macOS, Windows, and other Linux distros ship in v0.1+.
 
 # --- Status command ---
 
