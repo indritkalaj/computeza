@@ -51,6 +51,15 @@ pub struct ServiceInstall {
     /// Name of the CLI tool to symlink into `/usr/local/bin/computeza-<name>`.
     /// None means no PATH registration.
     pub cli_symlink: Option<CliSymlink>,
+    /// Environment variables to set on the service's systemd unit via
+    /// `Environment=` lines. Used by components that consume their
+    /// configuration through env vars rather than (or in addition to)
+    /// a config file -- e.g. lakekeeper's `ICEBERG_REST__PG_DATABASE_URL`.
+    /// Values are written verbatim into the unit; the driver is
+    /// responsible for shell-safe quoting if needed (typically not
+    /// needed because systemd parses Environment= line-by-line and
+    /// double-quotes inside values are literal).
+    pub env: Vec<(String, String)>,
 }
 
 /// One config file laid down before service start.
@@ -129,7 +138,13 @@ pub async fn install_service(
     progress.set_message(format!("Registering systemd unit {}", opts.unit_name));
     let bin_path = bin_dir.join(opts.binary_name);
     let args_str = opts.args.join(" ");
-    let unit_body = systemd_unit(opts.component, &bin_path, &args_str, &opts.root_dir);
+    let unit_body = systemd_unit(
+        opts.component,
+        &bin_path,
+        &args_str,
+        &opts.root_dir,
+        &opts.env,
+    );
     let unit_path = PathBuf::from("/etc/systemd/system").join(&opts.unit_name);
     fs::write(&unit_path, &unit_body).await?;
     info!(unit = %unit_path.display(), "wrote systemd unit");
@@ -274,7 +289,13 @@ pub enum ServiceError {
     NotReady { port: u16, timeout_secs: u64 },
 }
 
-fn systemd_unit(component: &str, bin_path: &Path, args: &str, root_dir: &Path) -> String {
+fn systemd_unit(
+    component: &str,
+    bin_path: &Path,
+    args: &str,
+    root_dir: &Path,
+    env: &[(String, String)],
+) -> String {
     // WorkingDirectory=<root>: many daemons (qdrant, kanidm,
     // probably others) resolve runtime paths -- snapshot temp
     // dirs, init-flag dot-files, log files -- relative to CWD.
@@ -288,6 +309,25 @@ fn systemd_unit(component: &str, bin_path: &Path, args: &str, root_dir: &Path) -
     // RuntimeDirectory=<component>: matches the postgres / kanidm
     // forward-compat. systemd mints /run/<component>/ for socket
     // / lock / pid files; cheap to include even when unused.
+    //
+    // Environment= lines: emitted one per `env` entry. Used by
+    // components like lakekeeper that consume their config via env
+    // vars (postgres connection string, encryption key, ...). We
+    // quote values with double quotes; systemd reads the value
+    // verbatim between the quotes, so embedded single quotes /
+    // shell metacharacters are fine. Embedded double quotes in
+    // values would need escaping; today's call sites don't supply
+    // any, and the function asserts on that in debug builds.
+    let env_block: String = env
+        .iter()
+        .map(|(k, v)| {
+            debug_assert!(
+                !v.contains('"'),
+                "Environment value for {k} contains a double quote which would break systemd parsing"
+            );
+            format!("Environment=\"{k}={v}\"\n         ")
+        })
+        .collect();
     format!(
         "[Unit]\n\
          Description=Computeza-managed {component}\n\
@@ -299,7 +339,7 @@ fn systemd_unit(component: &str, bin_path: &Path, args: &str, root_dir: &Path) -
          WorkingDirectory={root}\n\
          RuntimeDirectory={component}\n\
          RuntimeDirectoryMode=0755\n\
-         ExecStart={bin} {args}\n\
+         {env_block}ExecStart={bin} {args}\n\
          Restart=on-failure\n\
          RestartSec=5\n\
          NoNewPrivileges=yes\n\
@@ -314,6 +354,7 @@ fn systemd_unit(component: &str, bin_path: &Path, args: &str, root_dir: &Path) -
         bin = bin_path.display(),
         args = args,
         root = root_dir.display(),
+        env_block = env_block,
     )
 }
 

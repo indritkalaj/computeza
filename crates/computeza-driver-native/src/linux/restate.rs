@@ -90,6 +90,7 @@ pub async fn install(
             config: None,
             // restatectl ships in a separate tarball -- not bundled.
             cli_symlink: None,
+            env: Vec::new(),
         },
         progress,
     )

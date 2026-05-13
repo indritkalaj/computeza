@@ -76,6 +76,7 @@ pub async fn install(
             unit_name: opts.unit_name,
             config: None,
             cli_symlink: None,
+            env: Vec::new(),
         },
         progress,
     )
