@@ -92,11 +92,24 @@ pub async fn stop(unit: &str) -> Result<(), SystemctlError> {
 /// or a permissioned-out read returns an empty string rather than
 /// raising; the surrounding context is already an error.
 async fn journal_tail_for_unit(unit: &str) -> String {
+    journal_tail(unit, 30).await
+}
+
+/// Public variant exposed to per-component drivers so they can
+/// enrich their own failure paths (typically a `wait_for_ready`
+/// timeout where systemctl returned 0 but the daemon crashed
+/// during startup). Same best-effort semantics as
+/// [`journal_tail_for_unit`].
+///
+/// `lines` is the value passed to `journalctl -n` (clamp it to
+/// something reasonable -- 30 to 100 is the sane range).
+#[must_use]
+pub async fn journal_tail(unit: &str, lines: u32) -> String {
     let out = Command::new("journalctl")
         .arg("-u")
         .arg(unit)
         .arg("-n")
-        .arg("30")
+        .arg(lines.to_string())
         .arg("--no-pager")
         .arg("--output=cat")
         .output()

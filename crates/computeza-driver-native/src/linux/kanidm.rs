@@ -177,8 +177,22 @@ pub async fn install(
     //    We can't call `service::install_service` directly because it
     //    expects a Bundle to fetch -- the cargo path replaces that
     //    phase. Reimplement just the systemd registration here.
+    // Kanidm's binary looks up its web-UI static assets via the
+    // relative path `../core/static/...`. With systemd's default
+    // CWD of `/`, that resolves to nowhere and the daemon dies at
+    // startup with "Can't find external/bootstrap.bundle.min.js".
+    //
+    // In the source tree the binary lives at
+    // `<src>/server/daemon/target/release/kanidmd` and the assets
+    // at `<src>/server/core/static/...`, so setting
+    // WorkingDirectory=<src>/server/daemon makes the relative
+    // path resolve. We point the unit at the cached source tree
+    // (the same one we built from) -- ProtectSystem=strict only
+    // restricts writes, so the binary can still read the static
+    // assets without listing the src path in ReadWritePaths.
+    let working_dir = src_dir.join("server").join("daemon");
     let unit_path = PathBuf::from("/etc/systemd/system").join(&opts.unit_name);
-    let unit_body = systemd_unit(&bin_dir, &server_toml_path, &opts.root_dir);
+    let unit_body = systemd_unit(&bin_dir, &server_toml_path, &opts.root_dir, &working_dir);
     let mut f = fs::File::create(&unit_path).await?;
     f.write_all(unit_body.as_bytes()).await?;
     f.sync_all().await?;
@@ -194,7 +208,27 @@ pub async fn install(
         "Waiting for port {} to accept connections",
         opts.port
     ));
-    wait_for_port("127.0.0.1", opts.port, std::time::Duration::from_secs(60)).await?;
+    // wait_for_port returns NotReady on timeout; enrich it with
+    // the systemd journal so the operator sees the actual reason
+    // kanidmd crashed (config-schema mismatch, missing native lib,
+    // port in use, ...) on the install-result page instead of the
+    // generic "did not become ready" string.
+    if let Err(e) = wait_for_port("127.0.0.1", opts.port, std::time::Duration::from_secs(60)).await
+    {
+        if matches!(e, ServiceError::NotReady { .. }) {
+            let tail = super::systemctl::journal_tail(&opts.unit_name, 60).await;
+            if tail.is_empty() {
+                return Err(e);
+            }
+            return Err(ServiceError::Io(std::io::Error::other(format!(
+                "kanidmd did not bind 127.0.0.1:{} within 60s. Journal tail (most recent {} lines from `journalctl -u {} --no-pager`):\n\n{tail}",
+                opts.port,
+                tail.lines().count(),
+                opts.unit_name,
+            ))));
+        }
+        return Err(e);
+    }
 
     // 6. PATH shim for the kanidmd binary (no CLI tools shipped via
     //    this install path; operators install `kanidm_tools`
@@ -414,7 +448,18 @@ fn kanidm_server_toml(root_dir: &Path, port: u16, cert: &Path, key: &Path) -> St
     )
 }
 
-fn systemd_unit(bin_dir: &Path, config_path: &Path, root_dir: &Path) -> String {
+fn systemd_unit(bin_dir: &Path, config_path: &Path, root_dir: &Path, working_dir: &Path) -> String {
+    // RuntimeDirectory=kanidmd: matches the postgres / xtable
+    // forward-compat. Kanidm doesn't currently write to /run/, but
+    // adding the directive now is free and prevents a v0.1
+    // regression if a future kanidm version starts dropping socket
+    // / lock files there.
+    //
+    // WorkingDirectory=<src>/server/daemon: kanidm resolves its
+    // web UI static assets via the relative path
+    // `../core/static/...`. Without this directive the assets are
+    // looked up relative to systemd's default CWD of `/` and the
+    // daemon dies at startup with "Can't find external/...".
     format!(
         "[Unit]\n\
          Description=Computeza-managed Kanidm\n\
@@ -423,6 +468,9 @@ fn systemd_unit(bin_dir: &Path, config_path: &Path, root_dir: &Path) -> String {
          \n\
          [Service]\n\
          Type=simple\n\
+         RuntimeDirectory=kanidmd\n\
+         RuntimeDirectoryMode=0755\n\
+         WorkingDirectory={cwd}\n\
          ExecStart={bin}/kanidmd server -c {conf}\n\
          Restart=on-failure\n\
          RestartSec=5\n\
@@ -434,6 +482,7 @@ fn systemd_unit(bin_dir: &Path, config_path: &Path, root_dir: &Path) -> String {
          \n\
          [Install]\n\
          WantedBy=multi-user.target\n",
+        cwd = working_dir.display(),
         bin = bin_dir.display(),
         conf = config_path.display(),
         root = root_dir.display(),
