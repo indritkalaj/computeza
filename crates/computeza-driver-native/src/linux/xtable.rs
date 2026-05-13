@@ -512,34 +512,77 @@ async fn ensure_xtable_source_extracted(
 }
 
 /// Locate the shade-plugin bundled JAR after a successful build.
-/// Apache XTable's current module layout places it at
-/// `<src>/xtable-utilities/target/xtable-utilities-<v>-bundled.jar`,
-/// but if the project renames its shade output we fall back to a
-/// glob over `<src>/xtable-utilities/target/*-bundled.jar` so a
-/// minor upstream rename doesn't break the install.
-async fn locate_bundled_jar(src_dir: &Path, version: &str) -> Result<PathBuf, ServiceError> {
-    let target_dir = src_dir.join("xtable-utilities").join("target");
-    let expected = target_dir.join(format!("xtable-utilities-{version}-bundled.jar"));
-    if fs::try_exists(&expected).await.unwrap_or(false) {
-        return Ok(expected);
+///
+/// XTable shuffled module names across releases:
+///   - 0.3.0-incubating: `xtable-utilities/target/xtable-utilities-<v>-bundled.jar`
+///   - 0.2.0-incubating: the runnable fat JAR lives under a
+///     differently-named module (`utilities/`, or the shade output
+///     suffix differs)
+///
+/// We walk the whole source tree's `target/` dirs looking for any
+/// `*-bundled.jar`, then prefer the one from a `*utilities*` module
+/// when multiple candidates exist (intermediate shaded jars from
+/// other modules can also have `-bundled` in the name).
+async fn locate_bundled_jar(src_dir: &Path, _version: &str) -> Result<PathBuf, ServiceError> {
+    // `find` is in coreutils on every Linux distro we target; the
+    // -path glob restricts the walk to `*/target/*-bundled.jar`
+    // so we don't pull in spurious matches from source dirs.
+    let out = Command::new("find")
+        .arg(src_dir)
+        .arg("-path")
+        .arg("*/target/*-bundled.jar")
+        .output()
+        .await?;
+    if !out.status.success() {
+        return Err(ServiceError::Io(std::io::Error::other(format!(
+            "find for *-bundled.jar under {} failed (exit {:?}): {}",
+            src_dir.display(),
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))));
+    }
+    let candidates: Vec<PathBuf> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|s| PathBuf::from(s.trim()))
+        .filter(|p| !p.as_os_str().is_empty())
+        .collect();
+
+    // Prefer the utilities-module jar (contains the RunSync
+    // Main-Class manifest) over intermediate shaded jars from other
+    // modules.
+    if let Some(jar) = candidates.iter().find(|p| {
+        let s = p.to_string_lossy();
+        s.contains("/utilities/") || s.contains("/xtable-utilities/")
+    }) {
+        return Ok(jar.clone());
+    }
+    if let Some(jar) = candidates.first() {
+        return Ok(jar.clone());
     }
 
-    // Fallback: scan target/ for any *-bundled.jar.
-    if let Ok(mut rd) = fs::read_dir(&target_dir).await {
-        while let Ok(Some(entry)) = rd.next_entry().await {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if name_str.ends_with("-bundled.jar") {
-                return Ok(entry.path());
-            }
-        }
-    }
+    // Diagnostic fallback: surface what JARs the build actually
+    // produced so the operator (or future Claude) can pick the
+    // right module to target.
+    let all_jars = Command::new("find")
+        .arg(src_dir)
+        .arg("-path")
+        .arg("*/target/*.jar")
+        .output()
+        .await
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
 
     Err(ServiceError::Io(std::io::Error::other(format!(
-        "mvn build succeeded but no bundled JAR found under {} (expected \
-         xtable-utilities-{version}-bundled.jar). XTable's shade-plugin output \
-         naming may have changed at this version.",
-        target_dir.display()
+        "mvn build succeeded but no *-bundled.jar found anywhere under {}. \
+         XTable's shade-plugin output naming may have changed at this version.\n\n\
+         All JARs produced by the build (for diagnostic purposes):\n{}",
+        src_dir.display(),
+        if all_jars.is_empty() {
+            "(none found -- the build may not have produced any jars)".to_string()
+        } else {
+            all_jars
+        }
     ))))
 }
 
