@@ -68,6 +68,11 @@ pub async fn install(
             grpc = opts.port + 1,
             root = opts.root_dir.display(),
         ),
+        // Qdrant's config is driver-owned (we set port + storage
+        // path; operator should NOT hand-edit this -- they tweak
+        // via the install form's port override). Re-install
+        // overwrites freely.
+        overwrite_if_present: true,
     };
     let args = vec![
         "--config-path".into(),

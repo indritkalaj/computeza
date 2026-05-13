@@ -62,6 +62,13 @@ pub async fn install(
     progress: &ProgressHandle,
 ) -> Result<InstalledService, ServiceError> {
     let bundle = pick_bundle(opts.version.as_deref()).clone();
+    // Databend's config is a starting-point template that
+    // operators frequently extend (adding catalogs pointing at
+    // lakekeeper, swapping storage backends to S3 via Garage,
+    // etc.). `overwrite_if_present: false` preserves those edits
+    // across re-installs; the driver's contents only land on the
+    // first install or after the operator manually deletes the
+    // file.
     let config = ConfigFile {
         filename: "databend-query.toml".into(),
         contents: format!(
@@ -69,6 +76,7 @@ pub async fn install(
             port = opts.port,
             root = opts.root_dir.display(),
         ),
+        overwrite_if_present: false,
     };
     let args = vec![
         "-c".into(),

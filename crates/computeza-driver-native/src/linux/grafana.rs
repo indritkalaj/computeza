@@ -60,10 +60,66 @@ pub async fn install(
     progress: &ProgressHandle,
 ) -> Result<InstalledService, ServiceError> {
     let bundle = pick_bundle(opts.version.as_deref()).clone();
+
+    // Grafana's `--homepath` must point at the EXTRACTED tarball
+    // root (the directory that contains `conf/defaults.ini`,
+    // `public/`, `plugins-bundled/`), not at an arbitrary path
+    // under `<root>/`. The shared `install_service` extracts into
+    // `<root>/binaries/<version>/<bin_subpath_parent>/`. We
+    // reconstruct that path here from the bundle metadata.
+    let version_subdir = std::path::Path::new(bundle.bin_subpath)
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default();
+    let homepath = opts
+        .root_dir
+        .join("binaries")
+        .join(bundle.version)
+        .join(&version_subdir);
+
+    // Pin data + logs to stable paths under <root> so grafana's
+    // SQLite DB survives version bumps (the binaries/ cache may
+    // be pruned in v0.1+ but data/ + logs/ must persist). The
+    // env vars override grafana.ini's `[paths]` section at
+    // runtime.
+    let data_path = opts.root_dir.join("data");
+    let logs_path = opts.root_dir.join("logs");
+    let plugins_path = opts.root_dir.join("plugins");
+    let provisioning_path = opts.root_dir.join("conf").join("provisioning");
+
+    // Pre-create the data / logs / plugins / provisioning
+    // directories so grafana doesn't have to (and so a
+    // misconfigured sandbox fails-fast with a clearer error than
+    // grafana's own).
+    for p in [&data_path, &logs_path, &plugins_path, &provisioning_path] {
+        if let Err(e) = tokio::fs::create_dir_all(p).await {
+            tracing::warn!(path = %p.display(), error = %e, "pre-creating grafana state dir failed; grafana will retry");
+        }
+    }
+
+    let env = vec![
+        (
+            "GF_PATHS_DATA".into(),
+            data_path.to_string_lossy().into_owned(),
+        ),
+        (
+            "GF_PATHS_LOGS".into(),
+            logs_path.to_string_lossy().into_owned(),
+        ),
+        (
+            "GF_PATHS_PLUGINS".into(),
+            plugins_path.to_string_lossy().into_owned(),
+        ),
+        (
+            "GF_PATHS_PROVISIONING".into(),
+            provisioning_path.to_string_lossy().into_owned(),
+        ),
+    ];
+
     let args = vec![
         "server".into(),
         "--homepath".into(),
-        opts.root_dir.join("home").to_string_lossy().into_owned(),
+        homepath.to_string_lossy().into_owned(),
     ];
     service::install_service(
         ServiceInstall {
@@ -76,7 +132,7 @@ pub async fn install(
             unit_name: opts.unit_name,
             config: None,
             cli_symlink: None,
-            env: Vec::new(),
+            env,
         },
         progress,
     )

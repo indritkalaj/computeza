@@ -13,6 +13,7 @@
 
 pub mod path;
 pub mod postgres;
+pub mod release;
 pub mod service;
 pub mod systemctl;
 

@@ -205,6 +205,24 @@ pub async fn install(
         }
     }
 
+    // 4b. Stub datasets.yaml. xtable's RunSync requires
+    //     `--datasetConfig <file>`; on a fresh install the operator
+    //     hasn't supplied one yet, so write an empty stub. The
+    //     daemon will sync nothing until the operator replaces this
+    //     with a real spec, which is the v0.0.x behaviour we want
+    //     (install plumbing today, real sync later). Skip if the
+    //     operator has already laid one down to avoid clobbering
+    //     their work.
+    let datasets_path = opts.root_dir.join("datasets.yaml");
+    if !fs::try_exists(&datasets_path).await.unwrap_or(false) {
+        let stub = "# Apache XTable dataset sync spec. Generated on install.\n\
+                    # Replace this stub with your real source/target spec when ready.\n\
+                    # See https://xtable.apache.org/docs/setup for the schema.\n\
+                    datasets: []\n";
+        fs::write(&datasets_path, stub).await?;
+        info!(path = %datasets_path.display(), "wrote stub datasets.yaml");
+    }
+
     // 5. systemd unit. ExecStart shape depends on which classpath
     //    path won: a fat JAR launches with `java -jar`, a Maven-
     //    resolved lib dir launches with `java -cp lib/* RunSync`.
@@ -316,21 +334,31 @@ enum XtableClasspath {
 }
 
 fn systemd_unit(java_bin: &Path, classpath: &XtableClasspath, root_dir: &Path) -> String {
-    // We launch the utilities runner as a one-shot foreground process
-    // pointed at a config file we don't yet generate. v0.1 wires the
-    // operator-supplied source/target spec; for v0.0.x the unit
-    // installs but won't sync anything useful until the spec is in
-    // place. ExecStart shape stays stable so the spec drop-in is
-    // additive.
+    // xtable's RunSync exits after one sync cycle. With
+    // Type=simple + Restart=on-failure, systemd would re-launch
+    // immediately and we'd be in a tight CPU loop. The correct
+    // shape is Type=oneshot + RemainAfterExit=yes so:
+    //   - systemd waits for ExecStart to return (this is what
+    //     `systemctl start` expects to complete).
+    //   - The unit is considered "active" after a successful exit
+    //     (RemainAfterExit) so dependent units are happy.
+    //   - There is no restart loop. The operator triggers
+    //     subsequent syncs via a systemd timer (v0.1+) or by
+    //     re-running `systemctl start computeza-xtable`.
+    //
+    // The default JVM heap is too generous for a sync-only batch
+    // job; cap at 512 MiB so the host doesn't OOM when a colocated
+    // postgres or qdrant is also live. Operators with very large
+    // tables override via a systemd drop-in.
     let exec_start = match classpath {
         XtableClasspath::FatJar(jar) => format!(
-            "{java} -jar {jar} --datasetConfig {root}/datasets.yaml",
+            "{java} $JAVA_OPTS -jar {jar} --datasetConfig {root}/datasets.yaml",
             java = java_bin.display(),
             jar = jar.display(),
             root = root_dir.display(),
         ),
         XtableClasspath::LibDir(lib) => format!(
-            "{java} -cp {lib}/* org.apache.xtable.utilities.RunSync --datasetConfig {root}/datasets.yaml",
+            "{java} $JAVA_OPTS -cp {lib}/* org.apache.xtable.utilities.RunSync --datasetConfig {root}/datasets.yaml",
             java = java_bin.display(),
             lib = lib.display(),
             root = root_dir.display(),
@@ -338,12 +366,9 @@ fn systemd_unit(java_bin: &Path, classpath: &XtableClasspath, root_dir: &Path) -
     };
     // RuntimeDirectory=xtable: forward-compat for v0.1+ when the
     // unit becomes long-running (a daemon polling the dataset
-    // spec). v0.0.x runs as a one-shot batch job that doesn't need
-    // /run/xtable/, but the directive is free if unused -- systemd
-    // mints the dir on start and tears it down on stop. Adding it
-    // now means a v0.1 unit upgrade that introduces socket / PID
-    // files won't repeat the postgres-style read-only-fs
-    // regression.
+    // spec). v0.0.x runs as a one-shot batch job that doesn't
+    // need /run/xtable/, but the directive is free if unused --
+    // systemd mints the dir on start and tears it down on stop.
     format!(
         "[Unit]\n\
          Description=Computeza-managed Apache XTable runner\n\
@@ -351,12 +376,12 @@ fn systemd_unit(java_bin: &Path, classpath: &XtableClasspath, root_dir: &Path) -
          Wants=network-online.target\n\
          \n\
          [Service]\n\
-         Type=simple\n\
+         Type=oneshot\n\
+         RemainAfterExit=yes\n\
+         Environment=\"JAVA_OPTS=-Xmx512m\"\n\
          RuntimeDirectory=xtable\n\
          RuntimeDirectoryMode=0755\n\
-         ExecStart={exec_start}\n\
-         Restart=on-failure\n\
-         RestartSec=10\n\
+         ExecStart=/bin/sh -c '{exec_start}'\n\
          NoNewPrivileges=yes\n\
          PrivateTmp=yes\n\
          ProtectSystem=strict\n\
@@ -466,14 +491,28 @@ mod tests {
         let jar = PathBuf::from("/var/lib/computeza/xtable/lib/xtable-fat.jar");
         let root = PathBuf::from("/var/lib/computeza/xtable");
         let unit = systemd_unit(&java, &XtableClasspath::FatJar(jar.clone()), &root);
-        assert!(unit.contains(&format!(
-            "ExecStart={} -jar {} --datasetConfig {}/datasets.yaml",
-            java.display(),
-            jar.display(),
-            root.display()
-        )));
+        assert!(
+            unit.contains(&format!(
+                "-jar {} --datasetConfig {}/datasets.yaml",
+                jar.display(),
+                root.display()
+            )),
+            "ExecStart should invoke `java -jar <jar> --datasetConfig <root>/datasets.yaml`"
+        );
         assert!(unit.contains("ReadWritePaths=/var/lib/computeza/xtable"));
-        assert!(unit.contains("Restart=on-failure"));
+        assert!(
+            unit.contains("Type=oneshot"),
+            "xtable's RunSync exits after one cycle -- unit must be Type=oneshot, not Type=simple"
+        );
+        assert!(
+            unit.contains("RemainAfterExit=yes"),
+            "oneshot must remain-after-exit so systemctl is-active reports active"
+        );
+        assert!(
+            !unit.contains("Restart=on-failure"),
+            "no restart loop on a oneshot"
+        );
+        assert!(unit.contains("JAVA_OPTS=-Xmx512m"));
     }
 
     #[test]
@@ -483,8 +522,7 @@ mod tests {
         let root = PathBuf::from("/var/lib/computeza/xtable");
         let unit = systemd_unit(&java, &XtableClasspath::LibDir(lib.clone()), &root);
         assert!(unit.contains(&format!(
-            "ExecStart={} -cp {}/* org.apache.xtable.utilities.RunSync --datasetConfig {}/datasets.yaml",
-            java.display(),
+            "-cp {}/* org.apache.xtable.utilities.RunSync --datasetConfig {}/datasets.yaml",
             lib.display(),
             root.display()
         )));

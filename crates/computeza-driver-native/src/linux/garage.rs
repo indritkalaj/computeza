@@ -33,7 +33,13 @@ use tracing::info;
 
 use crate::progress::{InstallPhase, ProgressHandle};
 
+use super::release::{self, ReleaseManifest};
 use super::service::{InstalledService, ServiceError, Uninstalled};
+
+/// How many old release directories to retain after a successful
+/// install. Matches the kanidm driver; rationale documented in
+/// `linux::release`.
+const GARAGE_RELEASE_RETENTION: usize = 3;
 
 pub const UNIT_NAME: &str = "computeza-garage.service";
 pub const DEFAULT_S3_PORT: u16 = 3900;
@@ -105,9 +111,12 @@ pub async fn install(
     ));
     cargo_build_release(&cargo_path, &src_dir).await?;
 
-    // 4. Stable binary path under <root>/bin/garage.
-    let bin_dir = opts.root_dir.join("bin");
-    fs::create_dir_all(&bin_dir).await?;
+    // 4. Stage the freshly-built binary into a release directory
+    //    and atomic-swap `<root>/current` to point at it. systemd
+    //    ExecStart references `<root>/current/garage`, so the
+    //    symlink swap is what actually upgrades the running
+    //    daemon -- never an in-place overwrite of the executing
+    //    binary.
     let built = src_dir.join("target").join("release").join("garage");
     if !fs::try_exists(&built).await.unwrap_or(false) {
         return Err(ServiceError::BinaryMissing {
@@ -115,43 +124,90 @@ pub async fn install(
             bin_dir: src_dir.join("target").join("release"),
         });
     }
-    let final_binary = bin_dir.join("garage");
-
-    // Stop the service before replacing the binary so a re-install
-    // (where garage is already running) does not hit `Text file
-    // busy` (ETXTBSY) on the copy. Best-effort: on a fresh install
-    // the unit doesn't exist yet, so `systemctl stop` returns
-    // non-zero harmlessly.
-    let _ = super::systemctl::stop(&opts.unit_name).await;
-
-    // Atomic replace via tmp + rename. rename() on Linux works even
-    // if the target is currently executing -- the kernel re-points
-    // the directory entry to a new inode rather than overwriting
-    // the existing one in place.
-    let tmp_binary = bin_dir.join("garage.new");
-    if fs::try_exists(&tmp_binary).await.unwrap_or(false) {
-        let _ = fs::remove_file(&tmp_binary).await;
-    }
-    fs::copy(&built, &tmp_binary).await?;
+    progress.set_message(format!(
+        "Staging garage v{version} into a fresh release directory"
+    ));
+    let new_release = release::new_release(&opts.root_dir, version)
+        .await
+        .map_err(release_error_to_service)?;
+    let release_binary = new_release.dir.join("garage");
+    fs::copy(&built, &release_binary).await?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o755);
-        let _ = tokio::fs::set_permissions(&tmp_binary, perms).await;
+        let _ = tokio::fs::set_permissions(&release_binary, perms).await;
     }
-    fs::rename(&tmp_binary, &final_binary).await?;
+
+    // Pre-flight probe: confirm the binary at least executes
+    // `--version` before we swap it in. Catches glibc / linker
+    // problems BEFORE disrupting the running release.
+    progress.set_message("Pre-flighting the new garage binary (--version probe)");
+    release::preflight_probe(&new_release, "garage", &["--version"])
+        .await
+        .map_err(release_error_to_service)?;
+
+    let manifest = ReleaseManifest {
+        version: version.to_string(),
+        built_at: chrono::Utc::now(),
+        binary_sha256: None,
+    };
+    release::write_manifest(&new_release, &manifest)
+        .await
+        .map_err(release_error_to_service)?;
+
+    // Stop the running service (if any) BEFORE the symlink swap so
+    // the post-install `enable --now` actually launches the new
+    // binary.
+    let _ = super::systemctl::stop(&opts.unit_name).await;
+
+    progress.set_message(format!(
+        "Atomic-swap of <root>/current to the new release {}",
+        new_release.id
+    ));
+    release::make_current(&new_release)
+        .await
+        .map_err(release_error_to_service)?;
+
+    let pruned = release::prune_releases(&opts.root_dir, GARAGE_RELEASE_RETENTION)
+        .await
+        .map_err(release_error_to_service)?;
+    if !pruned.is_empty() {
+        info!(
+            count = pruned.len(),
+            retained = GARAGE_RELEASE_RETENTION,
+            "pruned stale garage release directories"
+        );
+    }
+
+    let current_dir = opts.root_dir.join("current");
+    let final_binary = current_dir.join("garage");
 
     // 5. Config + systemd unit.
+    //
+    // garage.toml is a starting-point template that operators
+    // edit -- the rpc_secret, admin_token, and metrics_token all
+    // ship as `change-me` placeholders and should be rotated by
+    // the operator before exposing the daemon. Preserve those
+    // edits across re-installs by writing only when the file
+    // doesn't already exist.
     let s3_port = opts.port;
     let rpc_port = s3_port + 1;
     let web_port = s3_port + 2;
     let admin_port = s3_port + 3;
     let config_path = opts.root_dir.join("garage.toml");
-    let config = garage_toml(&opts.root_dir, s3_port, rpc_port, web_port, admin_port);
-    let mut f = fs::File::create(&config_path).await?;
-    f.write_all(config.as_bytes()).await?;
-    f.sync_all().await?;
-    info!(config = %config_path.display(), "wrote garage.toml");
+    if !fs::try_exists(&config_path).await.unwrap_or(false) {
+        let config = garage_toml(&opts.root_dir, s3_port, rpc_port, web_port, admin_port);
+        let mut f = fs::File::create(&config_path).await?;
+        f.write_all(config.as_bytes()).await?;
+        f.sync_all().await?;
+        info!(config = %config_path.display(), "wrote garage.toml");
+    } else {
+        info!(
+            config = %config_path.display(),
+            "garage.toml already exists; re-install preserves operator edits (delete the file to regenerate)"
+        );
+    }
 
     let unit_path = PathBuf::from("/etc/systemd/system").join(&opts.unit_name);
     let unit = systemd_unit(&final_binary, &config_path, &opts.root_dir);
@@ -182,11 +238,20 @@ pub async fn install(
     };
 
     Ok(InstalledService {
-        bin_dir,
+        bin_dir: current_dir,
         unit_path,
         port: opts.port,
         cli_symlink,
     })
+}
+
+/// Convert a `release::ReleaseError` into the driver's
+/// `ServiceError::Io`. Matches the kanidm driver's boundary
+/// convention (the release module has its own error type for
+/// separation of concerns; we squash to the driver's outward
+/// error shape here).
+fn release_error_to_service(e: release::ReleaseError) -> ServiceError {
+    ServiceError::Io(std::io::Error::other(e.to_string()))
 }
 
 #[derive(Clone, Debug)]

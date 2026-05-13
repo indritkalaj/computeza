@@ -42,7 +42,14 @@ use tracing::info;
 
 use crate::progress::{InstallPhase, ProgressHandle};
 
+use super::release::{self, ReleaseManifest};
 use super::service::{self, InstalledService, ServiceError, Uninstalled};
+
+/// How many old release directories to retain after a successful
+/// install. Three is the sweet spot: enough for "rollback to the
+/// version before last" without burning unbounded disk. The
+/// active release is always preserved regardless.
+const KANIDM_RELEASE_RETENTION: usize = 3;
 
 pub const SERVICE_NAME: &str = "computeza-kanidm";
 pub const UNIT_NAME: &str = "computeza-kanidm.service";
@@ -133,8 +140,6 @@ pub async fn install(
     ));
     cargo_build_kanidmd(&cargo_path, &src_dir).await?;
 
-    let bin_dir = opts.root_dir.join("bin");
-    fs::create_dir_all(&bin_dir).await?;
     let built = src_dir.join("target").join("release").join("kanidmd");
     if !fs::try_exists(&built).await.unwrap_or(false) {
         return Err(ServiceError::BinaryMissing {
@@ -142,40 +147,89 @@ pub async fn install(
             bin_dir: src_dir.join("target").join("release"),
         });
     }
-    let final_binary = bin_dir.join("kanidmd");
 
-    // Stop the service before replacing the binary so a re-install
-    // (where kanidmd is already running from a previous attempt)
-    // does not hit `Text file busy` (ETXTBSY) on the copy. Linux
-    // refuses to overwrite an executable that's currently mapped
-    // into a running process. Best-effort: on a fresh install the
-    // unit doesn't exist yet, and `systemctl stop` against a
-    // missing unit returns non-zero but the failure is harmless.
-    let _ = super::systemctl::stop(&opts.unit_name).await;
-
-    // Atomic replace via tmp + rename: defensive in case the stop
-    // above was a no-op or something else still holds the inode.
-    // `rename` works on Linux even when the target is executing
-    // because the kernel re-points the directory entry to a new
-    // inode rather than overwriting in place.
-    let tmp_binary = bin_dir.join("kanidmd.new");
-    if fs::try_exists(&tmp_binary).await.unwrap_or(false) {
-        let _ = fs::remove_file(&tmp_binary).await;
-    }
-    fs::copy(&built, &tmp_binary).await?;
+    // Lay the freshly-built binary into a fresh release directory
+    // and atomic-swap `<root>/current` to point at it. The systemd
+    // unit's ExecStart and WorkingDirectory both reference
+    // `<root>/current/...`, so the swap is what actually upgrades
+    // the running daemon -- never an in-place overwrite of the
+    // executing binary.
+    progress.set_message(format!(
+        "Staging kanidm v{version} into a fresh release directory"
+    ));
+    let new_release = release::new_release(&opts.root_dir, version)
+        .await
+        .map_err(release_error_to_service)?;
+    let release_binary = new_release.dir.join("kanidmd");
+    fs::copy(&built, &release_binary).await?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o755);
-        let _ = tokio::fs::set_permissions(&tmp_binary, perms).await;
+        let _ = tokio::fs::set_permissions(&release_binary, perms).await;
     }
-    fs::rename(&tmp_binary, &final_binary).await?;
-    if !fs::try_exists(&final_binary).await.unwrap_or(false) {
-        return Err(ServiceError::BinaryMissing {
-            binary: "kanidmd".into(),
-            bin_dir: bin_dir.clone(),
-        });
+
+    // Symlink the cached source tree into the release dir as
+    // `src/`. The systemd unit's WorkingDirectory points at
+    // `<root>/current/src/server/daemon` so kanidmd's relative
+    // `../core/static/...` lookup resolves correctly regardless of
+    // which release is active.
+    let src_link = new_release.dir.join("src");
+    let src_link_target = std::path::Path::new("../..")
+        .join("src")
+        .join(format!("kanidm-{version}"));
+    let target_clone = src_link_target.clone();
+    let link_clone = src_link.clone();
+    tokio::task::spawn_blocking(move || std::os::unix::fs::symlink(&target_clone, &link_clone))
+        .await
+        .map_err(|e| ServiceError::Io(std::io::Error::other(e.to_string())))??;
+
+    // Pre-flight: confirm the freshly-built binary at least
+    // executes `--version` before we swap it in. Catches glibc /
+    // sqlite / linker problems BEFORE the running daemon is
+    // disrupted.
+    progress.set_message("Pre-flighting the new kanidmd binary (--version probe)");
+    release::preflight_probe(&new_release, "kanidmd", &["--version"])
+        .await
+        .map_err(release_error_to_service)?;
+
+    let manifest = ReleaseManifest {
+        version: version.to_string(),
+        built_at: chrono::Utc::now(),
+        binary_sha256: None,
+    };
+    release::write_manifest(&new_release, &manifest)
+        .await
+        .map_err(release_error_to_service)?;
+
+    // Stop the running service (if any) BEFORE the symlink swap so
+    // the post-install `enable --now` actually launches the new
+    // binary. Best-effort: missing-unit failures are harmless.
+    let _ = super::systemctl::stop(&opts.unit_name).await;
+
+    progress.set_message(format!(
+        "Atomic-swap of <root>/current to the new release {}",
+        new_release.id
+    ));
+    release::make_current(&new_release)
+        .await
+        .map_err(release_error_to_service)?;
+
+    // Retention: prune all but the most recent N releases. The
+    // active release is preserved even when it's older.
+    let pruned = release::prune_releases(&opts.root_dir, KANIDM_RELEASE_RETENTION)
+        .await
+        .map_err(release_error_to_service)?;
+    if !pruned.is_empty() {
+        info!(
+            count = pruned.len(),
+            retained = KANIDM_RELEASE_RETENTION,
+            "pruned stale kanidm release directories"
+        );
     }
+
+    let current_dir = opts.root_dir.join("current");
+    let final_binary = current_dir.join("kanidmd");
 
     // 3. Self-signed TLS cert (kanidm requires TLS even on loopback).
     progress.set_phase(InstallPhase::Initdb);
@@ -194,25 +248,28 @@ pub async fn install(
     fs::write(&server_toml_path, server_toml).await?;
 
     // 5. systemd unit + start, reusing the service helper's tail.
-    //    We can't call `service::install_service` directly because it
-    //    expects a Bundle to fetch -- the cargo path replaces that
-    //    phase. Reimplement just the systemd registration here.
-    // Kanidm's binary looks up its web-UI static assets via the
-    // relative path `../core/static/...`. With systemd's default
-    // CWD of `/`, that resolves to nowhere and the daemon dies at
-    // startup with "Can't find external/bootstrap.bundle.min.js".
+    //    We can't call `service::install_service` directly because
+    //    it expects a Bundle to fetch -- the cargo path replaces
+    //    that phase. Reimplement just the systemd registration
+    //    here.
     //
-    // In the source tree the binary lives at
-    // `<src>/server/daemon/target/release/kanidmd` and the assets
-    // at `<src>/server/core/static/...`, so setting
-    // WorkingDirectory=<src>/server/daemon makes the relative
-    // path resolve. We point the unit at the cached source tree
-    // (the same one we built from) -- ProtectSystem=strict only
-    // restricts writes, so the binary can still read the static
-    // assets without listing the src path in ReadWritePaths.
-    let working_dir = src_dir.join("server").join("daemon");
+    // ExecStart and WorkingDirectory both route through
+    // `<root>/current/`, the symlink the release module manages.
+    // Future re-installs just swap the symlink atomically; the
+    // unit file doesn't need rewriting unless the unit_name or
+    // root_dir changes. WorkingDirectory=<root>/current/src/server/daemon
+    // makes kanidmd's `../core/static/...` lookup resolve through
+    // the release dir's `src` symlink into the cached source
+    // tree. ProtectSystem=strict only restricts writes, so the
+    // binary can read the static assets without listing the
+    // resolved path in ReadWritePaths.
     let unit_path = PathBuf::from("/etc/systemd/system").join(&opts.unit_name);
-    let unit_body = systemd_unit(&bin_dir, &server_toml_path, &opts.root_dir, &working_dir);
+    let unit_body = systemd_unit(
+        &current_dir,
+        &server_toml_path,
+        &opts.root_dir,
+        &working_dir,
+    );
     let mut f = fs::File::create(&unit_path).await?;
     f.write_all(unit_body.as_bytes()).await?;
     f.sync_all().await?;
@@ -252,9 +309,11 @@ pub async fn install(
 
     // 6. PATH shim for the kanidmd binary (no CLI tools shipped via
     //    this install path; operators install `kanidm_tools`
-    //    separately if they want the client).
+    //    separately if they want the client). The shim points at
+    //    `<root>/current/kanidmd` so it follows future release
+    //    swaps automatically -- no need to re-register on upgrade.
     progress.set_phase(InstallPhase::RegisteringPath);
-    let cli_symlink = match super::path::register("kanidmd", &bin_dir.join("kanidmd")).await {
+    let cli_symlink = match super::path::register("kanidmd", &final_binary).await {
         Ok(p) => Some(p),
         Err(e) => {
             tracing::warn!(error = %e, "registering kanidmd symlink failed; non-fatal");
@@ -263,11 +322,19 @@ pub async fn install(
     };
 
     Ok(InstalledService {
-        bin_dir,
+        bin_dir: current_dir,
         unit_path,
         port: opts.port,
         cli_symlink,
     })
+}
+
+/// Convert a `release::ReleaseError` into the driver's
+/// `ServiceError::Io`. The release module has its own error type
+/// for separation of concerns; converting at the boundary keeps
+/// the driver's outward error surface unchanged.
+fn release_error_to_service(e: release::ReleaseError) -> ServiceError {
+    ServiceError::Io(std::io::Error::other(e.to_string()))
 }
 
 #[derive(Clone, Debug)]

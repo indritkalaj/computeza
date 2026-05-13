@@ -70,6 +70,14 @@ pub struct ConfigFile {
     pub filename: String,
     /// Verbatim contents.
     pub contents: String,
+    /// Idempotency policy. `true` (the default for most drivers)
+    /// overwrites any existing config -- safe for files the
+    /// driver fully owns. `false` writes only when the path
+    /// doesn't exist, preserving operator edits across re-installs.
+    /// Drivers whose config is meant as a starting-point template
+    /// (databend, future grafana.ini, ...) should set this to
+    /// `false`.
+    pub overwrite_if_present: bool,
 }
 
 /// PATH-shim registration for a CLI that ships in the bundle.
@@ -125,13 +133,23 @@ pub async fn install_service(
     }
 
     if let Some(cfg) = &opts.config {
-        progress.set_message(format!(
-            "Writing config {}/{}",
-            opts.root_dir.display(),
-            cfg.filename
-        ));
         fs::create_dir_all(&opts.root_dir).await?;
-        fs::write(opts.root_dir.join(&cfg.filename), &cfg.contents).await?;
+        let target = opts.root_dir.join(&cfg.filename);
+        let already_present = fs::try_exists(&target).await.unwrap_or(false);
+        if already_present && !cfg.overwrite_if_present {
+            progress.set_message(format!(
+                "Keeping operator-edited config at {} (re-install does not clobber)",
+                target.display()
+            ));
+            info!(path = %target.display(), "config preserved (overwrite_if_present=false)");
+        } else {
+            progress.set_message(format!(
+                "Writing config {}/{}",
+                opts.root_dir.display(),
+                cfg.filename
+            ));
+            fs::write(&target, &cfg.contents).await?;
+        }
     }
 
     progress.set_phase(InstallPhase::RegisteringService);
