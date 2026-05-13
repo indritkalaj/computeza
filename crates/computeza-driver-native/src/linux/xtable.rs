@@ -288,13 +288,23 @@ pub async fn install(
         info!(path = %datasets_path.display(), "wrote stub datasets.yaml");
     }
 
-    // 8. systemd unit. Uses the bundled fat JAR's embedded Main-Class
-    //    manifest, so the ExecStart is `java -jar <jar>` with no
-    //    explicit class name.
+    // 8. Discover the RunSync entry-point class by reading the
+    //    JAR. xtable-utilities's shade-plugin doesn't write a
+    //    Main-Class manifest entry, AND the class's package path
+    //    has shifted across releases (io.onetable.utility.* before
+    //    the Apache donation; org.apache.xtable.utilities.* after;
+    //    different point releases vary). Reading the actual class
+    //    out of the JAR sidesteps the version-by-version guessing.
+    let run_sync_class = discover_run_sync_class(&dest_jar).await?;
+    info!(class = %run_sync_class, "discovered xtable RunSync entry-point class");
+
+    // 9. systemd unit. ExecStart uses `java -cp <jar> <class>` (not
+    //    `-jar`) because the shaded JAR has no Main-Class manifest;
+    //    the class name we just discovered names the entry point.
     progress.set_phase(InstallPhase::RegisteringService);
     progress.set_message(format!("Registering systemd unit {}", opts.unit_name));
     let unit_path = PathBuf::from("/etc/systemd/system").join(&opts.unit_name);
-    let unit_body = systemd_unit(&java_bin, &dest_jar, &opts.root_dir);
+    let unit_body = systemd_unit(&java_bin, &dest_jar, &run_sync_class, &opts.root_dir);
     let mut f = fs::File::create(&unit_path).await?;
     f.write_all(unit_body.as_bytes()).await?;
     f.sync_all().await?;
@@ -637,15 +647,88 @@ async fn locate_bundled_jar(src_dir: &Path, _version: &str) -> Result<PathBuf, S
     ))))
 }
 
-/// Fully-qualified class name of XTable's RunSync entry point.
-/// Stable across 0.2.0 and 0.3.0-incubating; only used because the
-/// shade-plugin config in `xtable-utilities` doesn't write a
-/// Main-Class manifest entry, so `java -jar` fails with `no main
-/// manifest attribute`. `java -cp <jar> <classname>` is the
-/// upstream-documented invocation (see xtable.apache.org/docs/setup).
-const RUN_SYNC_CLASS: &str = "org.apache.xtable.utilities.RunSync";
+/// Read the bundled JAR (it's a ZIP) and discover the
+/// fully-qualified class name of XTable's RunSync entry point.
+///
+/// XTable's `xtable-utilities` shade-plugin doesn't write a
+/// Main-Class manifest entry, so `java -jar` doesn't work.
+/// `java -cp <jar> <class>` is the upstream-documented invocation,
+/// but the class's package path has shifted across releases:
+///   - 0.1.x and earlier (pre-Apache): `io.onetable.utility.RunSync`
+///   - 0.2.0+: somewhere under `org.apache.xtable.*`
+///   - The exact subpackage drifts (`.utility`, `.utilities`, etc.)
+///
+/// Reading the actual class path from the JAR sidesteps the
+/// version-by-version guessing. We try MANIFEST.MF's Main-Class
+/// first (in case a future release adds one); if that's absent, we
+/// scan ZIP entries for any `*RunSync.class` and convert the path
+/// (`org/apache/xtable/utilities/RunSync.class` ->
+/// `org.apache.xtable.utilities.RunSync`).
+async fn discover_run_sync_class(jar: &Path) -> Result<String, ServiceError> {
+    let jar = jar.to_owned();
+    // zip crate is synchronous; spawn_blocking keeps the tokio
+    // worker pool free during the (millisecond) probe.
+    let result = tokio::task::spawn_blocking(move || -> std::io::Result<String> {
+        use std::io::Read;
+        let file = std::fs::File::open(&jar)?;
+        let mut archive = zip::ZipArchive::new(file).map_err(|e| {
+            std::io::Error::other(format!("opening jar as zip: {e}"))
+        })?;
 
-fn systemd_unit(java_bin: &Path, jar: &Path, root_dir: &Path) -> String {
+        // Try MANIFEST.MF Main-Class first.
+        if let Ok(mut manifest) = archive.by_name("META-INF/MANIFEST.MF") {
+            let mut content = String::new();
+            if manifest.read_to_string(&mut content).is_ok() {
+                // MANIFEST.MF folds lines >72 chars onto the next
+                // with a leading space; un-fold before parsing.
+                let unfolded = content.replace("\r\n ", "").replace("\n ", "");
+                for line in unfolded.lines() {
+                    if let Some(class) = line.strip_prefix("Main-Class:") {
+                        return Ok(class.trim().to_string());
+                    }
+                }
+            }
+        }
+
+        // Fallback: scan all entries for `*RunSync.class`. Prefer
+        // ones containing "utilities" (the entry-point lives in
+        // the utilities module; transitively-shaded deps that
+        // happen to also define a RunSync class would be a
+        // surprise, but biasing toward "utilities" handles that
+        // case correctly).
+        let mut best: Option<String> = None;
+        let mut fallback: Option<String> = None;
+        for i in 0..archive.len() {
+            let entry = archive.by_index(i).map_err(|e| {
+                std::io::Error::other(format!("reading zip entry {i}: {e}"))
+            })?;
+            let name = entry.name();
+            if !name.ends_with("/RunSync.class") && name != "RunSync.class" {
+                continue;
+            }
+            let class_name = name.trim_end_matches(".class").replace('/', ".");
+            if name.contains("utilities") || name.contains("utility") {
+                best = Some(class_name);
+                break;
+            }
+            if fallback.is_none() {
+                fallback = Some(class_name);
+            }
+        }
+        best.or(fallback).ok_or_else(|| {
+            std::io::Error::other(
+                "no Main-Class manifest entry and no *RunSync.class found inside the JAR. \
+                 XTable's entry-point class layout may have changed at this version.",
+            )
+        })
+    })
+    .await
+    .map_err(|e| ServiceError::Io(std::io::Error::other(format!("spawn_blocking: {e}"))))?;
+
+    result.map_err(ServiceError::Io)
+}
+
+fn systemd_unit(java_bin: &Path, jar: &Path, run_sync_class: &str, root_dir: &Path) -> String {
     // xtable's RunSync exits after one sync cycle. With Type=simple
     // + Restart=on-failure systemd would re-launch immediately and
     // we'd be in a tight CPU loop. The correct shape is
@@ -670,7 +753,7 @@ fn systemd_unit(java_bin: &Path, jar: &Path, root_dir: &Path) -> String {
         "{java} $JAVA_OPTS -cp {jar} {cls} --datasetConfig {root}/datasets.yaml",
         java = java_bin.display(),
         jar = jar.display(),
-        cls = RUN_SYNC_CLASS,
+        cls = run_sync_class,
         root = root_dir.display(),
     );
     format!(
@@ -703,20 +786,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn systemd_unit_uses_cp_with_runsync_class() {
+    fn systemd_unit_uses_cp_with_discovered_class() {
         let java = PathBuf::from("/var/lib/computeza/xtable/jre/bin/java");
         let jar = PathBuf::from(
             "/var/lib/computeza/xtable/lib/xtable-utilities-0.2.0-incubating-bundled.jar",
         );
         let root = PathBuf::from("/var/lib/computeza/xtable");
-        let unit = systemd_unit(&java, &jar, &root);
+        // Class name is discovered from the JAR at install time;
+        // for the test we just pass a plausible candidate to exercise
+        // the formatting.
+        let cls = "io.onetable.utilities.RunSync";
+        let unit = systemd_unit(&java, &jar, cls, &root);
         assert!(
             unit.contains(&format!(
-                "-cp {} org.apache.xtable.utilities.RunSync --datasetConfig {}/datasets.yaml",
+                "-cp {} {cls} --datasetConfig {}/datasets.yaml",
                 jar.display(),
                 root.display()
             )),
-            "ExecStart should invoke `java -cp <jar> RunSync ...` -- xtable's \
+            "ExecStart should invoke `java -cp <jar> <discovered class> ...` -- xtable's \
              shade-plugin omits Main-Class so `java -jar` won't work"
         );
         assert!(
