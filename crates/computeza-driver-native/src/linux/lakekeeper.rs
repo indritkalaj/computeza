@@ -140,33 +140,45 @@ pub async fn install(
         port = opts.pg_port,
         db = opts.pg_database,
     );
-    // Lakekeeper 0.12.2's config-loader reads the `LAKEKEEPER__`
-    // env-var prefix. (Earlier versions used `ICEBERG_REST__`,
-    // inherited from the iceberg-rest-image fork; that prefix was
-    // dropped during the rename. Empirically confirmed on the
-    // 0.12.2 build: a manual `LAKEKEEPER__PG_DATABASE_URL=...
-    // lakekeeper serve` clears the "connection string must be
-    // provided" check, while the legacy prefix does not.)
+    // Lakekeeper 0.12.2's config struct has SEPARATE read and
+    // write connection fields -- there is no single
+    // `pg_database_url`. Reading the binary's static strings
+    // (`strings lakekeeper | grep pg_`) shows the actual config
+    // keys are:
     //
-    // We pass BOTH the URL form AND the individual-field form
-    // (PG_HOST / _PORT / _USER / _PASSWORD / _DATABASE). The
-    // config-loader accepts either; the duplication is harmless
-    // and immune to URL-parsing quirks (special chars in passwords,
-    // postgres:// vs postgresql:// scheme).
+    //   pg_database_url_read  / pg_database_url_write   (URL form)
+    //   pg_host_r             / pg_host_w               (host split by role)
+    //   pg_port, pg_user, pg_password, pg_database      (shared)
+    //   pg_encryption_key                               (shared)
+    //
+    // Our earlier env vars (`LAKEKEEPER__PG_DATABASE_URL`,
+    // `LAKEKEEPER__PG_HOST`) didn't match ANY field, so figment
+    // silently dropped them and the daemon's validator surfaced
+    // the misleading "A connection string or postgres host must
+    // be provided" error.
+    //
+    // For our single-instance setup, point both read and write at
+    // the same connection. v0.1+ can wire a read replica by
+    // overriding just the `_READ` URL.
     let port_str = opts.pg_port.to_string();
-    let fields: &[(&str, &str)] = &[
-        ("PG_DATABASE_URL", &pg_url),
-        ("PG_HOST", &opts.pg_host),
-        ("PG_PORT", &port_str),
-        ("PG_USER", &opts.pg_user),
-        ("PG_PASSWORD", &creds.db_password),
-        ("PG_DATABASE", &opts.pg_database),
-        ("PG_ENCRYPTION_KEY", &creds.encryption_key),
+    let env: Vec<(String, String)> = vec![
+        // URL form, split by role (both point at the same DB).
+        ("LAKEKEEPER__PG_DATABASE_URL_READ".into(), pg_url.clone()),
+        ("LAKEKEEPER__PG_DATABASE_URL_WRITE".into(), pg_url),
+        // Individual-field form (defensive belt-and-braces; the
+        // URL form should win but if figment's precedence is
+        // unexpected, these match the same fields).
+        ("LAKEKEEPER__PG_HOST_R".into(), opts.pg_host.clone()),
+        ("LAKEKEEPER__PG_HOST_W".into(), opts.pg_host.clone()),
+        ("LAKEKEEPER__PG_PORT".into(), port_str),
+        ("LAKEKEEPER__PG_USER".into(), opts.pg_user.clone()),
+        ("LAKEKEEPER__PG_PASSWORD".into(), creds.db_password.clone()),
+        ("LAKEKEEPER__PG_DATABASE".into(), opts.pg_database.clone()),
+        (
+            "LAKEKEEPER__PG_ENCRYPTION_KEY".into(),
+            creds.encryption_key.clone(),
+        ),
     ];
-    let env: Vec<(String, String)> = fields
-        .iter()
-        .map(|(k, v)| (format!("LAKEKEEPER__{k}"), (*v).to_string()))
-        .collect();
 
     // Surface the credentials on the install-result page (+ the
     // one-shot JSON download). The encryption key is the more
