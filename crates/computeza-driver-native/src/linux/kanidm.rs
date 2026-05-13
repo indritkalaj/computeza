@@ -11,9 +11,14 @@
 //!    install the toolchain via `prerequisites::ensure_rust_toolchain`
 //!    (system-wide into `/var/lib/computeza/toolchain/rust` + symlinks
 //!    on `/usr/local/bin`).
-//! 2. `cargo install kanidmd --locked --version <X> --root <root>`.
-//!    Slow (10-15 min compile on a 4-core box); progress messages
-//!    communicate this.
+//! 2. `cargo install --git https://github.com/kanidm/kanidm --tag <vX> --locked --root <root> kanidmd`.
+//!    Sourcing from the upstream git tag rather than crates.io is
+//!    deliberate: kanidm publishes to crates.io only intermittently
+//!    (many tagged releases never reach the registry), but every
+//!    release lands on git as a signed tag. The upstream `INSTALL.md`
+//!    documents `cargo install --git` as the supported install
+//!    method for that reason. Slow (10-15 min compile on a 4-core
+//!    box); progress messages communicate this.
 //! 3. Generate a self-signed TLS cert in pure Rust via `rcgen` --
 //!    kanidm refuses to start without TLS even on loopback. No host
 //!    openssl dependency.
@@ -40,9 +45,22 @@ pub const SERVICE_NAME: &str = "computeza-kanidm";
 pub const UNIT_NAME: &str = "computeza-kanidm.service";
 pub const DEFAULT_PORT: u16 = 8443;
 
-/// Pinned kanidm versions. These map to crates.io versions of the
-/// `kanidmd` crate. First entry is the default ("latest").
+/// Pinned kanidm versions. These map to **git tags** on
+/// `github.com/kanidm/kanidm` (the canonical install source -- see
+/// the module-level docs). The driver prepends `v` to form the tag
+/// name (`v1.10.1`, `v1.9.3`). First entry is the default
+/// ("latest").
+///
+/// When bumping: verify the tag exists at
+/// <https://github.com/kanidm/kanidm/tags> AND that the build still
+/// compiles against the toolchain `prerequisites::ensure_rust_toolchain`
+/// installs (kanidm tracks the latest stable Rust closely).
 const KANIDM_VERSIONS: &[&str] = &["1.10.1", "1.9.3"];
+
+/// Upstream git repository. Pulled by `cargo install --git` so the
+/// driver sources binaries directly from the project's signed tags
+/// rather than depending on crates.io being current.
+const KANIDM_GIT_URL: &str = "https://github.com/kanidm/kanidm";
 
 pub fn available_versions() -> &'static [&'static str] {
     KANIDM_VERSIONS
@@ -207,19 +225,29 @@ async fn cargo_install_kanidmd(
     root_dir: &Path,
     version: &str,
 ) -> Result<(), ServiceError> {
+    // Source from the upstream git tag rather than crates.io.
+    // Reason: kanidm publishes to crates.io intermittently and
+    // many tagged releases (including 1.10.1 as of May 2026)
+    // never land on the registry. `cargo install --git --tag` is
+    // the install method the upstream README + INSTALL.md
+    // recommend, so we're aligned with what kanidm operators
+    // expect to run.
+    let tag = format!("v{version}");
     let out = Command::new(cargo_bin)
         .arg("install")
-        .arg("kanidmd")
+        .arg("--git")
+        .arg(KANIDM_GIT_URL)
+        .arg("--tag")
+        .arg(&tag)
         .arg("--locked")
-        .arg("--version")
-        .arg(version)
         .arg("--root")
         .arg(root_dir)
+        .arg("kanidmd")
         .output()
         .await?;
     if !out.status.success() {
         return Err(ServiceError::Io(std::io::Error::other(format!(
-            "cargo install kanidmd@{version} failed (cargo={}): {}",
+            "cargo install --git {KANIDM_GIT_URL} --tag {tag} kanidmd failed (cargo={}). Most common causes: (1) the tag does not exist upstream -- check https://github.com/kanidm/kanidm/tags and update KANIDM_VERSIONS in this driver to a real tag; (2) the host Rust toolchain is older than the one kanidm needs (the prerequisites module installs a recent stable; if cargo came from the host distro it may be too old); (3) network egress to github.com is blocked. Full stderr below:\n{}",
             cargo_bin.display(),
             String::from_utf8_lossy(&out.stderr)
         ))));
