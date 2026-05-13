@@ -263,6 +263,7 @@ pub async fn install(
     // tree. ProtectSystem=strict only restricts writes, so the
     // binary can read the static assets without listing the
     // resolved path in ReadWritePaths.
+    let working_dir = current_dir.join("src").join("server").join("daemon");
     let unit_path = PathBuf::from("/etc/systemd/system").join(&opts.unit_name);
     let unit_body = systemd_unit(
         &current_dir,
