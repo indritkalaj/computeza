@@ -38,3 +38,8 @@ liblzma = { workspace = true }
 # Replaces a shell-out to `openssl req` so a virgin Linux host doesn't
 # need openssl on $PATH for the kanidm install path to work.
 rcgen = { workspace = true }
+# aes-gcm: pulled in for its `OsRng` CSPRNG re-export. Used by the
+# lakekeeper driver to generate the postgres user password +
+# secrets-encryption key at install time. Same provider the
+# ui-server already uses (consistent crypto across the codebase).
+aes-gcm = { workspace = true }
