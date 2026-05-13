@@ -791,6 +791,17 @@ async fn write_systemd_unit(
     user: &str,
     port: u16,
 ) -> Result<PathBuf, InstallError> {
+    // RuntimeDirectory=postgresql: systemd mints /run/postgresql/
+    // owned by the unit's User/Group on every start and tears it
+    // down on stop. Postgres needs this directory to drop its
+    // socket lock file (.s.PGSQL.<port>.lock); without it, the
+    // ProtectSystem=strict sandbox leaves /run/ read-only and
+    // postgres dies with "could not create lock file ... Read-only
+    // file system" before ever accepting a connection. Mode 0755
+    // matches the apt-postgres package's /run/postgresql perms.
+    //
+    // RestartSec=5 + Restart=on-failure: kept aggressive so a
+    // transient port collision recovers without operator action.
     let unit = format!(
         "[Unit]\n\
          Description=Computeza-managed PostgreSQL\n\
@@ -802,6 +813,8 @@ async fn write_systemd_unit(
          User={user}\n\
          Group={user}\n\
          Environment=PGPORT={port}\n\
+         RuntimeDirectory=postgresql\n\
+         RuntimeDirectoryMode=0755\n\
          ExecStart={bin}/postgres -D {data} -p {port}\n\
          ExecReload=/bin/kill -HUP $MAINPID\n\
          KillMode=mixed\n\
