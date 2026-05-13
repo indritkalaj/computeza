@@ -3,27 +3,38 @@
 //! This is the first end-to-end demonstration of the autonomous-installer
 //! mandate (spec section 2.1). The installer:
 //!
-//! 1. Locates the `postgres` and `initdb` binaries shipped by the system
-//!    package (typical paths: `/usr/lib/postgresql/<v>/bin/`, `/usr/bin/`).
-//!    v0.0.x assumes the package is present -- a follow-up will download,
-//!    SHA-verify, and extract a vendored binary tarball so even this
-//!    dependency goes away.
-//! 2. Creates a `postgres`-owned data directory at
+//! 1. Resolves the `postgres` and `initdb` binaries via the following
+//!    priority order:
+//!    a. Explicit `opts.bin_dir` override (operator pointed at a custom
+//!       install).
+//!    b. Distro package binaries -- typically `/usr/lib/postgresql/<v>/bin`
+//!       (Debian / Ubuntu) or `/usr/pgsql-<v>/bin` (RHEL / Fedora /
+//!       OpenSUSE), majors 13 to 18.
+//!    c. Computeza-managed EDB binary tarball, fetched from
+//!       `get.enterprisedb.com`, SHA-verified, and extracted under
+//!       `<root_dir>/binaries/<version>/`. This is what makes
+//!       `computeza install postgres` work on a host with no
+//!       pre-installed PostgreSQL package.
+//! 2. Ensures the `postgres` system user exists (created via `useradd
+//!    --system --no-create-home` when missing). The apt / yum packages
+//!    create it as a side effect; when we resolved binaries via EDB
+//!    fetch we have to do it ourselves.
+//! 3. Creates a `postgres`-owned data directory at
 //!    `/var/lib/computeza/postgres/data` and runs `initdb` against it
 //!    (idempotent: skipped if the directory is already initialised).
-//! 3. Writes a systemd unit at
+//! 4. Writes a systemd unit at
 //!    `/etc/systemd/system/computeza-postgres.service` and reloads the
 //!    systemd manager.
-//! 4. `systemctl enable --now computeza-postgres.service`.
-//! 5. Waits until Postgres accepts TCP connections on the configured port.
-//! 6. Registers a `computeza-psql` symlink under `/usr/local/bin/` per
+//! 5. `systemctl enable --now computeza-postgres.service`.
+//! 6. Waits until Postgres accepts TCP connections on the configured port.
+//! 7. Registers a `computeza-psql` symlink under `/usr/local/bin/` per
 //!    AGENTS.md rule section 4 (cross-platform PATH registration).
 //!
 //! Privileged operations (writing under `/var/lib`, `/etc/systemd/system`,
-//! `/usr/local/bin`, running `initdb` as the postgres user, `systemctl`)
-//! mean this code expects to be invoked while the binary is running as
-//! root. The wrapping `computeza install` subcommand re-execs itself
-//! with `sudo` when not already root.
+//! `/usr/local/bin`, running `initdb` as the postgres user, `systemctl`,
+//! `useradd`) mean this code expects to be invoked while the binary is
+//! running as root. The wrapping `computeza install` subcommand re-execs
+//! itself with `sudo` when not already root.
 
 use std::{
     io,
@@ -37,16 +48,22 @@ use tokio::{fs, io::AsyncWriteExt, net::TcpStream, process::Command, time::sleep
 use tracing::{debug, info, warn};
 
 use super::{path, systemctl};
+use crate::{
+    fetch::{self, ArchiveKind, Bundle, FetchError},
+    progress::{InstallPhase, ProgressHandle},
+};
 
 /// Configuration for [`install`].
 #[derive(Clone, Debug)]
 pub struct InstallOptions {
     /// Directory that will hold the PostgreSQL data files. Default
     /// `/var/lib/computeza/postgres`. The actual data lives in a `data/`
-    /// subdirectory; everything else (`log/`, `run/`) is alongside.
+    /// subdirectory; everything else (`log/`, `run/`, `binaries/<v>/`)
+    /// is alongside.
     pub root_dir: PathBuf,
     /// Where to find the `postgres` / `initdb` binaries. None means
-    /// auto-detect by scanning common locations.
+    /// auto-detect by scanning common locations and falling through to
+    /// fetching the Computeza-bundled EDB tarball.
     pub bin_dir: Option<PathBuf>,
     /// TCP port to listen on. Default 5432.
     pub port: u16,
@@ -55,6 +72,10 @@ pub struct InstallOptions {
     pub system_user: String,
     /// Name of the systemd unit. Default `computeza-postgres.service`.
     pub unit_name: String,
+    /// Which pinned EDB bundle to fetch when no host postgres is
+    /// detected. `None` means use the latest (`PG_LINUX_BUNDLES[0]`).
+    /// Pass a version string like `"17.9-1"` to pin an older line.
+    pub version: Option<String>,
 }
 
 impl Default for InstallOptions {
@@ -65,8 +86,56 @@ impl Default for InstallOptions {
             port: 5432,
             system_user: "postgres".into(),
             unit_name: "computeza-postgres.service".into(),
+            version: None,
         }
     }
+}
+
+/// Pinned EDB Linux x86_64 PostgreSQL binary tarballs. First entry is
+/// the default ("latest"). The UI exposes a dropdown of these versions
+/// on `/install` (parity with the Windows driver).
+///
+/// SHA-256 is `None` for v0.0.x -- pin before any stable release.
+/// AGENTS.md tracks the audit trail when checksums change.
+///
+/// Tarball layout (post-extract): `pgsql/bin/{postgres,initdb,psql,...}`
+/// plus `pgsql/lib`, `pgsql/share`, `pgsql/include`. Everything the
+/// daemon needs at runtime lives inside `pgsql/`, so the bundle is
+/// self-contained (no host `libpq` / `libicu` / etc. assumed).
+const PG_LINUX_BUNDLES: &[Bundle] = &[
+    Bundle {
+        version: "18.3-1",
+        url: "https://get.enterprisedb.com/postgresql/postgresql-18.3-1-linux-x64-binaries.tar.gz",
+        kind: ArchiveKind::TarGz,
+        sha256: None,
+        bin_subpath: "pgsql/bin",
+    },
+    Bundle {
+        version: "17.9-1",
+        url: "https://get.enterprisedb.com/postgresql/postgresql-17.9-1-linux-x64-binaries.tar.gz",
+        kind: ArchiveKind::TarGz,
+        sha256: None,
+        bin_subpath: "pgsql/bin",
+    },
+];
+
+/// Look up a bundle by its `version` string. Falls back to the first
+/// (latest) entry when `requested` is `None` or doesn't match.
+fn bundle_for_version(requested: Option<&str>) -> &'static Bundle {
+    match requested {
+        Some(v) => PG_LINUX_BUNDLES
+            .iter()
+            .find(|b| b.version == v)
+            .unwrap_or(&PG_LINUX_BUNDLES[0]),
+        None => &PG_LINUX_BUNDLES[0],
+    }
+}
+
+/// All bundles we ship. The UI iterates this to populate the version
+/// dropdown.
+#[must_use]
+pub fn available_versions() -> &'static [Bundle] {
+    PG_LINUX_BUNDLES
 }
 
 /// Information returned by a successful [`install`].
@@ -107,6 +176,9 @@ pub enum InstallError {
     /// PATH registration failed.
     #[error(transparent)]
     Path(#[from] path::PathError),
+    /// Fetching or extracting the EDB binary tarball failed.
+    #[error(transparent)]
+    Fetch(#[from] FetchError),
     /// Server never started accepting connections.
     #[error("postgres did not become ready on port {port} within {timeout_secs}s")]
     NotReady {
@@ -352,19 +424,51 @@ async fn detect_bin_dir() -> Result<PathBuf, InstallError> {
     Err(InstallError::BinaryNotFound(tried))
 }
 
-/// Install Postgres natively.
+/// Install Postgres natively. Convenience entry point that wires a
+/// no-op progress handle; the UI server uses
+/// [`install_with_progress`] for streamed updates.
 pub async fn install(opts: InstallOptions) -> Result<Installed, InstallError> {
-    let bin_dir = match opts.bin_dir.clone() {
-        Some(d) => d,
-        None => detect_bin_dir().await?,
-    };
+    install_with_progress(opts, &ProgressHandle::noop()).await
+}
+
+/// Install Postgres natively with streamed install-phase + byte
+/// progress updates.
+///
+/// Compared to [`install`], this surfaces per-step status (binary
+/// resolution, EDB fetch + extract, initdb, systemd registration,
+/// startup wait) through the supplied [`ProgressHandle`] so the
+/// operator console can render a live progress bar instead of a long
+/// quiet pause during the fetch.
+pub async fn install_with_progress(
+    opts: InstallOptions,
+    progress: &ProgressHandle,
+) -> Result<Installed, InstallError> {
+    progress.set_phase(InstallPhase::DetectingBinaries);
+    progress.set_message("Resolving the postgres binary directory");
+    let bin_dir = resolve_bin_dir(&opts, progress).await?;
     info!(bin_dir = %bin_dir.display(), "resolved postgres binaries");
+
+    progress.set_phase(InstallPhase::DetectingBinaries);
+    progress.set_message(format!(
+        "Ensuring the `{}` system user exists for the data directory",
+        opts.system_user
+    ));
+    ensure_system_user(&opts.system_user).await?;
 
     let data_dir = opts.root_dir.join("data");
 
+    progress.set_phase(InstallPhase::Extracting);
+    progress.set_message(format!(
+        "Preparing the data directory at {}",
+        data_dir.display()
+    ));
     create_data_dir(&data_dir, &opts.system_user).await?;
+
+    progress.set_message(format!("Running initdb against {}", data_dir.display()));
     run_initdb_if_needed(&bin_dir, &data_dir, &opts.system_user).await?;
 
+    progress.set_phase(InstallPhase::RegisteringService);
+    progress.set_message(format!("Registering systemd unit {}", opts.unit_name));
     let unit_path = write_systemd_unit(
         &opts.unit_name,
         &bin_dir,
@@ -375,8 +479,16 @@ pub async fn install(opts: InstallOptions) -> Result<Installed, InstallError> {
     .await?;
 
     systemctl::daemon_reload().await?;
+
+    progress.set_phase(InstallPhase::StartingService);
+    progress.set_message(format!("Starting {} on port {}", opts.unit_name, opts.port));
     systemctl::enable_now(&opts.unit_name).await?;
 
+    progress.set_phase(InstallPhase::WaitingForReady);
+    progress.set_message(format!(
+        "Waiting for postgres to accept TCP on 127.0.0.1:{}",
+        opts.port
+    ));
     wait_for_ready("127.0.0.1", opts.port, Duration::from_secs(30)).await?;
 
     let psql = bin_dir.join("psql");
@@ -397,6 +509,79 @@ pub async fn install(opts: InstallOptions) -> Result<Installed, InstallError> {
         port: opts.port,
         psql_symlink,
     })
+}
+
+/// Resolve the binary directory in priority order: explicit override,
+/// distro package, then EDB fetch. The fetch path lands the tarball
+/// under `<root_dir>/binaries/<version>/`; the cache is content-
+/// addressed by version so re-runs hit the existing extraction.
+async fn resolve_bin_dir(
+    opts: &InstallOptions,
+    progress: &ProgressHandle,
+) -> Result<PathBuf, InstallError> {
+    if let Some(d) = &opts.bin_dir {
+        return Ok(d.clone());
+    }
+    match detect_bin_dir().await {
+        Ok(d) => Ok(d),
+        Err(InstallError::BinaryNotFound(_)) => {
+            // Fall through to EDB fetch -- no distro postgres present.
+            let bundle = bundle_for_version(opts.version.as_deref());
+            let cache_root = opts.root_dir.join("binaries");
+            info!(
+                version = bundle.version,
+                url = bundle.url,
+                cache = %cache_root.display(),
+                "no distro postgres found; fetching Computeza-bundled EDB tarball"
+            );
+            progress.set_phase(InstallPhase::Downloading);
+            progress.set_message(format!(
+                "No distro postgres found. Downloading EDB binary tarball for PostgreSQL {} (one-time)",
+                bundle.version
+            ));
+            // Make sure the cache root exists; fetch_and_extract
+            // expects the parent to be writable.
+            fs::create_dir_all(&cache_root).await?;
+            let bin = fetch::fetch_and_extract(&cache_root, bundle, progress).await?;
+            Ok(bin)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Ensure the `postgres` system user exists. apt/yum packages create
+/// it as a side effect; when we resolved binaries via the EDB fetch
+/// path the user might not exist and `initdb` + the systemd unit
+/// would both fail otherwise.
+///
+/// `useradd` exits with status 9 when the account already exists,
+/// which we treat as success. Anything else surfaces as an
+/// [`InstallError::Io`] so the operator sees why creation failed
+/// (commonly: not running as root).
+async fn ensure_system_user(user: &str) -> Result<(), InstallError> {
+    // Cheap probe first to avoid shelling out unnecessarily.
+    let probe = Command::new("id").arg(user).output().await?;
+    if probe.status.success() {
+        return Ok(());
+    }
+    let status = Command::new("useradd")
+        .arg("--system")
+        .arg("--no-create-home")
+        .arg("--shell")
+        .arg("/usr/sbin/nologin")
+        .arg("--user-group")
+        .arg(user)
+        .status()
+        .await?;
+    // useradd returns 9 when the user already exists -- harmless.
+    if status.success() || status.code() == Some(9) {
+        Ok(())
+    } else {
+        Err(InstallError::Io(io::Error::other(format!(
+            "useradd --system {user} failed (exit {:?}); rerun the install as root or pre-create the user with `sudo useradd --system --no-create-home --shell /usr/sbin/nologin {user}`",
+            status.code(),
+        ))))
+    }
 }
 
 async fn create_data_dir(data_dir: &Path, user: &str) -> Result<(), InstallError> {

@@ -3548,7 +3548,10 @@ async fn run_postgres_install_with_progress(
     if let Some(s) = &config.service_name {
         opts.unit_name = format!("{s}.service");
     }
-    match postgres::install(opts).await {
+    if let Some(v) = &config.version {
+        opts.version = Some(v.clone());
+    }
+    match postgres::install_with_progress(opts, progress).await {
         Ok(r) => Ok((
             format!(
                 "bin_dir: {}\ndata_dir: {}\nsystemd unit: {}\nport: {}\npsql symlink: {}",
