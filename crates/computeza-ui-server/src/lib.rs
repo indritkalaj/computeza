@@ -1949,6 +1949,18 @@ async fn run_lakekeeper_bootstrap(
 
     // --- Step 2: create warehouse with S3 storage profile +
     // credentials pointing at Garage.
+    //
+    // Lakekeeper's storage-profile schema for S3 requires several
+    // fields that serde refuses to default:
+    //   - sts-enabled (bool): we use static access keys, not STS,
+    //     so this is always `false`. Required by Lakekeeper's
+    //     S3StorageProfile struct.
+    //   - flavor (string): "aws" vs "s3-compat". Garage is
+    //     S3-compatible but not AWS, so we pick "s3-compat".
+    //     Lakekeeper uses this to decide whether to add AWS-only
+    //     headers, attempt SigV4-A regional rewrites, etc.
+    //   - key-prefix: empty by default; Lakekeeper writes table
+    //     metadata + data under this prefix inside the bucket.
     let warehouse_url = format!("{}/management/v1/warehouse", base_url.trim_end_matches('/'));
     let warehouse_body = serde_json::json!({
         "warehouse-name": form.warehouse_name,
@@ -1959,6 +1971,9 @@ async fn run_lakekeeper_bootstrap(
             "endpoint": form.s3_endpoint,
             "region": form.s3_region,
             "path-style-access": true,
+            "sts-enabled": false,
+            "flavor": "s3-compat",
+            "key-prefix": "",
         },
         "storage-credential": {
             "type": "s3",
