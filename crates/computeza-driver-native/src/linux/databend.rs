@@ -112,9 +112,12 @@ pub async fn install(
             grpc = META_GRPC_PORT,
             raft = META_RAFT_PORT,
         ),
-        // Operator-tunable in production multi-node clusters;
-        // preserve edits across re-installs.
-        overwrite_if_present: false,
+        // Same reasoning as the query config below: v0.0.x's
+        // template is still evolving (raft ports, advertise-host
+        // semantics, etc.), so re-installs overwrite to roll out
+        // the latest fixes. Operator overrides land in
+        // `databend-meta.local.toml` once v0.1 ships drop-ins.
+        overwrite_if_present: true,
     };
     let meta_args = vec![
         "-c".into(),
@@ -170,7 +173,18 @@ pub async fn install(
             meta_grpc = META_GRPC_PORT,
             root = opts.root_dir.display(),
         ),
-        overwrite_if_present: false,
+        // Was `false` (preserve operator edits) but flipped to
+        // `true` because v0.0.x's config-template is still
+        // evolving -- e.g. the [meta] block was just added in
+        // ef0627f, and operators stuck with a pre-ef0627f config
+        // can't get the meta wiring without a manual edit. v0.1
+        // separates driver-owned base config from operator
+        // overrides via a `databend-query.local.toml` drop-in
+        // that does NOT get overwritten; until then the
+        // re-install authoritatively re-renders the base. Lost
+        // edits are surfaced in the install-result page so
+        // operators can re-apply them.
+        overwrite_if_present: true,
     };
     let query_args = vec![
         "-c".into(),
