@@ -797,6 +797,45 @@ dep, per-operator key UI, SMTP config). Treat it as a separate
 milestone with its own design pass; don't ram it through together
 with pieces 1+2.
 
+### Lakekeeper bootstrap (project + warehouse + storage credentials)
+
+**Status:** deferred to v0.1. Phase 1 of the workspace UI (catalog
+browser at `/workspace`) surfaces a warehouse list when Lakekeeper
+has one, but cannot drill into Iceberg namespaces / tables until a
+warehouse exists -- and the install path doesn't create one. The
+`/management/v1/project` + `/management/v1/warehouse` endpoints
+require a storage profile (S3 details pointing at the local Garage)
+plus storage credentials, which v0.0.x doesn't auto-provision.
+
+**Shape when it lands** (small wizard under `/install/lakekeeper`
+or a one-shot post-install step):
+1. After the lakekeeper systemd unit comes up, fetch the local
+   garage-instance's S3 endpoint + access keys from the metadata
+   store.
+2. POST `/management/v1/project` with a default project name
+   (e.g. `computeza-default`).
+3. POST `/management/v1/warehouse` with the project id, a default
+   warehouse name (e.g. `default`), storage-profile shape pointing
+   at the garage endpoint, and an `s3-access-key` /
+   `s3-secret-access-key` credential.
+4. Persist the warehouse name as a config row so phase 1.5's
+   workspace UI can use it as the URL prefix for Iceberg REST
+   catalog calls.
+
+**Phase 1.5 (immediately after bootstrap)**: extend the workspace
+catalog pane to drill warehouse -> namespace -> table by hitting
+`/catalog/v1/{warehouse-name-or-id}/namespaces` etc. Re-introduce
+the create-namespace form removed in commit 76cacc9 once the URL
+prefix is known.
+
+**Why this isn't a one-line fix**: Lakekeeper's storage-profile +
+credential shape varies by Lakekeeper version, the Garage admin API
+for minting an S3 access key is its own integration, and the
+warehouse name needs to round-trip through the metadata store so
+post-install code (UI, CLI, future reconcilers) all reach the same
+warehouse. Treat as a discrete v0.1 milestone alongside the
+identity-federation bootstrap.
+
 ### Apply-admin-password for kanidm + grafana
 
 **Status:** deferred; postgres works. The install path generates an

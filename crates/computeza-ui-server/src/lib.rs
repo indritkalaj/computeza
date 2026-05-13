@@ -649,10 +649,6 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/workspace", get(workspace_handler))
         .route("/workspace/sql/execute", post(workspace_sql_execute_handler))
         .route(
-            "/workspace/catalog/namespace/create",
-            post(workspace_create_namespace_handler),
-        )
-        .route(
             "/install",
             get(install_hub_handler).post(install_all_handler),
         )
@@ -897,92 +893,78 @@ async fn discover_databend_endpoint(
     Some(spec.endpoint.base_url)
 }
 
-/// One namespace + its tables, as the Lakekeeper Iceberg REST
-/// catalog returns them. Both Vec<Vec<String>> shapes come straight
-/// out of the spec: a namespace is a list of path segments
-/// (`["finance", "raw"]` -> "finance.raw") and tables are
-/// `{namespace: [...], name: "..."}`.
+/// What we learned from talking to the local Lakekeeper. Three
+/// states map to three different UX paths -- "not reachable" wants
+/// /status; "no warehouses" wants the bootstrap docs; "has
+/// warehouses" wants the browse-namespaces flow (v0.1).
 #[derive(Debug, Clone)]
-struct CatalogNamespace {
-    /// Path segments joined as "a.b.c" for display + SELECT.
-    qualified: String,
-    /// Tables under this namespace.
-    tables: Vec<String>,
+enum LakekeeperState {
+    /// `/management/v1/warehouse` failed (Lakekeeper unreachable,
+    /// 5xx, malformed JSON).
+    Unreachable,
+    /// Lakekeeper is up but has no warehouses configured. v0.0.x
+    /// doesn't auto-bootstrap; the operator must run the manual
+    /// curl recipe documented in AGENTS.md "Deferred work".
+    NoWarehouses,
+    /// At least one warehouse exists. v0.0.x lists their names;
+    /// v0.1 lands per-warehouse namespace + table browsing (the
+    /// Iceberg REST API under each warehouse is URL-prefixed and
+    /// requires bootstrapped storage credentials to write).
+    HasWarehouses(Vec<String>),
 }
 
-/// Fetch the namespace + table list from Lakekeeper. Best-effort:
-/// on any failure (timeout, 404, malformed JSON) returns an empty
-/// list so the page still renders with the SQL editor usable. The
-/// reason is shown to the operator via the empty-state copy.
-async fn fetch_catalog(base_url: &str) -> Vec<CatalogNamespace> {
+/// Probe Lakekeeper for its warehouse list. Uses the same
+/// management API the reconciler hits at `/management/v1/warehouse`
+/// (the Iceberg REST catalog API is gated behind a bootstrap step
+/// that v0.0.x doesn't automate -- see AGENTS.md "Deferred work").
+async fn probe_lakekeeper(base_url: &str) -> LakekeeperState {
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
     {
         Ok(c) => c,
-        Err(_) => return Vec::new(),
+        Err(_) => return LakekeeperState::Unreachable,
     };
 
-    // Lakekeeper exposes the Iceberg REST catalog under
-    // `/catalog/v1/...`. The standard list-namespaces endpoint
-    // returns `{"namespaces": [["finance"], ["finance","raw"], ...]}`.
-    let ns_url = format!("{}/catalog/v1/namespaces", base_url.trim_end_matches('/'));
-    let resp = match client.get(&ns_url).send().await {
+    let url = format!("{}/management/v1/warehouse", base_url.trim_end_matches('/'));
+    let resp = match client.get(&url).send().await {
         Ok(r) if r.status().is_success() => r,
-        _ => return Vec::new(),
+        _ => return LakekeeperState::Unreachable,
     };
     let body: serde_json::Value = match resp.json().await {
         Ok(b) => b,
-        Err(_) => return Vec::new(),
+        Err(_) => return LakekeeperState::Unreachable,
     };
-    let namespaces = body
-        .get("namespaces")
-        .and_then(|v| v.as_array())
+    // Lakekeeper returns either `{"warehouses": [...]}` (current
+    // shape) or a bare array on older releases.
+    let warehouses = body
+        .get("warehouses")
+        .and_then(|w| w.as_array())
         .cloned()
+        .or_else(|| body.as_array().cloned())
         .unwrap_or_default();
-
-    let mut out = Vec::new();
-    for ns in namespaces {
-        let segments: Vec<String> = ns
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|s| s.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if segments.is_empty() {
-            continue;
-        }
-        let qualified = segments.join(".");
-        // Iceberg REST encodes nested namespaces with `%1F` (unit
-        // separator) between segments in the URL path.
-        let encoded = segments.join("%1F");
-        let tables_url = format!(
-            "{}/catalog/v1/namespaces/{}/tables",
-            base_url.trim_end_matches('/'),
-            encoded
-        );
-        let tables = match client.get(&tables_url).send().await {
-            Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
-                Ok(b) => b
-                    .get("identifiers")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|t| {
-                                t.get("name").and_then(|n| n.as_str()).map(str::to_string)
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default(),
-                Err(_) => Vec::new(),
-            },
-            _ => Vec::new(),
-        };
-        out.push(CatalogNamespace { qualified, tables });
+    if warehouses.is_empty() {
+        return LakekeeperState::NoWarehouses;
     }
-    out
+    let names: Vec<String> = warehouses
+        .iter()
+        .filter_map(|w| {
+            w.get("name")
+                .and_then(|n| n.as_str())
+                .map(str::to_string)
+                .or_else(|| {
+                    w.get("warehouse-name")
+                        .and_then(|n| n.as_str())
+                        .map(str::to_string)
+                })
+                .or_else(|| {
+                    w.get("id")
+                        .and_then(|n| n.as_str())
+                        .map(str::to_string)
+                })
+        })
+        .collect();
+    LakekeeperState::HasWarehouses(names)
 }
 
 /// Query parameters accepted by the workspace page. `sql` lets the
@@ -1001,16 +983,16 @@ async fn workspace_handler(
     let l = Localizer::english();
     let lakekeeper = discover_lakekeeper_endpoint(state.store.as_deref()).await;
     let databend = discover_databend_endpoint(state.store.as_deref()).await;
-    let catalog = match &lakekeeper {
-        Some(url) => fetch_catalog(url).await,
-        None => Vec::new(),
+    let lk_state = match &lakekeeper {
+        Some(url) => probe_lakekeeper(url).await,
+        None => LakekeeperState::Unreachable,
     };
     let sql_prefill = q.sql.unwrap_or_default();
     Html(render_workspace_page(
         &l,
         lakekeeper.is_some(),
         databend.is_some(),
-        &catalog,
+        &lk_state,
         &sql_prefill,
         None,
     ))
@@ -1024,66 +1006,14 @@ struct WorkspaceSqlForm {
     sql: String,
 }
 
-/// Form body for `POST /workspace/catalog/namespace/create`. The
-/// `name` field accepts dotted notation (`finance.raw`) which gets
-/// split into Iceberg-REST path segments (`["finance", "raw"]`).
-#[derive(serde::Deserialize)]
-struct WorkspaceCreateNamespaceForm {
-    name: String,
-}
-
-async fn workspace_create_namespace_handler(
-    State(state): State<AppState>,
-    axum::extract::Form(form): axum::extract::Form<WorkspaceCreateNamespaceForm>,
-) -> axum::response::Redirect {
-    // Best-effort: a failure here is logged but we redirect back to
-    // /workspace regardless so the operator sees the updated catalog
-    // state (and an empty namespace listing if the create silently
-    // failed). The next iteration can surface the error inline; for
-    // phase 1 we keep it simple.
-    let Some(base_url) = discover_lakekeeper_endpoint(state.store.as_deref()).await else {
-        return axum::response::Redirect::to("/workspace");
-    };
-    let segments: Vec<&str> = form
-        .name
-        .split('.')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
-    if segments.is_empty() {
-        return axum::response::Redirect::to("/workspace");
-    }
-    let url = format!("{}/catalog/v1/namespaces", base_url.trim_end_matches('/'));
-    if let Ok(client) = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-    {
-        let body = serde_json::json!({
-            "namespace": segments,
-            "properties": {},
-        });
-        match client.post(&url).json(&body).send().await {
-            Ok(r) if r.status().is_success() => {
-                tracing::info!(namespace = %form.name, "lakekeeper namespace created");
-            }
-            Ok(r) => {
-                tracing::warn!(
-                    namespace = %form.name,
-                    status = r.status().as_u16(),
-                    "lakekeeper namespace create returned non-2xx"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    namespace = %form.name,
-                    error = %e,
-                    "lakekeeper namespace create failed"
-                );
-            }
-        }
-    }
-    axum::response::Redirect::to("/workspace")
-}
+// Note: a previous iteration of this file shipped a
+// workspace_create_namespace_handler that POSTed to
+// /catalog/v1/namespaces. That endpoint is gated behind a
+// Lakekeeper warehouse bootstrap that v0.0.x doesn't automate, so
+// it 404'd every time. The handler is gone -- catalog mutations
+// land in phase 1.5 after the bootstrap wizard (project +
+// warehouse + Garage storage profile) ships. See AGENTS.md
+// "Deferred work: Lakekeeper bootstrap".
 
 async fn workspace_sql_execute_handler(
     State(state): State<AppState>,
@@ -1096,15 +1026,15 @@ async fn workspace_sql_execute_handler(
         Some(url) => Some(execute_sql_against_databend(url, &form.sql).await),
         None => None,
     };
-    let catalog = match &lakekeeper {
-        Some(url) => fetch_catalog(url).await,
-        None => Vec::new(),
+    let lk_state = match &lakekeeper {
+        Some(url) => probe_lakekeeper(url).await,
+        None => LakekeeperState::Unreachable,
     };
     Html(render_workspace_page(
         &l,
         lakekeeper.is_some(),
         databend.is_some(),
-        &catalog,
+        &lk_state,
         &form.sql,
         result,
     ))
@@ -1218,19 +1148,18 @@ async fn execute_sql_against_databend(base_url: &str, sql: &str) -> SqlOutcome {
 /// only JS on the page is the existing CSRF auto-fill from
 /// render_shell. The catalog list renders on the left, the SQL
 /// editor and results render on the right.
+#[allow(clippy::too_many_arguments)]
 fn render_workspace_page(
     localizer: &Localizer,
     has_lakekeeper: bool,
     has_databend: bool,
-    catalog: &[CatalogNamespace],
+    lk_state: &LakekeeperState,
     sql_prefill: &str,
     result: Option<SqlOutcome>,
 ) -> String {
     let title = localizer.t("ui-workspace-title");
     let intro = localizer.t("ui-workspace-intro");
     let catalog_heading = localizer.t("ui-workspace-catalog-heading");
-    let catalog_empty = localizer.t("ui-workspace-catalog-empty");
-    let prefill_link = localizer.t("ui-workspace-catalog-fill-link");
     let sql_heading = localizer.t("ui-workspace-sql-heading");
     let sql_placeholder = localizer.t("ui-workspace-sql-placeholder");
     let sql_run = localizer.t("ui-workspace-sql-run");
@@ -1239,78 +1168,54 @@ fn render_workspace_page(
     let results_empty = localizer.t("ui-workspace-results-empty");
     let err_no_lakekeeper = localizer.t("ui-workspace-error-no-lakekeeper");
     let err_no_databend = localizer.t("ui-workspace-error-no-databend");
+    let lk_unreachable = localizer.t("ui-workspace-lakekeeper-unreachable");
+    let lk_no_warehouses = localizer.t("ui-workspace-lakekeeper-no-warehouses");
+    let lk_warehouses_heading = localizer.t("ui-workspace-lakekeeper-warehouses-heading");
+    let lk_warehouses_note = localizer.t("ui-workspace-lakekeeper-warehouses-note");
     let csrf = auth::csrf_input();
 
-    // The "Create namespace" form lives in the catalog pane
-    // whenever Lakekeeper is installed -- both for empty catalogs
-    // (so the operator's first action is obvious) and non-empty
-    // ones (so subsequent namespaces can be added in-place).
-    let create_label = localizer.t("ui-workspace-catalog-create-label");
-    let create_placeholder = localizer.t("ui-workspace-catalog-create-placeholder");
-    let create_button = localizer.t("ui-workspace-catalog-create-button");
-    let create_help = localizer.t("ui-workspace-catalog-create-help");
-    let create_namespace_form = if has_lakekeeper {
-        format!(
-            r#"<form method="post" action="/workspace/catalog/namespace/create" style="margin-top: 1rem; padding-top: 1rem; border-top: 1px solid rgba(255,255,255,0.06);">
-{csrf}
-<label for="ws-create-ns" style="font-size: 0.82rem; display: block; margin-bottom: 0.25rem;">{label}</label>
-<input id="ws-create-ns" name="name" class="cz-input" type="text" placeholder="{placeholder}" required style="width: 100%; font-family: ui-monospace, monospace; font-size: 0.85rem; margin-bottom: 0.5rem;" />
-<button type="submit" class="cz-btn">{button}</button>
-<p class="cz-muted" style="margin: 0.5rem 0 0; font-size: 0.75rem;">{help}</p>
-</form>"#,
-            csrf = csrf,
-            label = html_escape(&create_label),
-            placeholder = html_escape(&create_placeholder),
-            button = html_escape(&create_button),
-            help = html_escape(&create_help),
-        )
-    } else {
-        String::new()
-    };
-
+    // Catalog block surfaces three distinct Lakekeeper states.
+    // None of them currently allow drill-down into Iceberg
+    // namespaces / tables -- that arrives in phase 1.5 once we
+    // know which URL pattern Lakekeeper uses for per-warehouse
+    // Iceberg REST routes (and after the bootstrap wizard creates
+    // the warehouse + Garage storage credentials in the first
+    // place).
     let catalog_block = if !has_lakekeeper {
         format!(
             r#"<p class="cz-muted">{}</p>"#,
             html_escape(&err_no_lakekeeper)
         )
-    } else if catalog.is_empty() {
-        format!(
-            r#"<p class="cz-muted">{}</p>{form}"#,
-            html_escape(&catalog_empty),
-            form = create_namespace_form
-        )
     } else {
-        let items: String = catalog
-            .iter()
-            .map(|ns| {
-                let tables: String = ns
-                    .tables
+        match lk_state {
+            LakekeeperState::Unreachable => format!(
+                r#"<p class="cz-muted">{}</p>"#,
+                html_escape(&lk_unreachable)
+            ),
+            LakekeeperState::NoWarehouses => format!(
+                r#"<p class="cz-muted">{}</p>"#,
+                html_escape(&lk_no_warehouses)
+            ),
+            LakekeeperState::HasWarehouses(names) => {
+                let items: String = names
                     .iter()
-                    .map(|t| {
-                        let qualified_table = format!("{}.{}", ns.qualified, t);
-                        let prefill_sql = format!("SELECT * FROM {qualified_table} LIMIT 100");
+                    .map(|n| {
                         format!(
-                            r#"<li style="padding: 0.15rem 0;"><a href="/workspace?sql={enc}" style="text-decoration: none;"><code>{tbl}</code></a> <a href="/workspace?sql={enc}" class="cz-muted" style="font-size: 0.78rem; margin-left: 0.5rem;">{prefill}</a></li>"#,
-                            enc = url_encode(&prefill_sql),
-                            tbl = html_escape(&qualified_table),
-                            prefill = html_escape(&prefill_link),
+                            r#"<li style="padding: 0.3rem 0;"><code>{}</code></li>"#,
+                            html_escape(n)
                         )
                     })
                     .collect();
                 format!(
-                    r#"<li style="padding: 0.4rem 0;">
-<div style="font-weight: 600; font-size: 0.9rem;">{ns}</div>
-<ul style="list-style: none; padding-left: 1rem; margin: 0.25rem 0 0;">{tables}</ul>
-</li>"#,
-                    ns = html_escape(&ns.qualified),
-                    tables = tables,
+                    r#"<h3 style="margin: 0 0 0.5rem; font-size: 0.95rem;">{heading}</h3>
+<ul style="list-style: none; padding: 0; margin: 0 0 0.75rem;">{items}</ul>
+<p class="cz-muted" style="font-size: 0.78rem; margin: 0;">{note}</p>"#,
+                    heading = html_escape(&lk_warehouses_heading),
+                    items = items,
+                    note = html_escape(&lk_warehouses_note),
                 )
-            })
-            .collect();
-        format!(
-            r#"<ul style="list-style: none; padding: 0; margin: 0;">{items}</ul>{form}"#,
-            form = create_namespace_form
-        )
+            }
+        }
     };
 
     let results_block = match (has_databend, result) {
@@ -1399,6 +1304,14 @@ fn render_workspace_page(
 /// crate because the workspace surface is the only caller; a
 /// general-purpose helper would land in a util crate when the
 /// second caller shows up.
+///
+/// Currently dead-code-warned because the table-prefill links that
+/// used it were removed when the catalog pane pivoted to surfacing
+/// Lakekeeper warehouse state (commit removing the create-namespace
+/// handler). Will be re-introduced in phase 1.5 once warehouse
+/// bootstrap ships and Iceberg namespaces drill-down lands; keeping
+/// the helper here so the next iteration doesn't redefine it.
+#[allow(dead_code)]
 fn url_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
