@@ -745,3 +745,96 @@ xtable is `available: true` on the hub and the last entry in
 `INSTALL_ORDER` (because its dataset config typically references
 upstream sources living in earlier components like garage /
 lakekeeper).
+
+## Deferred work / open TODOs
+
+Tracked here so a future commit doesn't re-discover the same scope.
+Each entry names the feature, what's been scoped vs not, and the
+constraint that pushed it past v0.0.x.
+
+### Secrets: scheduled auto-rotation + encrypted-mail notification
+
+**Status:** deferred, **NOT** in v0.0.x. Manual rotation via
+`POST /admin/secrets/{name}/rotate` works today (and now applies the
+new value to the running component for postgres -- kanidm + grafana
+appliers are themselves deferred; see entries below).
+
+**Shape when it lands** (three discrete pieces; pieces 1+2 can ship
+together, piece 3 is a separate milestone):
+
+1. **Per-secret rotation policy** -- extend the secrets store schema
+   with `rotation_policy: Option<{ interval_days, last_rotated_at,
+   recipients: Vec<OperatorId>, pgp_key_refs: Vec<String> }>`. UI
+   form on the secret-detail page. Touches `computeza-secrets`,
+   ui-server, audit log.
+2. **Background rotation scheduler** -- new tick in
+   `crates/computeza/src/main.rs` (parallel to `reconcile_tick`)
+   firing hourly, walking secrets with policies, reusing the same
+   `apply_admin_password` + `secrets.put` path the manual handler
+   uses. Roll-forward semantics: a rotation that succeeds on the
+   apply step and fails on `secrets.put` retries on the next tick;
+   the live component already accepts the new value so the vault
+   eventually catches up.
+3. **Encrypted mail dispatch** -- after a successful rotation,
+   PGP-encrypt the new value to each configured recipient's public
+   key and send via SMTP. Uses `sequoia-openpgp` (pure-Rust, no GPG
+   dep) + `lettre` for SMTP. **Do NOT ship a plaintext-body or
+   TLS-only-without-PGP variant** -- defeats the vault abstraction
+   the moment a recipient's mailbox is compromised. New
+   `/admin/smtp` page persists SMTP host/port/user/password (the
+   password lives in the secrets store, naturally) and a
+   workspace-wide default recipient list. Per-operator PGP keys
+   upload at `/admin/operators/{id}/pgp-key`.
+
+**Failure semantics when mail fails after rotation succeeded:** keep
+the rotation, log the mail failure prominently, queue a retry. Do
+NOT roll back the rotation -- rolling back risks the same
+vault-vs-component drift bug that motivated `apply_admin_password`
+in the first place.
+
+**Scope discipline:** piece 3 is a substantial surface (new crypto
+dep, per-operator key UI, SMTP config). Treat it as a separate
+milestone with its own design pass; don't ram it through together
+with pieces 1+2.
+
+### Apply-admin-password for kanidm + grafana
+
+**Status:** deferred; postgres works. The install path generates an
+admin password and stores it in the secrets vault for postgres,
+kanidm, and grafana, but `apply_admin_password()` currently only
+applies it to postgres. Kanidm + grafana stay on their post-init
+default passwords; the reconciler observes them with an empty
+admin_token (works against unauth'd local endpoints; will surface
+FAILED when the operator configures real auth).
+
+When it lands:
+- **kanidm:** shell out to `kanidmd recover_account admin` against
+  the local-socket Unix endpoint. v0.0.x's kanidm driver already
+  ships the binary; reuse it.
+- **grafana:** POST to `/api/admin/users/{user_id}/password` with
+  basic-auth using the current default (admin/admin) before
+  rotation. After first rotation succeeds, switch to the new
+  password.
+
+Both need the live component running -- guard with a connectivity
+probe before the apply attempt, fall back to the existing
+"warns but doesn't fail" path so a transient outage doesn't break
+the rest of the install.
+
+### XTable runtime invocation
+
+**Status:** deferred to v0.1+. v0.0.x ships install plumbing only
+(JRE bootstrap, source build, JAR placement, datasets.yaml stub,
+systemd unit with `ExecStart=/bin/true`). Two upstream constraints
+box us in:
+- 0.2.0-incubating doesn't produce a runnable CLI JAR.
+- 0.3.0-incubating has the CLI but pins
+  `lombok-maven-plugin:1.18.20.0` (needs JDK <=16) AND
+  `quarkus-maven-plugin:3.2.12.Final` (needs JDK >=17) -- no JDK
+  satisfies both.
+
+Resolves when XTable upstream bumps the lombok plugin OR when we
+maintain a Computeza-bundled fat-JAR build pipeline that sidesteps
+the upstream pom collision. See
+`crates/computeza-driver-native/src/linux/xtable.rs` module
+doc-comment for the full constraint analysis.

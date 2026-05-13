@@ -820,7 +820,40 @@ pub fn router_with_state(state: AppState) -> Router {
 async fn install_hub_handler(State(state): State<AppState>) -> Html<String> {
     let l = Localizer::english();
     let active = active_jobs(&state);
-    Html(render_install_hub(&l, &active))
+    let installed = compute_installed_slugs(state.store.as_deref()).await;
+    Html(render_install_hub(&l, &active, &installed))
+}
+
+/// Read the metadata store and return the set of slugs that currently
+/// have a `{slug}-instance/local` row -- i.e. the components the
+/// operator has installed at least once and has not subsequently
+/// uninstalled. Used by the install hub to render an Install button
+/// (when missing) or an Uninstall button (when present) per card,
+/// so operators can re-install or tear down a single component
+/// without running the bulk Install-All / Uninstall-All flow.
+///
+/// Best-effort: a missing store or a list-failure returns an empty
+/// set so the UI degrades to "show Install button everywhere" -- a
+/// false negative is recoverable (the per-component handler is
+/// idempotent) but a false positive (Uninstall on a fresh install)
+/// would be confusing.
+async fn compute_installed_slugs(
+    store: Option<&computeza_state::SqliteStore>,
+) -> std::collections::HashSet<String> {
+    use computeza_state::Store;
+    let Some(store) = store else {
+        return std::collections::HashSet::new();
+    };
+    let mut out = std::collections::HashSet::new();
+    for c in COMPONENTS {
+        let kind = format!("{}-instance", c.slug);
+        if let Ok(rows) = store.list(&kind, None).await {
+            if !rows.is_empty() {
+                out.insert(c.slug.to_string());
+            }
+        }
+    }
+    out
 }
 
 /// Snapshot of an in-flight install job, surfaced on the install hub
@@ -6492,7 +6525,11 @@ fn canonical_defaults_for(slug: &str) -> (u16, String) {
 /// Inputs use the `<slug>__<field>` naming convention so the unified
 /// POST handler can extract per-slug configs from a flat HashMap.
 /// Blank fields fall through to driver defaults.
-fn render_unified_component_card(localizer: &Localizer, c: &ComponentEntry) -> String {
+fn render_unified_component_card(
+    localizer: &Localizer,
+    c: &ComponentEntry,
+    is_installed: bool,
+) -> String {
     let name = localizer.t(c.name_key);
     let role = localizer.t(c.role_key);
     let identity_label = localizer.t("ui-install-card-identity");
@@ -6509,13 +6546,57 @@ fn render_unified_component_card(localizer: &Localizer, c: &ComponentEntry) -> S
     let slug = c.slug;
     let (default_port, default_service) = canonical_defaults_for(slug);
 
-    let (badge_class, badge_text) = if c.available {
+    // Badge precedence: Installed > Planned > Available. "Installed"
+    // is the highest-signal status because it tells the operator the
+    // component actually exists on this host (vs. just being a
+    // shippable target). Computed from the metadata store before this
+    // render is called -- see compute_installed_slugs().
+    let installed_text = localizer.t("ui-install-status-installed");
+    let (badge_class, badge_text) = if is_installed {
+        ("cz-badge cz-badge-ok", installed_text.as_str())
+    } else if c.available {
         ("cz-badge cz-badge-info", status_available.as_str())
     } else {
         ("cz-badge cz-badge-info", status_planned.as_str())
     };
 
     let disabled_attr = if c.available { "" } else { " disabled" };
+
+    // Per-card action: Install (when missing) or Uninstall (when
+    // installed). These hit the same per-component routes that have
+    // existed for power users / CI scripts since v0.0.x landed, just
+    // surfaced in the hub UI so operators can recover from a single
+    // failed component without re-running the bulk install. The
+    // bulk Install-All button at the bottom of the page is still the
+    // happy path for fresh setups.
+    let action_label_install = localizer.t("ui-install-card-action-install");
+    let action_label_uninstall = localizer.t("ui-install-card-action-uninstall");
+    let action_help_installed = localizer.t("ui-install-card-action-help-installed");
+    let action_help_missing = localizer.t("ui-install-card-action-help-missing");
+    let action_block = if !c.available {
+        // Planned components have no per-component handler yet.
+        String::new()
+    } else if is_installed {
+        format!(
+            r#"<div style="margin-top: 0.85rem; padding: 0.75rem 0.9rem; border-radius: 0.5rem; background: rgba(255,99,99,0.08); border: 1px solid rgba(255,99,99,0.25);">
+<p class="cz-muted" style="margin: 0 0 0.6rem; font-size: 0.82rem;">{help}</p>
+<a class="cz-btn cz-btn-danger" href="/install/{slug}/uninstall">{label}</a>
+</div>"#,
+            slug = slug,
+            label = html_escape(&action_label_uninstall),
+            help = html_escape(&action_help_installed),
+        )
+    } else {
+        format!(
+            r#"<div style="margin-top: 0.85rem; padding: 0.75rem 0.9rem; border-radius: 0.5rem; background: rgba(74, 158, 255, 0.08); border: 1px solid rgba(74, 158, 255, 0.25);">
+<p class="cz-muted" style="margin: 0 0 0.6rem; font-size: 0.82rem;">{help}</p>
+<a class="cz-btn" href="/install/{slug}">{label}</a>
+</div>"#,
+            slug = slug,
+            label = html_escape(&action_label_install),
+            help = html_escape(&action_help_missing),
+        )
+    };
 
     let unavailable_block = if c.available {
         String::new()
@@ -6575,6 +6656,7 @@ fn render_unified_component_card(localizer: &Localizer, c: &ComponentEntry) -> S
 <p class="cz-muted" style="margin: 0.35rem 0 0; font-size: 0.78rem;">Leave the IdP dropdown on "None" to skip federation for this component. Claim-to-group mappings configure on the /admin/operators page after first sign-on.</p>
 </div>
 </div>
+{action_block}
 </div>
 </details>
 </li>"#,
@@ -6591,6 +6673,7 @@ fn render_unified_component_card(localizer: &Localizer, c: &ComponentEntry) -> S
         data_dir_label = html_escape(&data_dir_label),
         service_name_label = html_escape(&service_name_label),
         version_label = html_escape(&version_label),
+        action_block = action_block,
         default_port = default_port,
         default_service = html_escape(&default_service),
         disabled_attr = disabled_attr,
@@ -6611,7 +6694,11 @@ fn render_unified_component_card(localizer: &Localizer, c: &ComponentEntry) -> S
 /// remain available for power users and CI scripts but are no longer
 /// linked from the hub.
 #[must_use]
-pub fn render_install_hub(localizer: &Localizer, active: &[ActiveJob]) -> String {
+pub fn render_install_hub(
+    localizer: &Localizer,
+    active: &[ActiveJob],
+    installed: &std::collections::HashSet<String>,
+) -> String {
     let title = localizer.t("ui-install-hub-title");
     let intro = localizer.t("ui-install-hub-intro");
     let install_all_button = localizer.t("ui-install-all-button");
@@ -6619,7 +6706,7 @@ pub fn render_install_hub(localizer: &Localizer, active: &[ActiveJob]) -> String
 
     let cards: String = COMPONENTS
         .iter()
-        .map(|c| render_unified_component_card(localizer, c))
+        .map(|c| render_unified_component_card(localizer, c, installed.contains(c.slug)))
         .collect();
 
     let platform_banner = render_platform_banner(localizer);
@@ -11415,7 +11502,7 @@ mod tests {
     #[test]
     fn install_hub_renders_a_card_per_component_and_one_global_submit() {
         let l = Localizer::english();
-        let html = render_install_hub(&l, &[]);
+        let html = render_install_hub(&l, &[], &std::collections::HashSet::new());
         assert!(html.contains("Install Computeza"));
         assert!(
             html.contains(r#"name="csrf_token""#),
@@ -11467,7 +11554,7 @@ mod tests {
             components_done: 3,
             components_total: 10,
         }];
-        let html = render_install_hub(&l, &active);
+        let html = render_install_hub(&l, &active, &std::collections::HashSet::new());
         assert!(html.contains("Install in progress"));
         assert!(html.contains(r#"href="/install/job/abc-123""#));
         assert!(html.contains("3/10 components"));

@@ -424,6 +424,16 @@ ui-prerequisite-banner-needed-for   = Needed for
 ui-prerequisite-banner-install-hint = Install with
 ui-install-status-available  = Available
 ui-install-status-planned    = Planned
+ui-install-status-installed  = Installed
+
+# Per-card singular action labels: when a component is already
+# installed, the operator can tear down just that one; when it isn't,
+# the operator can install just that one without running the bulk
+# Install-All flow.
+ui-install-card-action-install      = Install just this one
+ui-install-card-action-uninstall    = Uninstall just this one
+ui-install-card-action-help-installed = This component is installed. Use this if you want to tear down just this one (e.g. to re-install with different settings) without affecting the rest of the cluster.
+ui-install-card-action-help-missing   = Install this single component without running the bulk Install-All flow. Useful when one earlier install failed and you want to retry just that component.
 ui-install-coming-soon-title = Install from the CLI
 ui-install-coming-soon-body  = This component's native install path is wired in `computeza-driver-native` for Ubuntu Linux (download + systemd unit + start). The per-component web wizard lands in a follow-up commit. Today: run `computeza install <slug>` from the CLI on an Ubuntu host (22.04 LTS or 24.04 LTS). macOS + Windows + non-Ubuntu Linux driver variants are v0.1+; the reconciler is already wired to observe any running instance once its spec is in the metadata store.
 ui-install-coming-soon-back  = Back to install hub

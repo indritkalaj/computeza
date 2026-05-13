@@ -143,6 +143,34 @@ cargo run --bin computeza -- --help
 The `rust-toolchain.toml` pins the Rust version; `rustup` will install it
 automatically on first build.
 
+## Roadmap (selected deferred work)
+
+Tracked in detail under `AGENTS.md` ("Deferred work / open TODOs").
+Headline items not yet in v0.0.x:
+
+- **Scheduled secrets auto-rotation + PGP-encrypted notification.**
+  Manual rotation works today via `/admin/secrets/{name}/rotate`
+  (and now applies the new value to postgres). Auto-rotate ships in
+  three pieces -- per-secret policy editor, hourly scheduler that
+  reuses the manual-rotate code path, and PGP-encrypted-over-SMTP
+  mail dispatch to a configurable recipient list. Pieces 1+2 are a
+  contained v0.1 milestone; piece 3 (with `sequoia-openpgp` +
+  per-operator key UI) gets its own design pass.
+- **Apply-admin-password for kanidm + grafana.** Postgres works
+  end-to-end; kanidm + grafana store generated passwords in the
+  vault but don't push them to the running component yet (each
+  needs its own mechanism -- `kanidmd recover_account` for kanidm,
+  `/api/admin/users/{id}/password` for grafana).
+- **XTable runtime invocation.** The install pipeline provisions
+  JRE + JAR + systemd unit, but ExecStart is `/bin/true` for
+  v0.0.x. Upstream JDK plugin-pin conflicts block a runnable build
+  today; full analysis in
+  [`crates/computeza-driver-native/src/linux/xtable.rs`](crates/computeza-driver-native/src/linux/xtable.rs).
+- **Cross-platform expansion.** macOS + Windows native drivers,
+  non-Ubuntu Linux distros, Kubernetes driver -- all v0.1+ once
+  Databend's release engineering catches up or we ship a
+  source-build fallback.
+
 ## License
 
 See [LICENSE.md](LICENSE.md). Computeza is commercial software licensed
