@@ -5949,39 +5949,41 @@ cd computeza</code></pre>
 
 <section class="cz-section" id="step-2-first-run">
 <h2>Step 2 -- first run + the secrets passphrase</h2>
-<p>The operator console encrypts every generated credential under a single passphrase that you supply via the <code>COMPUTEZA_SECRETS_PASSPHRASE</code> environment variable. Without it, the console still runs but credentials are surfaced on a one-time view page only -- not persisted.</p>
+<p>The operator console encrypts every generated credential under a single passphrase. <strong>Computeza auto-generates this passphrase on first boot</strong> -- you do not need to run <code>openssl rand</code> or set any environment variable yourself. The binary writes a 256-bit CSPRNG passphrase to <code>&lt;state_db_parent&gt;/computeza-passphrase</code> (mode 0600) and reuses it on every subsequent start.</p>
 <ol class="cz-ol">
-<li>Generate a strong passphrase and store it where you keep the rest of your infrastructure secrets:
-<pre><code>openssl rand -hex 32</code></pre>
-</li>
-<li>Boot the console with the passphrase exported. The default <code>127.0.0.1:8400</code> binding keeps the console reachable only from the host (recommended until you put a reverse proxy in front):
-<pre><code>export COMPUTEZA_SECRETS_PASSPHRASE='&lt;the-string-from-step-1&gt;'
-sudo -E ./target/release/computeza serve --addr 127.0.0.1:8400 \
+<li>Boot the console under sudo. The install path writes <code>/var/lib/computeza</code> + <code>/etc/systemd/system</code> + <code>/usr/local/bin</code> so it needs root; the <code>-E</code> flag preserves environment variables across the sudo boundary (matters when you later integrate with Vault / KMS via <code>COMPUTEZA_SECRETS_PASSPHRASE</code>).
+<pre><code>sudo -E ./target/release/computeza serve --addr 127.0.0.1:8400 \
     --state-db /var/lib/computeza/computeza-state.db</code></pre>
-The <code>-E</code> flag preserves the env var across the sudo boundary.
+</li>
+<li>On first run the binary logs a prominent warning:
+<pre><code>WARN: Generated a NEW secrets passphrase. To keep stored
+      secrets recoverable across hardware migrations and
+      disaster recovery you MUST back up THREE things together:
+      (1) /var/lib/computeza/computeza-passphrase
+      (2) /var/lib/computeza/computeza-secrets.salt
+      (3) /var/lib/computeza/computeza-secrets.jsonl</code></pre>
+Back those three files up together. Losing any one renders every stored secret permanently unrecoverable -- by design.
 </li>
 <li>Open <a href="/">http://localhost:8400</a> in a browser. The first request lands on <code>/setup</code> where you mint the initial admin account -- the only unauthenticated form on the console after first boot.</li>
-<li><strong>Back up three things together</strong> -- losing any one renders every stored secret permanently unrecoverable, by design:
-<ul>
-<li>The passphrase you generated (e.g. in a password manager).</li>
-<li><code>/var/lib/computeza/computeza-secrets.salt</code> (16 random bytes; generated on first run).</li>
-<li><code>/var/lib/computeza/computeza-secrets.jsonl</code> (the AES-256-GCM ciphertext, grows over time).</li>
-</ul>
-</li>
+<li><strong>Production: bring your own key.</strong> Operators integrating with HashiCorp Vault, AWS KMS, GCP KMS, PKCS#11, or TPM set <code>COMPUTEZA_SECRETS_PASSPHRASE</code> in the systemd EnvironmentFile= and the auto-generated file is ignored entirely. v0.1 ships a <code>KeyProvider</code> trait so the binary asks Vault for the key directly without staging anything on disk.</li>
 </ol>
+<p class="cz-muted">The "no manual openssl step" change landed on 2026-05-13. Older operator-side docs may still tell you to run <code>openssl rand -hex 32</code> -- ignore those; the binary does it for you.</p>
 </section>
 
 <section class="cz-section" id="step-3-components">
 <h2>Step 3 -- install managed components</h2>
 <p>Once signed in, the <a href="/install">/install</a> page is the one-screen hub: every managed component is listed as an accordion row with a per-component form for port + data-directory overrides. Each driver:</p>
 <ul>
-<li>Downloads its binaries from the upstream's CDN (SHA-verified where pinned), or uses a distro package when present.</li>
+<li>Downloads its binaries from the upstream (GitHub Releases for most; <code>dl.grafana.com</code> for Grafana; <code>git.deuxfleurs.fr</code> source tarball for Garage; <code>github.com/kanidm/kanidm</code> source tarball for Kanidm).</li>
 <li>Drops a data directory under <code>/var/lib/computeza/&lt;component&gt;/</code> (or your override).</li>
-<li>Writes a systemd unit named <code>computeza-&lt;component&gt;.service</code> and <code>enable --now</code>'s it.</li>
-<li>Waits for the service's health probe to succeed before reporting "installed".</li>
+<li>Writes a systemd unit named <code>computeza-&lt;component&gt;.service</code> with <code>WorkingDirectory</code> + <code>RuntimeDirectory</code> + a hardened sandbox (<code>ProtectSystem=strict</code>, <code>NoNewPrivileges</code>, etc.).</li>
+<li>For components with cross-component dependencies (Lakekeeper -&gt; PostgreSQL), runs the provisioning step (creates the role + database via <code>sudo -u postgres psql</code>) before the unit starts.</li>
+<li>For source-built components (Kanidm, Garage), uses the <strong>release-swap</strong> pattern -- atomic-swaps <code>&lt;root&gt;/current</code> to point at a fresh <code>releases/&lt;timestamp&gt;-v&lt;version&gt;/</code> directory, with a pre-flight <code>--help</code> probe before the swap. Rollback is one symlink command.</li>
+<li><code>systemctl stop</code> before <code>enable --now</code> so re-installs actually pick up the rewritten unit (otherwise the in-memory unit of the running daemon keeps using the OLD env vars).</li>
+<li>Waits for the TCP port. On timeout, the install-result page surfaces the last 60 lines of the unit's journal inline -- no <code>journalctl</code> round-trip needed to diagnose.</li>
 </ul>
-<p>No per-component apt / yum installs needed. The Linux Postgres driver also auto-fetches an EnterpriseDB binary tarball when no distro Postgres is present, so even Postgres is no-prereqs.</p>
-<p class="cz-muted">Re-running an install for an already-installed component is idempotent: the driver detects the existing data directory, leaves it untouched, and re-renders the unit file. Use <a href="/install">/install</a> -> <em>Uninstall</em> to tear a component down cleanly (drops the systemd unit + data dir).</p>
+<p><strong>Install order matters.</strong> Postgres should be installed first because Lakekeeper (and v0.1+ identity-store) consume it. The unified "Install everything" button handles ordering automatically; if you install per-component, do Postgres -&gt; OpenFGA -&gt; Kanidm -&gt; ... -&gt; Lakekeeper.</p>
+<p class="cz-muted">Re-running an install for an already-installed component is idempotent: data directories are preserved, config files marked <code>overwrite_if_present: false</code> (Databend, Garage) keep operator edits across re-installs, source builds atomic-swap rather than overwrite in place, and the postgres provisioning SQL is wrapped in <code>DO $$ IF NOT EXISTS $$</code> blocks.</p>
 </section>
 
 <section class="cz-section" id="step-4-license">
@@ -6028,21 +6030,41 @@ Then from Windows CMD / PowerShell: <code>wsl --shutdown</code>, re-open Ubuntu,
 
 <section class="cz-section" id="troubleshooting">
 <h2>Troubleshooting</h2>
+<p class="cz-muted"><strong>Read the install-result page first.</strong> When a component fails, the result page splices the last 60 lines of <code>journalctl -u computeza-&lt;component&gt;</code> directly into the error message. The actual daemon-side cause is inline -- no <code>journalctl</code> round-trip required for most failures.</p>
+
 <dl class="cz-dl">
 <dt>"Permission denied (os error 13)" during a component install</dt>
-<dd>The install path writes <code>/var/lib/computeza/*</code> and <code>/etc/systemd/system/*</code> -- both require root. Re-run with <code>sudo -E ./target/release/computeza serve ...</code>. The <code>-E</code> preserves <code>COMPUTEZA_SECRETS_PASSPHRASE</code> across the sudo boundary.</dd>
+<dd>The install path writes <code>/var/lib/computeza/*</code> and <code>/etc/systemd/system/*</code> -- both require root. Re-run with <code>sudo -E ./target/release/computeza serve ...</code>. The <code>-E</code> preserves environment variables (passphrase overrides, proxy settings, etc.) across the sudo boundary.</dd>
+
+<dt>"Text file busy (os error 26)" on a source-built component re-install</dt>
+<dd>Linux refuses to overwrite an executable that's currently mmap'd by a running process. The driver mitigates by <code>systemctl stop</code> + atomic rename, plus the release-swap pattern for kanidm + garage (binary lives under <code>&lt;root&gt;/releases/&lt;id&gt;/</code> and <code>current</code> is a symlink that's atomic-swapped). If you ever see this error in v0.0.x, you have a stale binary running outside systemd's tracking -- kill it with <code>pkill &lt;binary&gt;</code> and re-install.</dd>
+
+<dt>Service "did not become ready on port X within 30s"</dt>
+<dd>The driver's wait-for-port probe timed out. The error message now carries the unit's journal tail (60 lines) -- read it. Common daemon-side causes: missing config / env var, port already in use, sandbox blocking a relative path (we set <code>WorkingDirectory=&lt;root&gt;</code> + <code>RuntimeDirectory=&lt;component&gt;</code> in every unit to avoid this), or an upstream-side regression in the daemon itself.</dd>
+
+<dt>"Read-only file system" inside a managed daemon</dt>
+<dd>The unit's <code>ProtectSystem=strict</code> sandbox makes everything outside <code>ReadWritePaths</code> read-only. The driver lists <code>ReadWritePaths=&lt;root&gt;</code> + sets <code>WorkingDirectory=&lt;root&gt;</code> so relative writes inside the daemon land in writable territory. If a daemon writes to an absolute path outside <code>&lt;root&gt;</code>, file a bug -- the driver should be passing that path as a config flag rather than letting the daemon hardcode it.</dd>
 
 <dt>"postgres binaries not found"</dt>
-<dd>The Linux Postgres driver searches <code>/usr/lib/postgresql/&lt;v&gt;/bin</code>, <code>/usr/pgsql-&lt;v&gt;/bin</code>, and <code>/usr/{{,local/}}bin</code> for majors 13-18. When none match, it falls through to downloading the EnterpriseDB tarball under <code>&lt;root_dir&gt;/binaries/&lt;version&gt;/</code>. If both paths fail, check egress to <code>get.enterprisedb.com</code> or supply a custom <code>bin_dir</code> on the install form.</dd>
+<dd>The Linux Postgres driver searches <code>/usr/lib/postgresql/&lt;v&gt;/bin</code>, <code>/usr/pgsql-&lt;v&gt;/bin</code>, <code>/opt/postgresql/bin</code>, and <code>/usr/{{,local/}}bin</code> for majors 13-18. When no distro postgres is detected AND the install runs as root, the driver auto-invokes <code>apt-get install -y postgresql postgresql-contrib</code> (or the dnf/zypper/pacman equivalent). If the auto-install is what fails, the error tells you why -- typically not root, or no internet egress to the distro mirror.</dd>
 
 <dt>"Failed to connect to bus" during systemd registration</dt>
-<dd>systemd isn't running. On WSL2, enable it via <code>/etc/wsl.conf</code> and <code>wsl --shutdown</code> (see WSL section above). On a minimal LXC container, ensure the container template has systemd as PID 1.</dd>
+<dd>systemd isn't running. On WSL2, enable it via <code>/etc/wsl.conf</code> and <code>wsl --shutdown</code> (see WSL section above). On a minimal LXC container, ensure the container template has systemd as PID 1. systemd-free hosts are not supported in v0.0.x; the v0.1 spec adds OpenRC + supervisord variants.</dd>
+
+<dt>Kanidm install: "could not find `kanidmd` in registry"</dt>
+<dd>You're on an older binary. The kanidm driver was switched on 2026-05-13 from <code>cargo install --version</code> (crates.io, often stale) to <code>cargo build --release --bin kanidmd</code> against the upstream git tag. <code>git pull &amp;&amp; cargo build</code> and re-install.</dd>
+
+<dt>Kanidm install: "Can't find external/bootstrap.bundle.min.js"</dt>
+<dd>The unit's <code>WorkingDirectory</code> wasn't set to the source tree where kanidm's web-UI assets live. Fixed on 2026-05-13: the driver now sets <code>WorkingDirectory=&lt;root&gt;/current/src/server/daemon</code> so kanidm's relative <code>../core/static/...</code> lookup resolves. Re-install if you're seeing this on an older binary.</dd>
+
+<dt>Lakekeeper install: "A connection string or postgres host must be provided"</dt>
+<dd>Lakekeeper needs a postgres connection AND a migrated schema. The driver provisions both: it creates a dedicated <code>lakekeeper</code> postgres role + database (idempotent <code>DO $$ IF NOT EXISTS $$</code> blocks), wires the connection details into the unit's <code>Environment=</code> lines, and runs <code>lakekeeper migrate</code> via <code>ExecStartPre=</code> before <code>serve</code>. If you still see this after a re-install with the latest binary, run <code>strings &lt;lakekeeper-binary&gt; | grep -E 'LAKEKEEPER|PG_DATABASE'</code> to dump the env-var names the binary actually parses (env-var naming has changed across lakekeeper releases) and open an issue with the output.</dd>
+
+<dt>Postgres reconciler logs "password authentication failed for user postgres"</dt>
+<dd>The reconciler is trying to verify postgres via TCP but can't resolve the spec's <code>superuser_password_ref</code> against the secrets store. This is benign if you're not relying on reconciler health -- the warning fires every 30s, the component still works. Resolve it by attaching the secrets store (auto-attached as of 2026-05-13 even without setting the env var) and re-installing postgres so the generated password is persisted encrypted.</dd>
 
 <dt>License banner reads "Not yet valid" or "Signature failed"</dt>
 <dd>The envelope's <code>not_before</code> is in the future, the chain anchor doesn't match the baked-in trusted-root key, or the JSON was edited after signing. Re-request a fresh envelope from your reseller; the binary refuses tampered envelopes by design.</dd>
-
-<dt>Secrets warning banner reads "No secrets store is attached"</dt>
-<dd><code>COMPUTEZA_SECRETS_PASSPHRASE</code> is unset. The first-boot wizard at <a href="/setup">/setup</a> walks you through generating a passphrase + writing a systemd drop-in; manual setup is <code>export COMPUTEZA_SECRETS_PASSPHRASE=...</code> + restart.</dd>
 
 <dt>Console boots but pages return 502 / connection refused from the reverse proxy</dt>
 <dd>Check the bind address: if you set <code>--addr 0.0.0.0:8400</code> the reverse proxy reaches it on the public interface; for the recommended 127.0.0.1 binding, both the proxy and the console must be on the same host.</dd>
@@ -6050,8 +6072,15 @@ Then from Windows CMD / PowerShell: <code>wsl --shutdown</code>, re-open Ubuntu,
 <dt>An installed component shows "Failed" on /status</dt>
 <dd>Check the per-component systemd log: <code>journalctl -u computeza-&lt;component&gt; -n 200 --no-pager</code>. The most common cause is a port conflict with a pre-existing service on the same host (e.g. apt-installed Postgres on 5432 while the Computeza-managed Postgres tries to claim it). Disable the conflicting service with <code>sudo systemctl stop &lt;name&gt; &amp;&amp; sudo systemctl disable &lt;name&gt;</code>.</dd>
 
+<dt>"Incorrect username or password" at /login</dt>
+<dd>v0.0.x has no password-reset email flow. Recovery is to delete the operator file and re-mint the first admin via <code>/setup</code>:
+<pre><code>rm /var/lib/computeza/operators.jsonl
+# restart serve, then visit /setup
+</code></pre>
+If the file is at a different path, it's alongside <code>state.db</code>. v0.1 wires an external IdP (Entra ID / Okta / Auth0) via the <code>computeza-identity-federation</code> crate so password reset becomes an IdP concern.</dd>
+
 <dt>Forensics: who did what, and when?</dt>
-<dd>Every state change is appended to <code>&lt;state_db_parent&gt;/audit.jsonl</code> with an Ed25519 chained signature. View it under <a href="/audit">/audit</a>. The verifying key is at <code>audit.key</code>; back this up so an external auditor can verify the chain independently.</dd>
+<dd>Every state change is appended to <code>&lt;state_db_parent&gt;/audit.jsonl</code> with an Ed25519 chained signature. View it under <a href="/audit">/audit</a>. The verifying key is at <code>audit.key</code>; back this up so an external auditor can verify the chain independently. Credential downloads via <code>/install/credentials.json</code> are recorded -- so a future breach investigation can answer "who pulled the install credentials, when".</dd>
 </dl>
 </section>
 
