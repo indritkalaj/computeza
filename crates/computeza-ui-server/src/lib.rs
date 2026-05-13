@@ -878,6 +878,100 @@ async fn discover_lakekeeper_endpoint(
     Some(spec.endpoint.base_url)
 }
 
+/// Cap on how many recent queries we retain per workspace. Older
+/// entries get dropped when the list exceeds this. 20 is a
+/// balance between "useful enough to recover yesterday's work" and
+/// "small enough that a single resource row stays well under the
+/// 1MB SQLite-blob soft ceiling" -- 20 entries * ~2KB SQL each
+/// leaves plenty of headroom.
+const WORKSPACE_HISTORY_CAP: usize = 20;
+
+/// One row in the workspace SQL history. Persisted as JSON inside
+/// a single resource row (`workspace-history/default`) so we don't
+/// need a new SQLite table for v0.0.x. Multi-workspace history
+/// (one row per workspace name) lands when the workspace selector
+/// stops being hard-coded to "default".
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct WorkspaceHistoryEntry {
+    /// The query text, verbatim. v0.0.x stores plaintext; the
+    /// deferred secrets-redaction layer (AGENTS.md "Deferred work")
+    /// will replace this with a sanitised variant once it ships.
+    sql: String,
+    /// UTC timestamp when the query was submitted.
+    executed_at: chrono::DateTime<chrono::Utc>,
+    /// True iff Databend returned a result set (not an error).
+    ok: bool,
+    /// Number of rows returned. `None` for errored queries or
+    /// queries that don't produce rows (DDL, INSERT without
+    /// RETURNING).
+    row_count: Option<usize>,
+}
+
+/// Wrapper struct for the workspace-history resource spec. The
+/// `entries` vec is newest-first so the UI can iterate in display
+/// order without re-sorting.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct WorkspaceHistory {
+    #[serde(default)]
+    entries: Vec<WorkspaceHistoryEntry>,
+}
+
+/// Read the workspace SQL history from the metadata store. Returns
+/// an empty history when no row exists yet (first query of a fresh
+/// install) or when the store isn't attached.
+async fn load_workspace_history(
+    store: Option<&computeza_state::SqliteStore>,
+) -> WorkspaceHistory {
+    use computeza_state::Store;
+    let Some(store) = store else {
+        return WorkspaceHistory::default();
+    };
+    let key = computeza_state::ResourceKey::cluster_scoped("workspace-history", "default");
+    match store.load(&key).await {
+        Ok(Some(stored)) => serde_json::from_value(stored.spec).unwrap_or_default(),
+        _ => WorkspaceHistory::default(),
+    }
+}
+
+/// Prepend a new history entry and persist. Best-effort: a save
+/// failure logs but doesn't block the SQL roundtrip from
+/// returning to the operator. Caps the list at
+/// `WORKSPACE_HISTORY_CAP` entries (drops oldest).
+async fn record_workspace_history(
+    store: Option<&computeza_state::SqliteStore>,
+    entry: WorkspaceHistoryEntry,
+) {
+    use computeza_state::Store;
+    let Some(store) = store else {
+        return;
+    };
+    let key = computeza_state::ResourceKey::cluster_scoped("workspace-history", "default");
+    let existing = match store.load(&key).await {
+        Ok(Some(s)) => Some(s),
+        _ => None,
+    };
+    let mut history: WorkspaceHistory = existing
+        .as_ref()
+        .and_then(|s| serde_json::from_value(s.spec.clone()).ok())
+        .unwrap_or_default();
+    history.entries.insert(0, entry);
+    history.entries.truncate(WORKSPACE_HISTORY_CAP);
+    let value = match serde_json::to_value(&history) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not serialise workspace history; skipping save");
+            return;
+        }
+    };
+    let expected_revision = existing.as_ref().map(|s| s.revision);
+    if let Err(e) = store.save(&key, &value, expected_revision).await {
+        tracing::warn!(
+            error = %e,
+            "could not persist workspace history; the SQL result is still rendered, only the history list won't include this query"
+        );
+    }
+}
+
 /// Same shape as `discover_lakekeeper_endpoint`, for Databend.
 /// Phase 1 hits the HTTP query handler directly; multi-tenant
 /// dispatch (one databend per workspace group) lands in phase B
@@ -987,12 +1081,14 @@ async fn workspace_handler(
         Some(url) => probe_lakekeeper(url).await,
         None => LakekeeperState::Unreachable,
     };
+    let history = load_workspace_history(state.store.as_deref()).await;
     let sql_prefill = q.sql.unwrap_or_default();
     Html(render_workspace_page(
         &l,
         lakekeeper.is_some(),
         databend.is_some(),
         &lk_state,
+        &history,
         &sql_prefill,
         None,
     ))
@@ -1026,15 +1122,37 @@ async fn workspace_sql_execute_handler(
         Some(url) => Some(execute_sql_against_databend(url, &form.sql).await),
         None => None,
     };
+    // Record the query into the workspace history before rendering,
+    // so the history list shown to the operator includes the query
+    // they just ran (rather than the previous one).
+    if !form.sql.trim().is_empty() {
+        let (ok, row_count) = match &result {
+            Some(SqlOutcome::Ok { rows, .. }) => (true, Some(rows.len())),
+            Some(SqlOutcome::Err(_)) => (false, None),
+            None => (false, None),
+        };
+        record_workspace_history(
+            state.store.as_deref(),
+            WorkspaceHistoryEntry {
+                sql: form.sql.clone(),
+                executed_at: chrono::Utc::now(),
+                ok,
+                row_count,
+            },
+        )
+        .await;
+    }
     let lk_state = match &lakekeeper {
         Some(url) => probe_lakekeeper(url).await,
         None => LakekeeperState::Unreachable,
     };
+    let history = load_workspace_history(state.store.as_deref()).await;
     Html(render_workspace_page(
         &l,
         lakekeeper.is_some(),
         databend.is_some(),
         &lk_state,
+        &history,
         &form.sql,
         result,
     ))
@@ -1146,14 +1264,16 @@ async fn execute_sql_against_databend(base_url: &str, sql: &str) -> SqlOutcome {
 
 /// Render the two-pane workspace page. Pure-server template; the
 /// only JS on the page is the existing CSRF auto-fill from
-/// render_shell. The catalog list renders on the left, the SQL
-/// editor and results render on the right.
+/// render_shell + the Monaco loader at the bottom. The catalog
+/// list renders on the left, the SQL editor + history + results
+/// render on the right.
 #[allow(clippy::too_many_arguments)]
 fn render_workspace_page(
     localizer: &Localizer,
     has_lakekeeper: bool,
     has_databend: bool,
     lk_state: &LakekeeperState,
+    history: &WorkspaceHistory,
     sql_prefill: &str,
     result: Option<SqlOutcome>,
 ) -> String {
@@ -1172,7 +1292,73 @@ fn render_workspace_page(
     let lk_no_warehouses = localizer.t("ui-workspace-lakekeeper-no-warehouses");
     let lk_warehouses_heading = localizer.t("ui-workspace-lakekeeper-warehouses-heading");
     let lk_warehouses_note = localizer.t("ui-workspace-lakekeeper-warehouses-note");
+    let history_heading = localizer.t("ui-workspace-history-heading");
+    let history_empty = localizer.t("ui-workspace-history-empty");
+    let history_reload = localizer.t("ui-workspace-history-reload");
     let csrf = auth::csrf_input();
+
+    // History pane: collapsible <details> above the editor.
+    // Closed-by-default so the editor stays the primary surface.
+    // Each entry is a "Reload" link that bounces through
+    // /workspace?sql=... -- same prefill mechanism the catalog
+    // table-link uses, no JS required.
+    let history_block = {
+        let inner = if history.entries.is_empty() {
+            format!(r#"<p class="cz-muted" style="margin: 0;">{}</p>"#, html_escape(&history_empty))
+        } else {
+            let rows: String = history
+                .entries
+                .iter()
+                .map(|e| {
+                    let badge = if e.ok {
+                        let count = e
+                            .row_count
+                            .map(|n| format!("{n} rows"))
+                            .unwrap_or_else(|| "ok".to_string());
+                        format!(
+                            r#"<span class="cz-badge cz-badge-ok" style="font-size: 0.7rem;">{}</span>"#,
+                            html_escape(&count)
+                        )
+                    } else {
+                        r#"<span class="cz-badge cz-badge-warn" style="font-size: 0.7rem;">err</span>"#.to_string()
+                    };
+                    // Truncate the SQL preview so a 5KB query
+                    // doesn't blow up the history pane. Full text
+                    // ships when the operator clicks Reload.
+                    let preview: String = e.sql.lines().next().unwrap_or("").chars().take(80).collect();
+                    let preview = if preview.len() < e.sql.len() {
+                        format!("{preview}...")
+                    } else {
+                        preview
+                    };
+                    let ts = e.executed_at.format("%H:%M:%S").to_string();
+                    format!(
+                        r#"<li style="padding: 0.35rem 0; border-bottom: 1px solid rgba(255,255,255,0.04); display: flex; align-items: baseline; gap: 0.6rem;">
+<span class="cz-muted" style="font-size: 0.72rem; font-variant-numeric: tabular-nums;">{ts}</span>
+{badge}
+<code style="flex: 1; font-size: 0.78rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{preview}</code>
+<a href="/workspace?sql={enc}" class="cz-muted" style="font-size: 0.72rem;">{reload}</a>
+</li>"#,
+                        ts = html_escape(&ts),
+                        badge = badge,
+                        preview = html_escape(&preview),
+                        enc = url_encode(&e.sql),
+                        reload = html_escape(&history_reload),
+                    )
+                })
+                .collect();
+            format!(r#"<ul style="list-style: none; padding: 0; margin: 0;">{rows}</ul>"#)
+        };
+        format!(
+            r#"<details style="margin-bottom: 0.75rem;">
+<summary class="cz-muted" style="cursor: pointer; font-size: 0.82rem; padding: 0.25rem 0;">{heading} ({count})</summary>
+<div style="margin-top: 0.5rem; padding: 0.5rem 0.75rem; background: rgba(255,255,255,0.02); border-radius: 0.4rem;">{inner}</div>
+</details>"#,
+            heading = html_escape(&history_heading),
+            count = history.entries.len(),
+            inner = inner,
+        )
+    };
 
     // Catalog block surfaces three distinct Lakekeeper states.
     // None of them currently allow drill-down into Iceberg
@@ -1269,6 +1455,7 @@ fn render_workspace_page(
 </div>
 <div class="cz-card">
 <h2 style="margin-top: 0;">{sql_heading}</h2>
+{history_block}
 <form method="post" action="/workspace/sql/execute" id="cz-sql-form">
 {csrf}
 <!--
@@ -1390,6 +1577,7 @@ fn render_workspace_page(
         catalog_heading = html_escape(&catalog_heading),
         catalog_block = catalog_block,
         sql_heading = html_escape(&sql_heading),
+        history_block = history_block,
         sql_placeholder = html_escape(&sql_placeholder),
         sql_value = html_escape(sql_prefill),
         sql_value_attr = html_escape(sql_prefill),
