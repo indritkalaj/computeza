@@ -10,11 +10,16 @@
 //!    b. Distro package binaries -- typically `/usr/lib/postgresql/<v>/bin`
 //!       (Debian / Ubuntu) or `/usr/pgsql-<v>/bin` (RHEL / Fedora /
 //!       OpenSUSE), majors 13 to 18.
-//!    c. Computeza-managed EDB binary tarball, fetched from
-//!       `get.enterprisedb.com`, SHA-verified, and extracted under
-//!       `<root_dir>/binaries/<version>/`. This is what makes
-//!       `computeza install postgres` work on a host with no
-//!       pre-installed PostgreSQL package.
+//!    c. Distro-aware auto-install via the host's package manager
+//!       (`apt`, `dnf`, `zypper`, `pacman`). When no PostgreSQL is
+//!       found and we're running as root, the driver runs the
+//!       appropriate `apt install postgresql` (or equivalent) and
+//!       re-scans for the freshly-installed binaries. EnterpriseDB
+//!       used to publish portable Linux tarballs; they stopped
+//!       around 2023 and the only remaining cross-distro path is to
+//!       lean on the package manager. v0.1+ will additionally ship
+//!       Computeza-built portable Postgres binaries via GitHub
+//!       Releases so even the package-manager step goes away.
 //! 2. Ensures the `postgres` system user exists (created via `useradd
 //!    --system --no-create-home` when missing). The apt / yum packages
 //!    create it as a side effect; when we resolved binaries via EDB
@@ -48,10 +53,7 @@ use tokio::{fs, io::AsyncWriteExt, net::TcpStream, process::Command, time::sleep
 use tracing::{debug, info, warn};
 
 use super::{path, systemctl};
-use crate::{
-    fetch::{self, ArchiveKind, Bundle, FetchError},
-    progress::{InstallPhase, ProgressHandle},
-};
+use crate::progress::{InstallPhase, ProgressHandle};
 
 /// Configuration for [`install`].
 #[derive(Clone, Debug)]
@@ -72,9 +74,12 @@ pub struct InstallOptions {
     pub system_user: String,
     /// Name of the systemd unit. Default `computeza-postgres.service`.
     pub unit_name: String,
-    /// Which pinned EDB bundle to fetch when no host postgres is
-    /// detected. `None` means use the latest (`PG_LINUX_BUNDLES[0]`).
-    /// Pass a version string like `"17.9-1"` to pin an older line.
+    /// Major version to request from the host package manager when
+    /// no PostgreSQL is detected and the driver falls through to
+    /// `apt install postgresql-<major>` (or equivalent). `None`
+    /// defaults to whichever major the distro ships as the
+    /// unversioned `postgresql` meta-package -- the safest choice
+    /// because it tracks the distro's tested release.
     pub version: Option<String>,
 }
 
@@ -91,51 +96,101 @@ impl Default for InstallOptions {
     }
 }
 
-/// Pinned EDB Linux x86_64 PostgreSQL binary tarballs. First entry is
-/// the default ("latest"). The UI exposes a dropdown of these versions
-/// on `/install` (parity with the Windows driver).
-///
-/// SHA-256 is `None` for v0.0.x -- pin before any stable release.
-/// AGENTS.md tracks the audit trail when checksums change.
-///
-/// Tarball layout (post-extract): `pgsql/bin/{postgres,initdb,psql,...}`
-/// plus `pgsql/lib`, `pgsql/share`, `pgsql/include`. Everything the
-/// daemon needs at runtime lives inside `pgsql/`, so the bundle is
-/// self-contained (no host `libpq` / `libicu` / etc. assumed).
-const PG_LINUX_BUNDLES: &[Bundle] = &[
-    Bundle {
-        version: "18.3-1",
-        url: "https://get.enterprisedb.com/postgresql/postgresql-18.3-1-linux-x64-binaries.tar.gz",
-        kind: ArchiveKind::TarGz,
-        sha256: None,
-        bin_subpath: "pgsql/bin",
-    },
-    Bundle {
-        version: "17.9-1",
-        url: "https://get.enterprisedb.com/postgresql/postgresql-17.9-1-linux-x64-binaries.tar.gz",
-        kind: ArchiveKind::TarGz,
-        sha256: None,
-        bin_subpath: "pgsql/bin",
-    },
-];
+/// PostgreSQL major versions the UI surfaces for the install
+/// form. `None` (= "distro default") is the safest choice: the host
+/// package manager picks whichever major the distro tests against,
+/// and that's the major Computeza will probe first. The explicit
+/// majors below cover the supported window for operators who need
+/// to pin to a specific line.
+#[must_use]
+pub fn available_majors() -> &'static [&'static str] {
+    &["distro-default", "18", "17", "16", "15"]
+}
 
-/// Look up a bundle by its `version` string. Falls back to the first
-/// (latest) entry when `requested` is `None` or doesn't match.
-fn bundle_for_version(requested: Option<&str>) -> &'static Bundle {
-    match requested {
-        Some(v) => PG_LINUX_BUNDLES
-            .iter()
-            .find(|b| b.version == v)
-            .unwrap_or(&PG_LINUX_BUNDLES[0]),
-        None => &PG_LINUX_BUNDLES[0],
+/// Host package managers the auto-install fallback knows how to
+/// drive. Detected at runtime via `which`; the first one found wins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PackageManager {
+    /// Debian, Ubuntu, derivatives.
+    Apt,
+    /// Fedora, RHEL 8+, Rocky, AlmaLinux, derivatives.
+    Dnf,
+    /// SUSE, openSUSE.
+    Zypper,
+    /// Arch Linux, derivatives.
+    Pacman,
+}
+
+impl PackageManager {
+    fn binary(self) -> &'static str {
+        match self {
+            Self::Apt => "apt-get",
+            Self::Dnf => "dnf",
+            Self::Zypper => "zypper",
+            Self::Pacman => "pacman",
+        }
+    }
+
+    /// The argv used to install the PostgreSQL server + initdb.
+    ///
+    /// The package names differ slightly across families; the apt
+    /// path supports a per-major suffix (`postgresql-17`) because
+    /// Ubuntu/Debian ship multiple majors side-by-side under
+    /// `/usr/lib/postgresql/<v>/`. The dnf/zypper/pacman paths use
+    /// the meta-package and let the distro pick the major.
+    fn install_argv(self, major: Option<&str>) -> Vec<String> {
+        match self {
+            Self::Apt => {
+                let pkg = match major {
+                    Some(m) if m != "distro-default" => format!("postgresql-{m}"),
+                    _ => "postgresql".to_string(),
+                };
+                vec![
+                    "apt-get".into(),
+                    "install".into(),
+                    "-y".into(),
+                    pkg,
+                    "postgresql-contrib".into(),
+                ]
+            }
+            Self::Dnf => vec![
+                "dnf".into(),
+                "install".into(),
+                "-y".into(),
+                "postgresql-server".into(),
+                "postgresql-contrib".into(),
+            ],
+            Self::Zypper => vec![
+                "zypper".into(),
+                "install".into(),
+                "-y".into(),
+                "postgresql-server".into(),
+                "postgresql-contrib".into(),
+            ],
+            Self::Pacman => vec![
+                "pacman".into(),
+                "-S".into(),
+                "--noconfirm".into(),
+                "postgresql".into(),
+            ],
+        }
     }
 }
 
-/// All bundles we ship. The UI iterates this to populate the version
-/// dropdown.
-#[must_use]
-pub fn available_versions() -> &'static [Bundle] {
-    PG_LINUX_BUNDLES
+/// Probe `$PATH` for a supported package manager.
+async fn detect_package_manager() -> Option<PackageManager> {
+    for pm in [
+        PackageManager::Apt,
+        PackageManager::Dnf,
+        PackageManager::Zypper,
+        PackageManager::Pacman,
+    ] {
+        let out = Command::new("which").arg(pm.binary()).output().await.ok();
+        if out.is_some_and(|o| o.status.success()) {
+            return Some(pm);
+        }
+    }
+    None
 }
 
 /// Information returned by a successful [`install`].
@@ -176,9 +231,14 @@ pub enum InstallError {
     /// PATH registration failed.
     #[error(transparent)]
     Path(#[from] path::PathError),
-    /// Fetching or extracting the EDB binary tarball failed.
-    #[error(transparent)]
-    Fetch(#[from] FetchError),
+    /// The distro-aware auto-install fallback failed: either no
+    /// supported package manager was on $PATH, the install command
+    /// exited non-zero, or the freshly-installed package didn't
+    /// leave binaries where we expected to find them. Carries the
+    /// full operator-facing message so the install UI surfaces it
+    /// verbatim.
+    #[error("auto-install via host package manager failed: {0}")]
+    AutoInstall(String),
     /// Server never started accepting connections.
     #[error("postgres did not become ready on port {port} within {timeout_secs}s")]
     NotReady {
@@ -512,9 +572,8 @@ pub async fn install_with_progress(
 }
 
 /// Resolve the binary directory in priority order: explicit override,
-/// distro package, then EDB fetch. The fetch path lands the tarball
-/// under `<root_dir>/binaries/<version>/`; the cache is content-
-/// addressed by version so re-runs hit the existing extraction.
+/// distro package, then distro-aware auto-install via the host
+/// package manager.
 async fn resolve_bin_dir(
     opts: &InstallOptions,
     progress: &ProgressHandle,
@@ -524,29 +583,86 @@ async fn resolve_bin_dir(
     }
     match detect_bin_dir().await {
         Ok(d) => Ok(d),
-        Err(InstallError::BinaryNotFound(_)) => {
-            // Fall through to EDB fetch -- no distro postgres present.
-            let bundle = bundle_for_version(opts.version.as_deref());
-            let cache_root = opts.root_dir.join("binaries");
-            info!(
-                version = bundle.version,
-                url = bundle.url,
-                cache = %cache_root.display(),
-                "no distro postgres found; fetching Computeza-bundled EDB tarball"
-            );
-            progress.set_phase(InstallPhase::Downloading);
-            progress.set_message(format!(
-                "No distro postgres found. Downloading EDB binary tarball for PostgreSQL {} (one-time)",
-                bundle.version
-            ));
-            // Make sure the cache root exists; fetch_and_extract
-            // expects the parent to be writable.
-            fs::create_dir_all(&cache_root).await?;
-            let bin = fetch::fetch_and_extract(&cache_root, bundle, progress).await?;
-            Ok(bin)
+        Err(InstallError::BinaryNotFound(tried)) => {
+            // No distro postgres present yet. Drive the host
+            // package manager to install one (apt / dnf / zypper /
+            // pacman) and re-probe.
+            auto_install_via_package_manager(opts.version.as_deref(), progress).await?;
+            detect_bin_dir().await.map_err(|e| match e {
+                InstallError::BinaryNotFound(_) => InstallError::AutoInstall(format!(
+                    "package manager reported success but postgres binaries still not found in any of {tried:?}. The package may have installed to a non-standard path; pass `bin_dir` on the install form to point at the directory containing `postgres` and `initdb`."
+                )),
+                other => other,
+            })
         }
         Err(e) => Err(e),
     }
+}
+
+/// Drive the host package manager to install PostgreSQL.
+///
+/// Sequence:
+/// 1. Detect which package manager is on `$PATH`.
+/// 2. Run its install command for the operator-selected major (or
+///    the meta-package when no major was pinned).
+/// 3. Surface stderr verbatim on failure so the operator sees why
+///    it failed (commonly: not running as root, or no internet
+///    egress to the distro mirror).
+async fn auto_install_via_package_manager(
+    major: Option<&str>,
+    progress: &ProgressHandle,
+) -> Result<(), InstallError> {
+    let pm = detect_package_manager().await.ok_or_else(|| {
+        InstallError::AutoInstall(
+            "no supported package manager on $PATH (looked for apt-get, dnf, zypper, pacman). Either install postgres manually (`apt install postgresql` / `dnf install postgresql-server` / etc.) and re-submit the install form, or pass `bin_dir` on the form to point at an existing postgres install.".into(),
+        )
+    })?;
+
+    progress.set_phase(InstallPhase::Downloading);
+    progress.set_message(format!(
+        "No distro postgres found. Auto-installing via {} (one-time; pulls ~50-80 MiB from your distro's mirror).",
+        pm.binary()
+    ));
+
+    // apt-get needs `update` before `install` on a fresh container
+    // where the package cache is stale. Other managers refresh on
+    // every invocation.
+    if pm == PackageManager::Apt {
+        let upd = Command::new("apt-get")
+            .arg("update")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await?;
+        if !upd.status.success() {
+            return Err(InstallError::AutoInstall(format!(
+                "`apt-get update` failed (exit {:?}): {}. Rerun the install as root or fix the apt sources (commonly: no network egress to archive.ubuntu.com).",
+                upd.status.code(),
+                String::from_utf8_lossy(&upd.stderr).trim()
+            )));
+        }
+    }
+
+    let argv = pm.install_argv(major);
+    let argv_display = argv.join(" ");
+    info!(cmd = %argv_display, "running package-manager install for postgres");
+
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // dnf needs DNF_NOPLUGINS=0 to skip slow plugins on minimal images; safe to ignore otherwise.
+    let out = cmd.output().await?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(InstallError::AutoInstall(format!(
+            "`{argv_display}` failed (exit {:?}). Common causes: not running as root (re-run with `sudo -E`), no internet egress to your distro's package mirror, or the requested major isn't packaged for this distro. Full stderr below:\n{stderr}",
+            out.status.code(),
+        )));
+    }
+
+    info!(cmd = %argv_display, "postgres package install complete");
+    Ok(())
 }
 
 /// Ensure the `postgres` system user exists. apt/yum packages create

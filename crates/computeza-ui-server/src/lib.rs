@@ -3024,9 +3024,16 @@ struct VersionOption {
 }
 
 /// Available pinned bundle versions for the postgres install path.
-/// Windows has the autonomous-download bundles; Linux/macOS still rely
-/// on the host package manager, so we offer a single "(host-installed)"
-/// option that maps to `version = None` in the spec.
+///
+/// - Windows: EnterpriseDB still publishes portable ZIPs, so the
+///   driver downloads them per-release; the dropdown lists every
+///   pinned bundle.
+/// - Linux: EnterpriseDB stopped publishing Linux tarballs around
+///   2023. The driver falls through to the host package manager
+///   (apt / dnf / zypper / pacman); the dropdown lists the majors
+///   we'll request, with "distro-default" mapping to the
+///   unversioned meta-package (recommended).
+/// - macOS: still uses Postgres.app / brew detection.
 fn postgres_version_options() -> Vec<VersionOption> {
     #[cfg(target_os = "windows")]
     {
@@ -3041,7 +3048,27 @@ fn postgres_version_options() -> Vec<VersionOption> {
         }
         out
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    {
+        use computeza_driver_native::linux::postgres;
+        postgres::available_majors()
+            .iter()
+            .map(|m| {
+                if *m == "distro-default" {
+                    VersionOption {
+                        value: String::new(),
+                        label: "distro default (recommended)".into(),
+                    }
+                } else {
+                    VersionOption {
+                        value: (*m).to_string(),
+                        label: format!("PostgreSQL {m}"),
+                    }
+                }
+            })
+            .collect()
+    }
+    #[cfg(target_os = "macos")]
     {
         vec![VersionOption {
             value: String::new(),
