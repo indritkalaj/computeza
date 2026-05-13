@@ -11474,14 +11474,16 @@ mod tests {
         // view-once. Lock in that semantic without standing up
         // the whole axum router.
         use computeza_driver_native::progress::{GeneratedCredential, InstallProgress};
-        let mut p = InstallProgress::default();
-        p.credentials_for_download = Some(vec![GeneratedCredential {
-            component: "postgres".into(),
-            label: "superuser password".into(),
-            value: "deadbeef1234".into(),
-            username: Some("postgres".into()),
-            secret_ref: Some("postgres/admin-password".into()),
-        }]);
+        let mut p = InstallProgress {
+            credentials_for_download: Some(vec![GeneratedCredential {
+                component: "postgres".into(),
+                label: "superuser password".into(),
+                value: "deadbeef1234".into(),
+                username: Some("postgres".into()),
+                secret_ref: Some("postgres/admin-password".into()),
+            }]),
+            ..Default::default()
+        };
         let first = p.credentials_for_download.take();
         let second = p.credentials_for_download.take();
         assert!(

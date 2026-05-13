@@ -5,21 +5,21 @@
 //!
 //! 1. Resolves the `postgres` and `initdb` binaries via the following
 //!    priority order:
-//!    a. Explicit `opts.bin_dir` override (operator pointed at a custom
-//!       install).
-//!    b. Distro package binaries -- typically `/usr/lib/postgresql/<v>/bin`
-//!       (Debian / Ubuntu) or `/usr/pgsql-<v>/bin` (RHEL / Fedora /
-//!       OpenSUSE), majors 13 to 18.
-//!    c. Distro-aware auto-install via the host's package manager
-//!       (`apt`, `dnf`, `zypper`, `pacman`). When no PostgreSQL is
-//!       found and we're running as root, the driver runs the
-//!       appropriate `apt install postgresql` (or equivalent) and
-//!       re-scans for the freshly-installed binaries. EnterpriseDB
-//!       used to publish portable Linux tarballs; they stopped
-//!       around 2023 and the only remaining cross-distro path is to
-//!       lean on the package manager. v0.1+ will additionally ship
-//!       Computeza-built portable Postgres binaries via GitHub
-//!       Releases so even the package-manager step goes away.
+//!    - Explicit `opts.bin_dir` override (operator pointed at a custom
+//!      install).
+//!    - Distro package binaries -- typically `/usr/lib/postgresql/<v>/bin`
+//!      (Debian / Ubuntu) or `/usr/pgsql-<v>/bin` (RHEL / Fedora /
+//!      OpenSUSE), majors 13 to 18.
+//!    - Distro-aware auto-install via the host's package manager
+//!      (`apt`, `dnf`, `zypper`, `pacman`). When no PostgreSQL is
+//!      found and we're running as root, the driver runs the
+//!      appropriate `apt install postgresql` (or equivalent) and
+//!      re-scans for the freshly-installed binaries. EnterpriseDB
+//!      used to publish portable Linux tarballs; they stopped
+//!      around 2023 and the only remaining cross-distro path is to
+//!      lean on the package manager. v0.1+ will additionally ship
+//!      Computeza-built portable Postgres binaries via GitHub
+//!      Releases so even the package-manager step goes away.
 //! 2. Ensures the `postgres` system user exists (created via `useradd
 //!    --system --no-create-home` when missing). The apt / yum packages
 //!    create it as a side effect; when we resolved binaries via EDB

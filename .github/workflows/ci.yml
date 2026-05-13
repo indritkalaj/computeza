@@ -199,9 +199,16 @@ jobs:
           set -euo pipefail
           cd "${{ steps.prep.outputs.workdir }}"
           BODY=$(curl --silent --fail -b cookies.txt http://127.0.0.1:8401/install)
-          echo "$BODY" | grep -q "Install Computeza"
-          echo "$BODY" | grep -q 'name="postgres__port"'
-          echo "$BODY" | grep -q 'name="csrf_token"'
+          # Use a here-string rather than `echo "$BODY" | grep`:
+          # under `set -o pipefail`, grep -q exits on first match
+          # and SIGPIPEs echo, which fails the whole pipeline. The
+          # `/install` page is now large enough (landing CTAs,
+          # license banner JS, install-guide link, ...) that this
+          # race fires reliably -- a here-string bypasses it
+          # entirely because bash buffers heredoc input.
+          grep -q "Install Computeza" <<< "$BODY"
+          grep -q 'name="postgres__port"' <<< "$BODY"
+          grep -q 'name="csrf_token"' <<< "$BODY"
 
       - name: Audit log shows the first-boot setup event
         run: |
