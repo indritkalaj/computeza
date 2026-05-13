@@ -63,11 +63,25 @@ pub const DEFAULT_PORT: u16 = 8090;
 /// ("latest"). Source-only -- we build locally with Maven; see the
 /// module doc for why Maven Central resolution doesn't work.
 ///
+/// **Default is 0.2.0-incubating**, not 0.3.0-incubating, because
+/// 0.3.0 introduced an `xtable-service` Quarkus module that requires
+/// JDK >= 17, while the parent pom still pins
+/// `lombok-maven-plugin:1.18.20.0` which doesn't work on JDK 17+
+/// (lombok-1.18.20's `com.sun.tools.javac` internals were broken by
+/// JDK 17 point releases; fixed upstream in lombok 1.18.30 but
+/// XTable's pom hasn't been bumped). No single JDK satisfies both
+/// constraints. 0.2.0-incubating has no `xtable-service` module, so
+/// the build completes cleanly under JDK 11. Will flip back to 0.3.0
+/// once XTable upstream bumps lombok-maven-plugin past 1.18.20.
+///
+/// 0.3.0 is kept in the list so an operator can opt into it (with
+/// manual JDK gymnastics) via the UI version selector.
+///
 /// Verify a tag exists at
 /// <https://github.com/apache/incubator-xtable/releases> before adding
 /// it. The URL pattern is
 /// `github.com/apache/incubator-xtable/archive/refs/tags/<tag>.tar.gz`.
-pub const XTABLE_VERSIONS: &[&str] = &["0.3.0-incubating", "0.2.0-incubating"];
+pub const XTABLE_VERSIONS: &[&str] = &["0.2.0-incubating", "0.3.0-incubating"];
 
 #[must_use]
 pub fn available_versions() -> &'static [&'static str] {
@@ -613,10 +627,15 @@ mod tests {
     }
 
     #[test]
-    fn xtable_versions_default_is_latest() {
+    fn xtable_versions_default_is_0_2_0() {
+        // 0.2.0 not 0.3.0: 0.3.0 added an xtable-service Quarkus
+        // module requiring JDK 17+ while the parent pom still pins
+        // a lombok-maven-plugin that breaks on JDK 17+. Flip once
+        // XTable upstream bumps the lombok pin. See XTABLE_VERSIONS
+        // docstring.
         assert_eq!(
-            XTABLE_VERSIONS[0], "0.3.0-incubating",
-            "default version pin should be the latest published Apache XTable tag"
+            XTABLE_VERSIONS[0], "0.2.0-incubating",
+            "default must stay on 0.2.0 until XTable upstream fixes the lombok/quarkus JDK collision"
         );
     }
 }
