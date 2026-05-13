@@ -1,4 +1,23 @@
 //! Databend columnar SQL engine. Linux install path.
+//!
+//! Databend is a two-process system: `databend-meta` (Raft-based
+//! metadata store) and `databend-query` (SQL engine that talks to
+//! meta). The query refuses to start without explicit meta
+//! endpoints -- there's no embedded-meta mode in current releases.
+//!
+//! The driver installs BOTH as sibling systemd units:
+//!
+//! 1. `computeza-databend-meta.service` -- single-node Raft meta,
+//!    binds the gRPC API on 127.0.0.1:9191. Comes up first.
+//! 2. `computeza-databend.service` (query) -- binds the HTTP
+//!    handler on 127.0.0.1:8000 (operator-configurable port),
+//!    points at the local meta via `[meta] endpoints =
+//!    ["127.0.0.1:9191"]`. Comes up second.
+//!
+//! Both share the binary cache under `<root>/binaries/<version>/`
+//! (one tarball, two binaries: `databend-meta` + `databend-query`).
+//! Operators uninstall via `/install -> databend -> Uninstall`,
+//! which tears down both units.
 
 use std::path::PathBuf;
 
@@ -12,7 +31,14 @@ use super::service::{
 };
 
 pub const UNIT_NAME: &str = "computeza-databend.service";
+pub const META_UNIT_NAME: &str = "computeza-databend-meta.service";
 pub const DEFAULT_PORT: u16 = 8000;
+/// gRPC port the meta service binds. Hard-coded for v0.0.x; the
+/// query config below references the same value.
+const META_GRPC_PORT: u16 = 9191;
+/// Raft inter-node port. Single-node deployments don't actually
+/// use this for traffic, but databend-meta requires it to be set.
+const META_RAFT_PORT: u16 = 9192;
 
 // Repo moved from datafuselabs to databendlabs. Versions use the
 // `patch` suffix on stable; nightly tags also exist on the same repo
@@ -62,23 +88,91 @@ pub async fn install(
     progress: &ProgressHandle,
 ) -> Result<InstalledService, ServiceError> {
     let bundle = pick_bundle(opts.version.as_deref()).clone();
-    // Databend's config is a starting-point template that
-    // operators frequently extend (adding catalogs pointing at
-    // lakekeeper, swapping storage backends to S3 via Garage,
-    // etc.). `overwrite_if_present: false` preserves those edits
-    // across re-installs; the driver's contents only land on the
-    // first install or after the operator manually deletes the
-    // file.
-    let config = ConfigFile {
+
+    // Step 1: databend-meta must come up first; databend-query
+    // will fail to start until the meta service is listening on
+    // its gRPC port.
+    let meta_config = ConfigFile {
+        filename: "databend-meta.toml".into(),
+        contents: format!(
+            "log_dir = \"{root}/meta/logs\"\n\
+             admin_api_address = \"127.0.0.1:{admin}\"\n\
+             grpc_api_address = \"127.0.0.1:{grpc}\"\n\
+             grpc_api_advertise_host = \"127.0.0.1\"\n\
+             \n\
+             [raft_config]\n\
+             id = 1\n\
+             raft_listen_host = \"127.0.0.1\"\n\
+             raft_advertise_host = \"127.0.0.1\"\n\
+             raft_api_port = {raft}\n\
+             raft_dir = \"{root}/meta/raft\"\n\
+             single = true\n",
+            root = opts.root_dir.display(),
+            admin = META_GRPC_PORT + 10, // 9201; sidecar admin port
+            grpc = META_GRPC_PORT,
+            raft = META_RAFT_PORT,
+        ),
+        // Operator-tunable in production multi-node clusters;
+        // preserve edits across re-installs.
+        overwrite_if_present: false,
+    };
+    let meta_args = vec![
+        "-c".into(),
+        opts.root_dir
+            .join("databend-meta.toml")
+            .to_string_lossy()
+            .into_owned(),
+    ];
+    service::install_service(
+        ServiceInstall {
+            component: "databend-meta",
+            root_dir: opts.root_dir.clone(),
+            bundle: bundle.clone(),
+            binary_name: "databend-meta",
+            args: meta_args,
+            port: META_GRPC_PORT,
+            unit_name: META_UNIT_NAME.into(),
+            config: Some(meta_config),
+            cli_symlink: None,
+            env: Vec::new(),
+            exec_start_pre_args: Vec::new(),
+        },
+        progress,
+    )
+    .await?;
+
+    // Step 2: databend-query, pointing at the just-started meta.
+    // databend's config template is operator-extensible (operators
+    // commonly add `[[catalog]]` blocks pointing at lakekeeper, or
+    // swap storage backends to S3 via garage). overwrite_if_present
+    // is false so re-installs preserve those edits.
+    let query_config = ConfigFile {
         filename: "databend-query.toml".into(),
         contents: format!(
-            "[query]\nhttp_handler_host = \"127.0.0.1\"\nhttp_handler_port = {port}\n[storage]\ntype = \"fs\"\n[storage.fs]\ndata_path = \"{root}/data\"\n",
+            "[query]\n\
+             http_handler_host = \"127.0.0.1\"\n\
+             http_handler_port = {port}\n\
+             tenant_id = \"computeza\"\n\
+             cluster_id = \"local\"\n\
+             \n\
+             [meta]\n\
+             endpoints = [\"127.0.0.1:{meta_grpc}\"]\n\
+             username = \"root\"\n\
+             password = \"root\"\n\
+             client_timeout_in_second = 60\n\
+             auto_sync_interval = 60\n\
+             \n\
+             [storage]\n\
+             type = \"fs\"\n\
+             [storage.fs]\n\
+             data_path = \"{root}/data\"\n",
             port = opts.port,
+            meta_grpc = META_GRPC_PORT,
             root = opts.root_dir.display(),
         ),
         overwrite_if_present: false,
     };
-    let args = vec![
+    let query_args = vec![
         "-c".into(),
         opts.root_dir
             .join("databend-query.toml")
@@ -91,10 +185,10 @@ pub async fn install(
             root_dir: opts.root_dir,
             bundle,
             binary_name: "databend-query",
-            args,
+            args: query_args,
             port: opts.port,
             unit_name: opts.unit_name,
-            config: Some(config),
+            config: Some(query_config),
             cli_symlink: None,
             env: Vec::new(),
             exec_start_pre_args: Vec::new(),
@@ -120,6 +214,11 @@ impl Default for UninstallOptions {
 }
 
 pub async fn uninstall(opts: UninstallOptions) -> Result<Uninstalled, ServiceError> {
+    // Tear down the meta service first (best-effort) so the
+    // following uninstall_service call cleans up cleanly. We don't
+    // surface meta-side warnings to the operator -- they're not
+    // actionable.
+    let _ = service::uninstall_service("databend-meta", &opts.root_dir, META_UNIT_NAME, None).await;
     service::uninstall_service("databend", &opts.root_dir, &opts.unit_name, None).await
 }
 
