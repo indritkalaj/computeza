@@ -336,6 +336,14 @@ fn systemd_unit(java_bin: &Path, classpath: &XtableClasspath, root_dir: &Path) -
             root = root_dir.display(),
         ),
     };
+    // RuntimeDirectory=xtable: forward-compat for v0.1+ when the
+    // unit becomes long-running (a daemon polling the dataset
+    // spec). v0.0.x runs as a one-shot batch job that doesn't need
+    // /run/xtable/, but the directive is free if unused -- systemd
+    // mints the dir on start and tears it down on stop. Adding it
+    // now means a v0.1 unit upgrade that introduces socket / PID
+    // files won't repeat the postgres-style read-only-fs
+    // regression.
     format!(
         "[Unit]\n\
          Description=Computeza-managed Apache XTable runner\n\
@@ -344,6 +352,8 @@ fn systemd_unit(java_bin: &Path, classpath: &XtableClasspath, root_dir: &Path) -
          \n\
          [Service]\n\
          Type=simple\n\
+         RuntimeDirectory=xtable\n\
+         RuntimeDirectoryMode=0755\n\
          ExecStart={exec_start}\n\
          Restart=on-failure\n\
          RestartSec=10\n\
