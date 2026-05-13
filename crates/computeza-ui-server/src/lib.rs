@@ -2092,7 +2092,8 @@ fn render_workspace_bootstrap_form(
 </div>
 <div>
 <label for="bs-s3-region" style="font-size: 0.85rem;">Region</label>
-<input id="bs-s3-region" name="s3_region" class="cz-input" type="text" value="us-east-1" required style="width: 100%; font-family: ui-monospace, monospace;" />
+<input id="bs-s3-region" name="s3_region" class="cz-input" type="text" value="garage" required style="width: 100%; font-family: ui-monospace, monospace;" />
+<p class="cz-muted" style="margin: 0.3rem 0 0; font-size: 0.72rem;">Default is <code>garage</code> -- Garage uses this region name for SigV4 signatures by default. Using anything else (like <code>us-east-1</code>) makes Garage reject Lakekeeper's auth headers as "unexpected scope". If your Garage cluster was deployed with <code>s3_region</code> set explicitly in its config, match that value here.</p>
 </div>
 <div>
 <label for="bs-s3-bucket" style="font-size: 0.85rem;">Bucket</label>
