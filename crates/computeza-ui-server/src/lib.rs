@@ -5129,6 +5129,63 @@ pub fn render_shell(
   }}, true);
 }})();
 
+// Password-field show/hide toggle. For every <input type="password">
+// rendered on the page, we wrap the input in a relative-positioned
+// span and inject a small clickable "eye" button. Clicking flips the
+// input's `type` between "password" and "text" so the operator can
+// confirm what they typed before submitting. This applies on /login,
+// /setup, /admin/operators, /admin/secrets rotate, etc. -- every
+// password field, with no per-page wiring.
+//
+// Why JS rather than CSS-only: there is no CSS selector that
+// targets "the input is type=password vs text"; we must toggle the
+// attribute. The button is type="button" so it does not trigger
+// form submission, and the autocomplete attribute on the input is
+// untouched so password managers keep working.
+(function () {{
+  var SHOW = "M1 12c2.5-5 7-8 11-8s8.5 3 11 8c-2.5 5-7 8-11 8s-8.5-3-11-8z M12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6z";
+  var HIDE = "M3 3l18 18 M10.6 6.1A11 11 0 0 1 12 6c4 0 8.5 3 11 8a13 13 0 0 1-3.2 4.4 M6.7 6.7A13 13 0 0 0 1 12c2.5 5 7 8 11 8 1.5 0 2.9-.3 4.2-.9";
+  function eyeSvg(showing) {{
+    var d = showing ? HIDE : SHOW;
+    return '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="' + d + '"/></svg>';
+  }}
+  function decorate(input) {{
+    if (input.dataset.czEyeBound === "1") return;
+    input.dataset.czEyeBound = "1";
+    var wrap = document.createElement("span");
+    wrap.style.position = "relative";
+    wrap.style.display = "inline-block";
+    wrap.style.width = "100%";
+    input.parentNode.insertBefore(wrap, input);
+    wrap.appendChild(input);
+    input.style.paddingRight = "2.4rem";
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.setAttribute("aria-label", "Show password");
+    btn.setAttribute("title", "Show password");
+    btn.style.position = "absolute";
+    btn.style.right = "0.5rem";
+    btn.style.top = "50%";
+    btn.style.transform = "translateY(-50%)";
+    btn.style.background = "transparent";
+    btn.style.border = "0";
+    btn.style.cursor = "pointer";
+    btn.style.color = "inherit";
+    btn.style.padding = "0.2rem";
+    btn.style.lineHeight = "0";
+    btn.innerHTML = eyeSvg(false);
+    btn.addEventListener("click", function () {{
+      var showing = input.type === "text";
+      input.type = showing ? "password" : "text";
+      btn.innerHTML = eyeSvg(!showing);
+      btn.setAttribute("aria-label", showing ? "Show password" : "Hide password");
+      btn.setAttribute("title", showing ? "Show password" : "Hide password");
+    }});
+    wrap.appendChild(btn);
+  }}
+  document.querySelectorAll('input[type="password"]').forEach(decorate);
+}})();
+
 // License-status banner. Fetches /api/license/status (a public
 // endpoint) and injects a renewal banner above the page container
 // when the active envelope is expiring, expired, invalid, or
@@ -10837,6 +10894,29 @@ mod tests {
                 &html[..html.len().min(2000)]
             );
         }
+    }
+
+    #[test]
+    fn render_shell_wires_password_show_hide_toggle() {
+        // Smoke test: the inline JS that auto-decorates
+        // <input type="password"> with a show/hide eye is wired
+        // into the shared shell. Any page that renders through
+        // render_shell (login, setup, admin/operators, secrets
+        // rotate, etc.) gets it -- no per-page hookup needed.
+        let l = Localizer::english();
+        let html = render_login(&l, "/install", None);
+        assert!(
+            html.contains("dataset.czEyeBound"),
+            "render_shell should embed the password-eye toggle JS"
+        );
+        assert!(
+            html.contains(r#"input[type=\"password\"]"#)
+                || html.contains("input[type=\"password\"]"),
+            "the toggle should select every password input"
+        );
+        // The login form itself must still carry the password
+        // field, otherwise the toggle has nothing to attach to.
+        assert!(html.contains(r#"type="password""#));
     }
 
     #[test]

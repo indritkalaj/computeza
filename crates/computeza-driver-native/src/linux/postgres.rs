@@ -612,6 +612,25 @@ async fn auto_install_via_package_manager(
     major: Option<&str>,
     progress: &ProgressHandle,
 ) -> Result<(), InstallError> {
+    // Fail fast on non-root. Every supported package manager
+    // (apt-get / dnf / zypper / pacman) needs root to touch
+    // /var/lib/apt or /var/cache/dnf. Calling them anyway just
+    // surfaces a cryptic permission-denied error from the package
+    // manager; we'd rather tell the operator the actionable thing
+    // up front.
+    #[cfg(unix)]
+    {
+        // SAFETY: getuid() is always safe and always returns; it
+        // is one of the small set of libc calls Rust marks unsafe
+        // for ABI reasons rather than memory-safety reasons.
+        let euid = unsafe { libc::geteuid() };
+        if euid != 0 {
+            return Err(InstallError::AutoInstall(format!(
+                "no host postgres found, and the auto-install fallback needs root to drive the host package manager. The process is running as uid {euid} (non-root). Stop the operator console (Ctrl-C) and restart it under sudo, preserving your environment:\n\n    sudo -E ./target/release/computeza serve --addr 127.0.0.1:8400 --state-db /var/lib/computeza/computeza-state.db\n\nThe `-E` flag preserves COMPUTEZA_SECRETS_PASSPHRASE across the sudo boundary so the encrypted secrets store stays attached. Alternatively, install postgres manually (`sudo apt install postgresql postgresql-contrib`) and re-submit the install form -- the driver will detect the distro binaries and skip this fallback."
+            )));
+        }
+    }
+
     let pm = detect_package_manager().await.ok_or_else(|| {
         InstallError::AutoInstall(
             "no supported package manager on $PATH (looked for apt-get, dnf, zypper, pacman). Either install postgres manually (`apt install postgresql` / `dnf install postgresql-server` / etc.) and re-submit the install form, or pass `bin_dir` on the form to point at an existing postgres install.".into(),

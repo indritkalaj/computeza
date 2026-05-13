@@ -38,3 +38,9 @@ liblzma = { workspace = true }
 # Replaces a shell-out to `openssl req` so a virgin Linux host doesn't
 # need openssl on $PATH for the kanidm install path to work.
 rcgen = { workspace = true }
+
+# libc: geteuid() for the non-root pre-flight check before driving
+# the host package manager. Unix-only; the cfg-gated call site means
+# the dep is dead-code-eliminated on Windows.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
