@@ -163,11 +163,33 @@ pub async fn install(
     };
 
     if classpath_path.is_none() {
-        // 3. Maven fallback: needs mvn on $PATH.
+        // 3. Maven fallback: needs mvn on $PATH. Auto-install via
+        //    apt when missing AND we're root (same pattern the
+        //    postgres driver uses for `postgresql` on Ubuntu).
+        //    Operators on a non-Ubuntu distro see the actionable
+        //    error from `require_on_path` listing the right
+        //    package-manager invocation.
         progress.set_phase(InstallPhase::DetectingBinaries);
         progress
             .set_message("Verifying Maven (mvn) is on PATH for the xtable dep-resolve fallback");
-        require_on_path("mvn").await?;
+        if let Err(e) = require_on_path("mvn").await {
+            progress.set_phase(InstallPhase::Downloading);
+            progress.set_message(
+                "Auto-installing Maven via apt (one-time; required for the xtable dep-resolve)",
+            );
+            if let Err(install_err) = auto_install_maven().await {
+                // Surface BOTH errors so the operator sees the
+                // original "not on PATH" message + why the
+                // auto-install fallback didn't work.
+                return Err(ServiceError::Io(std::io::Error::other(format!(
+                    "{e}\n\nAuto-install fallback also failed: {install_err}"
+                ))));
+            }
+            // Re-check after install -- guards against `apt`
+            // succeeding without putting mvn on PATH (highly
+            // unusual but worth a probe).
+            require_on_path("mvn").await?;
+        }
 
         progress.set_phase(InstallPhase::Extracting);
         progress.set_message(format!(
@@ -299,6 +321,56 @@ async fn require_on_path(cmd: &str) -> Result<(), ServiceError> {
              OpenSUSE: `zypper install maven`. Arch: `pacman -S maven`."
         ))))
     }
+}
+
+/// Drive apt to install Maven. Mirrors the postgres driver's
+/// auto-install pattern: requires root, surfaces stderr verbatim
+/// on failure. Ubuntu-only (matches v0.0.x's supported platform).
+async fn auto_install_maven() -> Result<(), ServiceError> {
+    // Pre-flight: must be root for apt to write
+    // /var/lib/apt/lists. The userland error from apt itself is
+    // cryptic ("could not open lock file"); fail-fast with a
+    // clear message instead.
+    let euid_out = Command::new("id").arg("-u").output().await?;
+    let euid: u32 = String::from_utf8_lossy(&euid_out.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(u32::MAX);
+    if euid != 0 {
+        return Err(ServiceError::Io(std::io::Error::other(format!(
+            "auto-installing Maven requires root (process is uid {euid}). \
+             Restart the operator console under `sudo -E ./target/release/computeza serve ...` \
+             OR install Maven manually with `sudo apt install -y maven` and re-submit \
+             the install form."
+        ))));
+    }
+
+    // apt-get update first (needed on a fresh container/VM where
+    // the apt cache is stale; harmless otherwise).
+    let upd = Command::new("apt-get").arg("update").output().await?;
+    if !upd.status.success() {
+        return Err(ServiceError::Io(std::io::Error::other(format!(
+            "`apt-get update` failed (exit {:?}): {}. Check network egress to archive.ubuntu.com.",
+            upd.status.code(),
+            String::from_utf8_lossy(&upd.stderr).trim()
+        ))));
+    }
+
+    let out = Command::new("apt-get")
+        .arg("install")
+        .arg("-y")
+        .arg("maven")
+        .output()
+        .await?;
+    if !out.status.success() {
+        return Err(ServiceError::Io(std::io::Error::other(format!(
+            "`apt-get install -y maven` failed (exit {:?}): {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))));
+    }
+    info!("apt-get install -y maven completed");
+    Ok(())
 }
 
 fn pom_xml(version: &str) -> String {
