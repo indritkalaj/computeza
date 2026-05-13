@@ -134,23 +134,35 @@ pub async fn install(
             dest_jar.display()
         ));
     } else {
-        // 3. Need Maven (which pulls a JDK as a hard apt dep so we
-        //    get javac for free). Auto-install on Ubuntu when
-        //    missing, mirroring the postgres driver pattern.
+        // 3. Need Maven AND a JDK 17. XTable's parent pom pins
+        //    lombok-maven-plugin:1.18.20.0, which uses
+        //    com.sun.tools.javac internals removed in JDK 21+
+        //    (`com.sun.tools.javac.code.TypeTag :: UNKNOWN`). apt's
+        //    `maven` package pulls `default-jdk-headless` which on
+        //    Ubuntu 24.04 is JDK 21 -- that breaks delombok. We
+        //    explicitly install `openjdk-17-jdk-headless` alongside
+        //    and run mvn under JDK 17. The resulting JARs run fine
+        //    on our Temurin JRE 21 (Java is forward-compatible).
         progress.set_phase(InstallPhase::DetectingBinaries);
-        progress.set_message("Verifying Maven (mvn) is on PATH for the xtable source build");
-        if let Err(e) = require_on_path("mvn").await {
+        progress
+            .set_message("Verifying Maven + JDK 17 are present for the xtable source build");
+        let need_install = require_on_path("mvn").await.is_err()
+            || locate_jdk17().await.is_err();
+        if need_install {
             progress.set_phase(InstallPhase::Downloading);
             progress.set_message(
-                "Auto-installing Maven via apt (one-time; required to build xtable from source)",
+                "Auto-installing Maven + JDK 17 via apt (one-time; required to build xtable from source)",
             );
-            if let Err(install_err) = auto_install_maven().await {
-                return Err(ServiceError::Io(std::io::Error::other(format!(
-                    "{e}\n\nAuto-install fallback also failed: {install_err}"
-                ))));
-            }
+            auto_install_maven_and_jdk17().await?;
             require_on_path("mvn").await?;
         }
+        let jdk17_home = locate_jdk17().await.map_err(|e| {
+            ServiceError::Io(std::io::Error::other(format!(
+                "could not locate a JDK 17 on the host even after `apt install openjdk-17-jdk-headless`. \
+                 lombok-maven-plugin 1.18.20.0 (pinned by xtable's parent pom) doesn't work on JDK 21+. \
+                 Manual fix: `sudo apt install -y openjdk-17-jdk-headless`. Underlying: {e}"
+            )))
+        })?;
 
         // 4. Download + extract the source tarball.
         let src_root = opts.root_dir.join("src");
@@ -185,8 +197,16 @@ pub async fn install(
         // per-module error live on stdout; suppressing them leaves
         // the operator with only the irrelevant JVM `sun.misc.Unsafe`
         // warnings on stderr.
+        // Build under JDK 17. JAVA_HOME drives Maven's toolchain;
+        // prepending JDK 17's bin to PATH makes any plugins that
+        // shell out to `javac` also pick up the right compiler.
+        let jdk17_bin = jdk17_home.join("bin");
+        let path_var = std::env::var("PATH").unwrap_or_default();
+        let augmented_path = format!("{}:{}", jdk17_bin.display(), path_var);
         let out = Command::new("mvn")
             .current_dir(&src_dir)
+            .env("JAVA_HOME", &jdk17_home)
+            .env("PATH", &augmented_path)
             .arg("clean")
             .arg("package")
             .arg("-DskipTests")
@@ -306,19 +326,29 @@ async fn require_on_path(cmd: &str) -> Result<(), ServiceError> {
             "`{cmd}` not found on PATH. xtable install requires Maven to build the \
              upstream source tree (XTable's incubating releases are source-only; no \
              prebuilt JARs are published to Maven Central). \
-             Debian / Ubuntu: `apt install maven`. Fedora / RHEL: `dnf install maven`. \
-             OpenSUSE: `zypper install maven`. Arch: `pacman -S maven`."
+             Debian / Ubuntu: `apt install maven openjdk-17-jdk-headless`. \
+             Fedora / RHEL: `dnf install maven java-17-openjdk-devel`. \
+             OpenSUSE: `zypper install maven java-17-openjdk-devel`. \
+             Arch: `pacman -S maven jdk17-openjdk`. \
+             JDK 17 (not the default JDK 21) is required because XTable's parent pom \
+             pins lombok-maven-plugin:1.18.20.0 which breaks on JDK 21+."
         ))))
     }
 }
 
-/// Drive apt to install Maven. Mirrors the postgres driver's
-/// auto-install pattern: requires root, surfaces stderr verbatim
-/// on failure. Ubuntu-only (matches v0.0.x's supported platform).
-/// The `maven` apt package pulls `default-jdk-headless` as a hard
-/// dependency, so installing Maven also gives us the javac that
-/// `mvn package` needs at build time.
-async fn auto_install_maven() -> Result<(), ServiceError> {
+/// Drive apt to install Maven + JDK 17. Mirrors the postgres
+/// driver's auto-install pattern: requires root, surfaces stderr
+/// verbatim on failure. Ubuntu-only (matches v0.0.x's supported
+/// platform).
+///
+/// Why JDK 17 specifically: XTable's parent pom pins
+/// `lombok-maven-plugin:1.18.20.0`, which uses
+/// `com.sun.tools.javac` internals that were removed in JDK 21.
+/// Building under Ubuntu 24.04's default JDK 21 produces
+/// `com.sun.tools.javac.code.TypeTag :: UNKNOWN` from delombok.
+/// Forcing JDK 17 sidesteps the lombok-vs-modern-JDK incompatibility
+/// without patching upstream pom.xml.
+async fn auto_install_maven_and_jdk17() -> Result<(), ServiceError> {
     let euid_out = Command::new("id").arg("-u").output().await?;
     let euid: u32 = String::from_utf8_lossy(&euid_out.stdout)
         .trim()
@@ -326,10 +356,10 @@ async fn auto_install_maven() -> Result<(), ServiceError> {
         .unwrap_or(u32::MAX);
     if euid != 0 {
         return Err(ServiceError::Io(std::io::Error::other(format!(
-            "auto-installing Maven requires root (process is uid {euid}). \
+            "auto-installing Maven + JDK 17 requires root (process is uid {euid}). \
              Restart the operator console under `sudo -E ./target/release/computeza serve ...` \
-             OR install Maven manually with `sudo apt install -y maven` and re-submit \
-             the install form."
+             OR install manually with `sudo apt install -y maven openjdk-17-jdk-headless` \
+             and re-submit the install form."
         ))));
     }
 
@@ -346,17 +376,43 @@ async fn auto_install_maven() -> Result<(), ServiceError> {
         .arg("install")
         .arg("-y")
         .arg("maven")
+        .arg("openjdk-17-jdk-headless")
         .output()
         .await?;
     if !out.status.success() {
         return Err(ServiceError::Io(std::io::Error::other(format!(
-            "`apt-get install -y maven` failed (exit {:?}): {}",
+            "`apt-get install -y maven openjdk-17-jdk-headless` failed (exit {:?}): {}",
             out.status.code(),
             String::from_utf8_lossy(&out.stderr).trim()
         ))));
     }
-    info!("apt-get install -y maven completed");
+    info!("apt-get install -y maven openjdk-17-jdk-headless completed");
     Ok(())
+}
+
+/// Locate JAVA_HOME for the host's JDK 17. Probes the canonical
+/// `update-alternatives`-style paths Debian / Ubuntu uses for
+/// openjdk-17. Returns the directory that contains `bin/javac`.
+async fn locate_jdk17() -> Result<PathBuf, ServiceError> {
+    // Standard Debian/Ubuntu layout for openjdk-17-jdk-headless on
+    // amd64. The `.0` suffix variant shows up on some older point
+    // releases; the temurin path covers operators who installed
+    // Eclipse Temurin via their own apt repo before computeza ran.
+    const CANDIDATES: &[&str] = &[
+        "/usr/lib/jvm/java-17-openjdk-amd64",
+        "/usr/lib/jvm/java-1.17.0-openjdk-amd64",
+        "/usr/lib/jvm/temurin-17-jdk-amd64",
+        "/usr/lib/jvm/openjdk-17",
+    ];
+    for c in CANDIDATES {
+        let p = PathBuf::from(c);
+        if fs::try_exists(p.join("bin/javac")).await.unwrap_or(false) {
+            return Ok(p);
+        }
+    }
+    Err(ServiceError::Io(std::io::Error::other(
+        "no JDK 17 found under /usr/lib/jvm/. Install with `sudo apt install -y openjdk-17-jdk-headless`.",
+    )))
 }
 
 /// Download + extract the xtable source tarball into `<src_root>`,
