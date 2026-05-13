@@ -275,6 +275,19 @@ pub enum ServiceError {
 }
 
 fn systemd_unit(component: &str, bin_path: &Path, args: &str, root_dir: &Path) -> String {
+    // WorkingDirectory=<root>: many daemons (qdrant, kanidm,
+    // probably others) resolve runtime paths -- snapshot temp
+    // dirs, init-flag dot-files, log files -- relative to CWD.
+    // systemd's default CWD is `/`, which is read-only under the
+    // ProtectSystem=strict sandbox, so those relative writes
+    // crash the daemon at startup. Setting WorkingDirectory to
+    // the component's root_dir means every `./foo` inside the
+    // daemon's code lands somewhere we already have in
+    // ReadWritePaths.
+    //
+    // RuntimeDirectory=<component>: matches the postgres / kanidm
+    // forward-compat. systemd mints /run/<component>/ for socket
+    // / lock / pid files; cheap to include even when unused.
     format!(
         "[Unit]\n\
          Description=Computeza-managed {component}\n\
@@ -283,6 +296,9 @@ fn systemd_unit(component: &str, bin_path: &Path, args: &str, root_dir: &Path) -
          \n\
          [Service]\n\
          Type=simple\n\
+         WorkingDirectory={root}\n\
+         RuntimeDirectory={component}\n\
+         RuntimeDirectoryMode=0755\n\
          ExecStart={bin} {args}\n\
          Restart=on-failure\n\
          RestartSec=5\n\
