@@ -32,7 +32,7 @@ use std::net::SocketAddr;
 
 use axum::{
     extract::{Form, Path, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{Html, IntoResponse, Json, Response},
     routing::{get, post},
     Router,
@@ -732,6 +732,10 @@ pub fn router_with_state(state: AppState) -> Router {
         )
         .route("/install/{component}", get(install_component_handler))
         .route("/install/job/{id}", get(install_job_handler))
+        .route(
+            "/install/credentials.json/{id}",
+            get(install_credentials_json_handler),
+        )
         .route("/install/job/{id}/rollback", post(install_rollback_handler))
         .route("/api/install/job/{id}", get(install_job_api_handler))
         .route("/admin/secrets", get(secrets_index_handler))
@@ -3219,9 +3223,23 @@ async fn install_job_handler(
             // (some components may have generated credentials before
             // a later component failed -- the operator still needs
             // to capture them).
+            //
+            // Stash a clone under `credentials_for_download` so a
+            // single follow-up `GET /install/credentials.json/{job_id}`
+            // can return the same bag as a one-shot JSON download.
+            // Stashing only on first render (when the field is None)
+            // means a refresh of the page won't re-expose
+            // credentials via the download URL either.
             let credentials = job_arc
                 .as_ref()
-                .map(|s| std::mem::take(&mut s.lock().unwrap().generated_credentials))
+                .map(|s| {
+                    let mut guard = s.lock().unwrap();
+                    let bag = std::mem::take(&mut guard.generated_credentials);
+                    if guard.credentials_for_download.is_none() && !bag.is_empty() {
+                        guard.credentials_for_download = Some(bag.clone());
+                    }
+                    bag
+                })
                 .unwrap_or_default();
 
             // Show the rollback button whenever at least one component
@@ -3239,6 +3257,14 @@ async fn install_job_handler(
                 None
             };
 
+            // The download URL is only useful when we have
+            // credentials stashed AND we know the job_id (always
+            // true on this path). Hide the button on an empty bag.
+            let download_id = if credentials.is_empty() {
+                None
+            } else {
+                Some(job_id.as_str())
+            };
             if let Some(err) = &p.error {
                 (
                     StatusCode::OK,
@@ -3248,6 +3274,7 @@ async fn install_job_handler(
                         err,
                         &credentials,
                         rollback_id,
+                        download_id,
                     )),
                 )
             } else {
@@ -3260,6 +3287,7 @@ async fn install_job_handler(
                         &summary,
                         &credentials,
                         rollback_id,
+                        download_id,
                     )),
                 )
             }
@@ -3269,6 +3297,112 @@ async fn install_job_handler(
             Html(render_install_progress(&l, &job_id, &p)),
         ),
     }
+}
+
+/// GET /install/credentials.json/{job_id} -- one-shot JSON download
+/// of every credential generated during the install job. Drains
+/// `credentials_for_download` on first call so the download is
+/// truly view-once (matches the on-page table's view-once
+/// contract); subsequent calls return 410 Gone.
+///
+/// Gated behind `Permission::Manage` by `required_permission_for` --
+/// a Viewer should never reach a payload of admin passwords.
+///
+/// Every successful download writes an audit-log entry so a future
+/// breach investigation can answer "which operator pulled the
+/// credentials, when". The audit entry records WHO downloaded and
+/// WHICH job, not the credentials themselves.
+async fn install_credentials_json_handler(
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+    axum::Extension(session): axum::Extension<auth::Session>,
+) -> Response {
+    let job_arc = state.jobs.lock().unwrap().get(&job_id).cloned();
+    let Some(job_arc) = job_arc else {
+        return (StatusCode::NOT_FOUND, "unknown install job").into_response();
+    };
+    let drained = {
+        let mut guard = job_arc.lock().unwrap();
+        guard.credentials_for_download.take()
+    };
+    let Some(creds) = drained else {
+        // Either the result page hasn't rendered yet OR the file
+        // has already been downloaded. Either way the bag is gone.
+        return (
+            StatusCode::GONE,
+            "credentials are no longer available -- either the install hasn't completed yet, or this file has already been downloaded once. Each install run discloses its generated credentials exactly once; rotate them via /admin/secrets if you need to recover.",
+        )
+            .into_response();
+    };
+
+    let entries: Vec<serde_json::Value> = creds
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "component": c.component,
+                "label": c.label,
+                "username": c.username,
+                "value": c.value,
+                "secret_ref": c.secret_ref,
+            })
+        })
+        .collect();
+
+    let host = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_else(|_| "unknown".into());
+    let now = chrono::Utc::now();
+    let body = serde_json::json!({
+        "install_job_id": job_id,
+        "generated_at": now.to_rfc3339(),
+        "host": host,
+        "warning": "Treat this file as a secrets bundle. Anyone holding it can log in to every listed component. Store in a password manager or vault, then delete this download. Credentials can be rotated under /admin/secrets when the secrets store is attached.",
+        "credentials": entries,
+    });
+    let json = match serde_json::to_vec_pretty(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = %e, "serializing install credentials JSON failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "credentials JSON serialization failed",
+            )
+                .into_response();
+        }
+    };
+
+    if let Some(audit) = &state.audit {
+        let _ = audit
+            .append(
+                session.username.clone(),
+                computeza_audit::Action::UserAction,
+                Some(format!("install-job/{job_id}/credentials.json")),
+                serde_json::json!({
+                    "action": "download_install_credentials_json",
+                    "install_job_id": job_id,
+                    "credential_count": creds.len(),
+                }),
+            )
+            .await;
+    }
+
+    let filename = format!(
+        "computeza-credentials-{}.json",
+        now.format("%Y%m%dT%H%M%SZ")
+    );
+    let disposition = format!("attachment; filename=\"{filename}\"");
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json; charset=utf-8"),
+    );
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&disposition)
+            .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    (StatusCode::OK, headers, json).into_response()
 }
 
 /// GET /admin/secrets -- list every secret in the encrypted store.
@@ -9939,7 +10073,7 @@ pub fn render_setup_already_done(localizer: &Localizer) -> String {
 /// `<pre>` block after HTML-escaping.
 #[must_use]
 pub fn render_install_result(localizer: &Localizer, success: bool, detail: &str) -> String {
-    render_install_result_with_credentials(localizer, success, detail, &[], None)
+    render_install_result_with_credentials(localizer, success, detail, &[], None, None)
 }
 
 /// Variant of [`render_install_result`] that also displays one-time
@@ -9958,6 +10092,7 @@ pub fn render_install_result_with_credentials(
     detail: &str,
     credentials: &[computeza_driver_native::progress::GeneratedCredential],
     rollback_job_id: Option<&str>,
+    job_id_for_credentials_download: Option<&str>,
 ) -> String {
     let title = localizer.t("ui-install-result-title");
     let outcome = if success {
@@ -9972,7 +10107,8 @@ pub fn render_install_result_with_credentials(
     } else {
         "cz-badge cz-badge-fail"
     };
-    let credentials_block = render_credentials_block(localizer, credentials);
+    let credentials_block =
+        render_credentials_block(localizer, credentials, job_id_for_credentials_download);
     let rollback_block = rollback_job_id
         .map(|id| render_rollback_block(localizer, id))
         .unwrap_or_default();
@@ -10216,6 +10352,7 @@ fn render_rollback_block(localizer: &Localizer, job_id: &str) -> String {
 fn render_credentials_block(
     localizer: &Localizer,
     creds: &[computeza_driver_native::progress::GeneratedCredential],
+    job_id: Option<&str>,
 ) -> String {
     if creds.is_empty() {
         return String::new();
@@ -10245,6 +10382,20 @@ fn render_credentials_block(
         })
         .collect();
 
+    // Optional one-shot JSON download. Only rendered when we know
+    // the job_id (the unified-install flow always passes it; legacy
+    // tests that call render_install_result_with_credentials with
+    // None get the table without the button). Same view-once
+    // contract as the on-page table: server drains the cache on
+    // first hit, second click returns 410 Gone.
+    let download_block = match job_id {
+        Some(id) => format!(
+            r#"<p style="margin: 0.85rem 0 0;"><a class="cz-btn" href="/install/credentials.json/{id}" download>Download credentials as JSON</a> <span class="cz-muted" style="margin-left: 0.6rem; font-size: 0.82rem;">One-shot: the file is removed from the server on first download.</span></p>"#,
+            id = html_escape(id),
+        ),
+        None => String::new(),
+    };
+
     format!(
         r#"<section class="cz-section">
 <div class="cz-card" style="border-color: rgba(245, 181, 68, 0.55);">
@@ -10256,6 +10407,7 @@ fn render_credentials_block(
 {rows}
 </tbody>
 </table>
+{download_block}
 </div>
 </section>"#,
         title = html_escape(&title),
@@ -10265,6 +10417,7 @@ fn render_credentials_block(
         pass_h = html_escape(&pass_h),
         ref_h = html_escape(&ref_h),
         rows = rows,
+        download_block = download_block,
     )
 }
 
@@ -11231,7 +11384,7 @@ mod tests {
     #[test]
     fn render_credentials_block_is_empty_when_no_credentials() {
         let l = Localizer::english();
-        assert!(render_credentials_block(&l, &[]).is_empty());
+        assert!(render_credentials_block(&l, &[], None).is_empty());
     }
 
     #[test]
@@ -11254,7 +11407,7 @@ mod tests {
                 secret_ref: Some("kanidm/admin-password".into()),
             },
         ];
-        let html = render_credentials_block(&l, &creds);
+        let html = render_credentials_block(&l, &creds, None);
         assert!(html.contains("Generated credentials"));
         assert!(html.contains("Copy these values"));
         assert!(html.contains("postgres"));
@@ -11264,21 +11417,85 @@ mod tests {
         assert!(html.contains("postgres/admin-password"));
     }
 
+    #[test]
+    fn render_credentials_block_includes_json_download_when_job_id_provided() {
+        use computeza_driver_native::progress::GeneratedCredential;
+        let l = Localizer::english();
+        let creds = vec![GeneratedCredential {
+            component: "postgres".into(),
+            label: "superuser password".into(),
+            value: "deadbeef1234".into(),
+            username: Some("postgres".into()),
+            secret_ref: Some("postgres/admin-password".into()),
+        }];
+        let html = render_credentials_block(&l, &creds, Some("job-xyz"));
+        assert!(
+            html.contains(r#"href="/install/credentials.json/job-xyz""#),
+            "download button should target the JSON endpoint for the job"
+        );
+        assert!(html.contains("Download credentials as JSON"));
+        assert!(html.contains("One-shot"));
+    }
+
+    #[test]
+    fn render_credentials_block_omits_json_download_when_job_id_missing() {
+        use computeza_driver_native::progress::GeneratedCredential;
+        let l = Localizer::english();
+        let creds = vec![GeneratedCredential {
+            component: "postgres".into(),
+            label: "superuser password".into(),
+            value: "deadbeef1234".into(),
+            username: Some("postgres".into()),
+            secret_ref: Some("postgres/admin-password".into()),
+        }];
+        let html = render_credentials_block(&l, &creds, None);
+        assert!(!html.contains("/install/credentials.json/"));
+    }
+
     // ---- render_install_result_with_credentials ----
 
     #[test]
     fn install_result_with_credentials_omits_rollback_when_id_is_none() {
         let l = Localizer::english();
-        let html = render_install_result_with_credentials(&l, true, "ok", &[], None);
+        let html = render_install_result_with_credentials(&l, true, "ok", &[], None, None);
         assert!(!html.contains("Roll back this install"));
     }
 
     #[test]
     fn install_result_with_credentials_renders_rollback_when_id_provided() {
         let l = Localizer::english();
-        let html = render_install_result_with_credentials(&l, true, "ok", &[], Some("abc-123"));
+        let html =
+            render_install_result_with_credentials(&l, true, "ok", &[], Some("abc-123"), None);
         assert!(html.contains("Roll back this install"));
         assert!(html.contains(r#"action="/install/job/abc-123/rollback""#));
+    }
+
+    // ---- credentials_for_download one-shot drain semantics ----
+
+    #[test]
+    fn credentials_for_download_is_one_shot_drained() {
+        // The handler relies on Option::take to enforce
+        // view-once. Lock in that semantic without standing up
+        // the whole axum router.
+        use computeza_driver_native::progress::{GeneratedCredential, InstallProgress};
+        let mut p = InstallProgress::default();
+        p.credentials_for_download = Some(vec![GeneratedCredential {
+            component: "postgres".into(),
+            label: "superuser password".into(),
+            value: "deadbeef1234".into(),
+            username: Some("postgres".into()),
+            secret_ref: Some("postgres/admin-password".into()),
+        }]);
+        let first = p.credentials_for_download.take();
+        let second = p.credentials_for_download.take();
+        assert!(
+            first.is_some_and(|v| v.len() == 1),
+            "first drain returns the bag"
+        );
+        assert!(
+            second.is_none(),
+            "second drain returns None (handler responds 410 Gone in this case)"
+        );
     }
 
     // ---- render_secrets_index ----

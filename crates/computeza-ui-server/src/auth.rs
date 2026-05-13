@@ -179,6 +179,12 @@ pub fn required_permission_for(method: &str, path: &str) -> Option<Permission> {
     if path.starts_with("/admin/") {
         return Some(Permission::Manage);
     }
+    // Credentials JSON download surfaces every just-installed admin
+    // password + API token in one file. That's strictly Manage-grade
+    // even though it's a GET; a Viewer should never reach it.
+    if path.starts_with("/install/credentials.json/") {
+        return Some(Permission::Manage);
+    }
     // Read methods: Read is enough.
     if method == "GET" || method == "HEAD" {
         return Some(Permission::Read);
