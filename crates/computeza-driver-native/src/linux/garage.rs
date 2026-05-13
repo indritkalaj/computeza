@@ -116,14 +116,30 @@ pub async fn install(
         });
     }
     let final_binary = bin_dir.join("garage");
-    fs::copy(&built, &final_binary).await?;
-    // Ensure executable.
+
+    // Stop the service before replacing the binary so a re-install
+    // (where garage is already running) does not hit `Text file
+    // busy` (ETXTBSY) on the copy. Best-effort: on a fresh install
+    // the unit doesn't exist yet, so `systemctl stop` returns
+    // non-zero harmlessly.
+    let _ = super::systemctl::stop(&opts.unit_name).await;
+
+    // Atomic replace via tmp + rename. rename() on Linux works even
+    // if the target is currently executing -- the kernel re-points
+    // the directory entry to a new inode rather than overwriting
+    // the existing one in place.
+    let tmp_binary = bin_dir.join("garage.new");
+    if fs::try_exists(&tmp_binary).await.unwrap_or(false) {
+        let _ = fs::remove_file(&tmp_binary).await;
+    }
+    fs::copy(&built, &tmp_binary).await?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o755);
-        let _ = tokio::fs::set_permissions(&final_binary, perms).await;
+        let _ = tokio::fs::set_permissions(&tmp_binary, perms).await;
     }
+    fs::rename(&tmp_binary, &final_binary).await?;
 
     // 5. Config + systemd unit.
     let s3_port = opts.port;

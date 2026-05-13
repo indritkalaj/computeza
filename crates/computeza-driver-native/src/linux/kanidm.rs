@@ -143,13 +143,33 @@ pub async fn install(
         });
     }
     let final_binary = bin_dir.join("kanidmd");
-    fs::copy(&built, &final_binary).await?;
+
+    // Stop the service before replacing the binary so a re-install
+    // (where kanidmd is already running from a previous attempt)
+    // does not hit `Text file busy` (ETXTBSY) on the copy. Linux
+    // refuses to overwrite an executable that's currently mapped
+    // into a running process. Best-effort: on a fresh install the
+    // unit doesn't exist yet, and `systemctl stop` against a
+    // missing unit returns non-zero but the failure is harmless.
+    let _ = super::systemctl::stop(&opts.unit_name).await;
+
+    // Atomic replace via tmp + rename: defensive in case the stop
+    // above was a no-op or something else still holds the inode.
+    // `rename` works on Linux even when the target is executing
+    // because the kernel re-points the directory entry to a new
+    // inode rather than overwriting in place.
+    let tmp_binary = bin_dir.join("kanidmd.new");
+    if fs::try_exists(&tmp_binary).await.unwrap_or(false) {
+        let _ = fs::remove_file(&tmp_binary).await;
+    }
+    fs::copy(&built, &tmp_binary).await?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o755);
-        let _ = tokio::fs::set_permissions(&final_binary, perms).await;
+        let _ = tokio::fs::set_permissions(&tmp_binary, perms).await;
     }
+    fs::rename(&tmp_binary, &final_binary).await?;
     if !fs::try_exists(&final_binary).await.unwrap_or(false) {
         return Err(ServiceError::BinaryMissing {
             binary: "kanidmd".into(),
