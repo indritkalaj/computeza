@@ -140,8 +140,23 @@ pub async fn install(
         port = opts.pg_port,
         db = opts.pg_database,
     );
+    // Lakekeeper accepts either the full `ICEBERG_REST__PG_DATABASE_URL`
+    // OR the individual field set. We pass BOTH for belt-and-braces:
+    // URL parsers can be picky about special chars in passwords; the
+    // individual fields avoid that entire class of bug. If lakekeeper
+    // reads one form and ignores the other, either works -- the
+    // duplication is harmless because both forms agree on the
+    // connection target.
     let env: Vec<(String, String)> = vec![
         ("ICEBERG_REST__PG_DATABASE_URL".into(), pg_url),
+        ("ICEBERG_REST__PG_HOST".into(), opts.pg_host.clone()),
+        ("ICEBERG_REST__PG_PORT".into(), opts.pg_port.to_string()),
+        ("ICEBERG_REST__PG_USER".into(), opts.pg_user.clone()),
+        (
+            "ICEBERG_REST__PG_PASSWORD".into(),
+            creds.db_password.clone(),
+        ),
+        ("ICEBERG_REST__PG_DATABASE".into(), opts.pg_database.clone()),
         (
             "ICEBERG_REST__PG_ENCRYPTION_KEY".into(),
             creds.encryption_key.clone(),
