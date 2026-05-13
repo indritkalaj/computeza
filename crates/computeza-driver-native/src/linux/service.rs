@@ -136,16 +136,22 @@ pub async fn install_service(
         opts.component, opts.bundle.version
     ));
     let cache_root = opts.root_dir.join("binaries");
-    let bin_dir = fetch::fetch_and_extract(&cache_root, &opts.bundle, progress).await?;
-    if !fs::try_exists(bin_dir.join(opts.binary_name))
+    let initial_bin_dir = fetch::fetch_and_extract(&cache_root, &opts.bundle, progress).await?;
+    // The bundle's `bin_subpath` is a best-effort guess at where the
+    // binary lives inside the tarball; vendors frequently rename the
+    // top-level directory across versions (e.g.
+    // `greptime-linux-amd64-v1.0.1/` vs `greptime/`), which would
+    // make the static guess miss. If the binary isn't at the
+    // expected path, scan one level deeper for it. This is the
+    // bundled-binary equivalent of garage's `find_cargo_root` --
+    // tolerate any reasonable nesting without hand-coding per-version
+    // bin_subpath values.
+    let bin_dir = locate_binary_dir(&initial_bin_dir, opts.binary_name)
         .await
-        .unwrap_or(false)
-    {
-        return Err(ServiceError::BinaryMissing {
+        .ok_or_else(|| ServiceError::BinaryMissing {
             binary: opts.binary_name.into(),
-            bin_dir: bin_dir.clone(),
-        });
-    }
+            bin_dir: initial_bin_dir.clone(),
+        })?;
 
     if let Some(cfg) = &opts.config {
         fs::create_dir_all(&opts.root_dir).await?;
@@ -433,6 +439,71 @@ fn systemd_unit(
         env_block = env_block,
         pre_block = pre_block,
     )
+}
+
+/// Locate a binary inside a freshly-extracted bundle, tolerating
+/// the per-version nesting that several upstreams use (e.g.
+/// `greptime-linux-amd64-v1.0.1/greptime`, `grafana-v13.0.1/bin/grafana`).
+///
+/// Strategy:
+/// 1. If `<start>/<binary>` exists, return `start` (the common case
+///    where the bundle's `bin_subpath` was correct).
+/// 2. Otherwise, scan `start`'s direct children. If exactly one is a
+///    directory AND it contains the binary, return that subdir.
+/// 3. Otherwise, recurse one more level (the grafana case:
+///    `grafana-v13.0.1/bin/grafana` is two levels deep from the
+///    extraction root).
+/// 4. Give up after two levels -- deeper nesting suggests a
+///    misconfigured bundle and should fail loudly rather than be
+///    silently auto-detected.
+async fn locate_binary_dir(start: &Path, binary_name: &str) -> Option<PathBuf> {
+    if fs::try_exists(start.join(binary_name))
+        .await
+        .unwrap_or(false)
+    {
+        return Some(start.to_path_buf());
+    }
+    // Scan one level deep.
+    if let Some(level1) = single_subdir_containing(start, binary_name).await {
+        return Some(level1);
+    }
+    // Scan two levels deep -- check each direct subdir.
+    let mut entries = fs::read_dir(start).await.ok()?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if !entry.file_type().await.ok()?.is_dir() {
+            continue;
+        }
+        if let Some(level2) = single_subdir_containing(&entry.path(), binary_name).await {
+            return Some(level2);
+        }
+    }
+    None
+}
+
+/// List `dir`'s subdirectories; if any contains a file named
+/// `binary_name`, return the path to that subdirectory. Returns
+/// `None` if zero or multiple matches (we don't want to silently
+/// pick the wrong one).
+async fn single_subdir_containing(dir: &Path, binary_name: &str) -> Option<PathBuf> {
+    let mut entries = fs::read_dir(dir).await.ok()?;
+    let mut hits = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if !entry.file_type().await.ok()?.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        if fs::try_exists(path.join(binary_name))
+            .await
+            .unwrap_or(false)
+        {
+            hits.push(path);
+        }
+    }
+    if hits.len() == 1 {
+        Some(hits.into_iter().next().unwrap())
+    } else {
+        None
+    }
 }
 
 async fn wait_for_port(host: &str, port: u16, timeout: Duration) -> Result<(), ServiceError> {
