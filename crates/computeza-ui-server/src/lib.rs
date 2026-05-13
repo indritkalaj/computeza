@@ -649,6 +649,10 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/workspace", get(workspace_handler))
         .route("/workspace/sql/execute", post(workspace_sql_execute_handler))
         .route(
+            "/workspace/api/completions",
+            get(workspace_completions_handler),
+        )
+        .route(
             "/install",
             get(install_hub_handler).post(install_all_handler),
         )
@@ -1111,6 +1115,129 @@ struct WorkspaceSqlForm {
 // warehouse + Garage storage profile) ships. See AGENTS.md
 // "Deferred work: Lakekeeper bootstrap".
 
+/// JSON shape returned to Monaco's completion provider. Each item
+/// becomes a single CompletionItem in the suggestion list. `kind`
+/// is one of `database`, `table`, `column`, `warehouse`, `history`
+/// -- Monaco maps these to icons via the registered provider.
+#[derive(serde::Serialize, Default)]
+struct CompletionSource {
+    items: Vec<CompletionItem>,
+}
+
+#[derive(serde::Serialize)]
+struct CompletionItem {
+    /// Display label; this is what the operator sees in the
+    /// completion popup.
+    label: String,
+    /// Text that gets inserted when the operator accepts the
+    /// completion. Defaults to the same as `label` for symbol
+    /// suggestions; history entries insert the full SQL.
+    insert: String,
+    /// `database` | `table` | `column` | `warehouse` | `history`
+    kind: &'static str,
+    /// Short hint shown in the completion-popup detail area.
+    /// e.g. "table in finance.raw", "warehouse @ lakekeeper".
+    detail: Option<String>,
+}
+
+/// GET /workspace/api/completions
+///
+/// Aggregates symbol sources for Monaco's autocomplete:
+///   - Databend databases + tables (via `system.databases` /
+///     `system.tables` queries to the live HTTP handler).
+///   - Lakekeeper warehouse names (via the same management API
+///     `probe_lakekeeper` uses).
+///   - Recent queries from workspace history (deduplicated; the
+///     full SQL inserts as a snippet).
+///
+/// Each source is best-effort: a Databend outage skips its symbols
+/// but still returns warehouses + history. The endpoint never
+/// fails the request -- Monaco just gets a shorter list.
+async fn workspace_completions_handler(
+    State(state): State<AppState>,
+) -> axum::Json<CompletionSource> {
+    let mut items: Vec<CompletionItem> = Vec::new();
+
+    // Databend symbols
+    if let Some(url) = discover_databend_endpoint(state.store.as_deref()).await {
+        // Databases -- system.databases ships built-in
+        if let SqlOutcome::Ok { rows, .. } =
+            execute_sql_against_databend(&url, "SELECT name FROM system.databases ORDER BY name").await
+        {
+            for r in rows {
+                if let Some(name) = r.first() {
+                    items.push(CompletionItem {
+                        label: name.clone(),
+                        insert: name.clone(),
+                        kind: "database",
+                        detail: Some("database".to_string()),
+                    });
+                }
+            }
+        }
+        // Tables -- system.tables joins back to its database column
+        if let SqlOutcome::Ok { rows, .. } = execute_sql_against_databend(
+            &url,
+            "SELECT database, name FROM system.tables WHERE database NOT IN ('system','information_schema') ORDER BY database, name",
+        )
+        .await
+        {
+            for r in rows {
+                if let (Some(db), Some(name)) = (r.first(), r.get(1)) {
+                    let qualified = format!("{db}.{name}");
+                    items.push(CompletionItem {
+                        label: qualified.clone(),
+                        insert: qualified,
+                        kind: "table",
+                        detail: Some(format!("table in {db}")),
+                    });
+                }
+            }
+        }
+    }
+
+    // Lakekeeper warehouses
+    if let Some(url) = discover_lakekeeper_endpoint(state.store.as_deref()).await {
+        if let LakekeeperState::HasWarehouses(names) = probe_lakekeeper(&url).await {
+            for n in names {
+                items.push(CompletionItem {
+                    label: n.clone(),
+                    insert: n,
+                    kind: "warehouse",
+                    detail: Some("Lakekeeper warehouse".to_string()),
+                });
+            }
+        }
+    }
+
+    // History (dedup by the first line so repeated SELECT 1's
+    // don't bury fresh queries).
+    let history = load_workspace_history(state.store.as_deref()).await;
+    let mut seen_first_lines = std::collections::HashSet::new();
+    for entry in history.entries.into_iter().take(20) {
+        let first_line: String = entry.sql.lines().next().unwrap_or("").chars().take(60).collect();
+        if first_line.trim().is_empty() {
+            continue;
+        }
+        if !seen_first_lines.insert(first_line.clone()) {
+            continue;
+        }
+        let label = if first_line.len() < entry.sql.len() {
+            format!("{first_line}...")
+        } else {
+            first_line.clone()
+        };
+        items.push(CompletionItem {
+            label,
+            insert: entry.sql,
+            kind: "history",
+            detail: Some("recent query".to_string()),
+        });
+    }
+
+    axum::Json(CompletionSource { items })
+}
+
 async fn workspace_sql_execute_handler(
     State(state): State<AppState>,
     axum::extract::Form(form): axum::extract::Form<WorkspaceSqlForm>,
@@ -1541,6 +1668,67 @@ fn render_workspace_page(
         wordWrap: "on",
         fontSize: 13,
         fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+        // Trigger characters: most SQL completion lands on space
+        // or dot (qualifying a table). Keep the list small so we
+        // don't fight Monaco's built-in keyword completion which
+        // already triggers on letters.
+        suggest: {{ showWords: true }},
+      }});
+
+      // Schema-aware completion provider. Fetches from
+      // /workspace/api/completions which aggregates Databend
+      // databases + tables, Lakekeeper warehouses, and recent
+      // history. Cached for 30s in-process so each keystroke
+      // doesn't re-hit the server.
+      var completionCache = {{ items: null, expires: 0 }};
+      function fetchCompletions() {{
+        var now = Date.now();
+        if (completionCache.items && completionCache.expires > now) {{
+          return Promise.resolve(completionCache.items);
+        }}
+        return fetch("/workspace/api/completions", {{ credentials: "same-origin" }})
+          .then(function(r) {{ return r.ok ? r.json() : {{ items: [] }}; }})
+          .then(function(j) {{
+            completionCache = {{ items: j.items || [], expires: Date.now() + 30000 }};
+            return completionCache.items;
+          }})
+          .catch(function() {{ return []; }});
+      }}
+      // Pre-warm so the first Ctrl+Space hits a populated cache.
+      fetchCompletions();
+
+      var kindMap = {{
+        database:  monaco.languages.CompletionItemKind.Folder,
+        table:     monaco.languages.CompletionItemKind.Class,
+        column:    monaco.languages.CompletionItemKind.Field,
+        warehouse: monaco.languages.CompletionItemKind.Module,
+        history:   monaco.languages.CompletionItemKind.Snippet,
+      }};
+
+      monaco.languages.registerCompletionItemProvider("sql", {{
+        triggerCharacters: [" ", "."],
+        provideCompletionItems: function(model, position) {{
+          return fetchCompletions().then(function(items) {{
+            var word = model.getWordUntilPosition(position);
+            var range = {{
+              startLineNumber: position.lineNumber,
+              endLineNumber: position.lineNumber,
+              startColumn: word.startColumn,
+              endColumn: word.endColumn,
+            }};
+            return {{
+              suggestions: items.map(function(it) {{
+                return {{
+                  label: it.label,
+                  kind: kindMap[it.kind] || monaco.languages.CompletionItemKind.Text,
+                  insertText: it.insert || it.label,
+                  detail: it.detail || "",
+                  range: range,
+                }};
+              }}),
+            }};
+          }});
+        }},
       }});
 
       // Swap textarea for Monaco. Keep textarea in the DOM so the
