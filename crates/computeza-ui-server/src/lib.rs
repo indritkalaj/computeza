@@ -1112,6 +1112,28 @@ async fn finalize_managed_install_after_success(
     {
         let password = generate_random_password();
         let secret_ref = format!("{slug}/admin-password");
+
+        // Apply the password to the running component BEFORE
+        // persisting it in the secrets vault. Without this step the
+        // vault would be the only place the password exists; the
+        // component itself would still have its post-init default,
+        // so reconcilers + operator logins would fail with auth
+        // errors. Best-effort: a failure here is logged with the
+        // exact recovery action and the install continues (the
+        // operator can rotate via the admin UI to recover).
+        if let Err(e) = apply_admin_password(slug, username, &password).await {
+            tracing::warn!(
+                error = %e,
+                component = slug,
+                "install: failed to apply generated admin password to the running \
+                 {slug} component. The password is stored in secrets at \
+                 `{secret_ref}` but the component still has its post-init default. \
+                 Reconciler observe() will report FAILED until the operator rotates \
+                 via POST /admin/secrets/{secret_ref}/rotate (or applies the password \
+                 manually via the component's native CLI)."
+            );
+        }
+
         if let Some(secrets) = secrets {
             if let Err(e) = secrets.put(&secret_ref, &password).await {
                 tracing::warn!(
@@ -1195,6 +1217,88 @@ fn generate_random_password() -> String {
         out.push_str(&format!("{b:02x}"));
     }
     out
+}
+
+/// Apply a freshly-generated admin password to a running component so
+/// the reconciler + operator's stored credential agree with what the
+/// component will accept.
+///
+/// Currently wired for postgres only. Pipes
+/// `ALTER USER <user> PASSWORD '<pw>';` to `sudo -u postgres psql`
+/// via stdin (not -c) so the password does NOT appear in `ps` output.
+/// The psql invocation goes over the local Unix socket where the
+/// install's initdb left `--auth-local=peer`, so no bootstrap
+/// password is required.
+///
+/// kanidm + grafana password-apply paths land in a follow-up commit:
+/// each has its own mechanism (kanidm via `kanidmd recover_account`;
+/// grafana via the admin HTTP API), and wiring them is a separate
+/// concern from the postgres reconciler unblock.
+async fn apply_admin_password(slug: &str, username: &str, password: &str) -> Result<(), String> {
+    match slug {
+        "postgres" => apply_postgres_password(username, password).await,
+        "kanidm" | "grafana" => {
+            tracing::debug!(
+                component = slug,
+                "no admin-password applier wired for {slug} yet; the generated \
+                 password is in secrets, but the component still has its post-init \
+                 default. Manual rotation via the component's CLI is required for \
+                 the reconciler / operator login to succeed."
+            );
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Pipe `ALTER USER ... PASSWORD ...` to `sudo -u postgres psql` via
+/// stdin. Password reaches psql via the child process's stdin pipe,
+/// never via the command line, so `ps` does NOT leak it.
+///
+/// Returns the stderr / exit-code on failure so the caller's
+/// `tracing::warn!` carries actionable diagnostics.
+async fn apply_postgres_password(username: &str, password: &str) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt;
+    use tokio::process::Command;
+    let mut child = Command::new("sudo")
+        .arg("-n") // no password prompt; the install runs as root already
+        .arg("-u")
+        .arg("postgres")
+        .arg("psql")
+        .arg("-v")
+        .arg("ON_ERROR_STOP=1")
+        .arg("--quiet")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawning `sudo -u postgres psql`: {e}"))?;
+
+    let sql = format!("ALTER USER \"{username}\" PASSWORD '{password}';\n");
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(sql.as_bytes())
+            .await
+            .map_err(|e| format!("writing ALTER USER SQL to psql stdin: {e}"))?;
+        stdin
+            .shutdown()
+            .await
+            .map_err(|e| format!("closing psql stdin: {e}"))?;
+    }
+
+    let out = child
+        .wait_with_output()
+        .await
+        .map_err(|e| format!("waiting on psql: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "psql exited {:?}: stdout={} stderr={}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).trim(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
 }
 
 /// Look up whether a slug is marked `available: true` in [`COMPONENTS`].
