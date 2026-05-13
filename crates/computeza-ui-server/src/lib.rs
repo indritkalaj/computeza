@@ -1269,17 +1269,122 @@ fn render_workspace_page(
 </div>
 <div class="cz-card">
 <h2 style="margin-top: 0;">{sql_heading}</h2>
-<form method="post" action="/workspace/sql/execute">
+<form method="post" action="/workspace/sql/execute" id="cz-sql-form">
 {csrf}
-<textarea name="sql" rows="8" class="cz-input" style="font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.9rem; width: 100%;" placeholder="{sql_placeholder}">{sql_value}</textarea>
+<!--
+    Progressive enhancement: the textarea is the canonical form
+    field and is fully usable on its own. The sibling <div> below
+    is Monaco's mount point; the JS at the bottom of this file
+    hides the textarea and copies Monaco's content into it on
+    submit. If the Monaco CDN is blocked, JS is disabled, or the
+    asset fails to load, the textarea stays visible and the form
+    works unchanged.
+-->
+<textarea id="cz-sql-textarea" name="sql" rows="8" class="cz-input" style="font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.9rem; width: 100%;" placeholder="{sql_placeholder}">{sql_value}</textarea>
+<div id="cz-sql-monaco" data-initial="{sql_value_attr}" style="display: none; height: 16rem; border: 1px solid rgba(255,255,255,0.08); border-radius: 0.4rem; overflow: hidden;"></div>
 <p class="cz-muted" style="margin: 0.4rem 0 0.6rem; font-size: 0.78rem;">{sql_help}</p>
 <button type="submit" class="cz-btn cz-btn-primary">{sql_run}</button>
+<span class="cz-muted" style="margin-left: 0.75rem; font-size: 0.78rem;" id="cz-sql-shortcut-hint">Tip: Ctrl/Cmd+Enter runs the query.</span>
 </form>
 <h3 style="margin-top: 1.5rem;">{results_heading}</h3>
 {results_block}
 </div>
 </div>
-</section>"#,
+</section>
+<script>
+// Monaco editor progressive enhancement.
+//
+// Loads Monaco 0.45.0 from a CDN (pinned -- "latest" would expose
+// us to upstream breaking changes). On success: hides the textarea,
+// mounts Monaco in its place, copies Monaco's value back into the
+// textarea on submit so the form POST carries the right body. On
+// failure (CDN blocked, JS disabled, network down) the textarea
+// stays visible and the form works unchanged -- no functionality
+// loss, just no syntax highlighting.
+//
+// Ctrl/Cmd+Enter binds to form submit, matching the convention in
+// every other SQL IDE.
+(function() {{
+  var mount = document.getElementById("cz-sql-monaco");
+  var textarea = document.getElementById("cz-sql-textarea");
+  var form = document.getElementById("cz-sql-form");
+  if (!mount || !textarea || !form) return;
+
+  // Pin the Monaco version explicitly. Auto-latest would silently
+  // change behaviour; a pinned version is what every other CDN dep
+  // in this repo does (see fetch.rs Bundle pins for the same
+  // reasoning applied to component binaries).
+  var MONACO_VERSION = "0.45.0";
+  var BASE = "https://cdn.jsdelivr.net/npm/monaco-editor@" + MONACO_VERSION + "/min";
+
+  // Monaco's loader.js bootstraps an AMD `require` and pulls the
+  // editor bundle. Inject loader.js, then call require() for the
+  // editor.main module. If loader.js itself fails to load (network
+  // blocked, etc) the onerror keeps the textarea visible and we
+  // exit silently.
+  var script = document.createElement("script");
+  script.src = BASE + "/vs/loader.js";
+  script.onerror = function() {{
+    // CDN unreachable. Textarea stays visible; nothing to do.
+    console.warn("computeza workspace: Monaco CDN unreachable; falling back to textarea editor");
+  }};
+  script.onload = function() {{
+    if (typeof require !== "function" || !require.config) return;
+    require.config({{ paths: {{ vs: BASE + "/vs" }} }});
+    require(["vs/editor/editor.main"], function() {{
+      var initial = mount.getAttribute("data-initial") || "";
+      // Decode the HTML-encoded initial value back to plain text
+      // for Monaco. The server encoded &lt; &gt; &amp; &quot; &#39;
+      // and we reverse those four below; if other entities show up
+      // we'll add them when they do.
+      initial = initial
+        .replace(/&amp;/g, "&")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'");
+
+      var editor = monaco.editor.create(mount, {{
+        value: initial,
+        language: "sql",
+        theme: "vs-dark",
+        automaticLayout: true,
+        minimap: {{ enabled: false }},
+        scrollBeyondLastLine: false,
+        wordWrap: "on",
+        fontSize: 13,
+        fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+      }});
+
+      // Swap textarea for Monaco. Keep textarea in the DOM so the
+      // form submission still finds its `name="sql"` field; we
+      // just stop displaying it.
+      textarea.style.display = "none";
+      mount.style.display = "block";
+
+      // Ctrl/Cmd+Enter submits the form. Standard SQL-IDE shortcut.
+      editor.addCommand(
+        monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter,
+        function() {{ form.requestSubmit(); }}
+      );
+
+      // Sync Monaco -> textarea before submit so the POST body
+      // carries the current editor contents (not the original
+      // server-rendered value).
+      form.addEventListener("submit", function() {{
+        textarea.value = editor.getValue();
+      }});
+
+      // Move focus into the editor on page load so the operator
+      // can start typing immediately. Skip if the editor is
+      // pre-filled with a SELECT * the operator just clicked
+      // (let them inspect first).
+      if (!initial.trim()) editor.focus();
+    }});
+  }};
+  document.head.appendChild(script);
+}})();
+</script>"#,
         title = html_escape(&title),
         intro = html_escape(&intro),
         catalog_heading = html_escape(&catalog_heading),
@@ -1287,6 +1392,7 @@ fn render_workspace_page(
         sql_heading = html_escape(&sql_heading),
         sql_placeholder = html_escape(&sql_placeholder),
         sql_value = html_escape(sql_prefill),
+        sql_value_attr = html_escape(sql_prefill),
         sql_help = html_escape(&sql_help),
         sql_run = html_escape(&sql_run),
         results_heading = html_escape(&results_heading),
