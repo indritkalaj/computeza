@@ -5904,12 +5904,12 @@ pub fn render_install_guide(localizer: &Localizer) -> String {
 
 <section class="cz-section" id="prereqs">
 <h2>Prerequisites</h2>
-<p class="cz-muted">Verify each row before proceeding. v0.0.x targets Linux x86_64 for the full 11-component data plane; macOS and Windows ship a Postgres + Kanidm subset and gain the remaining components in v0.1+.</p>
+<p class="cz-muted">v0.0.x targets <strong>Ubuntu Linux x86_64 only</strong> for the full 11-component data plane. The constraint is Databend, which ships glibc-linked binaries we've verified only against Ubuntu's glibc + systemd userspace; other distros (Debian, Fedora, RHEL, openSUSE, Arch) will install most components but Databend's startup may fail with a glibc-version mismatch or systemd-unit semantic difference. macOS and Windows ship a Postgres + Kanidm subset and gain the remaining components in v0.1+. Verify each row before proceeding.</p>
 <div class="cz-table-wrap">
 <table class="cz-table">
 <thead><tr><th>Requirement</th><th>Minimum</th><th>Recommended</th><th>Notes</th></tr></thead>
 <tbody>
-<tr><td class="cz-strong">Operating system</td><td>Ubuntu 22.04 / Debian 12 / Fedora 39 / RHEL 9</td><td>Ubuntu 24.04 LTS</td><td>Any systemd-based distro works. macOS 13+ and Windows 11 supported for a partial stack (see <a href="/components">/components</a>).</td></tr>
+<tr><td class="cz-strong">Operating system</td><td>Ubuntu 22.04 LTS</td><td>Ubuntu 24.04 LTS</td><td><strong>Ubuntu-only in v0.0.x</strong>; Databend's binary distribution is the binding constraint. Other systemd-based distros likely work for the other 10 components but are unverified end-to-end. macOS 13+ and Windows 11 supported for a partial stack (Postgres + Kanidm) -- see <a href="/components">/components</a>. v0.1+ broadens the matrix to Debian / Fedora / RHEL after Databend release-engineering catches up.</td></tr>
 <tr><td class="cz-strong">Architecture</td><td>x86_64</td><td>x86_64</td><td>ARM64 lands in v0.1+ (spec section 10).</td></tr>
 <tr><td class="cz-strong">CPU</td><td>2 vCPU</td><td>4 vCPU</td><td>Postgres + Restate + Greptime are the heaviest co-residents.</td></tr>
 <tr><td class="cz-strong">RAM</td><td>4 GiB</td><td>8 GiB+</td><td>Per-component RAM dominated by Postgres shared_buffers + Greptime + Databend caches.</td></tr>
@@ -6046,7 +6046,7 @@ Then from Windows CMD / PowerShell: <code>wsl --shutdown</code>, re-open Ubuntu,
 <dd>The unit's <code>ProtectSystem=strict</code> sandbox makes everything outside <code>ReadWritePaths</code> read-only. The driver lists <code>ReadWritePaths=&lt;root&gt;</code> + sets <code>WorkingDirectory=&lt;root&gt;</code> so relative writes inside the daemon land in writable territory. If a daemon writes to an absolute path outside <code>&lt;root&gt;</code>, file a bug -- the driver should be passing that path as a config flag rather than letting the daemon hardcode it.</dd>
 
 <dt>"postgres binaries not found"</dt>
-<dd>The Linux Postgres driver searches <code>/usr/lib/postgresql/&lt;v&gt;/bin</code>, <code>/usr/pgsql-&lt;v&gt;/bin</code>, <code>/opt/postgresql/bin</code>, and <code>/usr/{{,local/}}bin</code> for majors 13-18. When no distro postgres is detected AND the install runs as root, the driver auto-invokes <code>apt-get install -y postgresql postgresql-contrib</code> (or the dnf/zypper/pacman equivalent). If the auto-install is what fails, the error tells you why -- typically not root, or no internet egress to the distro mirror.</dd>
+<dd>The Linux Postgres driver searches <code>/usr/lib/postgresql/&lt;v&gt;/bin</code> (Ubuntu / Debian default) for majors 13-18. When no distro postgres is detected AND the install runs as root, the driver auto-invokes <code>apt-get install -y postgresql postgresql-contrib</code>. If the auto-install is what fails, the error tells you why -- typically not root, or no internet egress to <code>archive.ubuntu.com</code>. dnf / zypper / pacman fallbacks exist in the driver but only the apt path is verified end-to-end in v0.0.x.</dd>
 
 <dt>"Failed to connect to bus" during systemd registration</dt>
 <dd>systemd isn't running. On WSL2, enable it via <code>/etc/wsl.conf</code> and <code>wsl --shutdown</code> (see WSL section above). On a minimal LXC container, ensure the container template has systemd as PID 1. systemd-free hosts are not supported in v0.0.x; the v0.1 spec adds OpenRC + supervisord variants.</dd>
