@@ -42,8 +42,17 @@ pub const DEFAULT_PORT: u16 = 8090;
 
 /// Pinned versions of `org.apache.xtable:xtable-utilities`. First
 /// entry is the default ("latest"). Versions correspond to Apache
-/// XTable release tags.
-pub const XTABLE_VERSIONS: &[&str] = &["0.3.0-incubating", "0.2.0-incubating"];
+/// XTable release tags **that are also published to Maven Central**
+/// -- the project's release cadence sometimes lands a git tag
+/// without the corresponding Maven artifact (incubating projects
+/// require IPMC sign-off for each release publication). Verify on
+/// <https://repo.maven.apache.org/maven2/org/apache/xtable/xtable-utilities/>
+/// before adding a new entry.
+///
+/// 0.3.0-incubating has a git tag but no Maven Central artifact as
+/// of May 2026 -- listed here as historical reference of a version
+/// we intentionally don't pin.
+pub const XTABLE_VERSIONS: &[&str] = &["0.2.0-incubating"];
 
 #[must_use]
 pub fn available_versions() -> &'static [&'static str] {
@@ -216,6 +225,14 @@ pub async fn install(
         // warnings about `sun.misc.Unsafe` go to stderr regardless.
         // Without stdout the operator sees only the warnings and
         // can't diagnose the failure.
+        //
+        // `-U` forces mvn to re-attempt artifact resolution for
+        // anything that previously failed. Without this, a
+        // prior failed install (e.g. trying a version not on
+        // Maven Central) leaves a negative cache that suppresses
+        // resolution attempts for hours -- so even after switching
+        // the version pin, mvn would still claim the version is
+        // unresolvable until the cache TTL expires.
         let out = Command::new("mvn")
             .arg("-f")
             .arg(&pom_path)
@@ -224,9 +241,11 @@ pub async fn install(
             .arg("-DincludeScope=runtime")
             // Batch mode (-B) keeps output non-interactive and
             // drops the download progress bar; -e adds the
-            // stack trace location to error reports.
+            // stack trace location to error reports; -U forces
+            // re-attempting cached resolution failures.
             .arg("-B")
             .arg("-e")
+            .arg("-U")
             .output()
             .await?;
         if !out.status.success() {
