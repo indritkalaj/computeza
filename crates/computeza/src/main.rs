@@ -546,22 +546,52 @@ async fn reconcile_tick(
         }
 
         // ---- kanidm-instance ----
+        //
+        // Kanidm authenticates with a Bearer API token (not a
+        // password). Provisioning that token is a multi-step
+        // bootstrap that v0.0.x doesn't automate (it requires
+        // shelling to `kanidmd recover_account admin`, logging in
+        // to get a session token, creating a service account, and
+        // generating a long-lived API token -- a v0.1 milestone per
+        // the AGENTS.md "Deferred work" entry).
+        //
+        // Until that lands, skip the observe entirely when no
+        // `kanidm/reconciler-token` exists in the secrets vault. A
+        // skipped observe leaves the row in UNKNOWN ("not yet
+        // observed"), which is the honest state -- vs FAILED, which
+        // would mean "we tried with an empty token and got 401" and
+        // misleadingly suggests the operator needs to debug
+        // connectivity rather than configure auth.
         {
             use computeza_reconciler_kanidm::{KanidmReconciler, KanidmSpec};
-            let rows = store.list("kanidm-instance", None).await.unwrap_or_default();
-            for sr in rows {
-                let spec: KanidmSpec = match serde_json::from_value(sr.spec.clone()) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::warn!(error = %e, name = %sr.key.name, "kanidm spec deserialize failed");
-                        continue;
-                    }
-                };
-                let reconciler: KanidmReconciler<NoOpDriver> =
-                    KanidmReconciler::new(spec.endpoint.clone(), spec.admin_token)
+            use secrecy::SecretString;
+            let token_opt = match secrets.as_deref() {
+                Some(s) => s.get("kanidm/reconciler-token").await.ok().flatten(),
+                None => None,
+            };
+            if let Some(token) = token_opt {
+                let rows = store.list("kanidm-instance", None).await.unwrap_or_default();
+                for sr in rows {
+                    let spec: KanidmSpec = match serde_json::from_value(sr.spec.clone()) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!(error = %e, name = %sr.key.name, "kanidm spec deserialize failed");
+                            continue;
+                        }
+                    };
+                    let reconciler: KanidmReconciler<NoOpDriver> =
+                        KanidmReconciler::new(
+                            spec.endpoint.clone(),
+                            SecretString::from(token.clone()),
+                        )
                         .with_state(store.clone(), &sr.key.name);
-                let _ = reconciler.observe(&ctx).await;
+                    let _ = reconciler.observe(&ctx).await;
+                }
             }
+            // No token -> intentionally skip dispatch. The UI shows
+            // UNKNOWN for kanidm-instance/local rows, which is
+            // accurate ("we haven't observed this yet") until the
+            // operator configures the reconciler token.
         }
 
         // ---- garage-instance ----
