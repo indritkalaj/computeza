@@ -168,6 +168,21 @@ pub async fn install_service(
     info!(unit = %unit_path.display(), "wrote systemd unit");
     systemctl::daemon_reload().await?;
 
+    // Stop the unit before enabling --now. Reason: `enable --now`
+    // is a no-op if the service is already active OR in a
+    // restart loop. `daemon-reload` re-reads the unit file from
+    // disk, but the *running* process keeps using the in-memory
+    // unit it was started with -- including the OLD `Environment=`
+    // lines, OLD `ExecStart`, etc. A re-install therefore writes
+    // a corrected unit to disk that the actually-running daemon
+    // never sees.
+    //
+    // Best-effort: a missing-unit `stop` returns non-zero
+    // harmlessly. The subsequent `enable --now` always starts the
+    // service afresh, picking up every change in the rewritten
+    // unit.
+    let _ = systemctl::stop(&opts.unit_name).await;
+
     progress.set_phase(InstallPhase::StartingService);
     progress.set_message(format!("Starting {}", opts.unit_name));
     systemctl::enable_now(&opts.unit_name).await?;
