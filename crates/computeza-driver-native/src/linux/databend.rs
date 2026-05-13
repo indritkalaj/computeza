@@ -149,12 +149,33 @@ pub async fn install(
     // commonly add `[[catalog]]` blocks pointing at lakekeeper, or
     // swap storage backends to S3 via garage). overwrite_if_present
     // is false so re-installs preserve those edits.
+    // Databend's query process exposes FIVE listening endpoints in
+    // addition to the HTTP handler the operator sees:
+    //   - flight_api  (gRPC; default 8080 -- collides with OpenFGA)
+    //   - admin_api   (default 8080 also)
+    //   - metric_api  (Prometheus; default 7070)
+    //   - mysql_handler (default 3307)
+    //   - clickhouse_http_handler (default 8124)
+    //
+    // Of those, only flight_api + admin_api hit conflicts on our
+    // standard port plan (OpenFGA owns 8080). We pin all the
+    // commonly-conflicting ones to offsets of opts.port so a
+    // re-run with `--port 9100` shifts the whole cluster
+    // together. Operators wanting to expose the mysql /
+    // clickhouse-compatible handlers add their own port lines
+    // -- those default OFF if not configured.
+    let flight_port = opts.port + 1; // 8001
+    let admin_port = opts.port + 2; // 8002
+    let metric_port = opts.port + 3; // 8003
     let query_config = ConfigFile {
         filename: "databend-query.toml".into(),
         contents: format!(
             "[query]\n\
              http_handler_host = \"127.0.0.1\"\n\
              http_handler_port = {port}\n\
+             flight_api_address = \"127.0.0.1:{flight_port}\"\n\
+             admin_api_address = \"127.0.0.1:{admin_port}\"\n\
+             metric_api_address = \"127.0.0.1:{metric_port}\"\n\
              tenant_id = \"computeza\"\n\
              cluster_id = \"local\"\n\
              \n\
@@ -170,6 +191,9 @@ pub async fn install(
              [storage.fs]\n\
              data_path = \"{root}/data\"\n",
             port = opts.port,
+            flight_port = flight_port,
+            admin_port = admin_port,
+            metric_port = metric_port,
             meta_grpc = META_GRPC_PORT,
             root = opts.root_dir.display(),
         ),
