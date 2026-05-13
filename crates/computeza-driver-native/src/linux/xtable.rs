@@ -1,19 +1,48 @@
 //! Apache XTable Iceberg<->Delta<->Hudi metadata sync. Linux install path.
 //!
+//! # v0.0.x scope: install plumbing only
+//!
+//! The systemd unit installed here runs a `/bin/true` no-op for
+//! v0.0.x. The runtime invocation -- the real
+//! `<java> -cp ... RunSync --datasetConfig ...` -- is deferred to
+//! v0.1+. Two upstream constraints box us in:
+//!
+//! 1. **0.2.0-incubating doesn't produce a runnable CLI JAR.** The
+//!    `xtable-utilities` module exists but its shade-plugin config
+//!    doesn't emit a `-bundled.jar`; the only shaded JAR the build
+//!    produces is `xtable-hudi-support-extensions_2.12-...-bundled.jar`
+//!    (21MB), which is the Hudi-side plugin hook (`XTableSyncTool`
+//!    is a `HoodieSyncTool` callback, not a standalone CLI).
+//!
+//! 2. **0.3.0-incubating has the CLI but contradictory JDK pins.**
+//!    The parent pom pins `lombok-maven-plugin:1.18.20.0`
+//!    (lombok 1.18.20 doesn't work on JDK 17+ -- `TypeTag::UNKNOWN`
+//!    on JDK 21, `currentBindings is null` on JDK 17.0.7+) AND
+//!    `quarkus-maven-plugin:3.2.12.Final` on the new
+//!    `xtable-service` module (requires JDK >=17). No single JDK
+//!    satisfies both.
+//!
+//! What this driver DOES do today:
+//!   - bootstraps a Temurin JRE 21 under `<root>/jre/`
+//!   - source-builds 0.2.0-incubating (or the version selected by
+//!     the operator) under JDK 11
+//!   - drops the largest shaded JAR into `<root>/lib/`
+//!   - writes a stub `<root>/datasets.yaml`
+//!   - registers a systemd unit (no-op ExecStart for now) so the
+//!     `/install -> xtable -> Uninstall` UI flow works
+//!
+//! v0.1+ resolves the runtime story (likely by upgrading to a 0.3.x
+//! point release that bumps the lombok plugin, OR by maintaining a
+//! Computeza-bundled fat-JAR build pipeline that side-steps the
+//! upstream pom).
+//!
 //! # Distribution channel
 //!
 //! Apache XTable is an Apache Incubator podling. **Its releases ship
 //! source-only** -- no prebuilt JARs land on Maven Central, and no
 //! binary release-assets ship on the GitHub release page. The
 //! published "releases" are PGP-signed source tarballs intended to be
-//! built locally per the standard Apache release model. Both
-//! 0.2.0-incubating and 0.3.0-incubating exhibit this: the git tags
-//! exist on `github.com/apache/incubator-xtable`, but
-//! `repo.maven.apache.org/maven2/org/apache/xtable/xtable-utilities/`
-//! returns 404 for every version. Earlier attempts to resolve via
-//! `mvn dependency:copy-dependencies` against Maven Central therefore
-//! failed for every version we tried -- the artifact simply isn't
-//! there.
+//! built locally per the standard Apache release model.
 //!
 //! Driver flow on a fresh host:
 //!
@@ -288,23 +317,20 @@ pub async fn install(
         info!(path = %datasets_path.display(), "wrote stub datasets.yaml");
     }
 
-    // 8. Discover the RunSync entry-point class by reading the
-    //    JAR. xtable-utilities's shade-plugin doesn't write a
-    //    Main-Class manifest entry, AND the class's package path
-    //    has shifted across releases (io.onetable.utility.* before
-    //    the Apache donation; org.apache.xtable.utilities.* after;
-    //    different point releases vary). Reading the actual class
-    //    out of the JAR sidesteps the version-by-version guessing.
-    let run_sync_class = discover_run_sync_class(&dest_jar).await?;
-    info!(class = %run_sync_class, "discovered xtable RunSync entry-point class");
-
-    // 9. systemd unit. ExecStart uses `java -cp <jar> <class>` (not
-    //    `-jar`) because the shaded JAR has no Main-Class manifest;
-    //    the class name we just discovered names the entry point.
+    // 8. systemd unit. v0.0.x ships install plumbing only -- the
+    //    runtime invocation (the actual `java -cp ... RunSync ...`)
+    //    is deferred to v0.1+ for reasons documented in the module
+    //    doc-comment above. The unit's ExecStart is a no-op that
+    //    exits 0 so `systemctl start` succeeds, the operator's
+    //    install completes cleanly, and the file layout
+    //    (`<root>/lib/<jar>`, `<root>/datasets.yaml`,
+    //    `<root>/jre/...`) is provisioned for the operator to
+    //    inspect and to be picked up by the v0.1+ runtime once the
+    //    classpath / entry-point story is resolved.
     progress.set_phase(InstallPhase::RegisteringService);
     progress.set_message(format!("Registering systemd unit {}", opts.unit_name));
     let unit_path = PathBuf::from("/etc/systemd/system").join(&opts.unit_name);
-    let unit_body = systemd_unit(&java_bin, &dest_jar, &run_sync_class, &opts.root_dir);
+    let unit_body = systemd_unit(&java_bin, &dest_jar, &opts.root_dir);
     let mut f = fs::File::create(&unit_path).await?;
     f.write_all(unit_body.as_bytes()).await?;
     f.sync_all().await?;
@@ -647,115 +673,28 @@ async fn locate_bundled_jar(src_dir: &Path, _version: &str) -> Result<PathBuf, S
     ))))
 }
 
-/// Read the bundled JAR (it's a ZIP) and discover the
-/// fully-qualified class name of XTable's RunSync entry point.
-///
-/// XTable's `xtable-utilities` shade-plugin doesn't write a
-/// Main-Class manifest entry, so `java -jar` doesn't work.
-/// `java -cp <jar> <class>` is the upstream-documented invocation,
-/// but the class's package path has shifted across releases:
-///   - 0.1.x and earlier (pre-Apache): `io.onetable.utility.RunSync`
-///   - 0.2.0+: somewhere under `org.apache.xtable.*`
-///   - The exact subpackage drifts (`.utility`, `.utilities`, etc.)
-///
-/// Reading the actual class path from the JAR sidesteps the
-/// version-by-version guessing. We try MANIFEST.MF's Main-Class
-/// first (in case a future release adds one); if that's absent, we
-/// scan ZIP entries for any `*RunSync.class` and convert the path
-/// (`org/apache/xtable/utilities/RunSync.class` ->
-/// `org.apache.xtable.utilities.RunSync`).
-async fn discover_run_sync_class(jar: &Path) -> Result<String, ServiceError> {
-    let jar = jar.to_owned();
-    // zip crate is synchronous; spawn_blocking keeps the tokio
-    // worker pool free during the (millisecond) probe.
-    let result = tokio::task::spawn_blocking(move || -> std::io::Result<String> {
-        use std::io::Read;
-        let file = std::fs::File::open(&jar)?;
-        let mut archive = zip::ZipArchive::new(file).map_err(|e| {
-            std::io::Error::other(format!("opening jar as zip: {e}"))
-        })?;
-
-        // Try MANIFEST.MF Main-Class first.
-        if let Ok(mut manifest) = archive.by_name("META-INF/MANIFEST.MF") {
-            let mut content = String::new();
-            if manifest.read_to_string(&mut content).is_ok() {
-                // MANIFEST.MF folds lines >72 chars onto the next
-                // with a leading space; un-fold before parsing.
-                let unfolded = content.replace("\r\n ", "").replace("\n ", "");
-                for line in unfolded.lines() {
-                    if let Some(class) = line.strip_prefix("Main-Class:") {
-                        return Ok(class.trim().to_string());
-                    }
-                }
-            }
-        }
-
-        // Fallback: scan all entries for `*RunSync.class`. Prefer
-        // ones containing "utilities" (the entry-point lives in
-        // the utilities module; transitively-shaded deps that
-        // happen to also define a RunSync class would be a
-        // surprise, but biasing toward "utilities" handles that
-        // case correctly).
-        let mut best: Option<String> = None;
-        let mut fallback: Option<String> = None;
-        for i in 0..archive.len() {
-            let entry = archive.by_index(i).map_err(|e| {
-                std::io::Error::other(format!("reading zip entry {i}: {e}"))
-            })?;
-            let name = entry.name();
-            if !name.ends_with("/RunSync.class") && name != "RunSync.class" {
-                continue;
-            }
-            let class_name = name.trim_end_matches(".class").replace('/', ".");
-            if name.contains("utilities") || name.contains("utility") {
-                best = Some(class_name);
-                break;
-            }
-            if fallback.is_none() {
-                fallback = Some(class_name);
-            }
-        }
-        best.or(fallback).ok_or_else(|| {
-            std::io::Error::other(
-                "no Main-Class manifest entry and no *RunSync.class found inside the JAR. \
-                 XTable's entry-point class layout may have changed at this version.",
-            )
-        })
-    })
-    .await
-    .map_err(|e| ServiceError::Io(std::io::Error::other(format!("spawn_blocking: {e}"))))?;
-
-    result.map_err(ServiceError::Io)
-}
-
-fn systemd_unit(java_bin: &Path, jar: &Path, run_sync_class: &str, root_dir: &Path) -> String {
-    // xtable's RunSync exits after one sync cycle. With Type=simple
-    // + Restart=on-failure systemd would re-launch immediately and
-    // we'd be in a tight CPU loop. The correct shape is
-    // Type=oneshot + RemainAfterExit=yes so:
-    //   - systemd waits for ExecStart to return (this is what
-    //     `systemctl start` expects to complete).
-    //   - The unit is considered "active" after a successful exit
-    //     (RemainAfterExit) so dependent units are happy.
-    //   - There is no restart loop. The operator triggers
-    //     subsequent syncs via a systemd timer (v0.1+) or by
-    //     re-running `systemctl start computeza-xtable`.
+fn systemd_unit(java_bin: &Path, jar: &Path, root_dir: &Path) -> String {
+    // v0.0.x ships install plumbing only. ExecStart is /bin/true
+    // (no-op, exits 0) so the install completes cleanly and the
+    // file layout (lib/<jar>, datasets.yaml, jre/...) is
+    // provisioned. The runtime invocation -- the real
+    // `<java> -cp ... RunSync --datasetConfig ...` -- is deferred
+    // to v0.1+ because:
+    //   - 0.2.0-incubating doesn't produce a runnable shaded JAR
+    //     for xtable-utilities (the standalone CLI shipped later).
+    //   - 0.3.0+ has the standalone CLI but its parent pom pins
+    //     plugin versions with contradictory JDK requirements
+    //     (lombok-maven-plugin:1.18.20.0 needs JDK <=16;
+    //     quarkus-maven-plugin:3.2.12.Final on xtable-service
+    //     needs JDK >=17). No single JDK builds both.
     //
-    // Cap the JVM heap at 512 MiB so a colocated postgres or qdrant
-    // doesn't OOM. Operators with very large tables override via a
-    // systemd drop-in.
-    //
-    // `-cp <jar> <classname>` not `-jar <jar>`: xtable's shade-plugin
-    // doesn't write a Main-Class manifest entry, so `java -jar`
-    // fails with "no main manifest attribute". Naming RunSync
-    // explicitly matches the upstream-documented invocation.
-    let exec_start = format!(
-        "{java} $JAVA_OPTS -cp {jar} {cls} --datasetConfig {root}/datasets.yaml",
-        java = java_bin.display(),
-        jar = jar.display(),
-        cls = run_sync_class,
-        root = root_dir.display(),
-    );
+    // Type=oneshot + RemainAfterExit=yes keeps the v0.0.x shape
+    // forward-compatible with the v0.1+ batch-sync invocation. The
+    // java_bin + jar args are accepted so the lib/jre layout is
+    // referenced from the unit file (operators can see what the
+    // install provisioned without spelunking the source).
+    let _ = (java_bin, jar);
+    let exec_start = "/bin/true".to_string();
     format!(
         "[Unit]\n\
          Description=Computeza-managed Apache XTable runner\n\
@@ -786,34 +725,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn systemd_unit_uses_cp_with_discovered_class() {
+    fn systemd_unit_is_v0_0_x_noop() {
+        // v0.0.x ships install plumbing only; ExecStart must be
+        // /bin/true. If a future commit wires the real RunSync
+        // invocation, this test must be rewritten (not deleted).
         let java = PathBuf::from("/var/lib/computeza/xtable/jre/bin/java");
         let jar = PathBuf::from(
             "/var/lib/computeza/xtable/lib/xtable-utilities-0.2.0-incubating-bundled.jar",
         );
         let root = PathBuf::from("/var/lib/computeza/xtable");
-        // Class name is discovered from the JAR at install time;
-        // for the test we just pass a plausible candidate to exercise
-        // the formatting.
-        let cls = "io.onetable.utilities.RunSync";
-        let unit = systemd_unit(&java, &jar, cls, &root);
+        let unit = systemd_unit(&java, &jar, &root);
         assert!(
-            unit.contains(&format!(
-                "-cp {} {cls} --datasetConfig {}/datasets.yaml",
-                jar.display(),
-                root.display()
-            )),
-            "ExecStart should invoke `java -cp <jar> <discovered class> ...` -- xtable's \
-             shade-plugin omits Main-Class so `java -jar` won't work"
+            unit.contains("ExecStart=/bin/true"),
+            "v0.0.x ExecStart must be /bin/true -- runtime invocation deferred to v0.1+"
         );
         assert!(
-            !unit.contains(&format!("-jar {}", jar.display())),
-            "must NOT use -jar -- the shaded jar lacks a Main-Class manifest entry"
+            !unit.contains("-jar") && !unit.contains("-cp"),
+            "v0.0.x must NOT attempt a JVM invocation; XTable 0.2.0 has no runnable CLI \
+             and 0.3.0 has a JDK plugin collision"
         );
         assert!(unit.contains("ReadWritePaths=/var/lib/computeza/xtable"));
         assert!(
             unit.contains("Type=oneshot"),
-            "xtable's RunSync exits after one cycle -- unit must be Type=oneshot, not Type=simple"
+            "unit shape stays oneshot for forward-compat with v0.1+ batch-sync"
         );
         assert!(
             unit.contains("RemainAfterExit=yes"),
@@ -823,7 +757,6 @@ mod tests {
             !unit.contains("Restart=on-failure"),
             "no restart loop on a oneshot"
         );
-        assert!(unit.contains("JAVA_OPTS=-Xmx512m"));
     }
 
     #[test]
