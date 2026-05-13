@@ -1,9 +1,10 @@
 //! Kanidm install path on Linux. Built on `linux::service` for the
-//! service-registration tail, but the binary-acquisition phase uses
-//! `cargo install` instead of `fetch::Bundle` because kanidm does not
-//! publish prebuilt binaries on GitHub releases. See the AGENTS.md
-//! "Verify the distribution channel BEFORE writing a driver" note for
-//! the lesson that drove this design.
+//! service-registration tail, but the binary-acquisition phase
+//! source-builds from the upstream GitHub tarball because kanidm
+//! does not publish prebuilt binaries on GitHub releases AND its
+//! crates.io presence is patchy. See the AGENTS.md "Verify the
+//! distribution channel BEFORE writing a driver" note for the
+//! lesson that drove this design.
 //!
 //! Flow on a fresh host:
 //!
@@ -11,20 +12,22 @@
 //!    install the toolchain via `prerequisites::ensure_rust_toolchain`
 //!    (system-wide into `/var/lib/computeza/toolchain/rust` + symlinks
 //!    on `/usr/local/bin`).
-//! 2. `cargo install --git https://github.com/kanidm/kanidm --tag <vX> --locked --root <root> kanidmd`.
-//!    Sourcing from the upstream git tag rather than crates.io is
-//!    deliberate: kanidm publishes to crates.io only intermittently
-//!    (many tagged releases never reach the registry), but every
-//!    release lands on git as a signed tag. The upstream `INSTALL.md`
-//!    documents `cargo install --git` as the supported install
-//!    method for that reason. Slow (10-15 min compile on a 4-core
-//!    box); progress messages communicate this.
-//! 3. Generate a self-signed TLS cert in pure Rust via `rcgen` --
+//! 2. Download `github.com/kanidm/kanidm/archive/refs/tags/v<X>.tar.gz`,
+//!    extract under `<root>/src/kanidm-<X>/` (cached on re-run).
+//! 3. `cargo build --release --bin kanidmd --manifest-path <src>/Cargo.toml`.
+//!    `--bin kanidmd` selects the binary by NAME (the binary name
+//!    has been stable across releases) rather than by package name
+//!    (which has churned across workspace refactors and broke
+//!    `cargo install kanidmd` on recent tags). Slow (10-20 min
+//!    compile on a 4-core box); progress messages communicate this.
+//! 4. Copy the resulting binary to `<root>/bin/kanidmd` so the
+//!    rest of the pipeline targets a stable path.
+//! 5. Generate a self-signed TLS cert in pure Rust via `rcgen` --
 //!    kanidm refuses to start without TLS even on loopback. No host
 //!    openssl dependency.
-//! 4. Write `server.toml` referencing the cert paths.
-//! 5. Write systemd unit, daemon-reload, enable --now.
-//! 6. Wait for the TCP port.
+//! 6. Write `server.toml` referencing the cert paths.
+//! 7. Write systemd unit, daemon-reload, enable --now.
+//! 8. Wait for the TCP port.
 //!
 //! Operator follow-up after install completes: kanidm requires
 //! recovering the initial admin password via
@@ -46,21 +49,17 @@ pub const UNIT_NAME: &str = "computeza-kanidm.service";
 pub const DEFAULT_PORT: u16 = 8443;
 
 /// Pinned kanidm versions. These map to **git tags** on
-/// `github.com/kanidm/kanidm` (the canonical install source -- see
-/// the module-level docs). The driver prepends `v` to form the tag
-/// name (`v1.10.1`, `v1.9.3`). First entry is the default
-/// ("latest").
+/// `github.com/kanidm/kanidm`; the driver fetches the matching
+/// source tarball from GitHub's archive endpoint. First entry is
+/// the default ("latest"). The version string is used twice: as
+/// the tag (prefixed `v`) and as the unpacked directory suffix
+/// (GitHub names archive directories `kanidm-<version>/`).
 ///
 /// When bumping: verify the tag exists at
 /// <https://github.com/kanidm/kanidm/tags> AND that the build still
 /// compiles against the toolchain `prerequisites::ensure_rust_toolchain`
 /// installs (kanidm tracks the latest stable Rust closely).
 const KANIDM_VERSIONS: &[&str] = &["1.10.1", "1.9.3"];
-
-/// Upstream git repository. Pulled by `cargo install --git` so the
-/// driver sources binaries directly from the project's signed tags
-/// rather than depending on crates.io being current.
-const KANIDM_GIT_URL: &str = "https://github.com/kanidm/kanidm";
 
 pub fn available_versions() -> &'static [&'static str] {
     KANIDM_VERSIONS
@@ -107,17 +106,51 @@ pub async fn install(
     fs::create_dir_all(&opts.root_dir).await?;
     let cargo_path = crate::prerequisites::ensure_rust_toolchain(progress).await?;
 
-    // 2. cargo install kanidmd.
+    // 2. Build kanidmd from the upstream source tarball.
+    //
+    //    Why not `cargo install --git --tag kanidmd`? Because kanidm
+    //    restructured its workspace and the binary crate's
+    //    *package* name no longer matches the binary name `kanidmd`.
+    //    `cargo install` requires a package name; `cargo build
+    //    --bin kanidmd` selects a binary by name regardless of
+    //    which workspace member owns it, which is what we want.
+    //
+    //    Flow mirrors the garage driver: fetch the GitHub source
+    //    tarball, extract under <root>/src/kanidm-<version>/,
+    //    cargo build --release --bin kanidmd, copy the resulting
+    //    binary into <root>/bin/kanidmd.
     progress.set_phase(InstallPhase::Downloading);
     progress.set_message(format!(
-        "cargo install kanidmd@{version} -- compiles from source, takes 10-15 minutes"
+        "Downloading Kanidm v{version} source tarball from github.com (one-time)"
     ));
-    cargo_install_kanidmd(&cargo_path, &opts.root_dir, version).await?;
+    let src_root = opts.root_dir.join("src");
+    fs::create_dir_all(&src_root).await?;
+    let src_dir = ensure_kanidm_source_extracted(&src_root, version).await?;
+
+    progress.set_phase(InstallPhase::Extracting);
+    progress.set_message(format!(
+        "cargo build --release --bin kanidmd v{version} -- compiles from source, takes 10-20 minutes"
+    ));
+    cargo_build_kanidmd(&cargo_path, &src_dir).await?;
+
     let bin_dir = opts.root_dir.join("bin");
-    if !fs::try_exists(bin_dir.join("kanidmd"))
-        .await
-        .unwrap_or(false)
+    fs::create_dir_all(&bin_dir).await?;
+    let built = src_dir.join("target").join("release").join("kanidmd");
+    if !fs::try_exists(&built).await.unwrap_or(false) {
+        return Err(ServiceError::BinaryMissing {
+            binary: "kanidmd".into(),
+            bin_dir: src_dir.join("target").join("release"),
+        });
+    }
+    let final_binary = bin_dir.join("kanidmd");
+    fs::copy(&built, &final_binary).await?;
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o755);
+        let _ = tokio::fs::set_permissions(&final_binary, perms).await;
+    }
+    if !fs::try_exists(&final_binary).await.unwrap_or(false) {
         return Err(ServiceError::BinaryMissing {
             binary: "kanidmd".into(),
             bin_dir: bin_dir.clone(),
@@ -220,35 +253,101 @@ pub async fn detect_installed() -> Vec<crate::detect::DetectedInstall> {
     }]
 }
 
-async fn cargo_install_kanidmd(
-    cargo_bin: &Path,
-    root_dir: &Path,
+/// Download + extract the upstream Kanidm source tarball under
+/// `<src_root>/kanidm-<version>/`. GitHub's archive URL for a tag
+/// `v<X>` extracts to a directory named `kanidm-<X>` (the
+/// repository name plus the tag without the leading `v`). Cached:
+/// if the directory already has a `Cargo.toml`, the extraction is
+/// reused.
+async fn ensure_kanidm_source_extracted(
+    src_root: &Path,
     version: &str,
-) -> Result<(), ServiceError> {
-    // Source from the upstream git tag rather than crates.io.
-    // Reason: kanidm publishes to crates.io intermittently and
-    // many tagged releases (including 1.10.1 as of May 2026)
-    // never land on the registry. `cargo install --git --tag` is
-    // the install method the upstream README + INSTALL.md
-    // recommend, so we're aligned with what kanidm operators
-    // expect to run.
-    let tag = format!("v{version}");
+) -> Result<PathBuf, ServiceError> {
+    let extracted = src_root.join(format!("kanidm-{version}"));
+    if fs::try_exists(extracted.join("Cargo.toml"))
+        .await
+        .unwrap_or(false)
+    {
+        info!(
+            extracted = %extracted.display(),
+            "kanidm source already extracted; skipping download"
+        );
+        return Ok(extracted);
+    }
+
+    let url = format!("https://github.com/kanidm/kanidm/archive/refs/tags/v{version}.tar.gz");
+    let tarball = src_root.join(format!("kanidm-{version}.tar.gz"));
+    let resp = reqwest::get(&url)
+        .await
+        .map_err(|e| ServiceError::Io(std::io::Error::other(format!("GET {url}: {e}"))))?;
+    if !resp.status().is_success() {
+        return Err(ServiceError::Io(std::io::Error::other(format!(
+            "GET {url} returned HTTP {}; verify the tag exists at https://github.com/kanidm/kanidm/tags",
+            resp.status().as_u16()
+        ))));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| ServiceError::Io(std::io::Error::other(format!("reading body: {e}"))))?;
+    let mut f = fs::File::create(&tarball).await?;
+    f.write_all(&bytes).await?;
+    f.sync_all().await?;
+    drop(f);
+
+    // Shell out to `tar` rather than carry yet another archive
+    // dep. `tar` is in coreutils everywhere we run.
+    let status = Command::new("tar")
+        .arg("-xzf")
+        .arg(&tarball)
+        .arg("-C")
+        .arg(src_root)
+        .status()
+        .await?;
+    if !status.success() {
+        return Err(ServiceError::Io(std::io::Error::other(format!(
+            "tar -xzf {} failed (exit {:?}); the downloaded archive may be incomplete or the tag may not exist",
+            tarball.display(),
+            status.code()
+        ))));
+    }
+    let _ = fs::remove_file(&tarball).await;
+
+    if !fs::try_exists(extracted.join("Cargo.toml"))
+        .await
+        .unwrap_or(false)
+    {
+        return Err(ServiceError::Io(std::io::Error::other(format!(
+            "extracted {} but no Cargo.toml inside -- GitHub's archive layout may have changed; expected kanidm-<version>/Cargo.toml",
+            extracted.display()
+        ))));
+    }
+    Ok(extracted)
+}
+
+/// Run `cargo build --release --bin kanidmd` against the unpacked
+/// source tree.
+///
+/// `--bin kanidmd` selects the binary by name, sidestepping the
+/// workspace package-name churn that broke `cargo install kanidmd`
+/// on recent tags (the binary lives in a package whose own name
+/// has changed across releases; the binary name has been stable).
+async fn cargo_build_kanidmd(cargo_bin: &Path, src_dir: &Path) -> Result<(), ServiceError> {
     let out = Command::new(cargo_bin)
-        .arg("install")
-        .arg("--git")
-        .arg(KANIDM_GIT_URL)
-        .arg("--tag")
-        .arg(&tag)
+        .arg("build")
+        .arg("--release")
         .arg("--locked")
-        .arg("--root")
-        .arg(root_dir)
+        .arg("--bin")
         .arg("kanidmd")
+        .arg("--manifest-path")
+        .arg(src_dir.join("Cargo.toml"))
         .output()
         .await?;
     if !out.status.success() {
         return Err(ServiceError::Io(std::io::Error::other(format!(
-            "cargo install --git {KANIDM_GIT_URL} --tag {tag} kanidmd failed (cargo={}). Most common causes: (1) the tag does not exist upstream -- check https://github.com/kanidm/kanidm/tags and update KANIDM_VERSIONS in this driver to a real tag; (2) the host Rust toolchain is older than the one kanidm needs (the prerequisites module installs a recent stable; if cargo came from the host distro it may be too old); (3) network egress to github.com is blocked. Full stderr below:\n{}",
+            "cargo build --release --bin kanidmd failed (cargo={}, src={}). Common causes: (1) the host Rust toolchain is older than what kanidm needs at this tag (the prerequisites module installs a recent stable; if a host distro cargo is shadowing it on $PATH, move it aside); (2) network egress to crates.io blocked while resolving deps; (3) a missing native lib that kanidm links against (sqlite3-dev on some minimal images). Full stderr below:\n{}",
             cargo_bin.display(),
+            src_dir.display(),
             String::from_utf8_lossy(&out.stderr)
         ))));
     }
