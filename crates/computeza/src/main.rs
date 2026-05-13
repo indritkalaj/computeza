@@ -26,6 +26,7 @@
 
 use std::net::SocketAddr;
 
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 use computeza_i18n::Localizer;
 
@@ -552,35 +553,45 @@ async fn reconcile_tick(
 
 /// Bootstrap the encrypted secrets store at startup.
 ///
-/// Reads `COMPUTEZA_SECRETS_PASSPHRASE` from the environment; returns
-/// `Ok(None)` (with a warning at the call site) when the var is unset
-/// so a fresh `computeza serve` still boots without forcing the
-/// operator to set up secrets immediately. When the passphrase IS set,
-/// the salt and ciphertext live next to `state_db` (default CWD):
+/// Passphrase resolution priority:
 ///
+/// 1. `COMPUTEZA_SECRETS_PASSPHRASE` env var -- highest precedence.
+///    Operators integrating with Vault / KMS / a secrets-manager
+///    sidecar set this and we honour it without touching disk.
+/// 2. `<state_db_parent>/computeza-passphrase` -- the auto-managed
+///    fallback. If the env var is unset but the file exists, we
+///    read it (mode 0600 expected) and proceed.
+/// 3. Auto-generate a fresh CSPRNG passphrase, write it to the
+///    fallback path with 0600 permissions, and log a prominent
+///    warning telling the operator to back it up. This makes the
+///    "encrypted secrets just work" the happy path on a first
+///    boot -- no manual `openssl rand` step required.
+///
+/// All three artefacts live next to `state_db` (default
+/// `/var/lib/computeza/`):
+///
+/// - `<state_db_parent>/computeza-passphrase` -- 64-char hex, 0600.
+///   Loss = lost secrets.
 /// - `<state_db_parent>/computeza-secrets.salt` -- 16 random bytes,
-///   generated on first run and stable thereafter.
+///   stable across runs.
 /// - `<state_db_parent>/computeza-secrets.jsonl` -- AES-256-GCM
 ///   ciphertext lines, one per secret name.
 ///
-/// Loss of the passphrase OR the salt makes existing ciphertext
-/// unrecoverable; the operator should back both up.
+/// Disaster-recovery rule: back up all three together. Losing any
+/// one renders existing ciphertext permanently unrecoverable.
 async fn open_secrets_store(
     state_db_path: &str,
 ) -> anyhow::Result<Option<computeza_secrets::SecretsStore>> {
-    let passphrase = match std::env::var("COMPUTEZA_SECRETS_PASSPHRASE") {
-        Ok(p) if !p.is_empty() => p,
-        _ => return Ok(None),
-    };
-
     let parent = std::path::Path::new(state_db_path)
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let passphrase_path = parent.join("computeza-passphrase");
     let salt_path = parent.join("computeza-secrets.salt");
     let store_path = parent.join("computeza-secrets.jsonl");
 
+    let passphrase = resolve_or_generate_passphrase(&passphrase_path).await?;
     let salt = ensure_secrets_salt(&salt_path).await?;
     let key = computeza_secrets::derive_kek_from_passphrase(passphrase.as_bytes(), &salt)
         .map_err(|e| anyhow::anyhow!("deriving secrets KEK: {e}"))?;
@@ -588,11 +599,116 @@ async fn open_secrets_store(
         .await
         .map_err(|e| anyhow::anyhow!("opening SecretsStore at {}: {e}", store_path.display()))?;
     tracing::info!(
+        passphrase = %passphrase_path.display(),
         salt = %salt_path.display(),
         store = %store_path.display(),
         "secrets store opened"
     );
     Ok(Some(store))
+}
+
+/// Three-tier passphrase resolver:
+///   1. `COMPUTEZA_SECRETS_PASSPHRASE` env var (operator opts in
+///      to bringing their own key -- Vault / KMS / etc.)
+///   2. `<state_db_parent>/computeza-passphrase` file (set by a
+///      previous run; we just read it).
+///   3. Auto-generate + persist a fresh 256-bit hex passphrase
+///      with mode 0600. Emit a prominent warning about backup.
+///
+/// Tier 3 is what removes the manual `openssl rand` step the
+/// previous install guide instructed operators to run -- now the
+/// system does it for them on first boot, and subsequent boots
+/// re-read the same value so the secrets store stays openable.
+async fn resolve_or_generate_passphrase(path: &std::path::Path) -> anyhow::Result<String> {
+    // Tier 1: env var wins.
+    if let Ok(p) = std::env::var("COMPUTEZA_SECRETS_PASSPHRASE") {
+        if !p.is_empty() {
+            tracing::info!(
+                "secrets passphrase sourced from COMPUTEZA_SECRETS_PASSPHRASE env var \
+                 (passphrase file at {} ignored if it exists)",
+                path.display()
+            );
+            return Ok(p);
+        }
+    }
+
+    // Tier 2: file exists -> use it.
+    if tokio::fs::try_exists(path).await.unwrap_or(false) {
+        let bytes = tokio::fs::read(path).await.with_context(|| {
+            format!("reading auto-managed passphrase file at {}", path.display())
+        })?;
+        let value = String::from_utf8(bytes)
+            .with_context(|| {
+                format!(
+                    "passphrase file at {} is not UTF-8; delete it to regenerate",
+                    path.display()
+                )
+            })?
+            .trim()
+            .to_string();
+        if value.is_empty() {
+            anyhow::bail!(
+                "passphrase file at {} is empty; delete it to regenerate or set \
+                 COMPUTEZA_SECRETS_PASSPHRASE to bring your own.",
+                path.display()
+            );
+        }
+        tracing::info!(
+            path = %path.display(),
+            "secrets passphrase loaded from auto-managed file"
+        );
+        return Ok(value);
+    }
+
+    // Tier 3: generate + persist.
+    use aes_gcm::aead::rand_core::RngCore;
+    use aes_gcm::aead::OsRng;
+    let mut buf = [0u8; 32];
+    OsRng.fill_bytes(&mut buf);
+    // 64-char hex (no quoting hazards, copy-pasteable, no
+    // external deps -- the binary crate doesn't carry the `hex`
+    // crate today and we don't want to pull it in just for this).
+    let mut passphrase = String::with_capacity(64);
+    for b in &buf {
+        passphrase.push_str(&format!("{b:02x}"));
+    }
+
+    if let Some(dir) = path.parent() {
+        tokio::fs::create_dir_all(dir).await?;
+    }
+    // Atomic write: tmp + rename so a concurrent reader never
+    // observes a half-written file.
+    let tmp = path.with_extension("new");
+    tokio::fs::write(&tmp, &passphrase).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        let _ = tokio::fs::set_permissions(&tmp, perms).await;
+    }
+    tokio::fs::rename(&tmp, path).await?;
+
+    let salt_hint = path.with_file_name("computeza-secrets.salt");
+    let ciphertext_hint = path.with_file_name("computeza-secrets.jsonl");
+    tracing::warn!(
+        passphrase_file = %path.display(),
+        salt_file = %salt_hint.display(),
+        ciphertext_file = %ciphertext_hint.display(),
+        "Generated a NEW secrets passphrase -- this is a first-run event. \
+         To keep stored secrets recoverable across hardware migrations and \
+         disaster recovery you MUST back up THREE things together: \
+         (1) the passphrase file shown above, \
+         (2) the salt file (computeza-secrets.salt in the same directory, \
+         created on the first secret-store touch), \
+         (3) the encrypted ciphertext file (computeza-secrets.jsonl, same \
+         directory). \
+         Losing any one of these renders every stored secret permanently \
+         unrecoverable -- there is no master recovery path by design. \
+         Operators integrating with Vault / KMS / a secrets manager should \
+         set COMPUTEZA_SECRETS_PASSPHRASE in the service environment instead; \
+         that path bypasses this auto-generated file."
+    );
+    Ok(passphrase)
 }
 
 /// Read the secrets salt from disk, or generate + persist a fresh
