@@ -1859,10 +1859,18 @@ async fn studio_bootstrap_form_handler(
         .as_ref()
         .map(|u| u.replace(":3903", ":3900"))
         .unwrap_or_else(|| "http://127.0.0.1:3900".to_string());
+    // Pre-fill the access-key and secret fields from the vault if
+    // Garage's post-install hook (or a previous manual bootstrap
+    // run) has populated them. Auto-bootstrap is the primary path
+    // since v0.1; this form is the power-user escape hatch when
+    // auto-bootstrap fails or when migrating from v0.0.x where the
+    // operator already minted credentials by hand.
+    let prefill = read_garage_credentials_for_prefill(state.secrets.as_deref()).await;
     Html(render_studio_bootstrap_form(
         &l,
         lakekeeper.is_some(),
         &suggested_s3,
+        &prefill,
         None,
     ))
 }
@@ -1872,23 +1880,73 @@ async fn studio_bootstrap_submit_handler(
     axum::extract::Form(form): axum::extract::Form<StudioBootstrapForm>,
 ) -> Html<String> {
     let l = Localizer::english();
+    let prefill = read_garage_credentials_for_prefill(state.secrets.as_deref()).await;
     let Some(lakekeeper_url) = discover_lakekeeper_endpoint(state.store.as_deref()).await else {
         return Html(render_studio_bootstrap_form(
             &l,
             false,
             &form.s3_endpoint,
+            &prefill,
             Some(Err(
                 "Lakekeeper is not installed; bootstrap cannot proceed. Install Lakekeeper from /install first.".to_string(),
             )),
         ));
     };
     let outcome = run_lakekeeper_bootstrap(&lakekeeper_url, &form).await;
+    // On success, also write back the (possibly operator-typed)
+    // credentials into the vault so subsequent auto-bootstrap
+    // re-runs use the same values. Idempotent: a successful run
+    // with vault-prefilled values is a no-op.
+    if outcome.is_ok() {
+        if let Some(secrets) = state.secrets.as_deref() {
+            let _ = secrets
+                .put("garage/lakekeeper-key-id", &form.s3_access_key)
+                .await;
+            let _ = secrets
+                .put("garage/lakekeeper-secret", &form.s3_secret_access_key)
+                .await;
+            let _ = secrets
+                .put("garage/lakekeeper-bucket", &form.s3_bucket)
+                .await;
+        }
+    }
     Html(render_studio_bootstrap_form(
         &l,
         true,
         &form.s3_endpoint,
+        &prefill,
         Some(outcome),
     ))
+}
+
+/// Pre-fill helper: read the three Garage credential entries from
+/// the vault if they're there. Used by /studio/bootstrap to
+/// pre-populate the form fields so the operator doesn't have to
+/// re-type them when running this form as an escape hatch (e.g.
+/// after a partial auto-bootstrap failure, or to test changes).
+#[derive(Debug, Default, Clone)]
+struct GarageCredentialPrefill {
+    key_id: String,
+    secret: String,
+    bucket: String,
+}
+
+async fn read_garage_credentials_for_prefill(
+    secrets: Option<&computeza_secrets::SecretsStore>,
+) -> GarageCredentialPrefill {
+    use secrecy::ExposeSecret;
+    let mut out = GarageCredentialPrefill::default();
+    let Some(s) = secrets else { return out };
+    if let Ok(Some(v)) = s.get("garage/lakekeeper-key-id").await {
+        out.key_id = v.expose_secret().to_string();
+    }
+    if let Ok(Some(v)) = s.get("garage/lakekeeper-secret").await {
+        out.secret = v.expose_secret().to_string();
+    }
+    if let Ok(Some(v)) = s.get("garage/lakekeeper-bucket").await {
+        out.bucket = v.expose_secret().to_string();
+    }
+    out
 }
 
 /// Same shape as the lakekeeper / databend discovery helpers, for
@@ -2112,6 +2170,7 @@ fn render_studio_bootstrap_form(
     localizer: &Localizer,
     has_lakekeeper: bool,
     suggested_s3_endpoint: &str,
+    prefill: &GarageCredentialPrefill,
     result: Option<Result<String, String>>,
 ) -> String {
     let title = localizer.t("ui-studio-bootstrap-title");
@@ -2179,11 +2238,11 @@ fn render_studio_bootstrap_form(
 </div>
 <div>
 <label for="bs-s3-bucket" style="font-size: 0.85rem;">Bucket</label>
-<input id="bs-s3-bucket" name="s3_bucket" class="cz-input" type="text" value="lakekeeper-default" required style="width: 100%; font-family: ui-monospace, monospace;" />
+<input id="bs-s3-bucket" name="s3_bucket" class="cz-input" type="text" value="{prefill_bucket}" required style="width: 100%; font-family: ui-monospace, monospace;" />
 </div>
 <div>
 <label for="bs-s3-ak" style="font-size: 0.85rem;">Access key ID</label>
-<input id="bs-s3-ak" name="s3_access_key" class="cz-input" type="text" required placeholder="GK..." style="width: 100%; font-family: ui-monospace, monospace;" />
+<input id="bs-s3-ak" name="s3_access_key" class="cz-input" type="text" required placeholder="GK..." value="{prefill_key_id}" style="width: 100%; font-family: ui-monospace, monospace;" />
 <p class="cz-muted" style="margin: 0.3rem 0 0; font-size: 0.72rem;"><strong>This is the auto-generated Access Key ID from Garage</strong> (looks like <code>GK4cf9b7d2e9a4b78...</code>), NOT the human-friendly alias you chose. Get it by running these commands on the Garage host in order:</p>
 <pre style="margin: 0.3rem 0 0; padding: 0.4rem 0.6rem; background: rgba(0,0,0,0.25); border-radius: 0.3rem; font-size: 0.72rem; overflow-x: auto;"># Set an alias once -- our installer ships `garage` as `computeza-garage`
 # to avoid clashing with distro packages of the same name. The CLI also
@@ -2208,7 +2267,7 @@ gg key info lakekeeper        # &lt;-- copy &quot;Key ID&quot; + &quot;Secret ke
 </div>
 <div>
 <label for="bs-s3-sk" style="font-size: 0.85rem;">Secret access key</label>
-<input id="bs-s3-sk" name="s3_secret_access_key" class="cz-input" type="password" required placeholder="opaque base64-ish string from `garage key info`" style="width: 100%; font-family: ui-monospace, monospace;" />
+<input id="bs-s3-sk" name="s3_secret_access_key" class="cz-input" type="password" required placeholder="opaque base64-ish string from `garage key info`" value="{prefill_secret}" style="width: 100%; font-family: ui-monospace, monospace;" />
 </div>
 <div>
 <button type="submit" class="cz-btn cz-btn-primary">Run bootstrap</button>
@@ -2220,6 +2279,9 @@ gg key info lakekeeper        # &lt;-- copy &quot;Key ID&quot; + &quot;Secret ke
         title = html_escape(&title),
         intro = html_escape(&intro),
         s3_endpoint = html_escape(suggested_s3_endpoint),
+        prefill_bucket = html_escape(if prefill.bucket.is_empty() { "lakekeeper-default" } else { &prefill.bucket }),
+        prefill_key_id = html_escape(&prefill.key_id),
+        prefill_secret = html_escape(&prefill.secret),
         csrf = csrf,
         result_block = result_block,
     );
