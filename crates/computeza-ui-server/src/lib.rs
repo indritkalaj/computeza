@@ -1635,12 +1635,12 @@ async fn studio_catalog_warehouse_handler(
     // surface the ?err=... query so the operator sees why the create
     // POST failed. ?wired=... is the success path of "Connect to SQL"
     // -- routed through the same renderer but styled as success.
-    let banner = recovery_report.or_else(|| q.err.clone());
     let final_html = render_studio_namespace_list(
         &l,
         &warehouse,
         result,
-        banner.as_deref(),
+        recovery_report.as_deref(),
+        q.err.as_deref(),
         q.wired.as_deref(),
         &sidebar,
     );
@@ -1849,11 +1849,18 @@ async fn studio_catalog_wire_databend_handler(
         s3_access_key: key_id.expose_secret().to_string(),
         s3_secret_access_key: secret_key.expose_secret().to_string(),
     };
-    match wire_databend_iceberg_catalog(state.store.as_deref(), &lakekeeper_url, &form).await {
+    match wire_databend_iceberg_catalog(
+        state.store.as_deref(),
+        state.secrets.as_deref(),
+        &lakekeeper_url,
+        &form,
+    )
+    .await
+    {
         DatabendWiringOutcome::Wired { catalog_name } => axum::response::Redirect::to(&format!(
             "{base_redirect}?wired={}",
             url_encode(&format!(
-                "SQL catalog `{catalog_name}` is now registered with Databend. Run `SELECT * FROM {catalog_name}.<namespace>.<table>` in the editor."
+                "SQL catalog `{catalog_name}` is now registered with Databend. Run `SELECT * FROM {catalog_name}.<schema>.<table>` in the editor."
             ))
         )),
         DatabendWiringOutcome::DatabendUnavailable => err_redirect(
@@ -1887,7 +1894,7 @@ async fn studio_catalog_namespace_create_handler(
         .map(str::to_string)
         .collect();
     if segments.is_empty() {
-        return redirect_err("Namespace name is required.");
+        return redirect_err("Schema name is required.");
     }
     let wh_id = resolve_warehouse_id_or_pass(&warehouse, Some(&base_url), state.secrets.as_deref()).await;
     let path = format!("/catalog/v1/{}/namespaces", url_encode(&wh_id));
@@ -2405,20 +2412,31 @@ fn render_studio_namespace_list(
     warehouse: &str,
     result: Result<serde_json::Value, String>,
     recovery_banner: Option<&str>,
+    err_banner: Option<&str>,
     wired_banner: Option<&str>,
     sidebar: &str,
 ) -> String {
     let crumbs = [(warehouse, &*format!("/studio/catalog/{warehouse}"))];
     let breadcrumbs = render_drilldown_breadcrumbs(&crumbs);
     let csrf = auth::csrf_input();
-    let banner_html = if let Some(msg) = recovery_banner {
-        format!(
-            r#"<div class="cz-studio-banner"><strong>State-mismatch recovery:</strong> {}</div>"#,
-            html_escape(msg)
-        )
-    } else if let Some(msg) = wired_banner {
+    // Banner precedence: wiring-success (green) > error (red) >
+    // auto-recovery (amber). Recovery is the noisiest and is what was
+    // labelled "State-mismatch recovery"; raw POST errors get their
+    // own label so the operator isn't misled into thinking a wiring
+    // error came from auto-recovery.
+    let banner_html = if let Some(msg) = wired_banner {
         format!(
             r#"<div class="cz-studio-banner" style="background: rgba(168, 232, 196, 0.06); border-color: rgba(168, 232, 196, 0.3); color: var(--ok);"><strong>SQL access wired:</strong> {}</div>"#,
+            html_escape(msg)
+        )
+    } else if let Some(msg) = err_banner {
+        format!(
+            r#"<div class="cz-studio-error" style="margin: 0 0 1.25rem;">{}</div>"#,
+            html_escape(msg)
+        )
+    } else if let Some(msg) = recovery_banner {
+        format!(
+            r#"<div class="cz-studio-banner"><strong>State-mismatch recovery:</strong> {}</div>"#,
             html_escape(msg)
         )
     } else {
@@ -2436,9 +2454,9 @@ fn render_studio_namespace_list(
                 (
                     r##"<div class="cz-studio-empty">
 <span class="cz-studio-empty-icon">⊕</span>
-<div class="cz-studio-empty-title">No namespaces yet</div>
-<p class="cz-studio-empty-text">Namespaces group related tables — think of them like databases or schemas. Use dotted names (<code>finance.raw</code>) for nested namespaces.</p>
-<a href="#cz-modal-new-namespace" class="cz-btn-primary">+ Create your first namespace</a>
+<div class="cz-studio-empty-title">No schemas yet</div>
+<p class="cz-studio-empty-text">Schemas group related tables. Use dotted names (<code>finance.raw</code>) for nested schemas.</p>
+<a href="#cz-modal-new-schema" class="cz-btn-primary">+ Create your first schema</a>
 </div>"##.to_string(),
                     0,
                 )
@@ -2458,7 +2476,7 @@ fn render_studio_namespace_list(
                         Some(format!(
                             r#"<li class="cz-studio-list-item">
 <a href="/studio/catalog/{wh}/{ns}"><span style="opacity:0.6;">▸</span><code>{ns_display}</code></a>
-<form method="post" action="/studio/catalog/{wh}/{ns}/delete" style="margin: 0;" onsubmit="return confirm('Delete namespace {ns_display}? This is destructive and fails if the namespace has tables.');">{csrf}
+<form method="post" action="/studio/catalog/{wh}/{ns}/delete" style="margin: 0;" onsubmit="return confirm('Delete schema {ns_display}? This is destructive and fails if the schema has tables.');">{csrf}
 <button type="submit" class="cz-btn-danger">Delete</button>
 </form>
 </li>"#,
@@ -2480,21 +2498,21 @@ fn render_studio_namespace_list(
     };
 
     let create_modal = format!(
-        r##"<div id="cz-modal-new-namespace" class="cz-modal-overlay" role="dialog" aria-labelledby="cz-modal-new-namespace-title" aria-modal="true">
+        r##"<div id="cz-modal-new-schema" class="cz-modal-overlay" role="dialog" aria-labelledby="cz-modal-new-schema-title" aria-modal="true">
 <a href="#" class="cz-modal-overlay-backdrop" aria-label="Close"></a>
 <div class="cz-modal">
 <a href="#" class="cz-modal-close" aria-label="Close">×</a>
-<h2 id="cz-modal-new-namespace-title" class="cz-modal-title">New namespace</h2>
-<p class="cz-modal-subtitle">Namespaces group related tables — think of them like databases or schemas. Dotted names like <code>finance.raw</code> become nested namespaces.</p>
+<h2 id="cz-modal-new-schema-title" class="cz-modal-title">New schema</h2>
+<p class="cz-modal-subtitle">Schemas group related tables — like databases. Dotted names like <code>finance.raw</code> become nested schemas.</p>
 <form method="post" action="/studio/catalog/{wh}/namespaces/create">{csrf}
 <div class="cz-modal-field">
-<label for="ns-create-name">Namespace name</label>
+<label for="ns-create-name">Schema name</label>
 <input id="ns-create-name" name="name" class="cz-input" type="text" placeholder="finance" required autofocus />
-<p class="cz-modal-field-hint">Iceberg stores nested namespaces as arrays (<code>["finance", "raw"]</code>); the dotted form is just shorthand.</p>
+<p class="cz-modal-field-hint">Iceberg stores nested schemas as arrays (<code>["finance", "raw"]</code>); the dotted form is just shorthand.</p>
 </div>
 <div class="cz-modal-actions">
 <a href="#" class="cz-btn-ghost">Cancel</a>
-<button type="submit" class="cz-btn-primary">Create namespace</button>
+<button type="submit" class="cz-btn-primary">Create schema</button>
 </div>
 </form>
 </div>
@@ -2520,12 +2538,12 @@ fn render_studio_namespace_list(
 {banner_html}
 <div class="cz-studio-actions" style="margin-bottom: 0.5rem;">
 <div>
-<h1 class="cz-studio-pane-title" style="margin: 0;">Namespaces in <code>{wh}</code>{count_label}</h1>
-<p class="cz-studio-pane-subtitle" style="margin: 0.25rem 0 0;">Iceberg namespaces group tables. Click a namespace to drill into its tables.</p>
+<h1 class="cz-studio-pane-title" style="margin: 0;">Schemas in <code>{wh}</code>{count_label}</h1>
+<p class="cz-studio-pane-subtitle" style="margin: 0.25rem 0 0;">Schemas group tables. Click a schema to drill into its tables.</p>
 </div>
 <span class="cz-studio-actions-spacer"></span>
 {wire_form}
-<a href="#cz-modal-new-namespace" class="cz-btn-primary">+ New namespace</a>
+<a href="#cz-modal-new-schema" class="cz-btn-primary">+ New schema</a>
 </div>
 {list_html}
 {create_modal}"##,
@@ -2657,7 +2675,7 @@ fn render_studio_table_list(
 <div class="cz-studio-actions" style="margin-bottom: 0.5rem;">
 <div>
 <h1 class="cz-studio-pane-title" style="margin: 0;">Tables in <code>{wh}</code>.<code>{ns}</code>{count_label}</h1>
-<p class="cz-studio-pane-subtitle" style="margin: 0.25rem 0 0;">Iceberg tables under this namespace. Click a table to inspect its schema.</p>
+<p class="cz-studio-pane-subtitle" style="margin: 0.25rem 0 0;">Iceberg tables under this schema. Click a table to inspect its columns.</p>
 </div>
 <span class="cz-studio-actions-spacer"></span>
 <a href="#cz-modal-new-table" class="cz-btn-primary">+ New table</a>
@@ -3635,7 +3653,15 @@ async fn studio_bootstrap_submit_handler(
     // the bootstrap -- the operator can still use the catalog via
     // REST/curl until they re-run bootstrap with Databend in place.
     let databend_wiring = if outcome.is_ok() {
-        Some(wire_databend_iceberg_catalog(state.store.as_deref(), &lakekeeper_url, &form).await)
+        Some(
+            wire_databend_iceberg_catalog(
+                state.store.as_deref(),
+                state.secrets.as_deref(),
+                &lakekeeper_url,
+                &form,
+            )
+            .await,
+        )
     } else {
         None
     };
@@ -3644,7 +3670,7 @@ async fn studio_bootstrap_submit_handler(
             let wiring_line = match databend_wiring {
                 Some(DatabendWiringOutcome::Wired { catalog_name }) => format!(
                     "\n - Databend SQL catalog `{catalog_name}` registered. Run \
-                     `SELECT * FROM {catalog_name}.<namespace>.<table>` in the \
+                     `SELECT * FROM {catalog_name}.<schema>.<table>` in the \
                      editor."
                 ),
                 Some(DatabendWiringOutcome::DatabendUnavailable) => "\n - Databend SQL wiring skipped: Databend isn't installed yet. Install it from /install and re-run bootstrap to expose this warehouse via SQL.".to_string(),
@@ -3783,8 +3809,16 @@ enum DatabendWiringOutcome {
 /// `DROP CATALOG IF EXISTS` then `CREATE CATALOG <name> TYPE=ICEBERG
 /// CONNECTION=(...)`. Best-effort: a Databend outage or unsupported
 /// syntax doesn't fail the bootstrap.
+///
+/// The WAREHOUSE param is the warehouse UUID, NOT the human name --
+/// Lakekeeper's `/catalog/v1/config?warehouse=<x>` lookup only resolves
+/// UUIDs (returning <name> here makes Lakekeeper 404 with
+/// NoSuchWarehouseException, which Databend surfaces as "Catalog
+/// creation failed"). We resolve the UUID via the same three-tier
+/// resolver the drill-down handlers use.
 async fn wire_databend_iceberg_catalog(
     store: Option<&computeza_state::SqliteStore>,
+    secrets: Option<&computeza_secrets::SecretsStore>,
     lakekeeper_url: &str,
     form: &StudioBootstrapForm,
 ) -> DatabendWiringOutcome {
@@ -3793,6 +3827,10 @@ async fn wire_databend_iceberg_catalog(
     };
     let catalog_name = sanitize_sql_identifier(&form.warehouse_name);
     let rest_address = format!("{}/catalog", lakekeeper_url.trim_end_matches('/'));
+    // Resolve name -> UUID. Lakekeeper's Iceberg-REST API keys
+    // catalogs by UUID; sending the human name makes /v1/config 404.
+    let warehouse_uuid =
+        resolve_warehouse_id_or_pass(&form.warehouse_name, Some(lakekeeper_url), secrets).await;
     // Drop first so re-running the bootstrap with new credentials
     // refreshes the catalog binding. Best-effort: if the catalog
     // doesn't exist yet the DROP is a no-op (Databend's IF EXISTS
@@ -3817,7 +3855,7 @@ async fn wire_databend_iceberg_catalog(
         )",
         name = catalog_name,
         address = sql_quote(&rest_address),
-        warehouse = sql_quote(&form.warehouse_name),
+        warehouse = sql_quote(&warehouse_uuid),
         s3_endpoint = sql_quote(&form.s3_endpoint),
         ak = sql_quote(&form.s3_access_key),
         sk = sql_quote(&form.s3_secret_access_key),
