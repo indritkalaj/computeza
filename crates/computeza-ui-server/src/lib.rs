@@ -3377,6 +3377,38 @@ struct LakekeeperBootstrapOk {
     warehouse_id: Option<String>,
 }
 
+/// Sanitize a warehouse name into an S3 key prefix.
+///
+/// S3 object keys can contain almost any UTF-8 byte, but Iceberg
+/// metadata paths get baked into manifest files and into Lakekeeper's
+/// own DB rows, so we keep the prefix conservative: lower-case
+/// alphanumerics, dashes, and underscores; everything else collapses
+/// to a single `-`. An empty input falls back to `warehouse` so the
+/// prefix is never the literal empty string (which would put metadata
+/// at the bucket root and collide with other warehouses).
+fn sanitize_s3_prefix(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut last_was_sep = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_was_sep = false;
+        } else if ch == '-' || ch == '_' {
+            out.push(ch);
+            last_was_sep = false;
+        } else if !last_was_sep {
+            out.push('-');
+            last_was_sep = true;
+        }
+    }
+    let trimmed = out.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "warehouse".to_string()
+    } else {
+        trimmed
+    }
+}
+
 async fn run_lakekeeper_bootstrap(
     base_url: &str,
     form: &StudioBootstrapForm,
@@ -3497,9 +3529,17 @@ async fn run_lakekeeper_bootstrap(
     //     S3-compatible but not AWS, so we pick "s3-compat".
     //     Lakekeeper uses this to decide whether to add AWS-only
     //     headers, attempt SigV4-A regional rewrites, etc.
-    //   - key-prefix: empty by default; Lakekeeper writes table
-    //     metadata + data under this prefix inside the bucket.
+    //   - key-prefix: MUST be unique per warehouse when warehouses
+    //     share an S3 bucket. An empty prefix puts metadata at the
+    //     bucket root, so a second warehouse using the same bucket
+    //     would overwrite the first one's table metadata. We derive
+    //     the prefix from the warehouse name (sanitized to s3-safe
+    //     chars), which is unique within a project. If the operator
+    //     bootstraps a second warehouse with a different bucket they
+    //     still get an isolated prefix -- no downside to always
+    //     setting one.
     let warehouse_url = format!("{}/management/v1/warehouse", base_url.trim_end_matches('/'));
+    let key_prefix = sanitize_s3_prefix(&form.warehouse_name);
     let warehouse_body = serde_json::json!({
         "warehouse-name": form.warehouse_name,
         // Lakekeeper resolves projects by UUID, not name. Sending
@@ -3516,7 +3556,7 @@ async fn run_lakekeeper_bootstrap(
             "path-style-access": true,
             "sts-enabled": false,
             "flavor": "s3-compat",
-            "key-prefix": "",
+            "key-prefix": key_prefix,
         },
         "storage-credential": {
             "type": "s3",
