@@ -1091,18 +1091,91 @@ async fn probe_lakekeeper_with_vault_fallback(
     secrets: Option<&computeza_secrets::SecretsStore>,
 ) -> LakekeeperState {
     let probe = probe_lakekeeper(base_url).await;
-    if let LakekeeperState::NoWarehouses = probe {
-        if let Some(s) = secrets {
-            if let Ok(Some(v)) = s.get("lakekeeper/default-warehouse-name").await {
-                use secrecy::ExposeSecret;
-                let name = v.expose_secret().to_string();
-                if !name.trim().is_empty() {
-                    tracing::info!(
-                        warehouse = %name,
-                        "probe_lakekeeper: list returned empty but vault has a known warehouse from bootstrap; using vault value"
-                    );
-                    return LakekeeperState::HasWarehouses(vec![name]);
-                }
+    // Fall back only on the "list returned empty" case. Unreachable
+    // / HasWarehouses / UnexpectedShape pass through unchanged.
+    if !matches!(probe, LakekeeperState::NoWarehouses) {
+        return probe;
+    }
+
+    use secrecy::ExposeSecret;
+    let secrets = match secrets {
+        Some(s) => s,
+        None => return probe,
+    };
+
+    // Tier 1: vault has the warehouse name from a previous successful
+    // bootstrap. Cheapest path. Hit if the new (post-fix)
+    // /studio/bootstrap submit handler ran since the last DB reset.
+    if let Ok(Some(v)) = secrets.get("lakekeeper/default-warehouse-name").await {
+        let name = v.expose_secret().to_string();
+        if !name.trim().is_empty() {
+            tracing::info!(
+                warehouse = %name,
+                "probe_lakekeeper: list empty; vault has warehouse name -- using"
+            );
+            return LakekeeperState::HasWarehouses(vec![name]);
+        }
+    }
+
+    // Tier 2: management API said empty AND vault has no warehouse
+    // name, but Garage credentials ARE in vault -- which means the
+    // operator DID run a bootstrap at some point, we just lost track
+    // of the warehouse name (pre-fix where the submit handler didn't
+    // persist the name). Probe the Iceberg catalog REST directly for
+    // common defaults; that endpoint is what engines actually use, so
+    // it's authoritative regardless of management-API quirks.
+    let garage_provisioned = matches!(
+        secrets.get("garage/lakekeeper-key-id").await,
+        Ok(Some(_))
+    );
+    if !garage_provisioned {
+        // No prior bootstrap detected; the "no warehouses" verdict is
+        // honest.
+        return probe;
+    }
+    tracing::info!(
+        "probe_lakekeeper: management API empty but garage creds exist in vault; \
+         attempting catalog-REST probe for known warehouse-name defaults"
+    );
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return probe,
+    };
+    let base = base_url.trim_end_matches('/');
+    // Order from most-likely (the bootstrap form's default) to less-
+    // likely. First 2xx wins.
+    for candidate in ["default", "computeza-default", "lakekeeper-default"] {
+        let url = format!("{base}/catalog/v1/{candidate}/namespaces");
+        match client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                tracing::info!(
+                    warehouse = %candidate,
+                    url = %url,
+                    "probe_lakekeeper: catalog REST confirmed warehouse exists; backfilling vault"
+                );
+                // Backfill the vault so future renders short-circuit
+                // at tier 1.
+                let _ = secrets
+                    .put("lakekeeper/default-warehouse-name", candidate)
+                    .await;
+                return LakekeeperState::HasWarehouses(vec![candidate.to_string()]);
+            }
+            Ok(resp) => {
+                tracing::info!(
+                    warehouse = %candidate,
+                    status = resp.status().as_u16(),
+                    "probe_lakekeeper: catalog REST said no for this name"
+                );
+            }
+            Err(e) => {
+                tracing::info!(
+                    warehouse = %candidate,
+                    error = %e,
+                    "probe_lakekeeper: catalog REST request failed for this name"
+                );
             }
         }
     }
@@ -2782,10 +2855,14 @@ async fn studio_bootstrap_submit_handler(
         ));
     };
     let outcome = run_lakekeeper_bootstrap(&lakekeeper_url, &form).await;
-    // On success, also write back the (possibly operator-typed)
-    // credentials into the vault so subsequent auto-bootstrap
-    // re-runs use the same values. Idempotent: a successful run
-    // with vault-prefilled values is a no-op.
+    // On success, persist BOTH the Garage credentials AND the
+    // warehouse name to vault so:
+    //   1. subsequent auto-bootstrap re-runs find the same values
+    //   2. probe_lakekeeper_with_vault_fallback finds the warehouse
+    //      name even if Lakekeeper's warehouse-list returns empty
+    //      (which it does in some auth / project-scope configs)
+    // Idempotent on re-submits; key facts the catalog pane needs
+    // to render the drill-down link.
     if outcome.is_ok() {
         if let Some(secrets) = state.secrets.as_deref() {
             let _ = secrets
@@ -2796,6 +2873,9 @@ async fn studio_bootstrap_submit_handler(
                 .await;
             let _ = secrets
                 .put("garage/lakekeeper-bucket", &form.s3_bucket)
+                .await;
+            let _ = secrets
+                .put("lakekeeper/default-warehouse-name", &form.warehouse_name)
                 .await;
         }
     }
