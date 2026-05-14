@@ -1555,6 +1555,7 @@ async fn get_lakekeeper_catalog_json(
 async fn studio_catalog_warehouse_handler(
     State(state): State<AppState>,
     axum::extract::Path(warehouse): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<FlashQuery>,
 ) -> Html<String> {
     let l = Localizer::english();
     let lakekeeper = discover_lakekeeper_endpoint(state.store.as_deref()).await;
@@ -1616,14 +1617,19 @@ async fn studio_catalog_warehouse_handler(
             }
         }
     }
-    let final_html =
-        render_studio_namespace_list(&l, &warehouse, result, recovery_report.as_deref());
+    // Recovery banner takes precedence over a flash error from a
+    // redirected POST (recovery is the more urgent issue). Otherwise
+    // surface the ?err=... query so the operator sees why the create
+    // POST failed.
+    let banner = recovery_report.or_else(|| q.err.clone());
+    let final_html = render_studio_namespace_list(&l, &warehouse, result, banner.as_deref());
     Html(final_html)
 }
 
 async fn studio_catalog_namespace_handler(
     State(state): State<AppState>,
     axum::extract::Path((warehouse, namespace)): axum::extract::Path<(String, String)>,
+    axum::extract::Query(q): axum::extract::Query<FlashQuery>,
 ) -> Html<String> {
     let l = Localizer::english();
     let Some(base_url) = discover_lakekeeper_endpoint(state.store.as_deref()).await else {
@@ -1647,7 +1653,22 @@ async fn studio_catalog_namespace_handler(
         ns_encoded
     );
     let result = get_lakekeeper_catalog_json(&base_url, &path).await;
-    Html(render_studio_table_list(&l, &warehouse, &namespace, result))
+    Html(render_studio_table_list(
+        &l,
+        &warehouse,
+        &namespace,
+        result,
+        q.err.as_deref(),
+    ))
+}
+
+/// Shared query shape for catalog GET handlers that may receive a
+/// flash error from a redirected POST. Stays at the request boundary --
+/// renderers take the unwrapped &str so they don't have to know about
+/// query parsing.
+#[derive(serde::Deserialize, Default)]
+struct FlashQuery {
+    err: Option<String>,
 }
 
 async fn studio_catalog_table_handler(
@@ -1735,8 +1756,12 @@ async fn studio_catalog_namespace_create_handler(
     axum::extract::Path(warehouse): axum::extract::Path<String>,
     axum::extract::Form(form): axum::extract::Form<CreateNamespaceForm>,
 ) -> axum::response::Redirect {
+    let base_redirect = format!("/studio/catalog/{warehouse}");
+    let redirect_err = |msg: &str| {
+        axum::response::Redirect::to(&format!("{base_redirect}?err={}", url_encode(msg)))
+    };
     let Some(base_url) = discover_lakekeeper_endpoint(state.store.as_deref()).await else {
-        return axum::response::Redirect::to(&format!("/studio/catalog/{warehouse}"));
+        return redirect_err("Lakekeeper endpoint is not registered.");
     };
     // Multi-level namespaces split on `.` -- "finance.raw" becomes
     // ["finance", "raw"] per Iceberg's namespace model.
@@ -1748,7 +1773,7 @@ async fn studio_catalog_namespace_create_handler(
         .map(str::to_string)
         .collect();
     if segments.is_empty() {
-        return axum::response::Redirect::to(&format!("/studio/catalog/{warehouse}"));
+        return redirect_err("Namespace name is required.");
     }
     let wh_id = resolve_warehouse_id_or_pass(&warehouse, Some(&base_url), state.secrets.as_deref()).await;
     let path = format!("/catalog/v1/{}/namespaces", url_encode(&wh_id));
@@ -1765,8 +1790,9 @@ async fn studio_catalog_namespace_create_handler(
             error = %e,
             "catalog: namespace create failed"
         );
+        return redirect_err(&e);
     }
-    axum::response::Redirect::to(&format!("/studio/catalog/{warehouse}"))
+    axum::response::Redirect::to(&base_redirect)
 }
 
 async fn studio_catalog_namespace_delete_handler(
@@ -1810,13 +1836,16 @@ async fn studio_catalog_table_create_handler(
     axum::extract::Path((warehouse, namespace)): axum::extract::Path<(String, String)>,
     axum::extract::Form(form): axum::extract::Form<CreateTableForm>,
 ) -> axum::response::Redirect {
-    let redirect_to = format!("/studio/catalog/{warehouse}/{namespace}");
+    let base_redirect = format!("/studio/catalog/{warehouse}/{namespace}");
+    let redirect_err = |msg: &str| {
+        axum::response::Redirect::to(&format!("{base_redirect}?err={}", url_encode(msg)))
+    };
     let Some(base_url) = discover_lakekeeper_endpoint(state.store.as_deref()).await else {
-        return axum::response::Redirect::to(&redirect_to);
+        return redirect_err("Lakekeeper endpoint is not registered.");
     };
     let table_name = form.name.trim();
     if table_name.is_empty() {
-        return axum::response::Redirect::to(&redirect_to);
+        return redirect_err("Table name is required.");
     }
     // Parse "name:type" lines into Iceberg schema fields. Ignore
     // blank lines + lines starting with #.
@@ -1847,13 +1876,9 @@ async fn studio_catalog_table_create_handler(
         })
         .collect();
     if fields.is_empty() {
-        tracing::warn!(
-            warehouse = %warehouse,
-            namespace = %namespace,
-            table = %table_name,
-            "catalog: table create skipped -- no columns parsed from form"
+        return redirect_err(
+            "No valid columns parsed. Each non-blank, non-comment line must look like `name:type`.",
         );
-        return axum::response::Redirect::to(&redirect_to);
     }
     let wh_id = resolve_warehouse_id_or_pass(&warehouse, Some(&base_url), state.secrets.as_deref()).await;
     let ns_encoded = namespace.split('.').collect::<Vec<_>>().join("%1F");
@@ -1862,13 +1887,19 @@ async fn studio_catalog_table_create_handler(
         url_encode(&wh_id),
         ns_encoded
     );
+    // Iceberg-REST CreateTableRequest. The schema must carry a
+    // `schema-id` (Lakekeeper rejects without it) and `partition-spec`
+    // must be an OBJECT (UnboundPartitionSpec) -- the legacy code sent
+    // an array which Lakekeeper rejects as invalid JSON shape. We
+    // omit partition-spec entirely for the unpartitioned default; the
+    // server fills in spec-id=0 / empty fields.
     let body = serde_json::json!({
         "name": table_name,
         "schema": {
             "type": "struct",
+            "schema-id": 0,
             "fields": fields,
         },
-        "partition-spec": [],
         "properties": {},
     });
     if let Err(e) =
@@ -1881,8 +1912,9 @@ async fn studio_catalog_table_create_handler(
             error = %e,
             "catalog: table create failed"
         );
+        return redirect_err(&e);
     }
-    axum::response::Redirect::to(&redirect_to)
+    axum::response::Redirect::to(&base_redirect)
 }
 
 async fn studio_catalog_table_delete_handler(
@@ -2131,6 +2163,7 @@ fn render_studio_table_list(
     warehouse: &str,
     namespace: &str,
     result: Result<serde_json::Value, String>,
+    error_banner: Option<&str>,
 ) -> String {
     let ns_href = format!("/studio/catalog/{warehouse}/{namespace}");
     let crumbs = [
@@ -2140,6 +2173,14 @@ fn render_studio_table_list(
     let breadcrumbs = render_drilldown_breadcrumbs(&crumbs);
     let sidebar = render_drilldown_sidebar(Some(warehouse));
     let csrf = auth::csrf_input();
+    let banner_html = error_banner
+        .map(|msg| {
+            format!(
+                r#"<div class="cz-studio-banner"><strong>Create failed:</strong> <pre style="white-space: pre-wrap; margin: 0.4rem 0 0; font-family: 'Geist Mono', ui-monospace, monospace; font-size: 0.78rem;">{}</pre></div>"#,
+                html_escape(msg)
+            )
+        })
+        .unwrap_or_default();
 
     let (list_html, table_count) = match result {
         Ok(v) => {
@@ -2225,6 +2266,7 @@ fn render_studio_table_list(
 
     let main_html = format!(
         r##"{breadcrumbs}
+{banner_html}
 <div class="cz-studio-actions" style="margin-bottom: 0.5rem;">
 <div>
 <h1 class="cz-studio-pane-title" style="margin: 0;">Tables in <code>{wh}</code>.<code>{ns}</code>{count_label}</h1>
