@@ -1073,6 +1073,42 @@ enum LakekeeperState {
 /// but no warehouse names can be extracted -- the raw body lands
 /// in the catalog pane so URL-pattern + response-shape drift is
 /// debuggable from /studio directly.
+/// Wrapper around `probe_lakekeeper` that falls back to the vault
+/// when Lakekeeper's warehouse-list returns empty. Reason: in some
+/// Lakekeeper configurations the warehouse-list endpoint is
+/// gated by auth, project scope, or other constraints that don't
+/// apply to the data-plane / catalog REST endpoints we use for
+/// drill-down. The bootstrap step (auto or manual via /studio/bootstrap)
+/// persists the warehouse name into `lakekeeper/default-warehouse-name`
+/// after a confirmed success. If we have that value, the warehouse
+/// definitely exists -- present it.
+///
+/// On NoWarehouses + vault entry present -> HasWarehouses([name]).
+/// On any other probe outcome (Unreachable / HasWarehouses /
+/// UnexpectedShape) -> pass through unchanged.
+async fn probe_lakekeeper_with_vault_fallback(
+    base_url: &str,
+    secrets: Option<&computeza_secrets::SecretsStore>,
+) -> LakekeeperState {
+    let probe = probe_lakekeeper(base_url).await;
+    if let LakekeeperState::NoWarehouses = probe {
+        if let Some(s) = secrets {
+            if let Ok(Some(v)) = s.get("lakekeeper/default-warehouse-name").await {
+                use secrecy::ExposeSecret;
+                let name = v.expose_secret().to_string();
+                if !name.trim().is_empty() {
+                    tracing::info!(
+                        warehouse = %name,
+                        "probe_lakekeeper: list returned empty but vault has a known warehouse from bootstrap; using vault value"
+                    );
+                    return LakekeeperState::HasWarehouses(vec![name]);
+                }
+            }
+        }
+    }
+    probe
+}
+
 async fn probe_lakekeeper(base_url: &str) -> LakekeeperState {
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
@@ -1081,74 +1117,75 @@ async fn probe_lakekeeper(base_url: &str) -> LakekeeperState {
         Ok(c) => c,
         Err(_) => return LakekeeperState::Unreachable,
     };
+    let base = base_url.trim_end_matches('/');
 
-    // Step 1: list projects (no scope; we want all of them).
-    let proj_url = format!("{}/management/v1/project", base_url.trim_end_matches('/'));
-    let proj_resp = match client.get(&proj_url).send().await {
-        Ok(r) if r.status().is_success() => r,
-        _ => return LakekeeperState::Unreachable,
-    };
-    let proj_text = match proj_resp.text().await {
-        Ok(t) => t,
-        Err(_) => return LakekeeperState::Unreachable,
-    };
-    let proj_v: serde_json::Value = match serde_json::from_str(&proj_text) {
-        Ok(v) => v,
-        Err(_) => {
-            return LakekeeperState::UnexpectedShape(format!(
-                "GET {proj_url} returned 2xx but body was not JSON:\n{proj_text}"
-            ));
+    // Build the endpoint list defensively. We ALWAYS try the
+    // unscoped warehouse endpoint -- that's the one the reconciler
+    // already validates as part of /status, so it's the most-likely-
+    // working URL. If we can also list projects, we additionally
+    // try project-scoped endpoints. Only if EVERY endpoint we try
+    // returns non-2xx (or doesn't respond) do we conclude
+    // Unreachable.
+    let mut endpoints: Vec<String> = vec![format!("{base}/management/v1/warehouse")];
+
+    // Best-effort project enrichment. If /management/v1/project
+    // fails or returns a shape we don't recognize, just skip the
+    // project-scoped variants -- the unscoped endpoint is still
+    // tried below.
+    let proj_url = format!("{base}/management/v1/project");
+    if let Ok(proj_resp) = client.get(&proj_url).send().await {
+        if proj_resp.status().is_success() {
+            if let Ok(proj_text) = proj_resp.text().await {
+                if let Ok(proj_v) = serde_json::from_str::<serde_json::Value>(&proj_text) {
+                    let project_ids: Vec<String> = proj_v
+                        .get("projects")
+                        .or_else(|| proj_v.get("data"))
+                        .and_then(|x| x.as_array())
+                        .cloned()
+                        .or_else(|| proj_v.as_array().cloned())
+                        .unwrap_or_default()
+                        .iter()
+                        .filter_map(|p| {
+                            p.get("project-id")
+                                .or_else(|| p.get("projectId"))
+                                .or_else(|| p.get("id"))
+                                .and_then(|x| x.as_str())
+                                .map(str::to_string)
+                        })
+                        .collect();
+                    for pid in &project_ids {
+                        endpoints.push(format!(
+                            "{base}/management/v1/warehouse?project-id={pid}"
+                        ));
+                    }
+                }
+            }
         }
-    };
-    let project_ids: Vec<String> = proj_v
-        .get("projects")
-        .or_else(|| proj_v.get("data"))
-        .and_then(|x| x.as_array())
-        .cloned()
-        .or_else(|| proj_v.as_array().cloned())
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|p| {
-            p.get("project-id")
-                .or_else(|| p.get("projectId"))
-                .or_else(|| p.get("id"))
-                .and_then(|x| x.as_str())
-                .map(str::to_string)
-        })
-        .collect();
-
-    // Step 2: for each project (or unscoped if no projects), hit
-    // the warehouse-list endpoint. Aggregate names. Keep the last
-    // raw body for the UnexpectedShape fallback.
-    let mut endpoints: Vec<String> = project_ids
-        .iter()
-        .map(|pid| {
-            format!(
-                "{}/management/v1/warehouse?project-id={}",
-                base_url.trim_end_matches('/'),
-                pid
-            )
-        })
-        .collect();
-    if endpoints.is_empty() {
-        endpoints.push(format!(
-            "{}/management/v1/warehouse",
-            base_url.trim_end_matches('/')
-        ));
     }
 
     let mut all_names: Vec<String> = Vec::new();
     let mut last_raw_body: Option<String> = None;
+    let mut any_2xx = false;
 
     for url in &endpoints {
         let resp = match client.get(url).send().await {
-            Ok(r) if r.status().is_success() => r,
-            _ => continue,
+            Ok(r) => r,
+            Err(e) => {
+                tracing::info!(url = %url, error = %e, "probe_lakekeeper: request failed");
+                continue;
+            }
         };
+        let status = resp.status();
+        if !status.is_success() {
+            tracing::info!(url = %url, status = status.as_u16(), "probe_lakekeeper: non-2xx");
+            continue;
+        }
+        any_2xx = true;
         let text = match resp.text().await {
             Ok(t) => t,
             Err(_) => continue,
         };
+        tracing::info!(url = %url, status = status.as_u16(), body = %text, "probe_lakekeeper: response");
         last_raw_body = Some(text.clone());
         let v: serde_json::Value = match serde_json::from_str(&text) {
             Ok(b) => b,
@@ -1183,13 +1220,18 @@ async fn probe_lakekeeper(base_url: &str) -> LakekeeperState {
         }
     }
 
+    if !any_2xx {
+        // Every warehouse-list endpoint we tried failed -- treat
+        // this as Lakekeeper-side unreachability. The reconciler's
+        // /status will say more about why.
+        return LakekeeperState::Unreachable;
+    }
     if !all_names.is_empty() {
         return LakekeeperState::HasWarehouses(all_names);
     }
-    // No names parsed. If Lakekeeper returned a body that looks
-    // meaningful but didn't match our shapes, expose it for
-    // debugging. An empty-array response (`[]`, `{"warehouses":[]}`,
-    // etc.) is the honest "no warehouses" state.
+    // 2xx but no names parsed. If body looks honestly empty,
+    // NoWarehouses. Otherwise UnexpectedShape with the raw body
+    // for paste-back debugging.
     let looks_empty = match &last_raw_body {
         None => true,
         Some(b) => {
@@ -1927,7 +1969,7 @@ async fn studio_handler(
     let lakekeeper = discover_lakekeeper_endpoint(state.store.as_deref()).await;
     let databend = discover_databend_endpoint(state.store.as_deref()).await;
     let lk_state = match &lakekeeper {
-        Some(url) => probe_lakekeeper(url).await,
+        Some(url) => probe_lakekeeper_with_vault_fallback(url, state.secrets.as_deref()).await,
         None => LakekeeperState::Unreachable,
     };
     let history = load_studio_history(state.store.as_deref()).await;
@@ -2115,7 +2157,7 @@ async fn studio_sql_execute_handler(
         .await;
     }
     let lk_state = match &lakekeeper {
-        Some(url) => probe_lakekeeper(url).await,
+        Some(url) => probe_lakekeeper_with_vault_fallback(url, state.secrets.as_deref()).await,
         None => LakekeeperState::Unreachable,
     };
     let history = load_studio_history(state.store.as_deref()).await;
