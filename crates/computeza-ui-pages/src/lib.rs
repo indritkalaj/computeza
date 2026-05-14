@@ -2,7 +2,7 @@
 //! model of the lakehouse.
 //!
 //! Per spec section 4.2, the console is organised by user task -- Overview,
-//! Workspaces (multi-tenant only), Identity, Storage, Catalogs, Compute,
+//! Tenants (multi-tenant only), Identity, Storage, Catalogs, Compute,
 //! AI Workspace, Pipelines, Dashboards, Audit & Compliance -- not by
 //! underlying component. This abstraction lets us swap components without
 //! retraining users.

@@ -221,13 +221,13 @@ ui-admin-groups-col-perms = Permissions
 ui-nav-admin-operators = Operators
 ui-nav-admin-groups    = Groups
 
-# --- /admin/workspaces ---
+# --- /admin/tenants ---
 
-ui-admin-workspaces-title = Workspaces
-ui-admin-workspaces-intro = Workspaces isolate one tenant's resources from another's. v0.0.x ships a single `default` workspace that every existing install row falls under. Multi-tenant installs (v0.1+) will let the operator carve out per-tenant workspaces with separate quotas and reseller chains.
-ui-admin-workspaces-col-name = Name
-ui-admin-workspaces-col-created = Created
-ui-admin-workspaces-default-note = `default` is the implicit workspace for every existing install row. Until v0.1 ships multi-tenant migration, you cannot create or rename workspaces from the console.
+ui-admin-tenants-title = Tenants
+ui-admin-tenants-intro = Tenants are the multi-tenancy boundary: each tenant owns its own resources, quotas and reseller chain. v0.0.x ships a single `default` tenant that every existing install row falls under. Multi-tenant installs (v0.1+) will let the operator carve out per-tenant boundaries from the console.
+ui-admin-tenants-col-name = Name
+ui-admin-tenants-col-created = Created
+ui-admin-tenants-default-note = `default` is the implicit tenant for every existing install row. Until v0.1 ships multi-tenant migration, you cannot create or rename tenants from the console.
 
 # --- /admin/branding ---
 
@@ -250,7 +250,7 @@ ui-admin-license-chain = Resale chain
 ui-admin-license-not-before = Valid from
 ui-admin-license-not-after = Valid until
 
-ui-nav-admin-workspaces = Workspaces
+ui-nav-admin-tenants    = Tenants
 ui-nav-admin-branding   = Branding
 ui-nav-admin-license    = License
 
@@ -288,32 +288,32 @@ ui-footer-version     = Version
 # --- Navigation ---
 
 ui-nav-components     = Components
-ui-nav-workspace      = Workspace
+ui-nav-studio         = Studio
 ui-nav-install        = Install
 
-# --- Workspace (catalog browser + SQL editor) ---
-ui-workspace-title              = Workspace
-ui-workspace-intro              = Browse the Iceberg catalog (Lakekeeper) and run SQL against the lakehouse engine (Databend). Phase 1 v0.0.x scope: catalog read + SQL execution against the local installation. Drag-and-drop pipelines, notebooks, and dedicated compute groups land in subsequent phases.
-ui-workspace-catalog-heading    = Catalog
-ui-workspace-lakekeeper-unreachable = Lakekeeper isn't responding on its management endpoint. Check /status (the lakekeeper reconciler will show FAILED if the service is down) or `systemctl status computeza-lakekeeper`.
-ui-workspace-lakekeeper-no-warehouses = Lakekeeper is running but has no warehouses configured. Iceberg namespaces + tables live inside a warehouse, so the catalog browser will stay empty until you bootstrap one. v0.0.x doesn't automate this; the wizard is on the v0.1 roadmap (see AGENTS.md "Deferred work: Lakekeeper bootstrap"). Manual bootstrap is a `curl` against `/management/v1/project` + `/management/v1/warehouse` with the local Garage S3 credentials.
-ui-workspace-lakekeeper-warehouses-heading = Warehouses
-ui-workspace-lakekeeper-warehouses-note = Browsing namespaces + tables inside a warehouse lands in phase 1.5 once the bootstrap wizard ships. For now the warehouse list confirms Lakekeeper is reachable + populated -- run SQL directly against Databend on the right.
-ui-workspace-history-heading = Recent queries
-ui-workspace-history-empty   = (no queries yet)
-ui-workspace-history-reload  = Reload
-ui-workspace-bootstrap-title = Lakekeeper bootstrap
-ui-workspace-bootstrap-intro = Create a Lakekeeper project + warehouse so the Iceberg catalog has somewhere to write. Run this once after installing Lakekeeper + Garage. The S3 credentials must already exist on the Garage side; v0.1 will auto-mint them.
-ui-workspace-bootstrap-link  = Run the bootstrap wizard >
-ui-workspace-catalog-fill-link  = Pre-fill SELECT *
-ui-workspace-sql-heading        = SQL
-ui-workspace-sql-placeholder    = SELECT 1
-ui-workspace-sql-run            = Run query
-ui-workspace-sql-help           = Hits Databend's HTTP query handler. Reads + writes from this editor are unrestricted in v0.0.x; per-user RLS lands in the Functions milestone (see AGENTS.md "Deferred work").
-ui-workspace-results-heading    = Results
-ui-workspace-results-empty      = Run a query above to see results.
-ui-workspace-error-no-lakekeeper = No Lakekeeper instance is registered. Install Lakekeeper from /install before using the catalog browser.
-ui-workspace-error-no-databend   = No Databend instance is registered. Install Databend from /install before running SQL.
+# --- Studio (catalog browser + SQL editor) ---
+ui-studio-title              = Studio
+ui-studio-intro              = Browse the Iceberg catalog (Lakekeeper) and run SQL against the lakehouse engine (Databend). Phase 1 v0.0.x scope: catalog read + SQL execution against the local installation. Drag-and-drop pipelines, notebooks, and dedicated compute groups land in subsequent phases.
+ui-studio-catalog-heading    = Catalog
+ui-studio-lakekeeper-unreachable = Lakekeeper isn't responding on its management endpoint. Check /status (the lakekeeper reconciler will show FAILED if the service is down) or `systemctl status computeza-lakekeeper`.
+ui-studio-lakekeeper-no-warehouses = Lakekeeper is running but has no warehouses configured. Iceberg namespaces + tables live inside a warehouse, so the catalog browser will stay empty until you bootstrap one. v0.0.x doesn't automate this; the wizard is on the v0.1 roadmap (see AGENTS.md "Deferred work: Lakekeeper bootstrap"). Manual bootstrap is a `curl` against `/management/v1/project` + `/management/v1/warehouse` with the local Garage S3 credentials.
+ui-studio-lakekeeper-warehouses-heading = Warehouses
+ui-studio-lakekeeper-warehouses-note = Browsing namespaces + tables inside a warehouse lands in phase 1.5 once the bootstrap wizard ships. For now the warehouse list confirms Lakekeeper is reachable + populated -- run SQL directly against Databend on the right.
+ui-studio-history-heading = Recent queries
+ui-studio-history-empty   = (no queries yet)
+ui-studio-history-reload  = Reload
+ui-studio-bootstrap-title = Lakekeeper bootstrap
+ui-studio-bootstrap-intro = Create a Lakekeeper project + warehouse so the Iceberg catalog has somewhere to write. Run this once after installing Lakekeeper + Garage. The S3 credentials must already exist on the Garage side; v0.1 will auto-mint them.
+ui-studio-bootstrap-link  = Run the bootstrap wizard >
+ui-studio-catalog-fill-link  = Pre-fill SELECT *
+ui-studio-sql-heading        = SQL
+ui-studio-sql-placeholder    = SELECT 1
+ui-studio-sql-run            = Run query
+ui-studio-sql-help           = Hits Databend's HTTP query handler. Reads + writes from this editor are unrestricted in v0.0.x; per-user RLS lands in the Functions milestone (see AGENTS.md "Deferred work").
+ui-studio-results-heading    = Results
+ui-studio-results-empty      = Run a query above to see results.
+ui-studio-error-no-lakekeeper = No Lakekeeper instance is registered. Install Lakekeeper from /install before using the catalog browser.
+ui-studio-error-no-databend   = No Databend instance is registered. Install Databend from /install before running SQL.
 ui-nav-status         = Status
 ui-nav-state          = Metadata store
 
@@ -341,7 +341,7 @@ ui-resource-uuid          = UUID
 ui-resource-revision      = Revision
 ui-resource-created-at    = Created at
 ui-resource-updated-at    = Updated at
-ui-resource-workspace     = Workspace
+ui-resource-tenant        = Tenant
 ui-resource-spec-heading  = Desired spec
 ui-resource-status-heading = Observed status
 ui-resource-no-status     = No status snapshot recorded yet.

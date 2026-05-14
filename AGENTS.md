@@ -827,7 +827,7 @@ sensible based on available disk on the host (statvfs(`<root>/data`)
 ### Lakekeeper bootstrap (project + warehouse + storage credentials)
 
 **Status:** deferred to v0.1. Phase 1 of the workspace UI (catalog
-browser at `/workspace`) surfaces a warehouse list when Lakekeeper
+browser at `/studio`) surfaces a warehouse list when Lakekeeper
 has one, but cannot drill into Iceberg namespaces / tables until a
 warehouse exists -- and the install path doesn't create one. The
 `/management/v1/project` + `/management/v1/warehouse` endpoints

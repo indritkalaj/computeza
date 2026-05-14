@@ -646,15 +646,15 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/", get(home_handler))
         .route("/components", get(components_handler))
         .route("/install-guide", get(install_guide_handler))
-        .route("/workspace", get(workspace_handler))
-        .route("/workspace/sql/execute", post(workspace_sql_execute_handler))
+        .route("/studio", get(studio_handler))
+        .route("/studio/sql/execute", post(studio_sql_execute_handler))
         .route(
-            "/workspace/api/completions",
-            get(workspace_completions_handler),
+            "/studio/api/completions",
+            get(studio_completions_handler),
         )
         .route(
-            "/workspace/bootstrap",
-            get(workspace_bootstrap_form_handler).post(workspace_bootstrap_submit_handler),
+            "/studio/bootstrap",
+            get(studio_bootstrap_form_handler).post(studio_bootstrap_submit_handler),
         )
         .route(
             "/install",
@@ -779,7 +779,7 @@ pub fn router_with_state(state: AppState) -> Router {
             post(admin_delete_operator_handler),
         )
         .route("/admin/groups", get(admin_groups_handler))
-        .route("/admin/workspaces", get(admin_workspaces_handler))
+        .route("/admin/tenants", get(admin_tenants_handler))
         .route(
             "/admin/branding",
             get(admin_branding_handler).post(admin_branding_save_handler),
@@ -828,20 +828,20 @@ pub fn router_with_state(state: AppState) -> Router {
 }
 
 // ============================================================
-// Workspace surface (phase 1: catalog browser + SQL editor)
+// Studio surface (phase 1: catalog browser + SQL editor)
 // ============================================================
 //
-// The /workspace page exposes two side-by-side pieces of the
+// The /studio page exposes two side-by-side pieces of the
 // installed lakehouse:
 //
 //   1. Catalog browser (left) -- lists Iceberg namespaces + tables
 //      by hitting the local Lakekeeper REST catalog. Each table
 //      surfaces a "Pre-fill SELECT *" link that bounces back to
-//      /workspace with `?sql=...` so the editor on the right loads
+//      /studio with `?sql=...` so the editor on the right loads
 //      with a starter query. No client-side JS required.
 //
 //   2. SQL editor (right) -- POSTs the query to
-//      /workspace/sql/execute which forwards to Databend's HTTP
+//      /studio/sql/execute which forwards to Databend's HTTP
 //      query handler and renders the response as an HTML table
 //      below the editor.
 //
@@ -854,19 +854,19 @@ pub fn router_with_state(state: AppState) -> Router {
 // Endpoint discovery: both Lakekeeper and Databend get their URLs
 // from the metadata store's `{slug}-instance/local` row spec --
 // same pattern reconcile_tick uses. No hardcoded 127.0.0.1:* here;
-// if the operator changed the port at install time the workspace
+// if the operator changed the port at install time the studio
 // follows.
 
 /// Minimal shape of `LakekeeperSpec` / `DatabendSpec` we need to
 /// pull the endpoint URL out. Defining inline avoids dragging the
 /// full reconciler crates into ui-server just for one field.
 #[derive(serde::Deserialize)]
-struct WorkspaceEndpointSpec {
-    endpoint: WorkspaceEndpointUrl,
+struct StudioEndpointSpec {
+    endpoint: StudioEndpointUrl,
 }
 
 #[derive(serde::Deserialize)]
-struct WorkspaceEndpointUrl {
+struct StudioEndpointUrl {
     base_url: String,
 }
 
@@ -882,25 +882,25 @@ async fn discover_lakekeeper_endpoint(
     let store = store?;
     let rows = store.list("lakekeeper-instance", None).await.ok()?;
     let sr = rows.into_iter().next()?;
-    let spec: WorkspaceEndpointSpec = serde_json::from_value(sr.spec).ok()?;
+    let spec: StudioEndpointSpec = serde_json::from_value(sr.spec).ok()?;
     Some(spec.endpoint.base_url)
 }
 
-/// Cap on how many recent queries we retain per workspace. Older
+/// Cap on how many recent queries we retain per studio. Older
 /// entries get dropped when the list exceeds this. 20 is a
 /// balance between "useful enough to recover yesterday's work" and
 /// "small enough that a single resource row stays well under the
 /// 1MB SQLite-blob soft ceiling" -- 20 entries * ~2KB SQL each
 /// leaves plenty of headroom.
-const WORKSPACE_HISTORY_CAP: usize = 20;
+const STUDIO_HISTORY_CAP: usize = 20;
 
-/// One row in the workspace SQL history. Persisted as JSON inside
-/// a single resource row (`workspace-history/default`) so we don't
-/// need a new SQLite table for v0.0.x. Multi-workspace history
-/// (one row per workspace name) lands when the workspace selector
+/// One row in the studio SQL history. Persisted as JSON inside
+/// a single resource row (`studio-history/default`) so we don't
+/// need a new SQLite table for v0.0.x. Multi-studio history
+/// (one row per studio name) lands when the studio selector
 /// stops being hard-coded to "default".
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct WorkspaceHistoryEntry {
+struct StudioHistoryEntry {
     /// The query text, verbatim. v0.0.x stores plaintext; the
     /// deferred secrets-redaction layer (AGENTS.md "Deferred work")
     /// will replace this with a sanitised variant once it ships.
@@ -915,59 +915,59 @@ struct WorkspaceHistoryEntry {
     row_count: Option<usize>,
 }
 
-/// Wrapper struct for the workspace-history resource spec. The
+/// Wrapper struct for the studio-history resource spec. The
 /// `entries` vec is newest-first so the UI can iterate in display
 /// order without re-sorting.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-struct WorkspaceHistory {
+struct StudioHistory {
     #[serde(default)]
-    entries: Vec<WorkspaceHistoryEntry>,
+    entries: Vec<StudioHistoryEntry>,
 }
 
-/// Read the workspace SQL history from the metadata store. Returns
+/// Read the studio SQL history from the metadata store. Returns
 /// an empty history when no row exists yet (first query of a fresh
 /// install) or when the store isn't attached.
-async fn load_workspace_history(
+async fn load_studio_history(
     store: Option<&computeza_state::SqliteStore>,
-) -> WorkspaceHistory {
+) -> StudioHistory {
     use computeza_state::Store;
     let Some(store) = store else {
-        return WorkspaceHistory::default();
+        return StudioHistory::default();
     };
-    let key = computeza_state::ResourceKey::cluster_scoped("workspace-history", "default");
+    let key = computeza_state::ResourceKey::cluster_scoped("studio-history", "default");
     match store.load(&key).await {
         Ok(Some(stored)) => serde_json::from_value(stored.spec).unwrap_or_default(),
-        _ => WorkspaceHistory::default(),
+        _ => StudioHistory::default(),
     }
 }
 
 /// Prepend a new history entry and persist. Best-effort: a save
 /// failure logs but doesn't block the SQL roundtrip from
 /// returning to the operator. Caps the list at
-/// `WORKSPACE_HISTORY_CAP` entries (drops oldest).
-async fn record_workspace_history(
+/// `STUDIO_HISTORY_CAP` entries (drops oldest).
+async fn record_studio_history(
     store: Option<&computeza_state::SqliteStore>,
-    entry: WorkspaceHistoryEntry,
+    entry: StudioHistoryEntry,
 ) {
     use computeza_state::Store;
     let Some(store) = store else {
         return;
     };
-    let key = computeza_state::ResourceKey::cluster_scoped("workspace-history", "default");
+    let key = computeza_state::ResourceKey::cluster_scoped("studio-history", "default");
     let existing = match store.load(&key).await {
         Ok(Some(s)) => Some(s),
         _ => None,
     };
-    let mut history: WorkspaceHistory = existing
+    let mut history: StudioHistory = existing
         .as_ref()
         .and_then(|s| serde_json::from_value(s.spec.clone()).ok())
         .unwrap_or_default();
     history.entries.insert(0, entry);
-    history.entries.truncate(WORKSPACE_HISTORY_CAP);
+    history.entries.truncate(STUDIO_HISTORY_CAP);
     let value = match serde_json::to_value(&history) {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!(error = %e, "could not serialise workspace history; skipping save");
+            tracing::warn!(error = %e, "could not serialise studio history; skipping save");
             return;
         }
     };
@@ -975,15 +975,15 @@ async fn record_workspace_history(
     if let Err(e) = store.save(&key, &value, expected_revision).await {
         tracing::warn!(
             error = %e,
-            "could not persist workspace history; the SQL result is still rendered, only the history list won't include this query"
+            "could not persist studio history; the SQL result is still rendered, only the history list won't include this query"
         );
     }
 }
 
 /// Same shape as `discover_lakekeeper_endpoint`, for Databend.
 /// Phase 1 hits the HTTP query handler directly; multi-tenant
-/// dispatch (one databend per workspace group) lands in phase B
-/// of the workspace roadmap.
+/// dispatch (one databend per studio group) lands in phase B
+/// of the studio roadmap.
 async fn discover_databend_endpoint(
     store: Option<&computeza_state::SqliteStore>,
 ) -> Option<String> {
@@ -991,7 +991,7 @@ async fn discover_databend_endpoint(
     let store = store?;
     let rows = store.list("databend-instance", None).await.ok()?;
     let sr = rows.into_iter().next()?;
-    let spec: WorkspaceEndpointSpec = serde_json::from_value(sr.spec).ok()?;
+    let spec: StudioEndpointSpec = serde_json::from_value(sr.spec).ok()?;
     Some(spec.endpoint.base_url)
 }
 
@@ -1069,18 +1069,18 @@ async fn probe_lakekeeper(base_url: &str) -> LakekeeperState {
     LakekeeperState::HasWarehouses(names)
 }
 
-/// Query parameters accepted by the workspace page. `sql` lets the
+/// Query parameters accepted by the studio page. `sql` lets the
 /// catalog browser's "Pre-fill SELECT *" link populate the editor
-/// without JavaScript -- the link hits `/workspace?sql=...` and the
+/// without JavaScript -- the link hits `/studio?sql=...` and the
 /// renderer drops the value into the textarea.
 #[derive(serde::Deserialize, Default)]
-struct WorkspaceQuery {
+struct StudioQuery {
     sql: Option<String>,
 }
 
-async fn workspace_handler(
+async fn studio_handler(
     State(state): State<AppState>,
-    axum::extract::Query(q): axum::extract::Query<WorkspaceQuery>,
+    axum::extract::Query(q): axum::extract::Query<StudioQuery>,
 ) -> Html<String> {
     let l = Localizer::english();
     let lakekeeper = discover_lakekeeper_endpoint(state.store.as_deref()).await;
@@ -1089,9 +1089,9 @@ async fn workspace_handler(
         Some(url) => probe_lakekeeper(url).await,
         None => LakekeeperState::Unreachable,
     };
-    let history = load_workspace_history(state.store.as_deref()).await;
+    let history = load_studio_history(state.store.as_deref()).await;
     let sql_prefill = q.sql.unwrap_or_default();
-    Html(render_workspace_page(
+    Html(render_studio_page(
         &l,
         lakekeeper.is_some(),
         databend.is_some(),
@@ -1102,16 +1102,16 @@ async fn workspace_handler(
     ))
 }
 
-/// Form body for `POST /workspace/sql/execute`. Plain
+/// Form body for `POST /studio/sql/execute`. Plain
 /// `application/x-www-form-urlencoded` so the bare HTML form works
 /// without JS.
 #[derive(serde::Deserialize)]
-struct WorkspaceSqlForm {
+struct StudioSqlForm {
     sql: String,
 }
 
 // Note: a previous iteration of this file shipped a
-// workspace_create_namespace_handler that POSTed to
+// studio_create_namespace_handler that POSTed to
 // /catalog/v1/namespaces. That endpoint is gated behind a
 // Lakekeeper warehouse bootstrap that v0.0.x doesn't automate, so
 // it 404'd every time. The handler is gone -- catalog mutations
@@ -1144,20 +1144,20 @@ struct CompletionItem {
     detail: Option<String>,
 }
 
-/// GET /workspace/api/completions
+/// GET /studio/api/completions
 ///
 /// Aggregates symbol sources for Monaco's autocomplete:
 ///   - Databend databases + tables (via `system.databases` /
 ///     `system.tables` queries to the live HTTP handler).
 ///   - Lakekeeper warehouse names (via the same management API
 ///     `probe_lakekeeper` uses).
-///   - Recent queries from workspace history (deduplicated; the
+///   - Recent queries from studio history (deduplicated; the
 ///     full SQL inserts as a snippet).
 ///
 /// Each source is best-effort: a Databend outage skips its symbols
 /// but still returns warehouses + history. The endpoint never
 /// fails the request -- Monaco just gets a shorter list.
-async fn workspace_completions_handler(
+async fn studio_completions_handler(
     State(state): State<AppState>,
 ) -> axum::Json<CompletionSource> {
     let mut items: Vec<CompletionItem> = Vec::new();
@@ -1216,7 +1216,7 @@ async fn workspace_completions_handler(
 
     // History (dedup by the first line so repeated SELECT 1's
     // don't bury fresh queries).
-    let history = load_workspace_history(state.store.as_deref()).await;
+    let history = load_studio_history(state.store.as_deref()).await;
     let mut seen_first_lines = std::collections::HashSet::new();
     for entry in history.entries.into_iter().take(20) {
         let first_line: String = entry.sql.lines().next().unwrap_or("").chars().take(60).collect();
@@ -1242,9 +1242,9 @@ async fn workspace_completions_handler(
     axum::Json(CompletionSource { items })
 }
 
-async fn workspace_sql_execute_handler(
+async fn studio_sql_execute_handler(
     State(state): State<AppState>,
-    axum::extract::Form(form): axum::extract::Form<WorkspaceSqlForm>,
+    axum::extract::Form(form): axum::extract::Form<StudioSqlForm>,
 ) -> Html<String> {
     let l = Localizer::english();
     let lakekeeper = discover_lakekeeper_endpoint(state.store.as_deref()).await;
@@ -1253,7 +1253,7 @@ async fn workspace_sql_execute_handler(
         Some(url) => Some(execute_sql_against_databend(url, &form.sql).await),
         None => None,
     };
-    // Record the query into the workspace history before rendering,
+    // Record the query into the studio history before rendering,
     // so the history list shown to the operator includes the query
     // they just ran (rather than the previous one).
     if !form.sql.trim().is_empty() {
@@ -1262,9 +1262,9 @@ async fn workspace_sql_execute_handler(
             Some(SqlOutcome::Err(_)) => (false, None),
             None => (false, None),
         };
-        record_workspace_history(
+        record_studio_history(
             state.store.as_deref(),
-            WorkspaceHistoryEntry {
+            StudioHistoryEntry {
                 sql: form.sql.clone(),
                 executed_at: chrono::Utc::now(),
                 ok,
@@ -1277,8 +1277,8 @@ async fn workspace_sql_execute_handler(
         Some(url) => probe_lakekeeper(url).await,
         None => LakekeeperState::Unreachable,
     };
-    let history = load_workspace_history(state.store.as_deref()).await;
-    Html(render_workspace_page(
+    let history = load_studio_history(state.store.as_deref()).await;
+    Html(render_studio_page(
         &l,
         lakekeeper.is_some(),
         databend.is_some(),
@@ -1393,45 +1393,45 @@ async fn execute_sql_against_databend(base_url: &str, sql: &str) -> SqlOutcome {
     SqlOutcome::Ok { columns, rows }
 }
 
-/// Render the two-pane workspace page. Pure-server template; the
+/// Render the two-pane studio page. Pure-server template; the
 /// only JS on the page is the existing CSRF auto-fill from
 /// render_shell + the Monaco loader at the bottom. The catalog
 /// list renders on the left, the SQL editor + history + results
 /// render on the right.
 #[allow(clippy::too_many_arguments)]
-fn render_workspace_page(
+fn render_studio_page(
     localizer: &Localizer,
     has_lakekeeper: bool,
     has_databend: bool,
     lk_state: &LakekeeperState,
-    history: &WorkspaceHistory,
+    history: &StudioHistory,
     sql_prefill: &str,
     result: Option<SqlOutcome>,
 ) -> String {
-    let title = localizer.t("ui-workspace-title");
-    let intro = localizer.t("ui-workspace-intro");
-    let catalog_heading = localizer.t("ui-workspace-catalog-heading");
-    let sql_heading = localizer.t("ui-workspace-sql-heading");
-    let sql_placeholder = localizer.t("ui-workspace-sql-placeholder");
-    let sql_run = localizer.t("ui-workspace-sql-run");
-    let sql_help = localizer.t("ui-workspace-sql-help");
-    let results_heading = localizer.t("ui-workspace-results-heading");
-    let results_empty = localizer.t("ui-workspace-results-empty");
-    let err_no_lakekeeper = localizer.t("ui-workspace-error-no-lakekeeper");
-    let err_no_databend = localizer.t("ui-workspace-error-no-databend");
-    let lk_unreachable = localizer.t("ui-workspace-lakekeeper-unreachable");
-    let lk_no_warehouses = localizer.t("ui-workspace-lakekeeper-no-warehouses");
-    let lk_warehouses_heading = localizer.t("ui-workspace-lakekeeper-warehouses-heading");
-    let lk_warehouses_note = localizer.t("ui-workspace-lakekeeper-warehouses-note");
-    let history_heading = localizer.t("ui-workspace-history-heading");
-    let history_empty = localizer.t("ui-workspace-history-empty");
-    let history_reload = localizer.t("ui-workspace-history-reload");
+    let title = localizer.t("ui-studio-title");
+    let intro = localizer.t("ui-studio-intro");
+    let catalog_heading = localizer.t("ui-studio-catalog-heading");
+    let sql_heading = localizer.t("ui-studio-sql-heading");
+    let sql_placeholder = localizer.t("ui-studio-sql-placeholder");
+    let sql_run = localizer.t("ui-studio-sql-run");
+    let sql_help = localizer.t("ui-studio-sql-help");
+    let results_heading = localizer.t("ui-studio-results-heading");
+    let results_empty = localizer.t("ui-studio-results-empty");
+    let err_no_lakekeeper = localizer.t("ui-studio-error-no-lakekeeper");
+    let err_no_databend = localizer.t("ui-studio-error-no-databend");
+    let lk_unreachable = localizer.t("ui-studio-lakekeeper-unreachable");
+    let lk_no_warehouses = localizer.t("ui-studio-lakekeeper-no-warehouses");
+    let lk_warehouses_heading = localizer.t("ui-studio-lakekeeper-warehouses-heading");
+    let lk_warehouses_note = localizer.t("ui-studio-lakekeeper-warehouses-note");
+    let history_heading = localizer.t("ui-studio-history-heading");
+    let history_empty = localizer.t("ui-studio-history-empty");
+    let history_reload = localizer.t("ui-studio-history-reload");
     let csrf = auth::csrf_input();
 
     // History pane: collapsible <details> above the editor.
     // Closed-by-default so the editor stays the primary surface.
     // Each entry is a "Reload" link that bounces through
-    // /workspace?sql=... -- same prefill mechanism the catalog
+    // /studio?sql=... -- same prefill mechanism the catalog
     // table-link uses, no JS required.
     let history_block = {
         let inner = if history.entries.is_empty() {
@@ -1468,7 +1468,7 @@ fn render_workspace_page(
 <span class="cz-muted" style="font-size: 0.72rem; font-variant-numeric: tabular-nums;">{ts}</span>
 {badge}
 <code style="flex: 1; font-size: 0.78rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{preview}</code>
-<a href="/workspace?sql={enc}" class="cz-muted" style="font-size: 0.72rem;">{reload}</a>
+<a href="/studio?sql={enc}" class="cz-muted" style="font-size: 0.72rem;">{reload}</a>
 </li>"#,
                         ts = html_escape(&ts),
                         badge = badge,
@@ -1510,10 +1510,10 @@ fn render_workspace_page(
                 html_escape(&lk_unreachable)
             ),
             LakekeeperState::NoWarehouses => {
-                let bootstrap_link = localizer.t("ui-workspace-bootstrap-link");
+                let bootstrap_link = localizer.t("ui-studio-bootstrap-link");
                 format!(
                     r#"<p class="cz-muted">{}</p>
-<p style="margin-top: 0.75rem;"><a href="/workspace/bootstrap" class="cz-btn cz-btn-primary">{}</a></p>"#,
+<p style="margin-top: 0.75rem;"><a href="/studio/bootstrap" class="cz-btn cz-btn-primary">{}</a></p>"#,
                     html_escape(&lk_no_warehouses),
                     html_escape(&bootstrap_link),
                 )
@@ -1592,7 +1592,7 @@ fn render_workspace_page(
 <div class="cz-card">
 <h2 style="margin-top: 0;">{sql_heading}</h2>
 {history_block}
-<form method="post" action="/workspace/sql/execute" id="cz-sql-form">
+<form method="post" action="/studio/sql/execute" id="cz-sql-form">
 {csrf}
 <!--
     Progressive enhancement: the textarea is the canonical form
@@ -1649,7 +1649,7 @@ fn render_workspace_page(
   script.src = BASE + "/vs/loader.js";
   script.onerror = function() {{
     // CDN unreachable. Textarea stays visible; nothing to do.
-    console.warn("computeza workspace: Monaco CDN unreachable; falling back to textarea editor");
+    console.warn("computeza studio: Monaco CDN unreachable; falling back to textarea editor");
   }};
   script.onload = function() {{
     if (typeof require !== "function" || !require.config) return;
@@ -1685,7 +1685,7 @@ fn render_workspace_page(
       }});
 
       // Schema-aware completion provider. Fetches from
-      // /workspace/api/completions which aggregates Databend
+      // /studio/api/completions which aggregates Databend
       // databases + tables, Lakekeeper warehouses, and recent
       // history. Cached for 30s in-process so each keystroke
       // doesn't re-hit the server.
@@ -1695,7 +1695,7 @@ fn render_workspace_page(
         if (completionCache.items && completionCache.expires > now) {{
           return Promise.resolve(completionCache.items);
         }}
-        return fetch("/workspace/api/completions", {{ credentials: "same-origin" }})
+        return fetch("/studio/api/completions", {{ credentials: "same-origin" }})
           .then(function(r) {{ return r.ok ? r.json() : {{ items: [] }}; }})
           .then(function(j) {{
             completionCache = {{ items: j.items || [], expires: Date.now() + 30000 }};
@@ -1785,14 +1785,14 @@ fn render_workspace_page(
         csrf = csrf,
     );
 
-    render_shell(localizer, &title, NavLink::Workspace, &body)
+    render_shell(localizer, &title, NavLink::Studio, &body)
 }
 
 /// Minimal percent-encoder used to pass the prefill-SQL through the
 /// query string. The set of unsafe characters here is conservative
 /// (anything not unreserved-per-RFC-3986 gets `%XX`-encoded). We
 /// pull this in inline rather than depending on the `urlencoding`
-/// crate because the workspace surface is the only caller; a
+/// crate because the studio surface is the only caller; a
 /// general-purpose helper would land in a util crate when the
 /// second caller shows up.
 ///
@@ -1834,9 +1834,9 @@ fn url_encode(s: &str) -> String {
 // in the driver).
 // ============================================================
 
-/// Form body for `POST /workspace/bootstrap`.
+/// Form body for `POST /studio/bootstrap`.
 #[derive(serde::Deserialize)]
-struct WorkspaceBootstrapForm {
+struct StudioBootstrapForm {
     project_name: String,
     warehouse_name: String,
     s3_endpoint: String,
@@ -1846,7 +1846,7 @@ struct WorkspaceBootstrapForm {
     s3_secret_access_key: String,
 }
 
-async fn workspace_bootstrap_form_handler(
+async fn studio_bootstrap_form_handler(
     State(state): State<AppState>,
 ) -> Html<String> {
     let l = Localizer::english();
@@ -1859,7 +1859,7 @@ async fn workspace_bootstrap_form_handler(
         .as_ref()
         .map(|u| u.replace(":3903", ":3900"))
         .unwrap_or_else(|| "http://127.0.0.1:3900".to_string());
-    Html(render_workspace_bootstrap_form(
+    Html(render_studio_bootstrap_form(
         &l,
         lakekeeper.is_some(),
         &suggested_s3,
@@ -1867,13 +1867,13 @@ async fn workspace_bootstrap_form_handler(
     ))
 }
 
-async fn workspace_bootstrap_submit_handler(
+async fn studio_bootstrap_submit_handler(
     State(state): State<AppState>,
-    axum::extract::Form(form): axum::extract::Form<WorkspaceBootstrapForm>,
+    axum::extract::Form(form): axum::extract::Form<StudioBootstrapForm>,
 ) -> Html<String> {
     let l = Localizer::english();
     let Some(lakekeeper_url) = discover_lakekeeper_endpoint(state.store.as_deref()).await else {
-        return Html(render_workspace_bootstrap_form(
+        return Html(render_studio_bootstrap_form(
             &l,
             false,
             &form.s3_endpoint,
@@ -1883,7 +1883,7 @@ async fn workspace_bootstrap_submit_handler(
         ));
     };
     let outcome = run_lakekeeper_bootstrap(&lakekeeper_url, &form).await;
-    Html(render_workspace_bootstrap_form(
+    Html(render_studio_bootstrap_form(
         &l,
         true,
         &form.s3_endpoint,
@@ -1900,7 +1900,7 @@ async fn discover_garage_endpoint(
     let store = store?;
     let rows = store.list("garage-instance", None).await.ok()?;
     let sr = rows.into_iter().next()?;
-    let spec: WorkspaceEndpointSpec = serde_json::from_value(sr.spec).ok()?;
+    let spec: StudioEndpointSpec = serde_json::from_value(sr.spec).ok()?;
     Some(spec.endpoint.base_url)
 }
 
@@ -1911,7 +1911,7 @@ async fn discover_garage_endpoint(
 /// non-2xx.
 async fn run_lakekeeper_bootstrap(
     base_url: &str,
-    form: &WorkspaceBootstrapForm,
+    form: &StudioBootstrapForm,
 ) -> Result<String, String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
@@ -2014,7 +2014,7 @@ async fn run_lakekeeper_bootstrap(
          - Project: `{}` ({})\n\
          - Warehouse: `{}` -> S3 bucket `{}` at {}\n\
          \n\
-         The /workspace catalog pane will now show this warehouse. \
+         The /studio catalog pane will now show this warehouse. \
          Drilling into namespaces + tables inside it lands in \
          phase 1.5 (the Iceberg-REST drill-down URLs depend on the \
          Lakekeeper release; deferred until empirically verified).",
@@ -2026,15 +2026,15 @@ async fn run_lakekeeper_bootstrap(
     ))
 }
 
-fn render_workspace_bootstrap_form(
+fn render_studio_bootstrap_form(
     localizer: &Localizer,
     has_lakekeeper: bool,
     suggested_s3_endpoint: &str,
     result: Option<Result<String, String>>,
 ) -> String {
-    let title = localizer.t("ui-workspace-bootstrap-title");
-    let intro = localizer.t("ui-workspace-bootstrap-intro");
-    let no_lakekeeper = localizer.t("ui-workspace-error-no-lakekeeper");
+    let title = localizer.t("ui-studio-bootstrap-title");
+    let intro = localizer.t("ui-studio-bootstrap-intro");
+    let no_lakekeeper = localizer.t("ui-studio-error-no-lakekeeper");
     let csrf = auth::csrf_input();
 
     let result_block = match result {
@@ -2063,7 +2063,7 @@ fn render_workspace_bootstrap_form(
 </section>"#,
             html_escape(&no_lakekeeper)
         );
-        return render_shell(localizer, &title, NavLink::Workspace, &body);
+        return render_shell(localizer, &title, NavLink::Studio, &body);
     }
 
     let body = format!(
@@ -2074,7 +2074,7 @@ fn render_workspace_bootstrap_form(
 <section class="cz-section" style="max-width: 50rem;">
 {result_block}
 <div class="cz-card">
-<form method="post" action="/workspace/bootstrap" style="display: flex; flex-direction: column; gap: 0.85rem;">
+<form method="post" action="/studio/bootstrap" style="display: flex; flex-direction: column; gap: 0.85rem;">
 {csrf}
 <div>
 <label for="bs-project" style="font-size: 0.85rem;">Project name</label>
@@ -2130,7 +2130,7 @@ gg key info lakekeeper        # &lt;-- copy &quot;Key ID&quot; + &quot;Secret ke
 </div>
 <div>
 <button type="submit" class="cz-btn cz-btn-primary">Run bootstrap</button>
-<a href="/workspace" class="cz-btn" style="margin-left: 0.5rem;">Cancel</a>
+<a href="/studio" class="cz-btn" style="margin-left: 0.5rem;">Cancel</a>
 </div>
 </form>
 </div>
@@ -2142,7 +2142,7 @@ gg key info lakekeeper        # &lt;-- copy &quot;Key ID&quot; + &quot;Secret ke
         result_block = result_block,
     );
 
-    render_shell(localizer, &title, NavLink::Workspace, &body)
+    render_shell(localizer, &title, NavLink::Studio, &body)
 }
 
 async fn install_hub_handler(State(state): State<AppState>) -> Html<String> {
@@ -6090,12 +6090,12 @@ async fn admin_groups_handler() -> Html<String> {
     Html(render_admin_groups(&l))
 }
 
-/// GET /admin/workspaces -- list workspaces. v0.0.x always shows
-/// the implicit `default` workspace; v0.1+ wires creation + per-
+/// GET /admin/studios -- list studios. v0.0.x always shows
+/// the implicit `default` studio; v0.1+ wires creation + per-
 /// tenant resource scoping.
-async fn admin_workspaces_handler() -> Html<String> {
+async fn admin_tenants_handler() -> Html<String> {
     let l = Localizer::english();
-    Html(render_admin_workspaces(&l))
+    Html(render_admin_studios(&l))
 }
 
 /// GET /admin/branding -- the white-labeling page. Reads the
@@ -6395,7 +6395,7 @@ async fn compliance_models_create_handler(
                 &cards,
                 true,
                 Some(
-                    "Prohibited classifications (Article 5 / Title II) cannot be registered. Remove the system from your AI workspace before continuing.",
+                    "Prohibited classifications (Article 5 / Title II) cannot be registered. Remove the system from your AI studio before continuing.",
                 ),
             ))
             .into_response();
@@ -6648,10 +6648,10 @@ pub enum NavLink {
     Operators,
     /// Admin group-listing page.
     Groups,
-    /// Admin workspaces page.
-    Workspaces,
-    /// Operator workspace (catalog browser + SQL editor).
-    Workspace,
+    /// Admin tenants page (multi-tenancy boundary management).
+    Tenants,
+    /// Operator studio (catalog browser + SQL editor).
+    Studio,
     /// Admin branding / white-labeling page.
     Branding,
     /// Admin license envelope viewer.
@@ -6676,7 +6676,7 @@ pub fn render_shell(
 ) -> String {
     let app_title = localizer.t("ui-app-title");
     let nav_components = localizer.t("ui-nav-components");
-    let nav_workspace = localizer.t("ui-nav-workspace");
+    let nav_studio = localizer.t("ui-nav-studio");
     let nav_install = localizer.t("ui-nav-install");
     let nav_status = localizer.t("ui-nav-status");
     let nav_state = localizer.t("ui-nav-state");
@@ -6685,7 +6685,7 @@ pub fn render_shell(
     let nav_audit = localizer.t("ui-audit-nav");
     let nav_admin_operators = localizer.t("ui-nav-admin-operators");
     let nav_admin_groups = localizer.t("ui-nav-admin-groups");
-    let nav_admin_workspaces = localizer.t("ui-nav-admin-workspaces");
+    let nav_admin_tenants = localizer.t("ui-nav-admin-tenants");
     let nav_admin_branding = localizer.t("ui-nav-admin-branding");
     let nav_admin_license = localizer.t("ui-nav-admin-license");
     let version_label = localizer.t("ui-footer-version");
@@ -6719,14 +6719,14 @@ pub fn render_shell(
     <a href="/components" class="{nc}">{nav_components}</a>
     <a href="/install-guide" class="{nig}">Install guide</a>
     <a href="/install" class="{ni}">{nav_install}</a>
-    <a href="/workspace" class="{nwks}">{nav_workspace}</a>
+    <a href="/studio" class="{nwks}">{nav_studio}</a>
     <a href="/status" class="{ns}">{nav_status}</a>
     <a href="/state" class="{nm}">{nav_state}</a>
     <a href="/admin/secrets" class="{na}">{nav_secrets}</a>
     <a href="/audit" class="{naud}">{nav_audit}</a>
     <a href="/admin/operators" class="{nops}">{nav_admin_operators}</a>
     <a href="/admin/groups" class="{ngrp}">{nav_admin_groups}</a>
-    <a href="/admin/workspaces" class="{nwsp}">{nav_admin_workspaces}</a>
+    <a href="/admin/tenants" class="{nwsp}">{nav_admin_tenants}</a>
     <a href="/admin/branding" class="{nbrd}">{nav_admin_branding}</a>
     <a href="/admin/license" class="{nlic}">{nav_admin_license}</a>
     <a href="/compliance/eu-ai-act" class="{ncmp}">Compliance</a>
@@ -6850,14 +6850,14 @@ pub fn render_shell(
         nc = nav_class(NavLink::Components),
         nig = nav_class(NavLink::InstallGuide),
         ni = nav_class(NavLink::Install),
-        nwks = nav_class(NavLink::Workspace),
+        nwks = nav_class(NavLink::Studio),
         ns = nav_class(NavLink::Status),
         nm = nav_class(NavLink::State),
         na = nav_class(NavLink::Secrets),
         naud = nav_class(NavLink::Audit),
         nops = nav_class(NavLink::Operators),
         ngrp = nav_class(NavLink::Groups),
-        nwsp = nav_class(NavLink::Workspaces),
+        nwsp = nav_class(NavLink::Tenants),
         nbrd = nav_class(NavLink::Branding),
         nlic = nav_class(NavLink::License),
         ncmp = nav_class(NavLink::Compliance),
@@ -7604,7 +7604,7 @@ If the file is at a different path, it's alongside <code>state.db</code>. v0.1 w
 /// Minimal percent-encoder for a single URL path segment. Encodes
 /// everything except unreserved chars + `-._~`. Not a full RFC 3986
 /// implementation; built for resource kinds and names, which are
-/// kebab-case ASCII per the workspace conventions.
+/// kebab-case ASCII per the studio conventions.
 fn urlencoding_min(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -10677,15 +10677,15 @@ fn group_checkboxes_html(prefix: &str, current: &[String]) -> String {
         .collect()
 }
 
-/// Render `GET /admin/workspaces` -- v0.0.x list. Always shows the
-/// implicit `default` workspace.
+/// Render `GET /admin/studios` -- v0.0.x list. Always shows the
+/// implicit `default` studio.
 #[must_use]
-pub fn render_admin_workspaces(localizer: &Localizer) -> String {
-    let title = localizer.t("ui-admin-workspaces-title");
-    let intro = localizer.t("ui-admin-workspaces-intro");
-    let col_name = localizer.t("ui-admin-workspaces-col-name");
-    let col_created = localizer.t("ui-admin-workspaces-col-created");
-    let note = localizer.t("ui-admin-workspaces-default-note");
+pub fn render_admin_studios(localizer: &Localizer) -> String {
+    let title = localizer.t("ui-admin-tenants-title");
+    let intro = localizer.t("ui-admin-tenants-intro");
+    let col_name = localizer.t("ui-admin-tenants-col-name");
+    let col_created = localizer.t("ui-admin-tenants-col-created");
+    let note = localizer.t("ui-admin-tenants-default-note");
 
     let body = format!(
         r#"<section class="cz-hero">
@@ -10709,7 +10709,7 @@ pub fn render_admin_workspaces(localizer: &Localizer) -> String {
         col_created = html_escape(&col_created),
         note = html_escape(&note),
     );
-    render_shell(localizer, &title, NavLink::Workspaces, &body)
+    render_shell(localizer, &title, NavLink::Tenants, &body)
 }
 
 /// Render `GET /admin/branding` -- the white-labeling form.
@@ -10821,7 +10821,7 @@ pub fn render_compliance_eu_ai_act(localizer: &Localizer) -> String {
 <section class="cz-section">
 <div class="cz-card">
 <h3 style="margin: 0 0 0.4rem;">Next step</h3>
-<p class="cz-muted" style="margin: 0 0 0.8rem; font-size: 0.85rem;">Register a model card for each AI system in your workspace. The registry produces the Annex IV technical documentation per system, links it to the audit log, and flags Prohibited classifications before they can deploy.</p>
+<p class="cz-muted" style="margin: 0 0 0.8rem; font-size: 0.85rem;">Register a model card for each AI system in your studio. The registry produces the Annex IV technical documentation per system, links it to the audit log, and flags Prohibited classifications before they can deploy.</p>
 <a href="/compliance/models" class="cz-btn cz-btn-primary">Open the model card registry</a>
 </div>
 </section>"#,
@@ -12225,7 +12225,7 @@ pub fn render_resource(
         let rev_label = localizer.t("ui-resource-revision");
         let created_label = localizer.t("ui-resource-created-at");
         let updated_label = localizer.t("ui-resource-updated-at");
-        let ws_label = localizer.t("ui-resource-workspace");
+        let ws_label = localizer.t("ui-resource-tenant");
         let spec_heading = localizer.t("ui-resource-spec-heading");
         let status_heading = localizer.t("ui-resource-status-heading");
         let no_status = localizer.t("ui-resource-no-status");
@@ -12238,7 +12238,7 @@ pub fn render_resource(
             }
             None => format!(r#"<p class="cz-muted">{}</p>"#, html_escape(&no_status)),
         };
-        let workspace = sr
+        let tenant = sr
             .key
             .workspace
             .as_deref()
@@ -12320,7 +12320,7 @@ pub fn render_resource(
 <dt>{rev_label}</dt><dd>{revision}</dd>
 <dt>{created_label}</dt><dd>{created_at}</dd>
 <dt>{updated_label}</dt><dd>{updated_at}</dd>
-<dt>{ws_label}</dt><dd>{workspace}</dd>
+<dt>{ws_label}</dt><dd>{tenant}</dd>
 </dl>
 </div>
 <section class="cz-section">
@@ -13691,7 +13691,7 @@ mod tests {
             seats: None,
             not_before: now - chrono::Duration::days(1),
             not_after: now + chrono::Duration::days(365),
-            features: vec!["ai-workspace".into()],
+            features: vec!["ai-studio".into()],
             billing_metadata: Some(computeza_license::BillingNote {
                 annual_value: Some(499_900),
                 currency: Some("EUR".into()),
@@ -13726,7 +13726,7 @@ mod tests {
         assert!(html.contains("ACME-2026-001"));
         assert!(html.contains("EUR"));
         assert!(html.contains("4999.00"));
-        assert!(html.contains("ai-workspace"));
+        assert!(html.contains("ai-studio"));
     }
 
     #[test]
