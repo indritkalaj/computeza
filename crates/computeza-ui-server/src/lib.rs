@@ -1993,7 +1993,13 @@ async fn run_lakekeeper_bootstrap(
         .text()
         .await
         .unwrap_or_else(|e| format!("(could not read body: {e})"));
-    if !warehouse_status.is_success() {
+    // 409 Conflict OR a body that mentions "already exists" means the
+    // warehouse with this name was created by a previous run. Treat
+    // as success so auto-bootstrap is idempotent.
+    let warehouse_existed = warehouse_status.as_u16() == 409
+        || warehouse_text.contains("already exists")
+        || warehouse_text.contains("WarehouseAlreadyExists");
+    if !warehouse_status.is_success() && !warehouse_existed {
         return Err(format!(
             "POST {warehouse_url} returned {}:\n{warehouse_text}\n\n\
              (Project step: {}.) Adjust storage-profile / \
@@ -2008,6 +2014,7 @@ async fn run_lakekeeper_bootstrap(
             }
         ));
     }
+    let _ = warehouse_existed; // used by success path below; reads silenced when unused
 
     Ok(format!(
         "Lakekeeper bootstrap succeeded:\n\
@@ -2424,6 +2431,81 @@ async fn delete_install_config(store: &SqliteStore, slug: &str) {
 /// it to `progress.finish_success`. Best-effort throughout -- a
 /// failed metadata write leaves the on-disk service running and
 /// appends a `Note:` line to the summary.
+/// Auto-bootstrap Lakekeeper's default project + warehouse using
+/// Garage credentials already in the vault. Returns artifacts to
+/// be persisted (the warehouse name, for the studio catalog
+/// browser to use).
+///
+/// Cross-component bootstrap: depends on Garage having installed
+/// (and its post-install hook having populated
+/// `garage/lakekeeper-key-id`, `garage/lakekeeper-secret`,
+/// `garage/lakekeeper-bucket` in the vault). INSTALL_ORDER ensures
+/// Garage installs first, so by the time this runs the vault
+/// should have what we need.
+#[cfg(target_os = "linux")]
+async fn auto_bootstrap_lakekeeper(
+    secrets: Option<&SecretsStore>,
+    store: Option<&SqliteStore>,
+) -> Result<Vec<computeza_driver_native::linux::BootstrapArtifact>, String> {
+    use secrecy::SecretString;
+    let secrets = secrets.ok_or_else(|| {
+        "no secrets store attached; auto-bootstrap requires the vault to read Garage credentials \
+         from. Set COMPUTEZA_SECRETS_PASSPHRASE or let the install path auto-generate one."
+            .to_string()
+    })?;
+    let key_id = secrets
+        .get("garage/lakekeeper-key-id")
+        .await
+        .map_err(|e| format!("vault read garage/lakekeeper-key-id: {e}"))?
+        .ok_or_else(|| {
+            "vault has no `garage/lakekeeper-key-id` -- Garage hasn't been installed yet, or its \
+             post-install bootstrap failed. Install Garage from /install first.".to_string()
+        })?;
+    let secret = secrets
+        .get("garage/lakekeeper-secret")
+        .await
+        .map_err(|e| format!("vault read garage/lakekeeper-secret: {e}"))?
+        .ok_or_else(|| {
+            "vault has `garage/lakekeeper-key-id` but no `garage/lakekeeper-secret` -- state \
+             mismatch. Rotate the Garage key (gg key delete lakekeeper && gg key create lakekeeper) \
+             and re-install."
+                .to_string()
+        })?;
+    let bucket = secrets
+        .get("garage/lakekeeper-bucket")
+        .await
+        .map_err(|e| format!("vault read garage/lakekeeper-bucket: {e}"))?
+        .unwrap_or_else(|| "lakekeeper-default".to_string());
+
+    let lakekeeper_url = discover_lakekeeper_endpoint(store).await.ok_or_else(|| {
+        "no Lakekeeper instance registered in the metadata store; the install pipeline should \
+         have written it. Check /status."
+            .to_string()
+    })?;
+    let garage_endpoint = discover_garage_endpoint(store)
+        .await
+        .map(|u| u.replace(":3903", ":3900"))
+        .unwrap_or_else(|| "http://127.0.0.1:3900".to_string());
+
+    let form = StudioBootstrapForm {
+        project_name: "computeza-default".to_string(),
+        warehouse_name: "default".to_string(),
+        s3_endpoint: garage_endpoint,
+        s3_region: "garage".to_string(),
+        s3_bucket: bucket.clone(),
+        s3_access_key: key_id,
+        s3_secret_access_key: secret,
+    };
+    run_lakekeeper_bootstrap(&lakekeeper_url, &form).await?;
+
+    Ok(vec![computeza_driver_native::linux::BootstrapArtifact {
+        vault_key: "lakekeeper/default-warehouse-name".to_string(),
+        value: SecretString::from("default".to_string()),
+        label: "Lakekeeper default warehouse name".to_string(),
+        display_inline: false,
+    }])
+}
+
 async fn finalize_managed_install_after_success(
     slug: &str,
     config: &InstallConfig,
@@ -2512,6 +2594,96 @@ async fn finalize_managed_install_after_success(
             username: Some(username.to_string()),
             secret_ref: Some(secret_ref),
         });
+    }
+
+    // Post-install bootstrap (v0.1 design doc §3.2). For components
+    // that need post-daemon-start setup beyond the systemd unit,
+    // their driver module exposes `post_install_bootstrap` returning
+    // a Vec<BootstrapArtifact>. Each artifact is persisted into the
+    // secrets vault under `vault_key`, and (if `display_inline`) is
+    // also pushed to the install job's credentials list so the
+    // credentials.json export downloadable from the install-result
+    // page surfaces it. Failures are logged + surfaced inline on
+    // the result page but do NOT fail the install -- the daemon is
+    // running and registered, the bootstrap can be retried.
+    #[cfg(target_os = "linux")]
+    {
+        let bootstrap_result: Option<
+            Result<Vec<computeza_driver_native::linux::BootstrapArtifact>, String>,
+        > = match slug {
+            "garage" => {
+                let root = config
+                    .root_dir
+                    .as_deref()
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| std::path::PathBuf::from("/var/lib/computeza/garage"));
+                Some(
+                    computeza_driver_native::linux::garage::post_install_bootstrap(&root)
+                        .await
+                        .map_err(|e| e.to_string()),
+                )
+            }
+            "lakekeeper" => {
+                // Cross-component bootstrap: read Garage credentials
+                // from vault (populated by `garage`'s earlier hook),
+                // call the existing run_lakekeeper_bootstrap to
+                // create the default project + warehouse. INSTALL_ORDER
+                // ensures Garage installed first, so vault entries
+                // should be populated by the time we hit this code.
+                Some(auto_bootstrap_lakekeeper(secrets, store).await)
+            }
+            _ => None,
+        };
+        if let Some(result) = bootstrap_result {
+            match result {
+                Ok(artifacts) => {
+                    let count = artifacts.len();
+                    for a in artifacts {
+                        use secrecy::ExposeSecret;
+                        let value = a.value.expose_secret().to_string();
+                        if let Some(secrets) = secrets {
+                            if let Err(e) = secrets.put(&a.vault_key, &value).await {
+                                tracing::warn!(
+                                    error = %e,
+                                    component = slug,
+                                    vault_key = %a.vault_key,
+                                    "post-install bootstrap: secrets.put failed; \
+                                     artifact still appears in the credentials.json download."
+                                );
+                            }
+                        }
+                        if a.display_inline {
+                            progress.push_credential(
+                                computeza_driver_native::progress::GeneratedCredential {
+                                    component: slug.to_string(),
+                                    label: a.label,
+                                    value,
+                                    username: None,
+                                    secret_ref: Some(a.vault_key),
+                                },
+                            );
+                        }
+                    }
+                    if count > 0 {
+                        summary.push_str(&format!(
+                            "\n\nPost-install bootstrap for {slug}: {count} artifact(s) persisted to vault."
+                        ));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        component = slug,
+                        "post-install bootstrap failed; daemon is running but downstream \
+                         auto-configuration may not work. Operator can retry via the studio \
+                         bootstrap form."
+                    );
+                    summary.push_str(&format!(
+                        "\n\nNote: post-install bootstrap for {slug} failed:\n{e}\n\nThe daemon is running and registered. Retry the bootstrap from /studio/bootstrap."
+                    ));
+                }
+            }
+        }
     }
 
     summary
