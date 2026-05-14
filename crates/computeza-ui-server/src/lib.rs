@@ -1660,12 +1660,13 @@ import {{ keymap }} from "https://esm.sh/@codemirror/view@6.30.0";
 import {{ sql }} from "https://esm.sh/@codemirror/lang-sql@6.7.1";
 import {{ autocompletion }} from "https://esm.sh/@codemirror/autocomplete@6.18.0";
 import {{ darcula }} from "https://esm.sh/@uiw/codemirror-theme-darcula@4.23.0";
-// fsegurai theme set -- four extra dark schemes the operator can pick
-// from. esm.sh resolves the named export per the package's index.
-import {{ tokyoNightStorm }} from "https://esm.sh/@fsegurai/codemirror-theme-tokyo-night-storm@6.2.0";
-import {{ nord }} from "https://esm.sh/@fsegurai/codemirror-theme-nord@6.2.0";
-import {{ materialDark }} from "https://esm.sh/@fsegurai/codemirror-theme-material-dark@6.2.0";
-import {{ forest }} from "https://esm.sh/@fsegurai/codemirror-theme-forest@6.2.0";
+// Optional themes (Tokyo Night Storm / Nord / Material Dark / Forest)
+// are loaded DYNAMICALLY below. Why: pinning a specific version that
+// turns out not to exist on npm, OR a named-export name that drifted
+// upstream, would make a static import fail and abort the entire
+// module -- which would silently break autocomplete + the editor
+// itself, not just the theme picker. Dynamic loading isolates each
+// theme's failure to that one theme.
 
 (function() {{
   var mount = document.getElementById("cz-sql-cm6");
@@ -1762,26 +1763,24 @@ import {{ forest }} from "https://esm.sh/@fsegurai/codemirror-theme-forest@6.2.0
     }},
   }});
 
-  // Theme registry. Keys match the <select> option values; values
-  // are the imported CM6 theme extensions. Darcula is the default.
-  var themes = {{
-    "darcula": darcula,
-    "tokyo-night-storm": tokyoNightStorm,
-    "nord": nord,
-    "material-dark": materialDark,
-    "forest": forest,
-  }};
-  var THEME_STORAGE_KEY = "cz-sql-theme";
-  var savedTheme = null;
-  try {{ savedTheme = window.localStorage.getItem(THEME_STORAGE_KEY); }} catch(e) {{ /* localStorage may be blocked */ }}
-  var initialThemeKey = (savedTheme && themes[savedTheme]) ? savedTheme : "darcula";
+  // Theme registry. Starts with Darcula (statically imported,
+  // known good). The four optional fsegurai themes are loaded
+  // dynamically below; whichever load successfully get added.
+  // The <select>'s dropdown options are filtered to match what
+  // actually loaded so the operator can't pick a theme that
+  // would no-op.
+  var themes = {{ "darcula": darcula }};
 
   // Compartment wraps the theme so we can swap it at runtime
   // without rebuilding the editor view. Each call to
   // themeCompartment.reconfigure(newExt) dispatched as an effect
   // replaces the previous theme atomically.
   var themeCompartment = new Compartment();
+  var THEME_STORAGE_KEY = "cz-sql-theme";
 
+  // Build the editor view FIRST with Darcula. Themes load async;
+  // we don't want to gate editor mount on network round-trips that
+  // might be slow or fail.
   var view = new EditorView({{
     parent: mount,
     state: EditorState.create({{
@@ -1789,7 +1788,7 @@ import {{ forest }} from "https://esm.sh/@fsegurai/codemirror-theme-forest@6.2.0
       extensions: [
         basicSetup,
         sql(),
-        themeCompartment.of(themes[initialThemeKey]),
+        themeCompartment.of(darcula),
         completionExt,
         submitKeymap,
         sizingTheme,
@@ -1798,43 +1797,78 @@ import {{ forest }} from "https://esm.sh/@fsegurai/codemirror-theme-forest@6.2.0
     }}),
   }});
 
-  // Wire the <select> change event. Reveal the toolbar only after
-  // the editor has mounted successfully (so JS-disabled fallback
-  // doesn't show a non-functional theme picker).
-  var toolbar = document.getElementById("cz-sql-toolbar");
-  var themeSelect = document.getElementById("cz-sql-theme");
-  if (toolbar && themeSelect) {{
-    themeSelect.value = initialThemeKey;
-    themeSelect.addEventListener("change", function() {{
-      var key = themeSelect.value;
-      var ext = themes[key];
-      if (!ext) return;
-      view.dispatch({{
-        effects: themeCompartment.reconfigure(ext),
-      }});
-      try {{ window.localStorage.setItem(THEME_STORAGE_KEY, key); }} catch(e) {{ /* ignore */ }}
-    }});
-    toolbar.style.display = "flex";
-  }}
-
-  // Swap textarea for CM6. Keep textarea in the DOM so the form
-  // submission still finds its `name="sql"` field; we just stop
-  // displaying it.
+  // Swap textarea for CM6 immediately. (Done early so the editor
+  // is visible while themes load in the background.)
   textarea.style.display = "none";
   mount.style.display = "block";
 
   // Sync CM6 -> textarea before submit so the POST body carries
-  // the current editor contents (not the original server-rendered
-  // value).
+  // the current editor contents.
   form.addEventListener("submit", function() {{
     textarea.value = view.state.doc.toString();
   }});
 
   // Move focus into the editor on page load so the operator can
   // start typing immediately. Skip if the editor is pre-filled
-  // with a SELECT * the operator just clicked (let them inspect
-  // first).
+  // with a SELECT * the operator just clicked.
   if (!initial.trim()) view.focus();
+
+  // Async-load each optional theme. Each load is independent;
+  // failures are logged but don't break the editor or other
+  // themes. Once all settle, the <select> options are filtered
+  // to what actually loaded and the saved-theme preference (if
+  // any) is applied.
+  function tryLoadTheme(key, url, exportName) {{
+    return import(url)
+      .then(function(mod) {{
+        var ext = mod[exportName] || mod.default;
+        if (ext) {{
+          themes[key] = ext;
+        }} else {{
+          console.warn("computeza studio: theme `" + key + "` loaded but no `" + exportName + "` export found");
+        }}
+      }})
+      .catch(function(err) {{
+        console.warn("computeza studio: theme `" + key + "` failed to load:", err);
+      }});
+  }}
+
+  Promise.all([
+    tryLoadTheme("tokyo-night-storm", "https://esm.sh/@fsegurai/codemirror-theme-tokyo-night-storm", "tokyoNightStorm"),
+    tryLoadTheme("nord", "https://esm.sh/@fsegurai/codemirror-theme-nord", "nord"),
+    tryLoadTheme("material-dark", "https://esm.sh/@fsegurai/codemirror-theme-material-dark", "materialDark"),
+    tryLoadTheme("forest", "https://esm.sh/@fsegurai/codemirror-theme-forest", "forest"),
+  ]).then(function() {{
+    var toolbar = document.getElementById("cz-sql-toolbar");
+    var themeSelect = document.getElementById("cz-sql-theme");
+    if (!toolbar || !themeSelect) return;
+
+    // Filter <select> options to themes that actually loaded so
+    // the operator can't pick a broken one.
+    Array.from(themeSelect.options).forEach(function(opt) {{
+      if (!themes[opt.value]) opt.remove();
+    }});
+
+    // Apply saved preference if it loaded; else fall back to Darcula.
+    var savedTheme = null;
+    try {{ savedTheme = window.localStorage.getItem(THEME_STORAGE_KEY); }} catch(e) {{}}
+    var initialThemeKey = (savedTheme && themes[savedTheme]) ? savedTheme : "darcula";
+    themeSelect.value = initialThemeKey;
+    if (initialThemeKey !== "darcula") {{
+      view.dispatch({{
+        effects: themeCompartment.reconfigure(themes[initialThemeKey]),
+      }});
+    }}
+
+    themeSelect.addEventListener("change", function() {{
+      var key = themeSelect.value;
+      var ext = themes[key];
+      if (!ext) return;
+      view.dispatch({{ effects: themeCompartment.reconfigure(ext) }});
+      try {{ window.localStorage.setItem(THEME_STORAGE_KEY, key); }} catch(e) {{}}
+    }});
+    toolbar.style.display = "flex";
+  }});
 }})();
 </script>
 <noscript>
