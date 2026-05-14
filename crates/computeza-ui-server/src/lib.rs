@@ -1059,7 +1059,9 @@ enum LakekeeperState {
     /// parse into the warehouse-list shape we expected. Carries
     /// the raw body so the operator (or future iterations) can see
     /// what Lakekeeper actually sent. Surfaces in the catalog pane
-    /// as a diagnostic block.
+    /// as a diagnostic block. The String is read via the Debug
+    /// impl, not destructured -- silence the compiler hint.
+    #[allow(dead_code)]
     UnexpectedShape(String),
 }
 
@@ -2371,7 +2373,10 @@ fn render_studio_table_detail(
                 });
             let raw_json = serde_json::to_string_pretty(&v)
                 .unwrap_or_else(|_| "(could not pretty-print)".to_string());
-            let prefill_sql = format!("SELECT * FROM {namespace}.{table} LIMIT 100");
+            let catalog_ident = sanitize_sql_identifier(warehouse);
+            let prefill_sql = format!(
+                "SELECT * FROM {catalog_ident}.{namespace}.{table} LIMIT 100"
+            );
             format!(
                 r#"<dl class="cz-dl">
 <dt>Location</dt><dd><code>{loc}</code></dd>
@@ -2383,7 +2388,7 @@ fn render_studio_table_detail(
 <div class="cz-studio-actions" style="margin-top: 1.25rem;">
 <a href="/studio?sql={prefill_enc}" class="cz-btn-primary">Pre-fill SELECT * in editor</a>
 <span class="cz-studio-actions-spacer"></span>
-<span class="cz-studio-editor-hint" style="margin: 0;">Querying this Iceberg table from Databend needs a <code>[[catalog]]</code> block pointing at Lakekeeper — deferred to phase 1.6.</span>
+<span class="cz-studio-editor-hint" style="margin: 0;">Reads <code>{catalog_ident}.{ns_display}.{tbl_display}</code> via the Databend catalog the bootstrap step registered. If the editor can't find this catalog, re-run <a href="/studio/bootstrap">bootstrap</a> with Databend installed.</span>
 </div>
 <details style="margin-top: 1.75rem;">
 <summary class="cz-studio-raw-summary">Raw Iceberg metadata (JSON)</summary>
@@ -2394,6 +2399,9 @@ fn render_studio_table_detail(
                 fmt = html_escape(&format_version),
                 schema_html = schema_html,
                 prefill_enc = url_encode(&prefill_sql),
+                catalog_ident = html_escape(&catalog_ident),
+                ns_display = html_escape(namespace),
+                tbl_display = html_escape(table),
                 raw = html_escape(&raw_json),
             )
         }
@@ -3303,10 +3311,34 @@ async fn studio_bootstrap_submit_handler(
             }
         }
     }
-    // Convert LakekeeperBootstrapOk -> String for the render
-    // function which only cares about the human message.
+    // After Lakekeeper succeeds, register this warehouse with
+    // Databend so the SQL editor can resolve
+    // `<warehouse>.<namespace>.<table>`. Best-effort: a missing
+    // Databend or a CREATE CATALOG syntax mismatch doesn't fail
+    // the bootstrap -- the operator can still use the catalog via
+    // REST/curl until they re-run bootstrap with Databend in place.
+    let databend_wiring = if outcome.is_ok() {
+        Some(wire_databend_iceberg_catalog(state.store.as_deref(), &lakekeeper_url, &form).await)
+    } else {
+        None
+    };
     let display_outcome: Result<String, String> = match outcome {
-        Ok(ok) => Ok(ok.message),
+        Ok(ok) => {
+            let wiring_line = match databend_wiring {
+                Some(DatabendWiringOutcome::Wired { catalog_name }) => format!(
+                    "\n - Databend SQL catalog `{catalog_name}` registered. Run \
+                     `SELECT * FROM {catalog_name}.<namespace>.<table>` in the \
+                     editor."
+                ),
+                Some(DatabendWiringOutcome::DatabendUnavailable) => "\n - Databend SQL wiring skipped: Databend isn't installed yet. Install it from /install and re-run bootstrap to expose this warehouse via SQL.".to_string(),
+                Some(DatabendWiringOutcome::Failed { reason }) => format!(
+                    "\n - Databend SQL wiring FAILED: {reason}\n   The Iceberg-REST API still works (browse via the Studio catalog pane). \
+                     To retry, run a CREATE CATALOG statement manually in the SQL editor."
+                ),
+                None => String::new(),
+            };
+            Ok(format!("{}{}", ok.message, wiring_line))
+        }
         Err(e) => Err(e),
     };
     Html(render_studio_bootstrap_form(
@@ -3375,6 +3407,109 @@ async fn discover_garage_endpoint(
 struct LakekeeperBootstrapOk {
     message: String,
     warehouse_id: Option<String>,
+}
+
+/// Escape a string for use inside a Databend SQL single-quoted
+/// literal. Databend follows SQL standard: a literal `'` is escaped
+/// as `''`. Backslashes do NOT need escaping in standard-mode quotes.
+/// This is the only sanitization the bootstrap wiring needs because
+/// the catalog name itself comes from sanitize_sql_identifier (alpha-
+/// numerics + `_` only), and all other interpolated values are
+/// wrapped in single-quoted literals.
+fn sql_quote(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+/// Sanitize a warehouse name into a SQL identifier acceptable to
+/// Databend's `CREATE CATALOG <name>` syntax. Databend identifiers
+/// must start with a letter or underscore and contain only ASCII
+/// alphanumerics + `_`. Anything else collapses to `_`. If the input
+/// starts with a digit we prefix `cat_` so the identifier is valid.
+fn sanitize_sql_identifier(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        return "warehouse".to_string();
+    }
+    if out.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        return format!("cat_{out}");
+    }
+    out
+}
+
+/// Outcome of attempting to wire Databend up to the just-bootstrapped
+/// Lakekeeper warehouse so `SELECT * FROM <catalog>.<namespace>.<tbl>`
+/// resolves in the SQL editor.
+#[derive(Debug)]
+enum DatabendWiringOutcome {
+    /// Databend isn't installed / discoverable -- nothing to wire.
+    /// Bootstrap still succeeds; the operator just has to install
+    /// Databend later and re-run bootstrap to enable SQL access.
+    DatabendUnavailable,
+    /// CREATE CATALOG succeeded; <warehouse_name>.<ns>.<tbl> now
+    /// resolves in Databend's parser.
+    Wired { catalog_name: String },
+    /// Databend rejected the CREATE CATALOG. The most likely cause is
+    /// a Databend version that doesn't accept Iceberg-REST as a
+    /// catalog type, or a syntax drift across releases. Carries the
+    /// raw error so the operator can adjust.
+    Failed { reason: String },
+}
+
+/// Auto-wire Databend → Lakekeeper-Iceberg by running
+/// `DROP CATALOG IF EXISTS` then `CREATE CATALOG <name> TYPE=ICEBERG
+/// CONNECTION=(...)`. Best-effort: a Databend outage or unsupported
+/// syntax doesn't fail the bootstrap.
+async fn wire_databend_iceberg_catalog(
+    store: Option<&computeza_state::SqliteStore>,
+    lakekeeper_url: &str,
+    form: &StudioBootstrapForm,
+) -> DatabendWiringOutcome {
+    let Some(databend_url) = discover_databend_endpoint(store).await else {
+        return DatabendWiringOutcome::DatabendUnavailable;
+    };
+    let catalog_name = sanitize_sql_identifier(&form.warehouse_name);
+    let rest_address = format!("{}/catalog", lakekeeper_url.trim_end_matches('/'));
+    // Drop first so re-running the bootstrap with new credentials
+    // refreshes the catalog binding. Best-effort: if the catalog
+    // doesn't exist yet the DROP is a no-op (Databend's IF EXISTS
+    // handles that).
+    let drop_sql = format!("DROP CATALOG IF EXISTS {catalog_name}");
+    if let SqlOutcome::Err(e) = execute_sql_against_databend(&databend_url, &drop_sql).await {
+        tracing::info!(
+            catalog = %catalog_name,
+            error = %e,
+            "wire_databend: DROP CATALOG IF EXISTS returned err (treating as ignorable)"
+        );
+    }
+    let create_sql = format!(
+        "CREATE CATALOG {name} TYPE = ICEBERG CONNECTION = (\
+            TYPE = 'rest', \
+            ADDRESS = '{address}', \
+            WAREHOUSE = '{warehouse}', \
+            \"s3.endpoint\" = '{s3_endpoint}', \
+            \"s3.access-key-id\" = '{ak}', \
+            \"s3.secret-access-key\" = '{sk}', \
+            \"s3.region\" = '{region}'\
+        )",
+        name = catalog_name,
+        address = sql_quote(&rest_address),
+        warehouse = sql_quote(&form.warehouse_name),
+        s3_endpoint = sql_quote(&form.s3_endpoint),
+        ak = sql_quote(&form.s3_access_key),
+        sk = sql_quote(&form.s3_secret_access_key),
+        region = sql_quote(&form.s3_region),
+    );
+    match execute_sql_against_databend(&databend_url, &create_sql).await {
+        SqlOutcome::Ok { .. } => DatabendWiringOutcome::Wired { catalog_name },
+        SqlOutcome::Err(e) => DatabendWiringOutcome::Failed { reason: e },
+    }
 }
 
 /// Sanitize a warehouse name into an S3 key prefix.
