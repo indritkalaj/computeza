@@ -2518,21 +2518,28 @@ async fn auto_bootstrap_lakekeeper(
     secrets: Option<&SecretsStore>,
     store: Option<&SqliteStore>,
 ) -> Result<Vec<computeza_driver_native::linux::BootstrapArtifact>, String> {
-    use secrecy::SecretString;
+    use secrecy::{ExposeSecret, SecretString};
     let secrets = secrets.ok_or_else(|| {
         "no secrets store attached; auto-bootstrap requires the vault to read Garage credentials \
          from. Set COMPUTEZA_SECRETS_PASSPHRASE or let the install path auto-generate one."
             .to_string()
     })?;
-    let key_id = secrets
+    // SecretsStore::get returns Option<SecretString>; pull each
+    // value into a plain String (via expose_secret) right here so
+    // the rest of this function can build a StudioBootstrapForm
+    // without the SecretString boxing in every call site. The
+    // String lifetimes end inside run_lakekeeper_bootstrap below.
+    let key_id: String = secrets
         .get("garage/lakekeeper-key-id")
         .await
         .map_err(|e| format!("vault read garage/lakekeeper-key-id: {e}"))?
         .ok_or_else(|| {
             "vault has no `garage/lakekeeper-key-id` -- Garage hasn't been installed yet, or its \
              post-install bootstrap failed. Install Garage from /install first.".to_string()
-        })?;
-    let secret = secrets
+        })?
+        .expose_secret()
+        .to_string();
+    let secret: String = secrets
         .get("garage/lakekeeper-secret")
         .await
         .map_err(|e| format!("vault read garage/lakekeeper-secret: {e}"))?
@@ -2541,11 +2548,14 @@ async fn auto_bootstrap_lakekeeper(
              mismatch. Rotate the Garage key (gg key delete lakekeeper && gg key create lakekeeper) \
              and re-install."
                 .to_string()
-        })?;
-    let bucket = secrets
+        })?
+        .expose_secret()
+        .to_string();
+    let bucket: String = secrets
         .get("garage/lakekeeper-bucket")
         .await
         .map_err(|e| format!("vault read garage/lakekeeper-bucket: {e}"))?
+        .map(|s| s.expose_secret().to_string())
         .unwrap_or_else(|| "lakekeeper-default".to_string());
 
     let lakekeeper_url = discover_lakekeeper_endpoint(store).await.ok_or_else(|| {
