@@ -669,12 +669,28 @@ pub fn router_with_state(state: AppState) -> Router {
             get(studio_catalog_warehouse_handler),
         )
         .route(
+            "/studio/catalog/{warehouse}/namespaces/create",
+            post(studio_catalog_namespace_create_handler),
+        )
+        .route(
             "/studio/catalog/{warehouse}/{namespace}",
             get(studio_catalog_namespace_handler),
         )
         .route(
+            "/studio/catalog/{warehouse}/{namespace}/delete",
+            post(studio_catalog_namespace_delete_handler),
+        )
+        .route(
+            "/studio/catalog/{warehouse}/{namespace}/tables/create",
+            post(studio_catalog_table_create_handler),
+        )
+        .route(
             "/studio/catalog/{warehouse}/{namespace}/{table}",
             get(studio_catalog_table_handler),
+        )
+        .route(
+            "/studio/catalog/{warehouse}/{namespace}/{table}/delete",
+            post(studio_catalog_table_delete_handler),
         )
         .route(
             "/install",
@@ -1227,6 +1243,237 @@ async fn studio_catalog_table_handler(
     ))
 }
 
+/// Shared POST/DELETE helper for the catalog mutate endpoints.
+/// Builds a request, fires it against Lakekeeper, returns the
+/// response body verbatim on non-2xx so URL-pattern / schema-shape
+/// drift across Lakekeeper releases is debuggable from the
+/// resulting flash message.
+async fn lakekeeper_catalog_mutate(
+    base_url: &str,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> Result<(), String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("building HTTP client: {e}"))?;
+    let url = format!("{}{}", base_url.trim_end_matches('/'), path);
+    let mut req = client.request(method.clone(), &url);
+    if let Some(b) = body {
+        req = req.json(&b);
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("{method} {url}: {e}"))?;
+    let status = resp.status();
+    let text = resp
+        .text()
+        .await
+        .unwrap_or_else(|e| format!("(could not read body: {e})"));
+    // Treat 200/201/204 as success. 409 (conflict / already exists)
+    // also counts as "the state we want exists" -- callers passing a
+    // create request are happy if the resource already exists.
+    if status.is_success() || status.as_u16() == 409 {
+        return Ok(());
+    }
+    Err(format!(
+        "{method} {url} returned {}:\n{text}",
+        status.as_u16()
+    ))
+}
+
+#[derive(serde::Deserialize)]
+struct CreateNamespaceForm {
+    name: String,
+}
+
+async fn studio_catalog_namespace_create_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(warehouse): axum::extract::Path<String>,
+    axum::extract::Form(form): axum::extract::Form<CreateNamespaceForm>,
+) -> axum::response::Redirect {
+    let Some(base_url) = discover_lakekeeper_endpoint(state.store.as_deref()).await else {
+        return axum::response::Redirect::to(&format!("/studio/catalog/{warehouse}"));
+    };
+    // Multi-level namespaces split on `.` -- "finance.raw" becomes
+    // ["finance", "raw"] per Iceberg's namespace model.
+    let segments: Vec<String> = form
+        .name
+        .split('.')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if segments.is_empty() {
+        return axum::response::Redirect::to(&format!("/studio/catalog/{warehouse}"));
+    }
+    let path = format!("/catalog/v1/{}/namespaces", url_encode(&warehouse));
+    let body = serde_json::json!({
+        "namespace": segments,
+        "properties": {},
+    });
+    if let Err(e) =
+        lakekeeper_catalog_mutate(&base_url, reqwest::Method::POST, &path, Some(body)).await
+    {
+        tracing::warn!(
+            warehouse = %warehouse,
+            namespace = %form.name,
+            error = %e,
+            "catalog: namespace create failed"
+        );
+    }
+    axum::response::Redirect::to(&format!("/studio/catalog/{warehouse}"))
+}
+
+async fn studio_catalog_namespace_delete_handler(
+    State(state): State<AppState>,
+    axum::extract::Path((warehouse, namespace)): axum::extract::Path<(String, String)>,
+) -> axum::response::Redirect {
+    let Some(base_url) = discover_lakekeeper_endpoint(state.store.as_deref()).await else {
+        return axum::response::Redirect::to(&format!("/studio/catalog/{warehouse}"));
+    };
+    let ns_encoded = namespace.split('.').collect::<Vec<_>>().join("%1F");
+    let path = format!(
+        "/catalog/v1/{}/namespaces/{}",
+        url_encode(&warehouse),
+        ns_encoded
+    );
+    if let Err(e) =
+        lakekeeper_catalog_mutate(&base_url, reqwest::Method::DELETE, &path, None).await
+    {
+        tracing::warn!(
+            warehouse = %warehouse,
+            namespace = %namespace,
+            error = %e,
+            "catalog: namespace delete failed"
+        );
+    }
+    axum::response::Redirect::to(&format!("/studio/catalog/{warehouse}"))
+}
+
+#[derive(serde::Deserialize)]
+struct CreateTableForm {
+    name: String,
+    /// Multi-line text where each line is `column_name:iceberg_type`.
+    /// Iceberg primitive types: long, int, string, boolean, double,
+    /// float, date, timestamp, timestamptz, binary.
+    columns: String,
+}
+
+async fn studio_catalog_table_create_handler(
+    State(state): State<AppState>,
+    axum::extract::Path((warehouse, namespace)): axum::extract::Path<(String, String)>,
+    axum::extract::Form(form): axum::extract::Form<CreateTableForm>,
+) -> axum::response::Redirect {
+    let redirect_to = format!("/studio/catalog/{warehouse}/{namespace}");
+    let Some(base_url) = discover_lakekeeper_endpoint(state.store.as_deref()).await else {
+        return axum::response::Redirect::to(&redirect_to);
+    };
+    let table_name = form.name.trim();
+    if table_name.is_empty() {
+        return axum::response::Redirect::to(&redirect_to);
+    }
+    // Parse "name:type" lines into Iceberg schema fields. Ignore
+    // blank lines + lines starting with #.
+    let fields: Vec<serde_json::Value> = form
+        .columns
+        .lines()
+        .filter_map(|line| {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with('#') {
+                return None;
+            }
+            let (name, ty) = t.split_once(':')?;
+            let n = name.trim();
+            let y = ty.trim();
+            if n.is_empty() || y.is_empty() {
+                return None;
+            }
+            Some((n.to_string(), y.to_string()))
+        })
+        .enumerate()
+        .map(|(idx, (name, ty))| {
+            serde_json::json!({
+                "id": (idx as i64) + 1,
+                "name": name,
+                "type": ty,
+                "required": false,
+            })
+        })
+        .collect();
+    if fields.is_empty() {
+        tracing::warn!(
+            warehouse = %warehouse,
+            namespace = %namespace,
+            table = %table_name,
+            "catalog: table create skipped -- no columns parsed from form"
+        );
+        return axum::response::Redirect::to(&redirect_to);
+    }
+    let ns_encoded = namespace.split('.').collect::<Vec<_>>().join("%1F");
+    let path = format!(
+        "/catalog/v1/{}/namespaces/{}/tables",
+        url_encode(&warehouse),
+        ns_encoded
+    );
+    let body = serde_json::json!({
+        "name": table_name,
+        "schema": {
+            "type": "struct",
+            "fields": fields,
+        },
+        "partition-spec": [],
+        "properties": {},
+    });
+    if let Err(e) =
+        lakekeeper_catalog_mutate(&base_url, reqwest::Method::POST, &path, Some(body)).await
+    {
+        tracing::warn!(
+            warehouse = %warehouse,
+            namespace = %namespace,
+            table = %table_name,
+            error = %e,
+            "catalog: table create failed"
+        );
+    }
+    axum::response::Redirect::to(&redirect_to)
+}
+
+async fn studio_catalog_table_delete_handler(
+    State(state): State<AppState>,
+    axum::extract::Path((warehouse, namespace, table)): axum::extract::Path<(
+        String,
+        String,
+        String,
+    )>,
+) -> axum::response::Redirect {
+    let redirect_to = format!("/studio/catalog/{warehouse}/{namespace}");
+    let Some(base_url) = discover_lakekeeper_endpoint(state.store.as_deref()).await else {
+        return axum::response::Redirect::to(&redirect_to);
+    };
+    let ns_encoded = namespace.split('.').collect::<Vec<_>>().join("%1F");
+    let path = format!(
+        "/catalog/v1/{}/namespaces/{}/tables/{}",
+        url_encode(&warehouse),
+        ns_encoded,
+        url_encode(&table)
+    );
+    if let Err(e) =
+        lakekeeper_catalog_mutate(&base_url, reqwest::Method::DELETE, &path, None).await
+    {
+        tracing::warn!(
+            warehouse = %warehouse,
+            namespace = %namespace,
+            table = %table,
+            error = %e,
+            "catalog: table delete failed"
+        );
+    }
+    axum::response::Redirect::to(&redirect_to)
+}
+
 /// Breadcrumb-only error page for the drill-down routes. Used
 /// when the prerequisites aren't met (Lakekeeper missing) so the
 /// operator sees consistent navigation regardless of state.
@@ -1271,6 +1518,7 @@ fn render_studio_namespace_list(
 ) -> String {
     let crumbs = [(warehouse, &*format!("/studio/catalog/{warehouse}"))];
     let breadcrumbs = render_drilldown_breadcrumbs(&crumbs);
+    let csrf = auth::csrf_input();
     let body_inner = match result {
         Ok(v) => {
             // Iceberg REST: `{"namespaces": [["finance"], ["finance","raw"], ...]}`
@@ -1280,7 +1528,7 @@ fn render_studio_namespace_list(
                 .cloned()
                 .unwrap_or_default();
             if namespaces.is_empty() {
-                r#"<p class="cz-muted">No namespaces in this warehouse yet. Create one via an Iceberg-aware tool (pyiceberg, Spark, Trino) or via Lakekeeper's management API.</p>"#.to_string()
+                r#"<p class="cz-muted">No namespaces in this warehouse yet. Use the form below to create your first one.</p>"#.to_string()
             } else {
                 let items: String = namespaces
                     .iter()
@@ -1295,10 +1543,16 @@ fn render_studio_namespace_list(
                         }
                         let qualified = segments.join(".");
                         Some(format!(
-                            r#"<li style="padding: 0.3rem 0;"><a href="/studio/catalog/{wh}/{ns}" style="text-decoration: none;"><code>{ns_display}</code></a></li>"#,
+                            r#"<li style="padding: 0.3rem 0; display: flex; align-items: center; justify-content: space-between; gap: 0.5rem;">
+<a href="/studio/catalog/{wh}/{ns}" style="text-decoration: none;"><code>{ns_display}</code></a>
+<form method="post" action="/studio/catalog/{wh}/{ns}/delete" style="margin: 0;" onsubmit="return confirm('Delete namespace {ns_display}? This is destructive and fails if the namespace has tables.');">{csrf}
+<button type="submit" class="cz-btn" style="font-size: 0.72rem; padding: 0.15rem 0.5rem; background: rgba(255,99,99,0.1); border-color: rgba(255,99,99,0.3);">Delete</button>
+</form>
+</li>"#,
                             wh = url_encode(warehouse),
                             ns = url_encode(&qualified),
                             ns_display = html_escape(&qualified),
+                            csrf = csrf,
                         ))
                     })
                     .collect();
@@ -1310,12 +1564,25 @@ fn render_studio_namespace_list(
             html_escape(&e)
         ),
     };
+    let create_form = format!(
+        r#"<form method="post" action="/studio/catalog/{wh}/namespaces/create" style="margin-top: 1rem; padding-top: 1rem; border-top: 1px solid rgba(255,255,255,0.06);">{csrf}
+<label for="ns-create-name" style="font-size: 0.82rem; display: block; margin-bottom: 0.25rem;">New namespace</label>
+<div style="display: flex; gap: 0.5rem; align-items: stretch;">
+<input id="ns-create-name" name="name" class="cz-input" type="text" placeholder="finance" required style="flex: 1; font-family: ui-monospace, monospace; font-size: 0.85rem;" />
+<button type="submit" class="cz-btn cz-btn-primary">Create</button>
+</div>
+<p class="cz-muted" style="margin: 0.4rem 0 0; font-size: 0.75rem;">Dotted names like <code>finance.raw</code> become nested namespaces (<code>["finance", "raw"]</code> in Iceberg's array model).</p>
+</form>"#,
+        wh = url_encode(warehouse),
+        csrf = csrf,
+    );
     let body = format!(
         r#"{breadcrumbs}
 <section class="cz-section" style="max-width: 60rem;">
 <div class="cz-card">
 <h2 style="margin-top: 0;">Namespaces in <code>{wh}</code></h2>
 {body_inner}
+{create_form}
 </div>
 </section>"#,
         wh = html_escape(warehouse),
@@ -1340,6 +1607,7 @@ fn render_studio_table_list(
         (namespace, &*ns_href),
     ];
     let breadcrumbs = render_drilldown_breadcrumbs(&crumbs);
+    let csrf = auth::csrf_input();
     let body_inner = match result {
         Ok(v) => {
             // Iceberg REST: `{"identifiers": [{"namespace": [...], "name": "..."}, ...]}`
@@ -1349,18 +1617,24 @@ fn render_studio_table_list(
                 .cloned()
                 .unwrap_or_default();
             if tables.is_empty() {
-                r#"<p class="cz-muted">No tables in this namespace yet.</p>"#.to_string()
+                r#"<p class="cz-muted">No tables in this namespace yet. Use the form below to create one.</p>"#.to_string()
             } else {
                 let items: String = tables
                     .iter()
                     .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
                     .map(|name| {
                         format!(
-                            r#"<li style="padding: 0.3rem 0;"><a href="/studio/catalog/{wh}/{ns}/{tbl}" style="text-decoration: none;"><code>{tbl_display}</code></a></li>"#,
+                            r#"<li style="padding: 0.3rem 0; display: flex; align-items: center; justify-content: space-between; gap: 0.5rem;">
+<a href="/studio/catalog/{wh}/{ns}/{tbl}" style="text-decoration: none;"><code>{tbl_display}</code></a>
+<form method="post" action="/studio/catalog/{wh}/{ns}/{tbl}/delete" style="margin: 0;" onsubmit="return confirm('Delete table {tbl_display}? This is destructive.');">{csrf}
+<button type="submit" class="cz-btn" style="font-size: 0.72rem; padding: 0.15rem 0.5rem; background: rgba(255,99,99,0.1); border-color: rgba(255,99,99,0.3);">Delete</button>
+</form>
+</li>"#,
                             wh = url_encode(warehouse),
                             ns = url_encode(namespace),
                             tbl = url_encode(name),
                             tbl_display = html_escape(name),
+                            csrf = csrf,
                         )
                     })
                     .collect();
@@ -1372,12 +1646,26 @@ fn render_studio_table_list(
             html_escape(&e)
         ),
     };
+    let create_form = format!(
+        r#"<form method="post" action="/studio/catalog/{wh}/{ns}/tables/create" style="margin-top: 1rem; padding-top: 1rem; border-top: 1px solid rgba(255,255,255,0.06);">{csrf}
+<label for="tbl-create-name" style="font-size: 0.82rem; display: block; margin-bottom: 0.25rem;">New table -- name</label>
+<input id="tbl-create-name" name="name" class="cz-input" type="text" placeholder="customers" required style="width: 100%; font-family: ui-monospace, monospace; font-size: 0.85rem; margin-bottom: 0.5rem;" />
+<label for="tbl-create-cols" style="font-size: 0.82rem; display: block; margin-bottom: 0.25rem;">Columns (one per line, <code>name:type</code>)</label>
+<textarea id="tbl-create-cols" name="columns" rows="5" class="cz-input" placeholder="id:long&#10;name:string&#10;email:string&#10;created_at:timestamp" required style="width: 100%; font-family: ui-monospace, monospace; font-size: 0.82rem;"></textarea>
+<p class="cz-muted" style="margin: 0.3rem 0 0.5rem; font-size: 0.72rem;">Iceberg primitives: <code>long</code>, <code>int</code>, <code>string</code>, <code>boolean</code>, <code>double</code>, <code>float</code>, <code>date</code>, <code>timestamp</code>, <code>timestamptz</code>, <code>binary</code>. Blank lines + lines starting with <code>#</code> are ignored.</p>
+<button type="submit" class="cz-btn cz-btn-primary">Create table</button>
+</form>"#,
+        wh = url_encode(warehouse),
+        ns = url_encode(namespace),
+        csrf = csrf,
+    );
     let body = format!(
         r#"{breadcrumbs}
 <section class="cz-section" style="max-width: 60rem;">
 <div class="cz-card">
 <h2 style="margin-top: 0;">Tables in <code>{wh}</code>.<code>{ns}</code></h2>
 {body_inner}
+{create_form}
 </div>
 </section>"#,
         wh = html_escape(warehouse),
