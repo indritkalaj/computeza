@@ -2108,7 +2108,17 @@ fn render_workspace_bootstrap_form(
 # needs `-c &lt;config&gt;` to find the running daemon&apos;s admin endpoint + token.
 alias gg=&quot;sudo /usr/local/bin/computeza-garage -c /var/lib/computeza/garage/garage.toml&quot;
 
-gg key create --name lakekeeper
+# === STEP 0: one-time cluster bootstrap (skip if `gg layout show` lists
+# `Status: active`) ============================================================
+# Garage refuses all data operations until its single-node layout is
+# applied. v0.1 will auto-run these at install time; for now run them
+# once per fresh Garage install:
+gg status                                      # copy the local Node ID (16-hex prefix)
+gg layout assign &lt;node-id&gt; -z dc1 -c 10G       # 10 GiB capacity, zone dc1
+gg layout apply --version 1                    # commit the layout
+
+# === STEP 1: create key + bucket + grant + read credentials ==================
+gg key create lakekeeper                       # positional name; --name is rejected in Garage 0.9+
 gg bucket create lakekeeper-default
 gg bucket allow lakekeeper-default --read --write --owner --key lakekeeper
 gg key info lakekeeper        # &lt;-- copy &quot;Key ID&quot; + &quot;Secret key&quot; from this output</pre>

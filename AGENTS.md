@@ -797,6 +797,33 @@ dep, per-operator key UI, SMTP config). Treat it as a separate
 milestone with its own design pass; don't ram it through together
 with pieces 1+2.
 
+### Garage cluster-layout bootstrap (single-node)
+
+**Status:** deferred to v0.1. The installer starts the Garage daemon
+fine, but Garage refuses all data operations (bucket create, key
+create, bucket allow) until its cluster layout is applied. Operators
+hit "Internal error: Layout not ready" on every admin call until
+they run, by hand:
+
+```
+gg status                            # find the local node ID
+gg layout assign <node-id> -z dc1 -c 10G
+gg layout apply --version 1
+```
+
+This is documented in the workspace bootstrap form's help text as
+STEP 0, but for v0.0.x it's an operator-driven step. v0.1 should
+run these three commands automatically at install time (after the
+daemon is up + the admin port is listening), gated on
+`gg layout show` not already reporting "active". Lives in
+`crates/computeza-driver-native/src/linux/garage.rs` -- add a new
+phase between `wait_for_port` and `path::register`.
+
+Capacity (`-c 10G`) is an arbitrary v0.0.x default suitable for a
+WSL/laptop test deployment; the auto-bootstrap should pick something
+sensible based on available disk on the host (statvfs(`<root>/data`)
+* 0.5 rounded down to a GiB boundary is a reasonable formula).
+
 ### Lakekeeper bootstrap (project + warehouse + storage credentials)
 
 **Status:** deferred to v0.1. Phase 1 of the workspace UI (catalog
