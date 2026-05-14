@@ -2593,6 +2593,119 @@ async fn execute_sql_against_databend(base_url: &str, sql: &str) -> SqlOutcome {
 /// list renders on the left, the SQL editor + history + results
 /// render on the right.
 #[allow(clippy::too_many_arguments)]
+/// Render the sidebar's "Catalog" section. The tree shows the
+/// warehouse list flat at /studio root; drill-down pages can pass
+/// `current_warehouse` / `current_namespace` / `current_table` to
+/// expand the relevant branches inline.
+#[allow(clippy::too_many_arguments)]
+fn render_sidebar_catalog_tree(
+    has_lakekeeper: bool,
+    lk_state: &LakekeeperState,
+    current_warehouse: Option<&str>,
+    current_namespace: Option<&str>,
+    current_table: Option<&str>,
+    err_no_lakekeeper: &str,
+    err_unreachable: &str,
+    err_no_warehouses: &str,
+) -> String {
+    if !has_lakekeeper {
+        return format!(
+            r#"<p class="cz-studio-sidebar-note">{}</p>"#,
+            html_escape(err_no_lakekeeper)
+        );
+    }
+    match lk_state {
+        LakekeeperState::Unreachable => format!(
+            r#"<p class="cz-studio-sidebar-note">{}</p>"#,
+            html_escape(err_unreachable)
+        ),
+        LakekeeperState::NoWarehouses => format!(
+            r#"<p class="cz-studio-sidebar-note">{}</p>
+<p style="padding: 0.5rem;"><a href="/studio/bootstrap" class="cz-btn-primary" style="font-size: 0.78rem;">Bootstrap</a></p>"#,
+            html_escape(err_no_warehouses)
+        ),
+        LakekeeperState::HasWarehouses(names) => {
+            let items: String = names
+                .iter()
+                .map(|n| {
+                    let is_current = current_warehouse == Some(n.as_str());
+                    let active_class = if is_current { " cz-tree-active" } else { "" };
+                    format!(
+                        r#"<li class="cz-tree-item"><a class="cz-tree-row{active}" href="/studio/catalog/{enc}"><span class="cz-tree-icon">⬢</span><span class="cz-tree-label">{display}</span></a></li>"#,
+                        active = active_class,
+                        enc = url_encode(n),
+                        display = html_escape(n),
+                    )
+                })
+                .collect();
+            format!(r#"<ul class="cz-tree">{items}</ul>"#)
+        }
+        LakekeeperState::UnexpectedShape(_) => format!(
+            r#"<p class="cz-studio-sidebar-note">Lakekeeper response shape unrecognized; see the catalog pane for details.</p>"#
+        ),
+    }
+    // current_namespace + current_table are reserved for the drill-
+    // down pages that pass full context; the /studio root only
+    // surfaces warehouses.
+    .to_string()
+    + {
+        let _ = (current_namespace, current_table);
+        ""
+    }
+}
+
+/// Render the sidebar's "Recent queries" section. Each entry is a
+/// clickable row that bounces through /studio?sql=... to prefill
+/// the editor.
+fn render_sidebar_recent_queries(history: &StudioHistory, reload_label: &str) -> String {
+    if history.entries.is_empty() {
+        return r#"<p class="cz-studio-sidebar-note">No queries yet. Run one above; it'll show here.</p>"#.to_string();
+    }
+    let items: String = history
+        .entries
+        .iter()
+        .take(8) // sidebar is tight; show the top 8 most recent
+        .map(|e| {
+            let badge_class = if e.ok { "cz-badge-ok" } else { "cz-badge-warn" };
+            let badge_text = if e.ok {
+                e.row_count
+                    .map(|n| format!("{n}"))
+                    .unwrap_or_else(|| "ok".to_string())
+            } else {
+                "err".to_string()
+            };
+            let preview: String = e
+                .sql
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(40)
+                .collect();
+            let preview = if preview.len() < e.sql.len() {
+                format!("{preview}…")
+            } else {
+                preview
+            };
+            let ts = e.executed_at.format("%H:%M").to_string();
+            format!(
+                r#"<li class="cz-tree-item"><a class="cz-tree-row" href="/studio?sql={enc}" title="{tooltip}">
+<span class="cz-tree-icon" style="font-size: 0.65rem;"><span class="cz-badge {badge_class}" style="font-size: 0.6rem; padding: 1px 4px;">{badge}</span></span>
+<span class="cz-tree-label" style="font-size: 0.72rem;">{preview}</span>
+<span class="cz-muted" style="font-size: 0.62rem; font-variant-numeric: tabular-nums;">{ts}</span>
+</a></li>"#,
+                enc = url_encode(&e.sql),
+                tooltip = html_escape(&format!("{} ({})", reload_label, &e.sql)),
+                badge_class = badge_class,
+                badge = html_escape(&badge_text),
+                preview = html_escape(&preview),
+                ts = html_escape(&ts),
+            )
+        })
+        .collect();
+    format!(r#"<ul class="cz-tree">{items}</ul>"#)
+}
+
 fn render_studio_page(
     localizer: &Localizer,
     has_lakekeeper: bool,
@@ -2603,151 +2716,68 @@ fn render_studio_page(
     result: Option<SqlOutcome>,
 ) -> String {
     let title = localizer.t("ui-studio-title");
-    let intro = localizer.t("ui-studio-intro");
-    let catalog_heading = localizer.t("ui-studio-catalog-heading");
-    let sql_heading = localizer.t("ui-studio-sql-heading");
     let sql_placeholder = localizer.t("ui-studio-sql-placeholder");
     let sql_run = localizer.t("ui-studio-sql-run");
     let sql_help = localizer.t("ui-studio-sql-help");
-    let results_heading = localizer.t("ui-studio-results-heading");
     let results_empty = localizer.t("ui-studio-results-empty");
     let err_no_lakekeeper = localizer.t("ui-studio-error-no-lakekeeper");
     let err_no_databend = localizer.t("ui-studio-error-no-databend");
     let lk_unreachable = localizer.t("ui-studio-lakekeeper-unreachable");
     let lk_no_warehouses = localizer.t("ui-studio-lakekeeper-no-warehouses");
-    let lk_warehouses_heading = localizer.t("ui-studio-lakekeeper-warehouses-heading");
-    let lk_warehouses_note = localizer.t("ui-studio-lakekeeper-warehouses-note");
-    let history_heading = localizer.t("ui-studio-history-heading");
-    let history_empty = localizer.t("ui-studio-history-empty");
     let history_reload = localizer.t("ui-studio-history-reload");
     let csrf = auth::csrf_input();
+    let _ = (
+        localizer.t("ui-studio-intro"),
+        localizer.t("ui-studio-catalog-heading"),
+        localizer.t("ui-studio-sql-heading"),
+        localizer.t("ui-studio-results-heading"),
+        localizer.t("ui-studio-lakekeeper-warehouses-heading"),
+        localizer.t("ui-studio-lakekeeper-warehouses-note"),
+        localizer.t("ui-studio-history-heading"),
+        localizer.t("ui-studio-history-empty"),
+    ); // i18n placeholders preserved for future re-use; new shell uses
+       // simpler hard-coded eyebrow labels for now.
 
-    // History pane: collapsible <details> above the editor.
-    // Closed-by-default so the editor stays the primary surface.
-    // Each entry is a "Reload" link that bounces through
-    // /studio?sql=... -- same prefill mechanism the catalog
-    // table-link uses, no JS required.
-    let history_block = {
-        let inner = if history.entries.is_empty() {
-            format!(r#"<p class="cz-muted" style="margin: 0;">{}</p>"#, html_escape(&history_empty))
-        } else {
-            let rows: String = history
-                .entries
-                .iter()
-                .map(|e| {
-                    let badge = if e.ok {
-                        let count = e
-                            .row_count
-                            .map(|n| format!("{n} rows"))
-                            .unwrap_or_else(|| "ok".to_string());
-                        format!(
-                            r#"<span class="cz-badge cz-badge-ok" style="font-size: 0.7rem;">{}</span>"#,
-                            html_escape(&count)
-                        )
-                    } else {
-                        r#"<span class="cz-badge cz-badge-warn" style="font-size: 0.7rem;">err</span>"#.to_string()
-                    };
-                    // Truncate the SQL preview so a 5KB query
-                    // doesn't blow up the history pane. Full text
-                    // ships when the operator clicks Reload.
-                    let preview: String = e.sql.lines().next().unwrap_or("").chars().take(80).collect();
-                    let preview = if preview.len() < e.sql.len() {
-                        format!("{preview}...")
-                    } else {
-                        preview
-                    };
-                    let ts = e.executed_at.format("%H:%M:%S").to_string();
-                    format!(
-                        r#"<li style="padding: 0.35rem 0; border-bottom: 1px solid rgba(255,255,255,0.04); display: flex; align-items: baseline; gap: 0.6rem;">
-<span class="cz-muted" style="font-size: 0.72rem; font-variant-numeric: tabular-nums;">{ts}</span>
-{badge}
-<code style="flex: 1; font-size: 0.78rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{preview}</code>
-<a href="/studio?sql={enc}" class="cz-muted" style="font-size: 0.72rem;">{reload}</a>
-</li>"#,
-                        ts = html_escape(&ts),
-                        badge = badge,
-                        preview = html_escape(&preview),
-                        enc = url_encode(&e.sql),
-                        reload = html_escape(&history_reload),
-                    )
-                })
-                .collect();
-            format!(r#"<ul style="list-style: none; padding: 0; margin: 0;">{rows}</ul>"#)
-        };
-        format!(
-            r#"<details style="margin-bottom: 0.75rem;">
-<summary class="cz-muted" style="cursor: pointer; font-size: 0.82rem; padding: 0.25rem 0;">{heading} ({count})</summary>
-<div style="margin-top: 0.5rem; padding: 0.5rem 0.75rem; background: rgba(255,255,255,0.02); border-radius: 0.4rem;">{inner}</div>
-</details>"#,
-            heading = html_escape(&history_heading),
-            count = history.entries.len(),
-            inner = inner,
-        )
-    };
+    // ---- Sidebar pieces -----------------------------------------------
+    // Catalog tree (warehouses only at /studio root; drill-down pages
+    // expand the current warehouse + namespace + table).
+    let catalog_tree_html = render_sidebar_catalog_tree(
+        has_lakekeeper,
+        lk_state,
+        None, // no current warehouse selected on /studio root
+        None,
+        None,
+        &err_no_lakekeeper,
+        &lk_unreachable,
+        &lk_no_warehouses,
+    );
+    // Recent queries list (always shown if non-empty).
+    let recent_html = render_sidebar_recent_queries(history, &history_reload);
 
-    // Catalog block surfaces three distinct Lakekeeper states.
-    // None of them currently allow drill-down into Iceberg
-    // namespaces / tables -- that arrives in phase 1.5 once we
-    // know which URL pattern Lakekeeper uses for per-warehouse
-    // Iceberg REST routes (and after the bootstrap wizard creates
-    // the warehouse + Garage storage credentials in the first
-    // place).
-    let catalog_block = if !has_lakekeeper {
-        format!(
-            r#"<p class="cz-muted">{}</p>"#,
-            html_escape(&err_no_lakekeeper)
-        )
-    } else {
-        match lk_state {
-            LakekeeperState::Unreachable => format!(
-                r#"<p class="cz-muted">{}</p>"#,
-                html_escape(&lk_unreachable)
-            ),
-            LakekeeperState::NoWarehouses => {
-                let bootstrap_link = localizer.t("ui-studio-bootstrap-link");
-                format!(
-                    r#"<p class="cz-muted">{}</p>
-<p style="margin-top: 0.75rem;"><a href="/studio/bootstrap" class="cz-btn cz-btn-primary">{}</a></p>"#,
-                    html_escape(&lk_no_warehouses),
-                    html_escape(&bootstrap_link),
-                )
-            }
-            LakekeeperState::HasWarehouses(names) => {
-                let items: String = names
-                    .iter()
-                    .map(|n| {
-                        format!(
-                            r#"<li style="padding: 0.3rem 0;"><a href="/studio/catalog/{enc}" style="text-decoration: none;"><code>{display}</code></a></li>"#,
-                            enc = url_encode(n),
-                            display = html_escape(n),
-                        )
-                    })
-                    .collect();
-                format!(
-                    r#"<h3 style="margin: 0 0 0.5rem; font-size: 0.95rem;">{heading}</h3>
-<ul style="list-style: none; padding: 0; margin: 0 0 0.75rem;">{items}</ul>
-<p class="cz-muted" style="font-size: 0.78rem; margin: 0;">{note}</p>"#,
-                    heading = html_escape(&lk_warehouses_heading),
-                    items = items,
-                    note = html_escape(&lk_warehouses_note),
-                )
-            }
-            LakekeeperState::UnexpectedShape(raw) => format!(
-                r#"<p class="cz-muted" style="margin-bottom: 0.5rem;">Lakekeeper is up but the warehouse-list response shape isn't one we know how to parse. Raw response below -- paste it back so we can adjust the parser.</p>
-<pre style="background: rgba(255, 193, 7, 0.06); border: 1px solid rgba(255, 193, 7, 0.3); border-radius: 0.4rem; padding: 0.6rem 0.75rem; font-size: 0.72rem; overflow-x: auto; white-space: pre-wrap;">{}</pre>"#,
-                html_escape(&raw)
-            ),
-        }
-    };
+    let sidebar_html = format!(
+        r#"<section class="cz-studio-sidebar-section">
+<div class="cz-studio-sidebar-eyebrow"><span>Catalog</span><a href="/studio/bootstrap" class="cz-studio-sidebar-action" title="Manual bootstrap (recovery)">+</a></div>
+{catalog_tree_html}
+</section>
+<section class="cz-studio-sidebar-section">
+<div class="cz-studio-sidebar-eyebrow"><span>Recent ({n})</span></div>
+{recent_html}
+</section>"#,
+        n = history.entries.len(),
+    );
 
-    let results_block = match (has_databend, result) {
+    // ---- Main pane: results-first when a query just ran, else editor --
+    let results_html = match (has_databend, result) {
         (false, _) => format!(
-            r#"<p class="cz-muted">{}</p>"#,
+            r#"<div class="cz-studio-results-empty">{}</div>"#,
             html_escape(&err_no_databend)
         ),
-        (true, None) => format!(r#"<p class="cz-muted">{}</p>"#, html_escape(&results_empty)),
+        (true, None) => format!(
+            r#"<div class="cz-studio-results-empty">{}</div>"#,
+            html_escape(&results_empty)
+        ),
         (true, Some(SqlOutcome::Err(msg))) => format!(
-            r#"<pre style="background: rgba(255,99,99,0.08); border: 1px solid rgba(255,99,99,0.25); border-radius: 0.4rem; padding: 0.75rem; overflow-x: auto; white-space: pre-wrap; font-size: 0.85rem;">{}</pre>"#,
+            r#"<pre class="cz-studio-error">{}</pre>"#,
             html_escape(&msg)
         ),
         (true, Some(SqlOutcome::Ok { columns, rows })) => {
@@ -2767,53 +2797,57 @@ fn render_studio_page(
                 .collect();
             let row_count = rows.len();
             format!(
-                r#"<p class="cz-muted" style="font-size: 0.82rem; margin: 0 0 0.5rem;">{row_count} row(s)</p>
+                r#"<div class="cz-studio-results-header">
+<span class="cz-studio-results-eyebrow">Results</span>
+<span class="cz-studio-results-count">{row_count} row{plural}</span>
+</div>
 <div style="overflow-x: auto;">
-<table class="cz-table" style="width: 100%; border-collapse: collapse; font-size: 0.85rem;">
+<table class="cz-studio-results-table">
 <thead><tr>{header}</tr></thead>
 <tbody>{body_rows}</tbody>
 </table>
-</div>"#
+</div>"#,
+                plural = if row_count == 1 { "" } else { "s" },
             )
         }
     };
 
-    let body = format!(
-        r#"<section class="cz-hero">
-<h1>{title}</h1>
-<p>{intro}</p>
-</section>
-<section class="cz-section" style="max-width: 80rem;">
-<div style="display: grid; grid-template-columns: 18rem 1fr; gap: 1rem;">
-<div class="cz-card">
-<h2 style="margin-top: 0;">{catalog_heading}</h2>
-{catalog_block}
+    let main_html = format!(
+        r#"<div class="cz-studio-crumbs">
+<a href="/studio">Studio</a><span class="cz-studio-crumbs-sep">/</span><span class="cz-studio-crumbs-current">SQL</span>
 </div>
-<div class="cz-card">
-<h2 style="margin-top: 0;">{sql_heading}</h2>
-{history_block}
+<h1 class="cz-studio-pane-title">SQL</h1>
+<p class="cz-studio-pane-subtitle">Run queries against the lakehouse engine (Databend). Use the catalog on the left to find tables. Ctrl/Cmd+Enter runs the current query.</p>
 <form method="post" action="/studio/sql/execute" id="cz-sql-form">
 {csrf}
-<!--
-    Progressive enhancement: the textarea is the canonical form
-    field and is fully usable on its own. The sibling <div> below
-    is Monaco's mount point; the JS at the bottom of this file
-    hides the textarea and copies Monaco's content into it on
-    submit. If the Monaco CDN is blocked, JS is disabled, or the
-    asset fails to load, the textarea stays visible and the form
-    works unchanged.
--->
-<textarea id="cz-sql-textarea" name="sql" rows="8" class="cz-input" style="font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.9rem; width: 100%;" placeholder="{sql_placeholder}">{sql_value}</textarea>
-<div id="cz-sql-monaco" data-initial="{sql_value_attr}" style="display: none; height: 16rem; border: 1px solid rgba(255,255,255,0.08); border-radius: 0.4rem; overflow: hidden;"></div>
-<p class="cz-muted" style="margin: 0.4rem 0 0.6rem; font-size: 0.78rem;">{sql_help}</p>
-<button type="submit" class="cz-btn cz-btn-primary">{sql_run}</button>
-<span class="cz-muted" style="margin-left: 0.75rem; font-size: 0.78rem;" id="cz-sql-shortcut-hint">Tip: Ctrl/Cmd+Enter runs the query.</span>
+<div class="cz-studio-editor-wrap">
+<textarea id="cz-sql-textarea" name="sql" class="cz-studio-editor-textarea" placeholder="{sql_placeholder}">{sql_value}</textarea>
+<div id="cz-sql-monaco" data-initial="{sql_value_attr}" style="display: none; height: 18rem;"></div>
+</div>
+<div class="cz-studio-actions">
+<button type="submit" class="cz-btn-primary">{sql_run}</button>
+<span class="cz-studio-editor-hint" style="margin-left: 0.25rem;">Ctrl/Cmd+Enter to run.</span>
+<div class="cz-studio-actions-spacer"></div>
+</div>
+<p class="cz-studio-editor-hint">{sql_help}</p>
 </form>
-<h3 style="margin-top: 1.5rem;">{results_heading}</h3>
-{results_block}
+<div class="cz-studio-results">
+{results_html}
+</div>"#,
+        csrf = csrf,
+        sql_placeholder = html_escape(&sql_placeholder),
+        sql_value = html_escape(sql_prefill),
+        sql_value_attr = html_escape(sql_prefill),
+        sql_run = html_escape(&sql_run),
+        sql_help = html_escape(&sql_help),
+        results_html = results_html,
+    );
+
+    let body = format!(
+        r#"<div class="cz-studio-shell">
+<aside class="cz-studio-sidebar">{sidebar_html}</aside>
+<main class="cz-studio-main">{main_html}</main>
 </div>
-</div>
-</section>
 <script>
 // Monaco editor progressive enhancement.
 //
@@ -2969,20 +3003,8 @@ fn render_studio_page(
   document.head.appendChild(script);
 }})();
 </script>"#,
-        title = html_escape(&title),
-        intro = html_escape(&intro),
-        catalog_heading = html_escape(&catalog_heading),
-        catalog_block = catalog_block,
-        sql_heading = html_escape(&sql_heading),
-        history_block = history_block,
-        sql_placeholder = html_escape(&sql_placeholder),
-        sql_value = html_escape(sql_prefill),
-        sql_value_attr = html_escape(sql_prefill),
-        sql_help = html_escape(&sql_help),
-        sql_run = html_escape(&sql_run),
-        results_heading = html_escape(&results_heading),
-        results_block = results_block,
-        csrf = csrf,
+        sidebar_html = sidebar_html,
+        main_html = main_html,
     );
 
     render_shell(localizer, &title, NavLink::Studio, &body)
