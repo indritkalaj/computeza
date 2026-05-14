@@ -845,9 +845,9 @@ pub fn router_with_state(state: AppState) -> Router {
 //      query handler and renders the response as an HTML table
 //      below the editor.
 //
-// Phase 1 deliberately uses a textarea (not a heavy editor) and full-page
+// Phase 1 deliberately uses a textarea (not Monaco) and full-page
 // form submits (no HTMX/JS). Each piece is independently useful and
-// the architecture stays inside the existing SSR pattern. CodeMirror 6 /
+// the architecture stays inside the existing SSR pattern. Monaco /
 // inline result streaming / catalog tree-view are follow-up work
 // once the roundtrip is proven.
 //
@@ -1119,12 +1119,10 @@ struct StudioSqlForm {
 // warehouse + Garage storage profile) ships. See AGENTS.md
 // "Deferred work: Lakekeeper bootstrap".
 
-/// JSON shape returned to the SQL editor's completion provider.
-/// Each item becomes a single completion entry. `kind` is one of
-/// `database`, `table`, `column`, `warehouse`, `history` -- the
-/// client maps these to icons via the registered provider (CM6
-/// `type` field today; was Monaco's CompletionItemKind before the
-/// CM6 swap).
+/// JSON shape returned to Monaco's completion provider. Each item
+/// becomes a single CompletionItem in the suggestion list. `kind`
+/// is one of `database`, `table`, `column`, `warehouse`, `history`
+/// -- Monaco maps these to icons via the registered provider.
 #[derive(serde::Serialize, Default)]
 struct CompletionSource {
     items: Vec<CompletionItem>,
@@ -1148,7 +1146,7 @@ struct CompletionItem {
 
 /// GET /studio/api/completions
 ///
-/// Aggregates symbol sources for the SQL editor's autocomplete:
+/// Aggregates symbol sources for Monaco's autocomplete:
 ///   - Databend databases + tables (via `system.databases` /
 ///     `system.tables` queries to the live HTTP handler).
 ///   - Lakekeeper warehouse names (via the same management API
@@ -1158,7 +1156,7 @@ struct CompletionItem {
 ///
 /// Each source is best-effort: a Databend outage skips its symbols
 /// but still returns warehouses + history. The endpoint never
-/// fails the request -- the editor just gets a shorter list.
+/// fails the request -- Monaco just gets a shorter list.
 async fn studio_completions_handler(
     State(state): State<AppState>,
 ) -> axum::Json<CompletionSource> {
@@ -1397,7 +1395,7 @@ async fn execute_sql_against_databend(base_url: &str, sql: &str) -> SqlOutcome {
 
 /// Render the two-pane studio page. Pure-server template; the
 /// only JS on the page is the existing CSRF auto-fill from
-/// render_shell + the CodeMirror 6 loader at the bottom. The catalog
+/// render_shell + the Monaco loader at the bottom. The catalog
 /// list renders on the left, the SQL editor + history + results
 /// render on the right.
 #[allow(clippy::too_many_arguments)]
@@ -1599,25 +1597,14 @@ fn render_studio_page(
 <!--
     Progressive enhancement: the textarea is the canonical form
     field and is fully usable on its own. The sibling <div> below
-    is CodeMirror 6's mount point; the JS at the bottom of this
-    file hides the textarea, mounts CM6 with the Darcula theme,
-    and copies CM6's content back into the textarea on submit. If
-    the CM6 ESM CDN is blocked, JS is disabled, or the modules
-    fail to load, the textarea stays visible and the form works
-    unchanged.
+    is Monaco's mount point; the JS at the bottom of this file
+    hides the textarea and copies Monaco's content into it on
+    submit. If the Monaco CDN is blocked, JS is disabled, or the
+    asset fails to load, the textarea stays visible and the form
+    works unchanged.
 -->
-<div id="cz-sql-toolbar" style="display: none; align-items: center; gap: 0.5rem; margin-bottom: 0.4rem;">
-  <label for="cz-sql-theme" class="cz-muted" style="font-size: 0.78rem;">Theme:</label>
-  <select id="cz-sql-theme" class="cz-input" style="width: auto; padding: 0.25rem 0.5rem; font-size: 0.78rem;">
-    <option value="darcula">Darcula</option>
-    <option value="tokyo-night-storm">Tokyo Night Storm</option>
-    <option value="nord">Nord</option>
-    <option value="material-dark">Material Dark</option>
-    <option value="forest">Forest</option>
-  </select>
-</div>
 <textarea id="cz-sql-textarea" name="sql" rows="8" class="cz-input" style="font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.9rem; width: 100%;" placeholder="{sql_placeholder}">{sql_value}</textarea>
-<div id="cz-sql-cm6" data-initial="{sql_value_attr}" style="display: none; height: 16rem; border: 1px solid rgba(255,255,255,0.08); border-radius: 0.4rem; overflow: hidden;"></div>
+<div id="cz-sql-monaco" data-initial="{sql_value_attr}" style="display: none; height: 16rem; border: 1px solid rgba(255,255,255,0.08); border-radius: 0.4rem; overflow: hidden;"></div>
 <p class="cz-muted" style="margin: 0.4rem 0 0.6rem; font-size: 0.78rem;">{sql_help}</p>
 <button type="submit" class="cz-btn cz-btn-primary">{sql_run}</button>
 <span class="cz-muted" style="margin-left: 0.75rem; font-size: 0.78rem;" id="cz-sql-shortcut-hint">Tip: Ctrl/Cmd+Enter runs the query.</span>
@@ -1627,253 +1614,161 @@ fn render_studio_page(
 </div>
 </div>
 </section>
-<script type="module">
-// CodeMirror 6 editor with the Darcula theme, progressive
-// enhancement model.
+<script>
+// Monaco editor progressive enhancement.
 //
-// Why CodeMirror 6 instead of Monaco: ~10x smaller bundle, modular
-// (only load what we use), better mobile support, and Darcula is
-// the operator's preferred dark theme. CM6 is distributed as ES
-// modules, so we use esm.sh which serves pre-bundled ESM versions
-// of npm packages -- no build step on our side.
-//
-// Pinning every dep version (CM6's discipline -- each sub-package
-// versions independently). Auto-latest would expose us to silent
-// upstream breaking changes; the values below match what was
-// stable at the time of writing and can be bumped deliberately.
-//
-// On success: hides the textarea, mounts CM6 in its place, copies
-// CM6's value back into the textarea on submit so the form POST
-// carries the right body.
-//
-// On failure (CDN blocked, JS disabled, network down, browser too
-// old for ES modules): the textarea stays visible and the form
-// works unchanged. No functionality loss, just no syntax
-// highlighting.
+// Loads Monaco 0.45.0 from a CDN (pinned -- "latest" would expose
+// us to upstream breaking changes). On success: hides the textarea,
+// mounts Monaco in its place, copies Monaco's value back into the
+// textarea on submit so the form POST carries the right body. On
+// failure (CDN blocked, JS disabled, network down) the textarea
+// stays visible and the form works unchanged -- no functionality
+// loss, just no syntax highlighting.
 //
 // Ctrl/Cmd+Enter binds to form submit, matching the convention in
 // every other SQL IDE.
-
-import {{ EditorView, basicSetup }} from "https://esm.sh/codemirror@6.0.1";
-import {{ EditorState, Compartment }} from "https://esm.sh/@codemirror/state@6.4.1";
-import {{ keymap }} from "https://esm.sh/@codemirror/view@6.30.0";
-import {{ sql }} from "https://esm.sh/@codemirror/lang-sql@6.7.1";
-import {{ autocompletion }} from "https://esm.sh/@codemirror/autocomplete@6.18.0";
-import {{ darcula }} from "https://esm.sh/@uiw/codemirror-theme-darcula@4.23.0";
-// Optional themes (Tokyo Night Storm / Nord / Material Dark / Forest)
-// are loaded DYNAMICALLY below. Why: pinning a specific version that
-// turns out not to exist on npm, OR a named-export name that drifted
-// upstream, would make a static import fail and abort the entire
-// module -- which would silently break autocomplete + the editor
-// itself, not just the theme picker. Dynamic loading isolates each
-// theme's failure to that one theme.
-
 (function() {{
-  var mount = document.getElementById("cz-sql-cm6");
+  var mount = document.getElementById("cz-sql-monaco");
   var textarea = document.getElementById("cz-sql-textarea");
   var form = document.getElementById("cz-sql-form");
   if (!mount || !textarea || !form) return;
 
-  // Decode the HTML-encoded initial value back to plain text. The
-  // server encoded &lt; &gt; &amp; &quot; &#39;; we reverse those
-  // five. If other entities show up we'll add them when they do.
-  var initial = (mount.getAttribute("data-initial") || "")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'");
+  // Pin the Monaco version explicitly. Auto-latest would silently
+  // change behaviour; a pinned version is what every other CDN dep
+  // in this repo does (see fetch.rs Bundle pins for the same
+  // reasoning applied to component binaries).
+  var MONACO_VERSION = "0.45.0";
+  var BASE = "https://cdn.jsdelivr.net/npm/monaco-editor@" + MONACO_VERSION + "/min";
 
-  // Schema-aware completion provider. Fetches from
-  // /studio/api/completions which aggregates Databend databases +
-  // tables, Lakekeeper warehouses, and recent history. Cached for
-  // 30s in-process so each keystroke doesn't re-hit the server.
-  var completionCache = {{ items: null, expires: 0 }};
-  function fetchCompletions() {{
-    var now = Date.now();
-    if (completionCache.items && completionCache.expires > now) {{
-      return Promise.resolve(completionCache.items);
-    }}
-    return fetch("/studio/api/completions", {{ credentials: "same-origin" }})
-      .then(function(r) {{ return r.ok ? r.json() : {{ items: [] }}; }})
-      .then(function(j) {{
-        completionCache = {{ items: j.items || [], expires: Date.now() + 30000 }};
-        return completionCache.items;
-      }})
-      .catch(function() {{ return []; }});
-  }}
-  // Pre-warm so the first Ctrl+Space hits a populated cache.
-  fetchCompletions();
+  // Monaco's loader.js bootstraps an AMD `require` and pulls the
+  // editor bundle. Inject loader.js, then call require() for the
+  // editor.main module. If loader.js itself fails to load (network
+  // blocked, etc) the onerror keeps the textarea visible and we
+  // exit silently.
+  var script = document.createElement("script");
+  script.src = BASE + "/vs/loader.js";
+  script.onerror = function() {{
+    // CDN unreachable. Textarea stays visible; nothing to do.
+    console.warn("computeza studio: Monaco CDN unreachable; falling back to textarea editor");
+  }};
+  script.onload = function() {{
+    if (typeof require !== "function" || !require.config) return;
+    require.config({{ paths: {{ vs: BASE + "/vs" }} }});
+    require(["vs/editor/editor.main"], function() {{
+      var initial = mount.getAttribute("data-initial") || "";
+      // Decode the HTML-encoded initial value back to plain text
+      // for Monaco. The server encoded &lt; &gt; &amp; &quot; &#39;
+      // and we reverse those four below; if other entities show up
+      // we'll add them when they do.
+      initial = initial
+        .replace(/&amp;/g, "&")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'");
 
-  // Map our backend's `kind` taxonomy to CM6's `type` field which
-  // drives the icon in the completion popup.
-  function kindToType(k) {{
-    switch (k) {{
-      case "database":  return "namespace";
-      case "table":     return "class";
-      case "column":    return "property";
-      case "warehouse": return "module";
-      case "history":   return "text";
-      default:          return "text";
-    }}
-  }}
+      var editor = monaco.editor.create(mount, {{
+        value: initial,
+        language: "sql",
+        theme: "vs-dark",
+        automaticLayout: true,
+        minimap: {{ enabled: false }},
+        scrollBeyondLastLine: false,
+        wordWrap: "on",
+        fontSize: 13,
+        fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+        // Trigger characters: most SQL completion lands on space
+        // or dot (qualifying a table). Keep the list small so we
+        // don't fight Monaco's built-in keyword completion which
+        // already triggers on letters.
+        suggest: {{ showWords: true }},
+      }});
 
-  var completionExt = autocompletion({{
-    override: [
-      async function(context) {{
-        var word = context.matchBefore(/[\w.]*/);
-        if (!word || (word.from === word.to && !context.explicit)) return null;
-        var items = await fetchCompletions();
-        return {{
-          from: word.from,
-          options: items.map(function(it) {{
-            return {{
-              label: it.label,
-              type: kindToType(it.kind),
-              detail: it.detail || "",
-              apply: it.insert || it.label,
-            }};
-          }}),
-        }};
-      }}
-    ]
-  }});
-
-  var submitKeymap = keymap.of([
-    {{
-      key: "Mod-Enter",      // Mod = Cmd on macOS, Ctrl elsewhere
-      run: function() {{ form.requestSubmit(); return true; }},
-      preventDefault: true,
-    }},
-  ]);
-
-  // Override CM6 sizing + monospace font to match the surrounding
-  // page. The active theme handles colors; this just sizes the
-  // container and picks the same font stack the textarea uses.
-  var sizingTheme = EditorView.theme({{
-    "&": {{
-      height: "16rem",
-      fontSize: "13px",
-    }},
-    ".cm-content": {{
-      fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
-    }},
-    ".cm-scroller": {{
-      overflow: "auto",
-    }},
-  }});
-
-  // Theme registry. Starts with Darcula (statically imported,
-  // known good). The four optional fsegurai themes are loaded
-  // dynamically below; whichever load successfully get added.
-  // The <select>'s dropdown options are filtered to match what
-  // actually loaded so the operator can't pick a theme that
-  // would no-op.
-  var themes = {{ "darcula": darcula }};
-
-  // Compartment wraps the theme so we can swap it at runtime
-  // without rebuilding the editor view. Each call to
-  // themeCompartment.reconfigure(newExt) dispatched as an effect
-  // replaces the previous theme atomically.
-  var themeCompartment = new Compartment();
-  var THEME_STORAGE_KEY = "cz-sql-theme";
-
-  // Build the editor view FIRST with Darcula. Themes load async;
-  // we don't want to gate editor mount on network round-trips that
-  // might be slow or fail.
-  var view = new EditorView({{
-    parent: mount,
-    state: EditorState.create({{
-      doc: initial,
-      extensions: [
-        basicSetup,
-        sql(),
-        themeCompartment.of(darcula),
-        completionExt,
-        submitKeymap,
-        sizingTheme,
-        EditorView.lineWrapping,
-      ],
-    }}),
-  }});
-
-  // Swap textarea for CM6 immediately. (Done early so the editor
-  // is visible while themes load in the background.)
-  textarea.style.display = "none";
-  mount.style.display = "block";
-
-  // Sync CM6 -> textarea before submit so the POST body carries
-  // the current editor contents.
-  form.addEventListener("submit", function() {{
-    textarea.value = view.state.doc.toString();
-  }});
-
-  // Move focus into the editor on page load so the operator can
-  // start typing immediately. Skip if the editor is pre-filled
-  // with a SELECT * the operator just clicked.
-  if (!initial.trim()) view.focus();
-
-  // Async-load each optional theme. Each load is independent;
-  // failures are logged but don't break the editor or other
-  // themes. Once all settle, the <select> options are filtered
-  // to what actually loaded and the saved-theme preference (if
-  // any) is applied.
-  function tryLoadTheme(key, url, exportName) {{
-    return import(url)
-      .then(function(mod) {{
-        var ext = mod[exportName] || mod.default;
-        if (ext) {{
-          themes[key] = ext;
-        }} else {{
-          console.warn("computeza studio: theme `" + key + "` loaded but no `" + exportName + "` export found");
+      // Schema-aware completion provider. Fetches from
+      // /studio/api/completions which aggregates Databend
+      // databases + tables, Lakekeeper warehouses, and recent
+      // history. Cached for 30s in-process so each keystroke
+      // doesn't re-hit the server.
+      var completionCache = {{ items: null, expires: 0 }};
+      function fetchCompletions() {{
+        var now = Date.now();
+        if (completionCache.items && completionCache.expires > now) {{
+          return Promise.resolve(completionCache.items);
         }}
-      }})
-      .catch(function(err) {{
-        console.warn("computeza studio: theme `" + key + "` failed to load:", err);
+        return fetch("/studio/api/completions", {{ credentials: "same-origin" }})
+          .then(function(r) {{ return r.ok ? r.json() : {{ items: [] }}; }})
+          .then(function(j) {{
+            completionCache = {{ items: j.items || [], expires: Date.now() + 30000 }};
+            return completionCache.items;
+          }})
+          .catch(function() {{ return []; }});
+      }}
+      // Pre-warm so the first Ctrl+Space hits a populated cache.
+      fetchCompletions();
+
+      var kindMap = {{
+        database:  monaco.languages.CompletionItemKind.Folder,
+        table:     monaco.languages.CompletionItemKind.Class,
+        column:    monaco.languages.CompletionItemKind.Field,
+        warehouse: monaco.languages.CompletionItemKind.Module,
+        history:   monaco.languages.CompletionItemKind.Snippet,
+      }};
+
+      monaco.languages.registerCompletionItemProvider("sql", {{
+        triggerCharacters: [" ", "."],
+        provideCompletionItems: function(model, position) {{
+          return fetchCompletions().then(function(items) {{
+            var word = model.getWordUntilPosition(position);
+            var range = {{
+              startLineNumber: position.lineNumber,
+              endLineNumber: position.lineNumber,
+              startColumn: word.startColumn,
+              endColumn: word.endColumn,
+            }};
+            return {{
+              suggestions: items.map(function(it) {{
+                return {{
+                  label: it.label,
+                  kind: kindMap[it.kind] || monaco.languages.CompletionItemKind.Text,
+                  insertText: it.insert || it.label,
+                  detail: it.detail || "",
+                  range: range,
+                }};
+              }}),
+            }};
+          }});
+        }},
       }});
-  }}
 
-  Promise.all([
-    tryLoadTheme("tokyo-night-storm", "https://esm.sh/@fsegurai/codemirror-theme-tokyo-night-storm", "tokyoNightStorm"),
-    tryLoadTheme("nord", "https://esm.sh/@fsegurai/codemirror-theme-nord", "nord"),
-    tryLoadTheme("material-dark", "https://esm.sh/@fsegurai/codemirror-theme-material-dark", "materialDark"),
-    tryLoadTheme("forest", "https://esm.sh/@fsegurai/codemirror-theme-forest", "forest"),
-  ]).then(function() {{
-    var toolbar = document.getElementById("cz-sql-toolbar");
-    var themeSelect = document.getElementById("cz-sql-theme");
-    if (!toolbar || !themeSelect) return;
+      // Swap textarea for Monaco. Keep textarea in the DOM so the
+      // form submission still finds its `name="sql"` field; we
+      // just stop displaying it.
+      textarea.style.display = "none";
+      mount.style.display = "block";
 
-    // Filter <select> options to themes that actually loaded so
-    // the operator can't pick a broken one.
-    Array.from(themeSelect.options).forEach(function(opt) {{
-      if (!themes[opt.value]) opt.remove();
-    }});
+      // Ctrl/Cmd+Enter submits the form. Standard SQL-IDE shortcut.
+      editor.addCommand(
+        monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter,
+        function() {{ form.requestSubmit(); }}
+      );
 
-    // Apply saved preference if it loaded; else fall back to Darcula.
-    var savedTheme = null;
-    try {{ savedTheme = window.localStorage.getItem(THEME_STORAGE_KEY); }} catch(e) {{}}
-    var initialThemeKey = (savedTheme && themes[savedTheme]) ? savedTheme : "darcula";
-    themeSelect.value = initialThemeKey;
-    if (initialThemeKey !== "darcula") {{
-      view.dispatch({{
-        effects: themeCompartment.reconfigure(themes[initialThemeKey]),
+      // Sync Monaco -> textarea before submit so the POST body
+      // carries the current editor contents (not the original
+      // server-rendered value).
+      form.addEventListener("submit", function() {{
+        textarea.value = editor.getValue();
       }});
-    }}
 
-    themeSelect.addEventListener("change", function() {{
-      var key = themeSelect.value;
-      var ext = themes[key];
-      if (!ext) return;
-      view.dispatch({{ effects: themeCompartment.reconfigure(ext) }});
-      try {{ window.localStorage.setItem(THEME_STORAGE_KEY, key); }} catch(e) {{}}
+      // Move focus into the editor on page load so the operator
+      // can start typing immediately. Skip if the editor is
+      // pre-filled with a SELECT * the operator just clicked
+      // (let them inspect first).
+      if (!initial.trim()) editor.focus();
     }});
-    toolbar.style.display = "flex";
-  }});
+  }};
+  document.head.appendChild(script);
 }})();
-</script>
-<noscript>
-  <!-- JS disabled: the textarea above is already usable; no banner needed. -->
-</noscript>"#,
+</script>"#,
         title = html_escape(&title),
         intro = html_escape(&intro),
         catalog_heading = html_escape(&catalog_heading),
