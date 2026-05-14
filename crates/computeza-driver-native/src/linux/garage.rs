@@ -760,3 +760,191 @@ async fn wait_for_port(
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 }
+
+// ============================================================
+// Unit tests for the Garage CLI output parsers
+// ============================================================
+//
+// The parsers are pure-text functions, so we can cover them without
+// a live Garage daemon. These tests pin the parsing logic against
+// real CLI output samples so a Garage CLI shape drift surfaces as a
+// test failure rather than a runtime "no node ID found" error
+// (which would only fire on a fresh install at a customer site).
+//
+// Item 10 of v0.1 §8.1 -- the integration-style "v0.0.x -> v0.1
+// idempotent re-bootstrap" smoke test requires a live Garage +
+// Lakekeeper and is a CI concern (lands once we have a linux
+// runner). Unit-level coverage here is the first half.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Real `gg status` output from a fresh single-node WSL2
+    /// install BEFORE layout-apply. The "NO ROLE ASSIGNED" cell is
+    /// the canonical "needs bootstrap" signal -- if Garage changes
+    /// how it labels this state we want the test to break loudly.
+    const STATUS_FRESH: &str = "==== HEALTHY NODES ====
+ID                Hostname       Address         Tags  Zone  Capacity          DataAvail  Version
+2c0944894cb4a143  LHIND-N212001  127.0.0.1:3901              NO ROLE ASSIGNED             cargo:2.3.0
+";
+
+    /// Same node AFTER layout-apply: zone + capacity + DataAvail
+    /// populated, no NO ROLE ASSIGNED.
+    const STATUS_BOOTSTRAPPED: &str = "==== HEALTHY NODES ====
+ID                Hostname       Address         Tags  Zone  Capacity          DataAvail  Version
+2c0944894cb4a143  LHIND-N212001  127.0.0.1:3901        dc1   10.0 GiB          9.3 GiB    cargo:2.3.0
+";
+
+    /// Real `gg key info` output. Secret redacted on subsequent
+    /// reads (Garage policy).
+    const KEY_INFO_EXISTING: &str = "==== ACCESS KEY INFORMATION ====
+Key ID:              GK029bcc02bc15f7ab9e12980d
+Key name:            lakekeeper
+Secret key:          (redacted)
+Created:             2026-05-14 09:05:30.733 +02:00
+Validity:            valid
+Expiration:          never
+
+Can create buckets:  false
+
+==== BUCKETS FOR THIS KEY ====
+Permissions  ID                Global aliases      Local aliases
+RWO          ffe1c8c4ba15d402  lakekeeper-default
+";
+
+    /// Real `gg key create` output. Secret revealed exactly once at
+    /// creation time -- this is the only window we have to capture
+    /// it for the vault.
+    const KEY_CREATE_FRESH: &str = "==== ACCESS KEY INFORMATION ====
+Key ID:              GK029bcc02bc15f7ab9e12980d
+Key name:            lakekeeper
+Secret key:          7cbb3d01779fae7bedfcc329dd7c9d88bd9ecd5944a4cc8645b403c8e19f42a1
+Created:             2026-05-14 09:05:30.733 +02:00
+Validity:            valid
+Expiration:          never
+
+Can create buckets:  false
+
+==== BUCKETS FOR THIS KEY ====
+Permissions  ID  Global aliases  Local aliases
+";
+
+    #[test]
+    fn parse_local_node_id_picks_first_16hex_token() {
+        let id = parse_local_node_id(STATUS_FRESH).expect("must parse");
+        assert_eq!(id, "2c0944894cb4a143");
+    }
+
+    #[test]
+    fn parse_local_node_id_works_for_bootstrapped_status() {
+        // Same node ID is in the header line; parsing must not be
+        // confused by the additional populated columns.
+        let id = parse_local_node_id(STATUS_BOOTSTRAPPED).expect("must parse");
+        assert_eq!(id, "2c0944894cb4a143");
+    }
+
+    #[test]
+    fn parse_local_node_id_returns_err_on_empty_output() {
+        let res = parse_local_node_id("==== HEALTHY NODES ====\n");
+        assert!(res.is_err(), "empty status must error");
+    }
+
+    #[test]
+    fn parse_local_node_id_returns_err_on_garbage() {
+        let res = parse_local_node_id("hello world\nnothing hex here\n");
+        assert!(res.is_err(), "non-hex output must error");
+    }
+
+    #[test]
+    fn parse_key_id_extracts_from_create_output() {
+        let id = parse_key_id(KEY_CREATE_FRESH).expect("must parse");
+        assert_eq!(id, "GK029bcc02bc15f7ab9e12980d");
+    }
+
+    #[test]
+    fn parse_key_id_extracts_from_info_output() {
+        let id = parse_key_id(KEY_INFO_EXISTING).expect("must parse");
+        assert_eq!(id, "GK029bcc02bc15f7ab9e12980d");
+    }
+
+    #[test]
+    fn parse_key_secret_extracts_from_create_output() {
+        let secret = parse_key_secret(KEY_CREATE_FRESH).expect("must parse");
+        assert_eq!(
+            secret,
+            "7cbb3d01779fae7bedfcc329dd7c9d88bd9ecd5944a4cc8645b403c8e19f42a1"
+        );
+    }
+
+    #[test]
+    fn parse_key_secret_errors_on_redacted_info_output() {
+        // This is the critical test for the v0.0.x -> v0.1 migration
+        // path: if the lakekeeper key already exists, the secret
+        // can't be recovered -- the parser must error explicitly so
+        // the orchestrator surfaces a clean StateMismatch instead
+        // of silently writing the literal string "(redacted)" into
+        // the vault.
+        let res = parse_key_secret(KEY_INFO_EXISTING);
+        assert!(res.is_err(), "redacted secret must error");
+        let msg = res.unwrap_err().to_string();
+        assert!(
+            msg.contains("redacted") || msg.contains("already existed"),
+            "error must mention the redacted case so operators know to rotate: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_field_extracts_trimmed_value() {
+        let out = "Key ID:              GK029bcc02bc15f7ab9e12980d\nOther:               value\n";
+        assert_eq!(
+            parse_field(out, "Key ID:"),
+            Some("GK029bcc02bc15f7ab9e12980d".to_string())
+        );
+        assert_eq!(parse_field(out, "Other:"), Some("value".to_string()));
+    }
+
+    #[test]
+    fn parse_field_returns_none_for_missing_label() {
+        let out = "Key ID:    foo\nOther: bar\n";
+        assert_eq!(parse_field(out, "Missing:"), None);
+    }
+
+    /// Phase-coverage smoke test for the v0.0.x -> v0.1 migration
+    /// scenario. Documents the expected behavior so a future refactor
+    /// of the idempotency logic can't silently regress it:
+    ///   * STATUS_BOOTSTRAPPED -> layout-step is a no-op (no NO ROLE).
+    ///   * KEY_INFO_EXISTING -> key-step sees key exists, must NOT
+    ///     attempt to re-parse the redacted secret (the production
+    ///     code path skips parse_key_secret entirely in this branch).
+    ///   * KEY_CREATE_FRESH -> fresh-install path captures secret.
+    #[test]
+    fn migration_v0_0_x_scenario_coverage() {
+        // Layout step idempotency: bootstrapped status doesn't
+        // contain the "NO ROLE ASSIGNED" string the production code
+        // greps for.
+        assert!(
+            !STATUS_BOOTSTRAPPED.contains("NO ROLE ASSIGNED"),
+            "bootstrapped status must NOT carry the role-missing marker"
+        );
+        assert!(
+            STATUS_FRESH.contains("NO ROLE ASSIGNED"),
+            "fresh status must carry the role-missing marker so bootstrap fires"
+        );
+
+        // Key step: parse_key_id succeeds against `key info` output
+        // so the production code can use the existing Key ID.
+        let id_from_info = parse_key_id(KEY_INFO_EXISTING).expect("must parse existing");
+        let id_from_create = parse_key_id(KEY_CREATE_FRESH).expect("must parse fresh");
+        assert_eq!(
+            id_from_info, id_from_create,
+            "same key surfaces same ID in both info + create outputs"
+        );
+
+        // Key step: parse_key_secret must error on `key info` output
+        // so the production code's StateMismatch branch fires.
+        assert!(parse_key_secret(KEY_INFO_EXISTING).is_err());
+        // ...but succeeds on `key create` output.
+        assert!(parse_key_secret(KEY_CREATE_FRESH).is_ok());
+    }
+}

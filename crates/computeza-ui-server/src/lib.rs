@@ -656,6 +656,26 @@ pub fn router_with_state(state: AppState) -> Router {
             "/studio/bootstrap",
             get(studio_bootstrap_form_handler).post(studio_bootstrap_submit_handler),
         )
+        // Iceberg-REST catalog drill-down (phase 1.5):
+        //   /studio/catalog/:warehouse                       -> namespace list
+        //   /studio/catalog/:warehouse/:namespace            -> table list
+        //   /studio/catalog/:warehouse/:namespace/:table     -> table detail
+        // All three hit Lakekeeper's /catalog/v1/* surface and
+        // surface response bodies verbatim on non-2xx so URL-pattern
+        // drift across Lakekeeper releases is debuggable from the
+        // page itself.
+        .route(
+            "/studio/catalog/:warehouse",
+            get(studio_catalog_warehouse_handler),
+        )
+        .route(
+            "/studio/catalog/:warehouse/:namespace",
+            get(studio_catalog_namespace_handler),
+        )
+        .route(
+            "/studio/catalog/:warehouse/:namespace/:table",
+            get(studio_catalog_table_handler),
+        )
         .route(
             "/install",
             get(install_hub_handler).post(install_all_handler),
@@ -1071,6 +1091,426 @@ async fn probe_lakekeeper(base_url: &str) -> LakekeeperState {
         })
         .collect();
     LakekeeperState::HasWarehouses(names)
+}
+
+// ============================================================
+// Iceberg-REST catalog drill-down (phase 1.5)
+// ============================================================
+//
+// Three routes under /studio/catalog/* let the operator navigate
+// the catalog the way they navigate a filesystem:
+//   warehouse -> namespaces -> tables -> table detail.
+//
+// All three hit Lakekeeper's /catalog/v1/* Iceberg-REST surface.
+// URL prefix patterns drift across Lakekeeper releases (some use
+// warehouse name, some UUID, some configurable via /v1/config) so
+// each handler surfaces the full Lakekeeper response body verbatim
+// on non-2xx for debuggability.
+//
+// Row preview is deferred to phase 1.6 -- it requires Databend ->
+// Lakekeeper Iceberg catalog wiring (a Databend `[[catalog]]` block
+// pointing at Lakekeeper's REST endpoint) which doesn't exist yet.
+
+/// Fetch JSON from Lakekeeper's catalog REST. Returns a tuple of
+/// (status, parsed-json-or-error-text). Caller decides what shapes
+/// it expects; this just handles the HTTP + parsing boilerplate.
+async fn get_lakekeeper_catalog_json(
+    base_url: &str,
+    path: &str,
+) -> Result<serde_json::Value, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("building HTTP client: {e}"))?;
+    let url = format!("{}{}", base_url.trim_end_matches('/'), path);
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("GET {url}: {e}"))?;
+    let status = resp.status();
+    let text = resp
+        .text()
+        .await
+        .unwrap_or_else(|e| format!("(could not read body: {e})"));
+    if !status.is_success() {
+        return Err(format!(
+            "GET {url} returned {}:\n{text}\n\nIf Lakekeeper uses a different URL pattern for this resource (warehouse UUID vs name, /catalog/v1 vs /iceberg/v1, etc.), iterate via this verbose error.",
+            status.as_u16()
+        ));
+    }
+    serde_json::from_str(&text)
+        .map_err(|e| format!("GET {url} body did not parse as JSON: {e}\nbody: {text}"))
+}
+
+async fn studio_catalog_warehouse_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(warehouse): axum::extract::Path<String>,
+) -> Html<String> {
+    let l = Localizer::english();
+    let lakekeeper = discover_lakekeeper_endpoint(state.store.as_deref()).await;
+    let Some(base_url) = lakekeeper else {
+        return Html(render_studio_drilldown_error(
+            &l,
+            &[(&warehouse, &format!("/studio/catalog/{warehouse}"))],
+            "Lakekeeper is not registered in the metadata store. Install Lakekeeper from /install first.",
+        ));
+    };
+    // Iceberg REST: list namespaces under the warehouse. Path
+    // pattern is `/catalog/v1/{warehouse}/namespaces` per the
+    // Iceberg REST spec; some Lakekeeper releases may expect the
+    // warehouse UUID here instead of the name. Pass through what
+    // we get verbatim.
+    let path = format!("/catalog/v1/{}/namespaces", url_encode(&warehouse));
+    let result = get_lakekeeper_catalog_json(&base_url, &path).await;
+    Html(render_studio_namespace_list(&l, &warehouse, result))
+}
+
+async fn studio_catalog_namespace_handler(
+    State(state): State<AppState>,
+    axum::extract::Path((warehouse, namespace)): axum::extract::Path<(String, String)>,
+) -> Html<String> {
+    let l = Localizer::english();
+    let Some(base_url) = discover_lakekeeper_endpoint(state.store.as_deref()).await else {
+        return Html(render_studio_drilldown_error(
+            &l,
+            &[
+                (&warehouse, &format!("/studio/catalog/{warehouse}")),
+                (&namespace, &format!("/studio/catalog/{warehouse}/{namespace}")),
+            ],
+            "Lakekeeper is not registered.",
+        ));
+    };
+    // Multi-level namespaces ("finance.raw") become %1F-separated
+    // (unit-separator) in the Iceberg REST URL spec. Single-level
+    // is the common case in v0.0.x; we still encode for safety.
+    let ns_encoded = namespace.split('.').collect::<Vec<_>>().join("%1F");
+    let path = format!(
+        "/catalog/v1/{}/namespaces/{}/tables",
+        url_encode(&warehouse),
+        ns_encoded
+    );
+    let result = get_lakekeeper_catalog_json(&base_url, &path).await;
+    Html(render_studio_table_list(&l, &warehouse, &namespace, result))
+}
+
+async fn studio_catalog_table_handler(
+    State(state): State<AppState>,
+    axum::extract::Path((warehouse, namespace, table)): axum::extract::Path<(
+        String,
+        String,
+        String,
+    )>,
+) -> Html<String> {
+    let l = Localizer::english();
+    let Some(base_url) = discover_lakekeeper_endpoint(state.store.as_deref()).await else {
+        return Html(render_studio_drilldown_error(
+            &l,
+            &[
+                (&warehouse, &format!("/studio/catalog/{warehouse}")),
+                (&namespace, &format!("/studio/catalog/{warehouse}/{namespace}")),
+                (&table, &format!("/studio/catalog/{warehouse}/{namespace}/{table}")),
+            ],
+            "Lakekeeper is not registered.",
+        ));
+    };
+    let ns_encoded = namespace.split('.').collect::<Vec<_>>().join("%1F");
+    let path = format!(
+        "/catalog/v1/{}/namespaces/{}/tables/{}",
+        url_encode(&warehouse),
+        ns_encoded,
+        url_encode(&table)
+    );
+    let result = get_lakekeeper_catalog_json(&base_url, &path).await;
+    Html(render_studio_table_detail(
+        &l, &warehouse, &namespace, &table, result,
+    ))
+}
+
+/// Breadcrumb-only error page for the drill-down routes. Used
+/// when the prerequisites aren't met (Lakekeeper missing) so the
+/// operator sees consistent navigation regardless of state.
+fn render_studio_drilldown_error(
+    localizer: &Localizer,
+    crumbs: &[(&str, &str)],
+    message: &str,
+) -> String {
+    let breadcrumbs = render_drilldown_breadcrumbs(crumbs);
+    let body = format!(
+        r#"{breadcrumbs}
+<section class="cz-section" style="max-width: 60rem;">
+<div class="cz-card" style="background: rgba(255,99,99,0.06); border: 1px solid rgba(255,99,99,0.3);">
+<p style="margin: 0;">{}</p>
+</div>
+</section>"#,
+        html_escape(message)
+    );
+    render_shell(localizer, "Catalog", NavLink::Studio, &body)
+}
+
+fn render_drilldown_breadcrumbs(crumbs: &[(&str, &str)]) -> String {
+    let mut out = String::from(
+        r#"<section class="cz-section" style="max-width: 60rem; padding-top: 0.5rem; padding-bottom: 0.5rem;"><nav class="cz-muted" style="font-size: 0.85rem;"><a href="/studio">Studio</a> / <a href="/studio">Catalog</a>"#,
+    );
+    for (label, href) in crumbs {
+        out.push_str(" / ");
+        out.push_str(&format!(
+            r#"<a href="{}"><code>{}</code></a>"#,
+            html_escape(href),
+            html_escape(label)
+        ));
+    }
+    out.push_str("</nav></section>");
+    out
+}
+
+fn render_studio_namespace_list(
+    localizer: &Localizer,
+    warehouse: &str,
+    result: Result<serde_json::Value, String>,
+) -> String {
+    let crumbs = [(warehouse, &*format!("/studio/catalog/{warehouse}"))];
+    let breadcrumbs = render_drilldown_breadcrumbs(&crumbs);
+    let body_inner = match result {
+        Ok(v) => {
+            // Iceberg REST: `{"namespaces": [["finance"], ["finance","raw"], ...]}`
+            let namespaces = v
+                .get("namespaces")
+                .and_then(|n| n.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if namespaces.is_empty() {
+                r#"<p class="cz-muted">No namespaces in this warehouse yet. Create one via an Iceberg-aware tool (pyiceberg, Spark, Trino) or via Lakekeeper's management API.</p>"#.to_string()
+            } else {
+                let items: String = namespaces
+                    .iter()
+                    .filter_map(|ns| {
+                        let segments: Vec<String> = ns
+                            .as_array()?
+                            .iter()
+                            .filter_map(|s| s.as_str().map(str::to_string))
+                            .collect();
+                        if segments.is_empty() {
+                            return None;
+                        }
+                        let qualified = segments.join(".");
+                        Some(format!(
+                            r#"<li style="padding: 0.3rem 0;"><a href="/studio/catalog/{wh}/{ns}" style="text-decoration: none;"><code>{ns_display}</code></a></li>"#,
+                            wh = url_encode(warehouse),
+                            ns = url_encode(&qualified),
+                            ns_display = html_escape(&qualified),
+                        ))
+                    })
+                    .collect();
+                format!(r#"<ul style="list-style: none; padding: 0; margin: 0;">{items}</ul>"#)
+            }
+        }
+        Err(e) => format!(
+            r#"<pre style="background: rgba(255,99,99,0.08); border: 1px solid rgba(255,99,99,0.25); border-radius: 0.4rem; padding: 0.75rem; overflow-x: auto; white-space: pre-wrap; font-size: 0.85rem;">{}</pre>"#,
+            html_escape(&e)
+        ),
+    };
+    let body = format!(
+        r#"{breadcrumbs}
+<section class="cz-section" style="max-width: 60rem;">
+<div class="cz-card">
+<h2 style="margin-top: 0;">Namespaces in <code>{wh}</code></h2>
+{body_inner}
+</div>
+</section>"#,
+        wh = html_escape(warehouse),
+    );
+    render_shell(
+        localizer,
+        &format!("Catalog: {warehouse}"),
+        NavLink::Studio,
+        &body,
+    )
+}
+
+fn render_studio_table_list(
+    localizer: &Localizer,
+    warehouse: &str,
+    namespace: &str,
+    result: Result<serde_json::Value, String>,
+) -> String {
+    let ns_href = format!("/studio/catalog/{warehouse}/{namespace}");
+    let crumbs = [
+        (warehouse, &*format!("/studio/catalog/{warehouse}")),
+        (namespace, &*ns_href),
+    ];
+    let breadcrumbs = render_drilldown_breadcrumbs(&crumbs);
+    let body_inner = match result {
+        Ok(v) => {
+            // Iceberg REST: `{"identifiers": [{"namespace": [...], "name": "..."}, ...]}`
+            let tables = v
+                .get("identifiers")
+                .and_then(|n| n.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if tables.is_empty() {
+                r#"<p class="cz-muted">No tables in this namespace yet.</p>"#.to_string()
+            } else {
+                let items: String = tables
+                    .iter()
+                    .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+                    .map(|name| {
+                        format!(
+                            r#"<li style="padding: 0.3rem 0;"><a href="/studio/catalog/{wh}/{ns}/{tbl}" style="text-decoration: none;"><code>{tbl_display}</code></a></li>"#,
+                            wh = url_encode(warehouse),
+                            ns = url_encode(namespace),
+                            tbl = url_encode(name),
+                            tbl_display = html_escape(name),
+                        )
+                    })
+                    .collect();
+                format!(r#"<ul style="list-style: none; padding: 0; margin: 0;">{items}</ul>"#)
+            }
+        }
+        Err(e) => format!(
+            r#"<pre style="background: rgba(255,99,99,0.08); border: 1px solid rgba(255,99,99,0.25); border-radius: 0.4rem; padding: 0.75rem; overflow-x: auto; white-space: pre-wrap; font-size: 0.85rem;">{}</pre>"#,
+            html_escape(&e)
+        ),
+    };
+    let body = format!(
+        r#"{breadcrumbs}
+<section class="cz-section" style="max-width: 60rem;">
+<div class="cz-card">
+<h2 style="margin-top: 0;">Tables in <code>{wh}</code>.<code>{ns}</code></h2>
+{body_inner}
+</div>
+</section>"#,
+        wh = html_escape(warehouse),
+        ns = html_escape(namespace),
+    );
+    render_shell(
+        localizer,
+        &format!("Catalog: {warehouse}.{namespace}"),
+        NavLink::Studio,
+        &body,
+    )
+}
+
+fn render_studio_table_detail(
+    localizer: &Localizer,
+    warehouse: &str,
+    namespace: &str,
+    table: &str,
+    result: Result<serde_json::Value, String>,
+) -> String {
+    let ns_href = format!("/studio/catalog/{warehouse}/{namespace}");
+    let tbl_href = format!("/studio/catalog/{warehouse}/{namespace}/{table}");
+    let crumbs = [
+        (warehouse, &*format!("/studio/catalog/{warehouse}")),
+        (namespace, &*ns_href),
+        (table, &*tbl_href),
+    ];
+    let breadcrumbs = render_drilldown_breadcrumbs(&crumbs);
+    let body_inner = match result {
+        Ok(v) => {
+            // Iceberg REST table-load response is large; show the
+            // most operator-relevant pieces (schema + location +
+            // current snapshot) inline and the full raw JSON in a
+            // collapsible <details> block.
+            let location = v
+                .get("metadata")
+                .and_then(|m| m.get("location"))
+                .or_else(|| v.get("location"))
+                .and_then(|x| x.as_str())
+                .unwrap_or("(unknown)");
+            let current_snapshot = v
+                .get("metadata")
+                .and_then(|m| m.get("current-snapshot-id"))
+                .or_else(|| v.get("current-snapshot-id"))
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "(none)".to_string());
+            let schema_html = v
+                .get("metadata")
+                .and_then(|m| m.get("schemas"))
+                .and_then(|s| s.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|s| s.get("fields"))
+                .and_then(|f| f.as_array())
+                .map(|fields| {
+                    let rows: String = fields
+                        .iter()
+                        .map(|f| {
+                            let name = f.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                            let ty = f
+                                .get("type")
+                                .map(|t| t.to_string().replace('"', ""))
+                                .unwrap_or_else(|| "?".into());
+                            let nullable = f
+                                .get("required")
+                                .and_then(|r| r.as_bool())
+                                .map(|r| if r { "NOT NULL" } else { "NULL OK" })
+                                .unwrap_or("?");
+                            format!(
+                                "<tr><td><code>{}</code></td><td><code>{}</code></td><td class=\"cz-muted\">{}</td></tr>",
+                                html_escape(name),
+                                html_escape(&ty),
+                                nullable
+                            )
+                        })
+                        .collect();
+                    format!(
+                        r#"<table class="cz-table" style="width: 100%; border-collapse: collapse; font-size: 0.85rem;">
+<thead><tr><th>Column</th><th>Type</th><th>Nullable</th></tr></thead>
+<tbody>{rows}</tbody>
+</table>"#
+                    )
+                })
+                .unwrap_or_else(|| {
+                    r#"<p class="cz-muted">No schema found in table metadata.</p>"#.to_string()
+                });
+            let raw_json = serde_json::to_string_pretty(&v)
+                .unwrap_or_else(|_| "(could not pretty-print)".to_string());
+            let prefill_sql = format!(
+                "SELECT * FROM {namespace}.{table} LIMIT 100",
+            );
+            format!(
+                r#"<dl class="cz-dl">
+<dt>Location</dt><dd><code>{loc}</code></dd>
+<dt>Current snapshot</dt><dd><code>{snap}</code></dd>
+</dl>
+<h3 style="margin-top: 1.2rem;">Schema</h3>
+{schema_html}
+<p style="margin-top: 1rem;"><a href="/studio?sql={prefill_enc}" class="cz-btn">Pre-fill SELECT * in editor</a>
+<span class="cz-muted" style="margin-left: 0.5rem; font-size: 0.78rem;">Querying this Iceberg table from Databend requires a Databend `[[catalog]]` block pointing at Lakekeeper -- deferred to phase 1.6.</span></p>
+<details style="margin-top: 1.5rem;">
+<summary class="cz-muted" style="cursor: pointer; font-size: 0.82rem;">Raw Iceberg metadata (JSON)</summary>
+<pre style="margin-top: 0.5rem; padding: 0.75rem; background: rgba(0,0,0,0.25); border-radius: 0.4rem; overflow-x: auto; font-size: 0.78rem;">{raw}</pre>
+</details>"#,
+                loc = html_escape(location),
+                snap = html_escape(&current_snapshot),
+                schema_html = schema_html,
+                prefill_enc = url_encode(&prefill_sql),
+                raw = html_escape(&raw_json),
+            )
+        }
+        Err(e) => format!(
+            r#"<pre style="background: rgba(255,99,99,0.08); border: 1px solid rgba(255,99,99,0.25); border-radius: 0.4rem; padding: 0.75rem; overflow-x: auto; white-space: pre-wrap; font-size: 0.85rem;">{}</pre>"#,
+            html_escape(&e)
+        ),
+    };
+    let body = format!(
+        r#"{breadcrumbs}
+<section class="cz-section" style="max-width: 60rem;">
+<div class="cz-card">
+<h2 style="margin-top: 0;"><code>{wh}</code>.<code>{ns}</code>.<code>{tbl}</code></h2>
+{body_inner}
+</div>
+</section>"#,
+        wh = html_escape(warehouse),
+        ns = html_escape(namespace),
+        tbl = html_escape(table),
+    );
+    render_shell(
+        localizer,
+        &format!("Catalog: {warehouse}.{namespace}.{table}"),
+        NavLink::Studio,
+        &body,
+    )
 }
 
 /// Query parameters accepted by the studio page. `sql` lets the
@@ -1527,8 +1967,9 @@ fn render_studio_page(
                     .iter()
                     .map(|n| {
                         format!(
-                            r#"<li style="padding: 0.3rem 0;"><code>{}</code></li>"#,
-                            html_escape(n)
+                            r#"<li style="padding: 0.3rem 0;"><a href="/studio/catalog/{enc}" style="text-decoration: none;"><code>{display}</code></a></li>"#,
+                            enc = url_encode(n),
+                            display = html_escape(n),
                         )
                     })
                     .collect();
