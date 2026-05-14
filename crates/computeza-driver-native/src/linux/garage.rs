@@ -245,6 +245,274 @@ pub async fn install(
     })
 }
 
+// ============================================================
+// Post-install bootstrap (per v0.1 design doc §3.2 + §3.3)
+// ============================================================
+
+/// Name of the Garage access key we mint exclusively for
+/// Lakekeeper's use. Hard-coded -- only one Lakekeeper warehouse
+/// uses this key in v0.1; multi-warehouse keying is a v0.2
+/// concern.
+const BOOTSTRAP_KEY_NAME: &str = "lakekeeper";
+
+/// Garage bucket Lakekeeper writes Iceberg metadata + data into.
+/// Hard-coded for the same reason as BOOTSTRAP_KEY_NAME.
+const BOOTSTRAP_BUCKET_NAME: &str = "lakekeeper-default";
+
+/// Zone label used when assigning the local Garage node a role.
+/// "dc1" is arbitrary -- single-node deployments only have one
+/// zone. Multi-node + multi-zone layouts are a v0.2 driver task.
+const BOOTSTRAP_ZONE: &str = "dc1";
+
+/// Capacity assigned to the local Garage node at layout-apply
+/// time. The right long-term answer is "statvfs(<root>/data) * 0.5
+/// rounded down" (per AGENTS.md). For v0.1 we hard-code a value
+/// that works on every realistic dev box; operators with smaller
+/// disks can re-run layout assign by hand to override.
+const BOOTSTRAP_CAPACITY: &str = "10G";
+
+/// Idempotent post-install bootstrap. Run after `install_service`
+/// returns + the Garage admin port is accepting connections.
+/// Performs three steps in order:
+///
+///   1. Cluster layout: assign the local node to zone `dc1` with
+///      10G capacity and apply the layout. Skipped if the layout
+///      is already active (idempotent re-runs).
+///   2. Access key: mint a `lakekeeper`-named key. Skipped if the
+///      key already exists (which means a previous install already
+///      bootstrapped it -- the secret is in the vault, and Garage
+///      won't reveal it again).
+///   3. Bucket: create `lakekeeper-default` and grant the
+///      `lakekeeper` key RWO permissions. Both idempotent on the
+///      Garage side.
+///
+/// Returns one `BootstrapArtifact` per piece of state the
+/// orchestrator should persist into the vault + credentials.json.
+/// Always returns the bucket-name artifact. Returns the key-id +
+/// secret artifacts ONLY on first run (when the key was actually
+/// created); on re-runs where the key already exists, returns
+/// nothing for those two (the vault is the source of truth -- the
+/// orchestrator preserves the existing entries).
+pub async fn post_install_bootstrap(
+    root_dir: &Path,
+) -> Result<Vec<super::BootstrapArtifact>, super::BootstrapError> {
+    use secrecy::SecretString;
+
+    let bin = PathBuf::from("/usr/local/bin/computeza-garage");
+    let conf = root_dir.join("garage.toml");
+
+    // ---- Step 1: layout ------------------------------------------------
+    let status_out = run_garage_cli(&bin, &conf, &["status"]).await?;
+    let layout_already_applied = !status_out.contains("NO ROLE ASSIGNED");
+    if !layout_already_applied {
+        let node_id = parse_local_node_id(&status_out)?;
+        info!(node_id = %node_id, "garage bootstrap: assigning layout");
+        run_garage_cli(
+            &bin,
+            &conf,
+            &[
+                "layout",
+                "assign",
+                &node_id,
+                "-z",
+                BOOTSTRAP_ZONE,
+                "-c",
+                BOOTSTRAP_CAPACITY,
+            ],
+        )
+        .await?;
+        // Layout version starts at 0 (un-applied); first apply
+        // commits it as version 1. `gg layout apply --version 1`
+        // is the explicit-version invocation Garage requires to
+        // confirm the operator knows what they're committing.
+        run_garage_cli(&bin, &conf, &["layout", "apply", "--version", "1"]).await?;
+        info!("garage bootstrap: layout applied (zone={BOOTSTRAP_ZONE}, capacity={BOOTSTRAP_CAPACITY})");
+    } else {
+        info!("garage bootstrap: layout already applied; skipping");
+    }
+
+    // ---- Step 2: access key --------------------------------------------
+    let key_info = run_garage_cli(&bin, &conf, &["key", "info", BOOTSTRAP_KEY_NAME])
+        .await
+        .ok();
+    let mut artifacts: Vec<super::BootstrapArtifact> = Vec::new();
+    let key_id: String = if let Some(info) = key_info.as_deref() {
+        // Key already exists; re-use the existing Key ID. The secret
+        // cannot be recovered (Garage redacts on `key info`) so we
+        // don't emit a secret artifact -- the orchestrator preserves
+        // the vault entry from the original creation.
+        let id = parse_key_id(info)?;
+        info!(key_id = %id, "garage bootstrap: lakekeeper key already exists; skipping create");
+        id
+    } else {
+        // Create the key; capture both ID + Secret from the create
+        // output (this is the ONLY moment Garage reveals the
+        // secret). Both go into artifacts so the orchestrator can
+        // persist them.
+        let create_out =
+            run_garage_cli(&bin, &conf, &["key", "create", BOOTSTRAP_KEY_NAME]).await?;
+        let id = parse_key_id(&create_out)?;
+        let secret = parse_key_secret(&create_out)?;
+        info!(key_id = %id, "garage bootstrap: lakekeeper key created");
+        artifacts.push(super::BootstrapArtifact {
+            vault_key: "garage/lakekeeper-key-id".into(),
+            value: SecretString::from(id.clone()),
+            label: "Garage Access Key ID (Lakekeeper-scoped)".into(),
+            display_inline: true,
+        });
+        artifacts.push(super::BootstrapArtifact {
+            vault_key: "garage/lakekeeper-secret".into(),
+            value: SecretString::from(secret),
+            label: "Garage Secret Access Key (Lakekeeper-scoped)".into(),
+            display_inline: true,
+        });
+        id
+    };
+
+    // ---- Step 3: bucket + allow ----------------------------------------
+    // `bucket create` is idempotent enough -- it errors with a
+    // specific message if the bucket exists, which we treat as
+    // success.
+    match run_garage_cli(&bin, &conf, &["bucket", "create", BOOTSTRAP_BUCKET_NAME]).await {
+        Ok(_) => info!("garage bootstrap: lakekeeper-default bucket created"),
+        Err(super::BootstrapError::CliFailed { stderr, .. })
+            if stderr.contains("already exists") || stderr.contains("Bucket already exists") =>
+        {
+            info!("garage bootstrap: lakekeeper-default bucket already exists; skipping");
+        }
+        Err(e) => return Err(e),
+    }
+    // `bucket allow` is idempotent on the Garage side (re-running
+    // just re-asserts the grant).
+    run_garage_cli(
+        &bin,
+        &conf,
+        &[
+            "bucket",
+            "allow",
+            BOOTSTRAP_BUCKET_NAME,
+            "--read",
+            "--write",
+            "--owner",
+            "--key",
+            BOOTSTRAP_KEY_NAME,
+        ],
+    )
+    .await?;
+    info!("garage bootstrap: lakekeeper key granted RWO on lakekeeper-default");
+
+    // Always emit the bucket-name artifact (non-secret metadata
+    // Lakekeeper's bootstrap step needs to read from the vault).
+    artifacts.push(super::BootstrapArtifact {
+        vault_key: "garage/lakekeeper-bucket".into(),
+        value: SecretString::from(BOOTSTRAP_BUCKET_NAME.to_string()),
+        label: "Garage bucket name (Lakekeeper-scoped)".into(),
+        display_inline: false,
+    });
+
+    let _ = key_id; // silence "unused" warning when key already existed
+    Ok(artifacts)
+}
+
+/// Shell out to the `computeza-garage` CLI with `-c <conf>` and the
+/// caller's argv suffix. Returns stdout as a UTF-8 string on
+/// success, or a `BootstrapError::CliFailed` carrying stderr on
+/// non-zero exit.
+async fn run_garage_cli(
+    bin: &Path,
+    conf: &Path,
+    args: &[&str],
+) -> Result<String, super::BootstrapError> {
+    let mut cmd = Command::new(bin);
+    cmd.arg("-c").arg(conf);
+    for a in args {
+        cmd.arg(a);
+    }
+    let out = cmd.output().await?;
+    if !out.status.success() {
+        return Err(super::BootstrapError::CliFailed {
+            code: out.status.code(),
+            stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Parse the local node ID from `gg status` output. The healthy-
+/// nodes table has columns `ID | Hostname | Address | ...`; we
+/// pick the first 16-hex token on a line that looks like a node
+/// row (16-char lowercase hex prefix, then whitespace).
+fn parse_local_node_id(status_out: &str) -> Result<String, super::BootstrapError> {
+    // Match a 16-char hex string at the start of a line (allowing
+    // leading whitespace), optionally followed by more text. Single-
+    // node clusters have exactly one such line.
+    let re = regex_lite_first_match(status_out, |line| {
+        let trimmed = line.trim_start();
+        if trimmed.len() < 16 {
+            return None;
+        }
+        let prefix = &trimmed[..16];
+        if prefix.chars().all(|c| c.is_ascii_hexdigit()) {
+            Some(prefix.to_string())
+        } else {
+            None
+        }
+    });
+    re.ok_or_else(|| super::BootstrapError::ParseFailed {
+        what: "garage node ID (16-char hex prefix)".into(),
+        output: status_out.to_string(),
+    })
+}
+
+/// Parse the `Key ID:` line out of `gg key info` / `gg key create`
+/// output.
+fn parse_key_id(out: &str) -> Result<String, super::BootstrapError> {
+    parse_field(out, "Key ID:").ok_or_else(|| super::BootstrapError::ParseFailed {
+        what: "garage `Key ID:` field".into(),
+        output: out.to_string(),
+    })
+}
+
+/// Parse the `Secret key:` line out of `gg key create` output.
+/// Returns an error if the value is `(redacted)` -- that means we
+/// called this on `gg key info` output by mistake (Garage redacts
+/// the secret on subsequent reads).
+fn parse_key_secret(out: &str) -> Result<String, super::BootstrapError> {
+    let v = parse_field(out, "Secret key:").ok_or_else(|| super::BootstrapError::ParseFailed {
+        what: "garage `Secret key:` field".into(),
+        output: out.to_string(),
+    })?;
+    if v == "(redacted)" {
+        return Err(super::BootstrapError::StateMismatch(
+            "garage `Secret key:` was redacted; the key already existed and the secret cannot be recovered. \
+             Rotate via `gg key delete lakekeeper && gg key create lakekeeper` (re-grant bucket access after) \
+             and re-run install.".into(),
+        ));
+    }
+    Ok(v)
+}
+
+/// Generic "Field: value" line extractor. Returns the trimmed
+/// value following the first occurrence of `prefix` at the start
+/// of a line. Used for Garage CLI output which uses fixed
+/// "Label:                value" formatting.
+fn parse_field(out: &str, prefix: &str) -> Option<String> {
+    for line in out.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            return Some(rest.trim().to_string());
+        }
+    }
+    None
+}
+
+/// Tiny line-scanning helper used by parse_local_node_id -- avoids
+/// pulling in the `regex` crate dependency for the one use case.
+/// Returns the first line that matches the closure.
+fn regex_lite_first_match<T>(text: &str, f: impl Fn(&str) -> Option<T>) -> Option<T> {
+    text.lines().find_map(f)
+}
+
 /// Convert a `release::ReleaseError` into the driver's
 /// `ServiceError::Io`. Matches the kanidm driver's boundary
 /// convention (the release module has its own error type for
