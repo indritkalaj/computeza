@@ -661,6 +661,10 @@ pub fn router_with_state(state: AppState) -> Router {
             get(install_hub_handler).post(install_all_handler),
         )
         .route(
+            "/install/:slug/retry-bootstrap",
+            post(retry_bootstrap_handler),
+        )
+        .route(
             "/install/postgres",
             get(install_postgres_form_handler).post(install_postgres_handler),
         )
@@ -2651,6 +2655,123 @@ async fn auto_bootstrap_lakekeeper(
         label: "Lakekeeper default warehouse name".to_string(),
         display_inline: false,
     }])
+}
+
+/// POST /install/:slug/retry-bootstrap — re-run the post-install
+/// bootstrap step for a single component without doing a full
+/// re-install. Use case: install completed cleanly (daemon up,
+/// systemd unit registered, install-config persisted) but the
+/// post-install bootstrap failed for a recoverable reason (network
+/// blip, Lakekeeper API field-name drift the operator just patched,
+/// vault unavailable at install time, etc.). Retry lets the
+/// operator re-hit the bootstrap without going through the
+/// uninstall + install cycle.
+///
+/// Returns an HTML page with the bootstrap result inlined.
+/// Idempotent: the underlying bootstrap fns are designed to no-op
+/// when state already exists.
+async fn retry_bootstrap_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(slug): axum::extract::Path<String>,
+) -> Html<String> {
+    let l = Localizer::english();
+    let result = run_post_install_bootstrap_for_slug(&slug, &state).await;
+    let body = match result {
+        Ok(summary) => format!(
+            r#"<section class="cz-hero"><h1>Retry succeeded</h1></section>
+<section class="cz-section" style="max-width: 50rem;">
+<div class="cz-card" style="background: rgba(80, 220, 120, 0.06); border: 1px solid rgba(80, 220, 120, 0.3);">
+<pre style="white-space: pre-wrap; margin: 0; font-size: 0.85rem;">{}</pre>
+</div>
+<p style="margin-top: 1rem;"><a href="/install" class="cz-btn">Back to Install hub</a> <a href="/studio" class="cz-btn">Open Studio</a></p>
+</section>"#,
+            html_escape(&summary)
+        ),
+        Err(msg) => format!(
+            r#"<section class="cz-hero"><h1>Retry failed</h1></section>
+<section class="cz-section" style="max-width: 50rem;">
+<div class="cz-card" style="background: rgba(255, 99, 99, 0.06); border: 1px solid rgba(255, 99, 99, 0.3);">
+<pre style="white-space: pre-wrap; margin: 0; font-size: 0.85rem;">{}</pre>
+</div>
+<p style="margin-top: 1rem;"><a href="/install" class="cz-btn">Back to Install hub</a></p>
+</section>"#,
+            html_escape(&msg)
+        ),
+    };
+    Html(render_shell(
+        &l,
+        &format!("Retry bootstrap: {slug}"),
+        NavLink::Install,
+        &body,
+    ))
+}
+
+/// Dispatcher: given a component slug, run that component's
+/// post-install bootstrap step and persist any artifacts. Mirrors
+/// the dispatch logic in `finalize_managed_install_after_success`
+/// but factored out so the retry endpoint and the auto-run path
+/// share one implementation.
+async fn run_post_install_bootstrap_for_slug(
+    slug: &str,
+    state: &AppState,
+) -> Result<String, String> {
+    let store = state.store.as_deref();
+    let secrets = state.secrets.as_deref();
+
+    #[cfg(target_os = "linux")]
+    {
+        let config = match store {
+            Some(s) => load_install_config(s, slug).await.unwrap_or_default(),
+            None => InstallConfig::default(),
+        };
+        let bootstrap_result: Result<
+            Vec<computeza_driver_native::linux::BootstrapArtifact>,
+            String,
+        > = match slug {
+            "garage" => {
+                let root = config
+                    .root_dir
+                    .as_deref()
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| std::path::PathBuf::from("/var/lib/computeza/garage"));
+                computeza_driver_native::linux::garage::post_install_bootstrap(&root)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            "lakekeeper" => auto_bootstrap_lakekeeper(secrets, store).await,
+            other => {
+                return Err(format!(
+                    "no post-install bootstrap defined for `{other}` -- only `garage` and `lakekeeper` support retry today. \
+                     Add a branch in run_post_install_bootstrap_for_slug() if you've wired a new component."
+                ));
+            }
+        };
+
+        let artifacts = bootstrap_result?;
+        let count = artifacts.len();
+        for a in artifacts {
+            use secrecy::ExposeSecret;
+            let value = a.value.expose_secret().to_string();
+            if let Some(secrets) = secrets {
+                if let Err(e) = secrets.put(&a.vault_key, &value).await {
+                    tracing::warn!(
+                        error = %e,
+                        component = slug,
+                        vault_key = %a.vault_key,
+                        "retry-bootstrap: secrets.put failed"
+                    );
+                }
+            }
+        }
+        Ok(format!(
+            "Retry succeeded for component `{slug}`. {count} artifact(s) persisted to vault.\n\nNext step: visit /studio to confirm the catalog state."
+        ))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (slug, store, secrets);
+        Err("retry-bootstrap is only implemented on Linux".to_string())
+    }
 }
 
 async fn finalize_managed_install_after_success(
