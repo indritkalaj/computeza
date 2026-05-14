@@ -285,21 +285,56 @@ pub async fn uninstall_service(
             Ok(()) => out.ok(format!("removed unit file {}", unit_path.display())),
             Err(e) => out.warn(format!("removing unit file {}: {e}", unit_path.display())),
         }
-        if let Err(e) = systemctl::daemon_reload().await {
-            out.warn(format!("daemon-reload: {e}"));
-        } else {
-            out.ok("daemon-reload");
+    }
+    // Older releases shipped a sibling drop-in dir
+    // /etc/systemd/system/{unit}.d/; clean that too if present so
+    // re-installs start with a clean override stack.
+    let dropin_dir = PathBuf::from("/etc/systemd/system").join(format!("{unit_name}.d"));
+    if fs::try_exists(&dropin_dir).await.unwrap_or(false) {
+        match fs::remove_dir_all(&dropin_dir).await {
+            Ok(()) => out.ok(format!("removed drop-in dir {}", dropin_dir.display())),
+            Err(e) => out.warn(format!("removing drop-in dir {}: {e}", dropin_dir.display())),
+        }
+    }
+    // systemd may still hold a failed-unit reference even after the
+    // file is gone; reset-failed clears it so the next install
+    // doesn't trip the "already exists in failed state" check.
+    if let Err(e) = systemctl::run(&["reset-failed", unit_name]).await {
+        // Not fatal -- most often this just means the unit was
+        // never in a failed state. Log at info level.
+        tracing::info!(unit = %unit_name, error = %e, "uninstall: reset-failed (informational)");
+    }
+    if let Err(e) = systemctl::daemon_reload().await {
+        out.warn(format!("daemon-reload: {e}"));
+    } else {
+        out.ok("daemon-reload");
+    }
+
+    // Wipe the entire component root_dir (binaries, configs, data,
+    // logs, snapshot dirs, lock files, ...). Previously we only
+    // removed root_dir/data which left binaries/<version>/, the
+    // generated *.toml, and per-component subdirs like meta/, raft/,
+    // metadata/ behind -- visible as "residuals" after uninstall.
+    if fs::try_exists(root_dir).await.unwrap_or(false) {
+        match fs::remove_dir_all(root_dir).await {
+            Ok(()) => out.ok(format!("removed component dir {}", root_dir.display())),
+            Err(e) => out.warn(format!("removing {}: {e}", root_dir.display())),
         }
     }
 
-    // Data dir lives under root_dir/data or root_dir itself depending
-    // on the component. We delete root_dir/data if present, else the
-    // top-level root_dir contents.
-    let data_dir = root_dir.join("data");
-    if fs::try_exists(&data_dir).await.unwrap_or(false) {
-        match fs::remove_dir_all(&data_dir).await {
-            Ok(()) => out.ok(format!("removed data dir {}", data_dir.display())),
-            Err(e) => out.warn(format!("removing data dir {}: {e}", data_dir.display())),
+    // systemd RuntimeDirectory: /run/{component} is auto-created at
+    // unit-start time and auto-removed at unit-stop time, but if the
+    // unit crashed we sometimes see a leftover. Best-effort sweep.
+    let runtime_dir = PathBuf::from("/run").join(component);
+    if fs::try_exists(&runtime_dir).await.unwrap_or(false) {
+        match fs::remove_dir_all(&runtime_dir).await {
+            Ok(()) => out.ok(format!("removed runtime dir {}", runtime_dir.display())),
+            Err(e) => {
+                // /run is tmpfs -- failures here usually mean
+                // another process is holding a file open. Don't
+                // fail the uninstall over it.
+                tracing::info!(dir = %runtime_dir.display(), error = %e, "uninstall: could not remove runtime dir (informational)");
+            }
         }
     }
 
@@ -310,7 +345,25 @@ pub async fn uninstall_service(
             out.ok(format!("removed /usr/local/bin/computeza-{name}"));
         }
     }
-    let _ = component;
+
+    // Best-effort: if /var/lib/computeza is now empty (every
+    // component uninstalled), remove the parent so the operator
+    // can verify "no residuals" with a single `ls`. We only remove
+    // when truly empty -- never `remove_dir_all` on the shared
+    // parent, since other components may still be installed.
+    if let Some(parent) = root_dir.parent() {
+        if parent.ends_with("computeza") {
+            if let Ok(mut entries) = fs::read_dir(parent).await {
+                if entries.next_entry().await.ok().flatten().is_none() {
+                    match fs::remove_dir(parent).await {
+                        Ok(()) => out.ok(format!("removed empty parent {}", parent.display())),
+                        Err(e) => tracing::info!(parent = %parent.display(), error = %e, "uninstall: parent not empty / could not remove (informational)"),
+                    }
+                }
+            }
+        }
+    }
+
     Ok(out)
 }
 
