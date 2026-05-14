@@ -673,6 +673,10 @@ pub fn router_with_state(state: AppState) -> Router {
             post(studio_catalog_namespace_create_handler),
         )
         .route(
+            "/studio/catalog/{warehouse}/wire-databend",
+            post(studio_catalog_wire_databend_handler),
+        )
+        .route(
             "/studio/catalog/{warehouse}/{namespace}",
             get(studio_catalog_namespace_handler),
         )
@@ -1560,12 +1564,19 @@ async fn studio_catalog_warehouse_handler(
     axum::extract::Query(q): axum::extract::Query<FlashQuery>,
 ) -> Html<String> {
     let l = Localizer::english();
+    let focus = SidebarFocus {
+        warehouse: Some(&warehouse),
+        namespace: None,
+        table: None,
+    };
+    let sidebar = build_studio_full_sidebar(&state, focus).await;
     let lakekeeper = discover_lakekeeper_endpoint(state.store.as_deref()).await;
     let Some(base_url) = lakekeeper else {
         return Html(render_studio_drilldown_error(
             &l,
             &[(&warehouse, &format!("/studio/catalog/{warehouse}"))],
             "Lakekeeper is not registered in the metadata store. Install Lakekeeper from /install first.",
+            &sidebar,
         ));
     };
     // Resolve human-friendly name -> UUID (Lakekeeper's catalog
@@ -1622,9 +1633,17 @@ async fn studio_catalog_warehouse_handler(
     // Recovery banner takes precedence over a flash error from a
     // redirected POST (recovery is the more urgent issue). Otherwise
     // surface the ?err=... query so the operator sees why the create
-    // POST failed.
+    // POST failed. ?wired=... is the success path of "Connect to SQL"
+    // -- routed through the same renderer but styled as success.
     let banner = recovery_report.or_else(|| q.err.clone());
-    let final_html = render_studio_namespace_list(&l, &warehouse, result, banner.as_deref());
+    let final_html = render_studio_namespace_list(
+        &l,
+        &warehouse,
+        result,
+        banner.as_deref(),
+        q.wired.as_deref(),
+        &sidebar,
+    );
     Html(final_html)
 }
 
@@ -1634,6 +1653,12 @@ async fn studio_catalog_namespace_handler(
     axum::extract::Query(q): axum::extract::Query<FlashQuery>,
 ) -> Html<String> {
     let l = Localizer::english();
+    let focus = SidebarFocus {
+        warehouse: Some(&warehouse),
+        namespace: Some(&namespace),
+        table: None,
+    };
+    let sidebar = build_studio_full_sidebar(&state, focus).await;
     let Some(base_url) = discover_lakekeeper_endpoint(state.store.as_deref()).await else {
         return Html(render_studio_drilldown_error(
             &l,
@@ -1642,6 +1667,7 @@ async fn studio_catalog_namespace_handler(
                 (&namespace, &format!("/studio/catalog/{warehouse}/{namespace}")),
             ],
             "Lakekeeper is not registered.",
+            &sidebar,
         ));
     };
     let wh_id = resolve_warehouse_id_or_pass(&warehouse, Some(&base_url), state.secrets.as_deref()).await;
@@ -1661,16 +1687,19 @@ async fn studio_catalog_namespace_handler(
         &namespace,
         result,
         q.err.as_deref(),
+        &sidebar,
     ))
 }
 
 /// Shared query shape for catalog GET handlers that may receive a
-/// flash error from a redirected POST. Stays at the request boundary --
-/// renderers take the unwrapped &str so they don't have to know about
-/// query parsing.
+/// flash message from a redirected POST: `err` for failures, `wired`
+/// for success of the "Connect to SQL" action. Stays at the request
+/// boundary -- renderers take the unwrapped &str so they don't have
+/// to know about query parsing.
 #[derive(serde::Deserialize, Default)]
 struct FlashQuery {
     err: Option<String>,
+    wired: Option<String>,
 }
 
 async fn studio_catalog_table_handler(
@@ -1682,6 +1711,12 @@ async fn studio_catalog_table_handler(
     )>,
 ) -> Html<String> {
     let l = Localizer::english();
+    let focus = SidebarFocus {
+        warehouse: Some(&warehouse),
+        namespace: Some(&namespace),
+        table: Some(&table),
+    };
+    let sidebar = build_studio_full_sidebar(&state, focus).await;
     let Some(base_url) = discover_lakekeeper_endpoint(state.store.as_deref()).await else {
         return Html(render_studio_drilldown_error(
             &l,
@@ -1691,6 +1726,7 @@ async fn studio_catalog_table_handler(
                 (&table, &format!("/studio/catalog/{warehouse}/{namespace}/{table}")),
             ],
             "Lakekeeper is not registered.",
+            &sidebar,
         ));
     };
     let wh_id = resolve_warehouse_id_or_pass(&warehouse, Some(&base_url), state.secrets.as_deref()).await;
@@ -1703,7 +1739,7 @@ async fn studio_catalog_table_handler(
     );
     let result = get_lakekeeper_catalog_json(&base_url, &path).await;
     Html(render_studio_table_detail(
-        &l, &warehouse, &namespace, &table, result,
+        &l, &warehouse, &namespace, &table, result, &sidebar,
     ))
 }
 
@@ -1751,6 +1787,82 @@ async fn lakekeeper_catalog_mutate(
 #[derive(serde::Deserialize)]
 struct CreateNamespaceForm {
     name: String,
+}
+
+/// POST /studio/catalog/{warehouse}/wire-databend
+///
+/// Re-fires `CREATE CATALOG` against Databend for an already-
+/// bootstrapped warehouse, using credentials cached in vault. Lets
+/// the operator wire SQL access on demand without re-entering keys --
+/// useful when:
+///   - Lakekeeper was bootstrapped before the auto-wire shipped
+///   - Databend was installed AFTER the original bootstrap
+///   - The CREATE CATALOG silently failed during bootstrap (network
+///     glitch, missing meta, version mismatch) and needs a retry
+///
+/// Redirects back to the warehouse page with `?err=...` on failure or
+/// `?wired=...` on success so the operator sees the outcome inline.
+async fn studio_catalog_wire_databend_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(warehouse): axum::extract::Path<String>,
+) -> axum::response::Redirect {
+    use secrecy::ExposeSecret;
+    let base_redirect = format!("/studio/catalog/{warehouse}");
+    let err_redirect = |msg: &str| {
+        axum::response::Redirect::to(&format!("{base_redirect}?err={}", url_encode(msg)))
+    };
+    let Some(secrets) = state.secrets.as_deref() else {
+        return err_redirect("Vault is not configured; cannot read cached credentials.");
+    };
+    let Some(lakekeeper_url) = discover_lakekeeper_endpoint(state.store.as_deref()).await else {
+        return err_redirect("Lakekeeper endpoint is not registered.");
+    };
+    // Pull the Garage credentials + bucket from vault. These were
+    // persisted by the bootstrap form (see studio_bootstrap_submit_handler).
+    let Some(key_id) = secrets.get("garage/lakekeeper-key-id").await.ok().flatten() else {
+        return err_redirect(
+            "Garage access key ID not in vault. Re-run /studio/bootstrap to populate credentials.",
+        );
+    };
+    let Some(secret_key) = secrets.get("garage/lakekeeper-secret").await.ok().flatten() else {
+        return err_redirect(
+            "Garage secret access key not in vault. Re-run /studio/bootstrap to populate credentials.",
+        );
+    };
+    let bucket = secrets
+        .get("garage/lakekeeper-bucket")
+        .await
+        .ok()
+        .flatten()
+        .map(|v| v.expose_secret().to_string())
+        .unwrap_or_else(|| "lakekeeper-default".to_string());
+    let garage_endpoint = discover_garage_endpoint(state.store.as_deref())
+        .await
+        .map(|u| u.replace(":3903", ":3900"))
+        .unwrap_or_else(|| "http://127.0.0.1:3900".to_string());
+    let form = StudioBootstrapForm {
+        project_name: "computeza-default".to_string(),
+        warehouse_name: warehouse.clone(),
+        s3_endpoint: garage_endpoint,
+        s3_region: "garage".to_string(),
+        s3_bucket: bucket,
+        s3_access_key: key_id.expose_secret().to_string(),
+        s3_secret_access_key: secret_key.expose_secret().to_string(),
+    };
+    match wire_databend_iceberg_catalog(state.store.as_deref(), &lakekeeper_url, &form).await {
+        DatabendWiringOutcome::Wired { catalog_name } => axum::response::Redirect::to(&format!(
+            "{base_redirect}?wired={}",
+            url_encode(&format!(
+                "SQL catalog `{catalog_name}` is now registered with Databend. Run `SELECT * FROM {catalog_name}.<namespace>.<table>` in the editor."
+            ))
+        )),
+        DatabendWiringOutcome::DatabendUnavailable => err_redirect(
+            "Databend isn't installed or discoverable. Install it from /install and try again.",
+        ),
+        DatabendWiringOutcome::Failed { reason } => err_redirect(&format!(
+            "Databend rejected CREATE CATALOG:\n{reason}\n\nMost likely cause: the Databend version doesn't accept Iceberg-REST as a catalog type, or the CREATE CATALOG syntax drifted. Adjust wire_databend_iceberg_catalog() and re-run."
+        )),
+    }
 }
 
 async fn studio_catalog_namespace_create_handler(
@@ -1960,10 +2072,9 @@ fn render_studio_drilldown_error(
     localizer: &Localizer,
     crumbs: &[(&str, &str)],
     message: &str,
+    sidebar: &str,
 ) -> String {
     let breadcrumbs = render_drilldown_breadcrumbs(crumbs);
-    let current_warehouse = crumbs.first().map(|(label, _)| *label);
-    let sidebar = render_drilldown_sidebar(current_warehouse);
     let main_html = format!(
         r#"{breadcrumbs}
 <div class="cz-studio-error">{}</div>"#,
@@ -2006,26 +2117,286 @@ fn render_drilldown_breadcrumbs(crumbs: &[(&str, &str)]) -> String {
     out
 }
 
-/// Sidebar for drill-down pages. Shows a "← All warehouses" link
-/// back to /studio, plus the current warehouse highlighted. Future
-/// iteration can expand to show namespaces/tables inline; for now
-/// we keep it lean to avoid an extra HTTP roundtrip per page load.
-fn render_drilldown_sidebar(current_warehouse: Option<&str>) -> String {
-    let wh_item = current_warehouse
-        .map(|wh| {
-            format!(
-                r#"<li class="cz-tree-item"><a class="cz-tree-row cz-tree-active" href="/studio/catalog/{enc}"><span class="cz-tree-icon">⬢</span><span class="cz-tree-label">{display}</span></a></li>"#,
-                enc = url_encode(wh),
-                display = html_escape(wh),
-            )
+/// Build the full sidebar HTML used on every Studio page: the
+/// expandable catalog tree (warehouses → namespaces → tables, with
+/// the focused branch open) plus the Recent Queries section. Each
+/// page passes the operator's current focus so the right branch
+/// renders expanded and the right row gets `cz-tree-active`.
+async fn build_studio_full_sidebar(state: &AppState, focus: SidebarFocus<'_>) -> String {
+    let tree = build_studio_sidebar_tree(state, focus).await;
+    let tree_html = render_studio_tree_sidebar(&tree, focus);
+    let history = load_studio_history(state.store.as_deref()).await;
+    let recent_html = render_sidebar_recent_queries(&history, "Reload query");
+    format!(
+        r#"{tree_html}
+<section class="cz-studio-sidebar-section">
+<div class="cz-studio-sidebar-eyebrow"><span>Recent ({n})</span></div>
+{recent_html}
+</section>"#,
+        n = history.entries.len(),
+    )
+}
+
+/// In-memory shape of the full sidebar tree at render time. Built by
+/// `build_studio_sidebar_tree` from live Lakekeeper state + the
+/// current focus path; rendered by `render_studio_tree_sidebar`.
+#[derive(Debug, Default)]
+struct StudioSidebarTree {
+    warehouses: Vec<SidebarWarehouseNode>,
+}
+
+#[derive(Debug)]
+struct SidebarWarehouseNode {
+    name: String,
+    /// `None` when this warehouse isn't on the focus path -- the tree
+    /// renders it as a collapsed `<details>` and clicking expands it
+    /// via navigation. `Some(Ok(...))` when this is the focused
+    /// warehouse and namespaces were fetched. `Some(Err(...))` when
+    /// fetch failed -- inline error in the tree.
+    namespaces: Option<Result<Vec<SidebarNamespaceNode>, String>>,
+}
+
+#[derive(Debug)]
+struct SidebarNamespaceNode {
+    qualified: String,
+    tables: Option<Result<Vec<String>, String>>,
+}
+
+/// Where the user currently is. Drives which subtrees render expanded
+/// and which row gets `cz-tree-active`.
+#[derive(Debug, Default, Clone, Copy)]
+struct SidebarFocus<'a> {
+    warehouse: Option<&'a str>,
+    namespace: Option<&'a str>,
+    table: Option<&'a str>,
+}
+
+/// Fetch the warehouse list (always) + drill one level deeper for the
+/// currently focused warehouse + namespace. Each tier is best-effort:
+/// if a network call fails we attach the error to the subtree so the
+/// sidebar still renders.
+async fn build_studio_sidebar_tree(
+    state: &AppState,
+    focus: SidebarFocus<'_>,
+) -> StudioSidebarTree {
+    let Some(base_url) = discover_lakekeeper_endpoint(state.store.as_deref()).await else {
+        return StudioSidebarTree::default();
+    };
+    let lk_state =
+        probe_lakekeeper_with_vault_fallback(&base_url, state.secrets.as_deref()).await;
+    let names: Vec<String> = match lk_state {
+        LakekeeperState::HasWarehouses(n) => n,
+        _ => Vec::new(),
+    };
+    let mut warehouses: Vec<SidebarWarehouseNode> = Vec::with_capacity(names.len());
+    for name in names {
+        let namespaces = if focus.warehouse == Some(name.as_str()) {
+            Some(load_namespaces_for_sidebar(state, &base_url, &name, focus).await)
+        } else {
+            None
+        };
+        warehouses.push(SidebarWarehouseNode { name, namespaces });
+    }
+    StudioSidebarTree { warehouses }
+}
+
+/// Fetch a warehouse's namespace list and, if focus has a current
+/// namespace, fetch its tables too. Returns Ok with the namespace
+/// nodes (each optionally populated with table children) or Err with
+/// the Lakekeeper error message.
+async fn load_namespaces_for_sidebar(
+    state: &AppState,
+    base_url: &str,
+    warehouse: &str,
+    focus: SidebarFocus<'_>,
+) -> Result<Vec<SidebarNamespaceNode>, String> {
+    let wh_id =
+        resolve_warehouse_id_or_pass(warehouse, Some(base_url), state.secrets.as_deref()).await;
+    let path = format!("/catalog/v1/{}/namespaces", url_encode(&wh_id));
+    let v = get_lakekeeper_catalog_json(base_url, &path).await?;
+    let qualified_names: Vec<String> = v
+        .get("namespaces")
+        .and_then(|n| n.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|ns| {
+                    let segs: Vec<String> = ns
+                        .as_array()?
+                        .iter()
+                        .filter_map(|s| s.as_str().map(str::to_string))
+                        .collect();
+                    if segs.is_empty() {
+                        return None;
+                    }
+                    Some(segs.join("."))
+                })
+                .collect()
         })
         .unwrap_or_default();
+    let mut nodes: Vec<SidebarNamespaceNode> = Vec::with_capacity(qualified_names.len());
+    for qualified in qualified_names {
+        let tables = if focus.namespace == Some(qualified.as_str()) {
+            let ns_encoded = qualified.split('.').collect::<Vec<_>>().join("%1F");
+            let tpath = format!(
+                "/catalog/v1/{}/namespaces/{}/tables",
+                url_encode(&wh_id),
+                ns_encoded
+            );
+            Some(
+                get_lakekeeper_catalog_json(base_url, &tpath)
+                    .await
+                    .map(|tv| {
+                        tv.get("identifiers")
+                            .and_then(|n| n.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|t| {
+                                        t.get("name")
+                                            .and_then(|n| n.as_str())
+                                            .map(str::to_string)
+                                    })
+                                    .collect::<Vec<String>>()
+                            })
+                            .unwrap_or_default()
+                    }),
+            )
+        } else {
+            None
+        };
+        nodes.push(SidebarNamespaceNode { qualified, tables });
+    }
+    Ok(nodes)
+}
+
+/// Render the persistent expandable tree sidebar. Uses `<details>`
+/// elements so expand/collapse works without JS. The focused branch
+/// renders with `open`; other warehouses render collapsed with their
+/// names only (clicking navigates, which on the next page-load shows
+/// them expanded).
+fn render_studio_tree_sidebar(tree: &StudioSidebarTree, focus: SidebarFocus<'_>) -> String {
+    if tree.warehouses.is_empty() {
+        return format!(
+            r#"<section class="cz-studio-sidebar-section">
+<div class="cz-studio-sidebar-eyebrow"><span>Catalog</span><a href="/studio/bootstrap" class="cz-studio-sidebar-action" title="Bootstrap a warehouse">+</a></div>
+<p class="cz-studio-sidebar-note">No warehouses yet. <a href="/studio/bootstrap" style="color: var(--lavender);">Bootstrap one</a> to start.</p>
+</section>"#,
+        );
+    }
+    let items: String = tree
+        .warehouses
+        .iter()
+        .map(|wh| render_sidebar_warehouse(wh, focus))
+        .collect();
     format!(
         r#"<section class="cz-studio-sidebar-section">
-<div class="cz-studio-sidebar-eyebrow"><span>Catalog</span><a href="/studio" class="cz-studio-sidebar-action" title="Back to Studio">↩</a></div>
-<ul class="cz-tree">{wh_item}</ul>
-<p class="cz-studio-sidebar-note" style="margin-top: 0.75rem;">Click warehouse name to go up. Use the main pane to browse namespaces + tables.</p>
+<div class="cz-studio-sidebar-eyebrow"><span>Catalog</span><a href="/studio/bootstrap" class="cz-studio-sidebar-action" title="Bootstrap a warehouse">+</a></div>
+<ul class="cz-tree">{items}</ul>
 </section>"#,
+    )
+}
+
+fn render_sidebar_warehouse(node: &SidebarWarehouseNode, focus: SidebarFocus<'_>) -> String {
+    let is_current = focus.warehouse == Some(node.name.as_str());
+    let href = format!("/studio/catalog/{}", url_encode(&node.name));
+    let active = if is_current && focus.namespace.is_none() {
+        " cz-tree-active"
+    } else {
+        ""
+    };
+    let open_attr = if is_current { " open" } else { "" };
+    let children_html = match &node.namespaces {
+        Some(Ok(nss)) if nss.is_empty() => format!(
+            r#"<li class="cz-tree-empty">No namespaces yet.</li>"#
+        ),
+        Some(Ok(nss)) => nss
+            .iter()
+            .map(|ns| render_sidebar_namespace(&node.name, ns, focus))
+            .collect::<String>(),
+        Some(Err(e)) => format!(
+            r#"<li class="cz-tree-error" title="{}">⚠ load failed</li>"#,
+            html_escape(e)
+        ),
+        None => String::new(),
+    };
+    let children_block = if is_current {
+        format!(r#"<ul class="cz-tree-children">{children_html}</ul>"#)
+    } else {
+        String::new()
+    };
+    format!(
+        r#"<li class="cz-tree-item"><details class="cz-tree-details"{open_attr}>
+<summary class="cz-tree-row{active}"><span class="cz-tree-toggle"></span><span class="cz-tree-icon">⬢</span><a class="cz-tree-link" href="{href}">{label}</a></summary>
+{children_block}
+</details></li>"#,
+        href = html_escape(&href),
+        label = html_escape(&node.name),
+    )
+}
+
+fn render_sidebar_namespace(
+    warehouse: &str,
+    node: &SidebarNamespaceNode,
+    focus: SidebarFocus<'_>,
+) -> String {
+    let is_current = focus.namespace == Some(node.qualified.as_str());
+    let href = format!(
+        "/studio/catalog/{}/{}",
+        url_encode(warehouse),
+        url_encode(&node.qualified)
+    );
+    let active = if is_current && focus.table.is_none() {
+        " cz-tree-active"
+    } else {
+        ""
+    };
+    let open_attr = if is_current { " open" } else { "" };
+    let children_html = match &node.tables {
+        Some(Ok(tbls)) if tbls.is_empty() => {
+            r#"<li class="cz-tree-empty">No tables yet.</li>"#.to_string()
+        }
+        Some(Ok(tbls)) => tbls
+            .iter()
+            .map(|t| render_sidebar_table(warehouse, &node.qualified, t, focus))
+            .collect(),
+        Some(Err(e)) => format!(
+            r#"<li class="cz-tree-error" title="{}">⚠ load failed</li>"#,
+            html_escape(e)
+        ),
+        None => String::new(),
+    };
+    let children_block = if is_current {
+        format!(r#"<ul class="cz-tree-children">{children_html}</ul>"#)
+    } else {
+        String::new()
+    };
+    format!(
+        r#"<li class="cz-tree-item"><details class="cz-tree-details"{open_attr}>
+<summary class="cz-tree-row{active}"><span class="cz-tree-toggle"></span><span class="cz-tree-icon">◇</span><a class="cz-tree-link" href="{href}">{label}</a></summary>
+{children_block}
+</details></li>"#,
+        href = html_escape(&href),
+        label = html_escape(&node.qualified),
+    )
+}
+
+fn render_sidebar_table(
+    warehouse: &str,
+    namespace: &str,
+    table: &str,
+    focus: SidebarFocus<'_>,
+) -> String {
+    let is_current = focus.table == Some(table);
+    let href = format!(
+        "/studio/catalog/{}/{}/{}",
+        url_encode(warehouse),
+        url_encode(namespace),
+        url_encode(table)
+    );
+    let active = if is_current { " cz-tree-active" } else { "" };
+    format!(
+        r#"<li class="cz-tree-item"><a class="cz-tree-row cz-tree-leaf{active}" href="{href}"><span class="cz-tree-toggle"></span><span class="cz-tree-icon">▤</span><span class="cz-tree-label">{label}</span></a></li>"#,
+        href = html_escape(&href),
+        label = html_escape(table),
     )
 }
 
@@ -2034,19 +2405,25 @@ fn render_studio_namespace_list(
     warehouse: &str,
     result: Result<serde_json::Value, String>,
     recovery_banner: Option<&str>,
+    wired_banner: Option<&str>,
+    sidebar: &str,
 ) -> String {
     let crumbs = [(warehouse, &*format!("/studio/catalog/{warehouse}"))];
     let breadcrumbs = render_drilldown_breadcrumbs(&crumbs);
-    let sidebar = render_drilldown_sidebar(Some(warehouse));
     let csrf = auth::csrf_input();
-    let banner_html = recovery_banner
-        .map(|msg| {
-            format!(
-                r#"<div class="cz-studio-banner"><strong>State-mismatch recovery:</strong> {}</div>"#,
-                html_escape(msg)
-            )
-        })
-        .unwrap_or_default();
+    let banner_html = if let Some(msg) = recovery_banner {
+        format!(
+            r#"<div class="cz-studio-banner"><strong>State-mismatch recovery:</strong> {}</div>"#,
+            html_escape(msg)
+        )
+    } else if let Some(msg) = wired_banner {
+        format!(
+            r#"<div class="cz-studio-banner" style="background: rgba(168, 232, 196, 0.06); border-color: rgba(168, 232, 196, 0.3); color: var(--ok);"><strong>SQL access wired:</strong> {}</div>"#,
+            html_escape(msg)
+        )
+    } else {
+        String::new()
+    };
 
     let (list_html, namespace_count) = match result {
         Ok(v) => {
@@ -2131,6 +2508,13 @@ fn render_studio_namespace_list(
         n => format!(r#" <span class="cz-studio-results-count">({n})</span>"#),
     };
 
+    let wire_form = format!(
+        r#"<form method="post" action="/studio/catalog/{wh_enc}/wire-databend" style="margin: 0;" title="Re-fire CREATE CATALOG against Databend so the SQL editor can read tables in this warehouse. Uses credentials cached in vault from the original bootstrap.">{csrf}
+<button type="submit" class="cz-btn-ghost">Connect to SQL</button>
+</form>"#,
+        wh_enc = url_encode(warehouse),
+        csrf = csrf,
+    );
     let main_html = format!(
         r##"{breadcrumbs}
 {banner_html}
@@ -2140,6 +2524,7 @@ fn render_studio_namespace_list(
 <p class="cz-studio-pane-subtitle" style="margin: 0.25rem 0 0;">Iceberg namespaces group tables. Click a namespace to drill into its tables.</p>
 </div>
 <span class="cz-studio-actions-spacer"></span>
+{wire_form}
 <a href="#cz-modal-new-namespace" class="cz-btn-primary">+ New namespace</a>
 </div>
 {list_html}
@@ -2166,6 +2551,7 @@ fn render_studio_table_list(
     namespace: &str,
     result: Result<serde_json::Value, String>,
     error_banner: Option<&str>,
+    sidebar: &str,
 ) -> String {
     let ns_href = format!("/studio/catalog/{warehouse}/{namespace}");
     let crumbs = [
@@ -2173,7 +2559,6 @@ fn render_studio_table_list(
         (namespace, &*ns_href),
     ];
     let breadcrumbs = render_drilldown_breadcrumbs(&crumbs);
-    let sidebar = render_drilldown_sidebar(Some(warehouse));
     let csrf = auth::csrf_input();
     let banner_html = error_banner
         .map(|msg| {
@@ -2302,6 +2687,7 @@ fn render_studio_table_detail(
     namespace: &str,
     table: &str,
     result: Result<serde_json::Value, String>,
+    sidebar: &str,
 ) -> String {
     let ns_href = format!("/studio/catalog/{warehouse}/{namespace}");
     let tbl_href = format!("/studio/catalog/{warehouse}/{namespace}/{table}");
@@ -2311,7 +2697,6 @@ fn render_studio_table_detail(
         (table, &*tbl_href),
     ];
     let breadcrumbs = render_drilldown_breadcrumbs(&crumbs);
-    let sidebar = render_drilldown_sidebar(Some(warehouse));
     let body_inner = match result {
         Ok(v) => {
             let location = v
@@ -2452,6 +2837,7 @@ async fn studio_handler(
     };
     let history = load_studio_history(state.store.as_deref()).await;
     let sql_prefill = q.sql.unwrap_or_default();
+    let sidebar = build_studio_full_sidebar(&state, SidebarFocus::default()).await;
     Html(render_studio_page(
         &l,
         lakekeeper.is_some(),
@@ -2460,6 +2846,7 @@ async fn studio_handler(
         &history,
         &sql_prefill,
         None,
+        &sidebar,
     ))
 }
 
@@ -2639,6 +3026,7 @@ async fn studio_sql_execute_handler(
         None => LakekeeperState::Unreachable,
     };
     let history = load_studio_history(state.store.as_deref()).await;
+    let sidebar = build_studio_full_sidebar(&state, SidebarFocus::default()).await;
     Html(render_studio_page(
         &l,
         lakekeeper.is_some(),
@@ -2647,6 +3035,7 @@ async fn studio_sql_execute_handler(
         &history,
         &form.sql,
         result,
+        &sidebar,
     ))
 }
 
@@ -2757,69 +3146,10 @@ async fn execute_sql_against_databend(base_url: &str, sql: &str) -> SqlOutcome {
 /// Render the two-pane studio page. Pure-server template; the
 /// only JS on the page is the existing CSRF auto-fill from
 /// render_shell + the Monaco loader at the bottom. The catalog
-/// list renders on the left, the SQL editor + history + results
-/// render on the right.
+/// tree renders on the left (built async by the handler via
+/// `build_studio_full_sidebar`), the SQL editor + results pane
+/// renders on the right.
 #[allow(clippy::too_many_arguments)]
-/// Render the sidebar's "Catalog" section. The tree shows the
-/// warehouse list flat at /studio root; drill-down pages can pass
-/// `current_warehouse` / `current_namespace` / `current_table` to
-/// expand the relevant branches inline.
-#[allow(clippy::too_many_arguments)]
-fn render_sidebar_catalog_tree(
-    has_lakekeeper: bool,
-    lk_state: &LakekeeperState,
-    current_warehouse: Option<&str>,
-    current_namespace: Option<&str>,
-    current_table: Option<&str>,
-    err_no_lakekeeper: &str,
-    err_unreachable: &str,
-    err_no_warehouses: &str,
-) -> String {
-    if !has_lakekeeper {
-        return format!(
-            r#"<p class="cz-studio-sidebar-note">{}</p>"#,
-            html_escape(err_no_lakekeeper)
-        );
-    }
-    match lk_state {
-        LakekeeperState::Unreachable => format!(
-            r#"<p class="cz-studio-sidebar-note">{}</p>"#,
-            html_escape(err_unreachable)
-        ),
-        LakekeeperState::NoWarehouses => format!(
-            r#"<p class="cz-studio-sidebar-note">{}</p>
-<p style="padding: 0.5rem;"><a href="/studio/bootstrap" class="cz-btn-primary" style="font-size: 0.78rem;">Bootstrap</a></p>"#,
-            html_escape(err_no_warehouses)
-        ),
-        LakekeeperState::HasWarehouses(names) => {
-            let items: String = names
-                .iter()
-                .map(|n| {
-                    let is_current = current_warehouse == Some(n.as_str());
-                    let active_class = if is_current { " cz-tree-active" } else { "" };
-                    format!(
-                        r#"<li class="cz-tree-item"><a class="cz-tree-row{active}" href="/studio/catalog/{enc}"><span class="cz-tree-icon">⬢</span><span class="cz-tree-label">{display}</span></a></li>"#,
-                        active = active_class,
-                        enc = url_encode(n),
-                        display = html_escape(n),
-                    )
-                })
-                .collect();
-            format!(r#"<ul class="cz-tree">{items}</ul>"#)
-        }
-        LakekeeperState::UnexpectedShape(_) => format!(
-            r#"<p class="cz-studio-sidebar-note">Lakekeeper response shape unrecognized; see the catalog pane for details.</p>"#
-        ),
-    }
-    // current_namespace + current_table are reserved for the drill-
-    // down pages that pass full context; the /studio root only
-    // surfaces warehouses.
-    .to_string()
-    + {
-        let _ = (current_namespace, current_table);
-        ""
-    }
-}
 
 /// Render the sidebar's "Recent queries" section. Each entry is a
 /// clickable row that bounces through /studio?sql=... to prefill
@@ -2881,6 +3211,7 @@ fn render_studio_page(
     history: &StudioHistory,
     sql_prefill: &str,
     result: Option<SqlOutcome>,
+    sidebar_html: &str,
 ) -> String {
     let title = localizer.t("ui-studio-title");
     let sql_placeholder = localizer.t("ui-studio-sql-placeholder");
@@ -2905,32 +3236,18 @@ fn render_studio_page(
     ); // i18n placeholders preserved for future re-use; new shell uses
        // simpler hard-coded eyebrow labels for now.
 
-    // ---- Sidebar pieces -----------------------------------------------
-    // Catalog tree (warehouses only at /studio root; drill-down pages
-    // expand the current warehouse + namespace + table).
-    let catalog_tree_html = render_sidebar_catalog_tree(
+    // Sidebar is built by the handler (it's async; needs Lakekeeper +
+    // store access) and passed in as `sidebar_html`. The variables
+    // below stay for future use if we want to surface no-lakekeeper /
+    // unreachable hints in the editor pane.
+    let _ = (
+        history,
         has_lakekeeper,
         lk_state,
-        None, // no current warehouse selected on /studio root
-        None,
-        None,
         &err_no_lakekeeper,
         &lk_unreachable,
         &lk_no_warehouses,
-    );
-    // Recent queries list (always shown if non-empty).
-    let recent_html = render_sidebar_recent_queries(history, &history_reload);
-
-    let sidebar_html = format!(
-        r#"<section class="cz-studio-sidebar-section">
-<div class="cz-studio-sidebar-eyebrow"><span>Catalog</span><a href="/studio/bootstrap" class="cz-studio-sidebar-action" title="Manual bootstrap (recovery)">+</a></div>
-{catalog_tree_html}
-</section>
-<section class="cz-studio-sidebar-section">
-<div class="cz-studio-sidebar-eyebrow"><span>Recent ({n})</span></div>
-{recent_html}
-</section>"#,
-        n = history.entries.len(),
+        &history_reload,
     );
 
     // ---- Main pane: results-first when a query just ran, else editor --
