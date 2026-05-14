@@ -1616,25 +1616,8 @@ async fn studio_catalog_warehouse_handler(
             }
         }
     }
-    let mut final_html = render_studio_namespace_list(&l, &warehouse, result);
-    if let Some(report) = recovery_report {
-        // Inject the recovery banner right after the breadcrumbs.
-        // The banner is colored amber (warning) regardless of
-        // whether the recovery succeeded -- both cases warrant
-        // operator attention.
-        let banner = format!(
-            r#"<section class="cz-section" style="max-width: 60rem; padding-top: 0;"><div class="cz-card" style="background: rgba(255, 193, 7, 0.06); border: 1px solid rgba(255, 193, 7, 0.3);"><p style="margin: 0; font-size: 0.85rem;"><strong>State-mismatch recovery:</strong> {}</p></div></section>"#,
-            html_escape(&report)
-        );
-        // Insert after the breadcrumb nav -- find first </section> close.
-        if let Some(idx) = final_html.find("</nav></section>") {
-            let after = idx + "</nav></section>".len();
-            final_html.insert_str(after, &banner);
-        } else {
-            // Fallback: prepend to the body.
-            final_html = format!("{banner}{final_html}");
-        }
-    }
+    let final_html =
+        render_studio_namespace_list(&l, &warehouse, result, recovery_report.as_deref());
     Html(final_html)
 }
 
@@ -1945,52 +1928,109 @@ fn render_studio_drilldown_error(
     message: &str,
 ) -> String {
     let breadcrumbs = render_drilldown_breadcrumbs(crumbs);
-    let body = format!(
+    let current_warehouse = crumbs.first().map(|(label, _)| *label);
+    let sidebar = render_drilldown_sidebar(current_warehouse);
+    let main_html = format!(
         r#"{breadcrumbs}
-<section class="cz-section" style="max-width: 60rem;">
-<div class="cz-card" style="background: rgba(255,99,99,0.06); border: 1px solid rgba(255,99,99,0.3);">
-<p style="margin: 0;">{}</p>
-</div>
-</section>"#,
+<div class="cz-studio-error">{}</div>"#,
         html_escape(message)
+    );
+    let body = format!(
+        r#"<div class="cz-studio-shell">
+<aside class="cz-studio-sidebar">{sidebar}</aside>
+<main class="cz-studio-main">{main_html}</main>
+</div>"#
     );
     render_shell(localizer, "Catalog", NavLink::Studio, &body)
 }
 
+/// Render the breadcrumb bar at the top of a drill-down main pane.
+/// Uses the new `.cz-studio-crumbs` styling.
 fn render_drilldown_breadcrumbs(crumbs: &[(&str, &str)]) -> String {
     let mut out = String::from(
-        r#"<section class="cz-section" style="max-width: 60rem; padding-top: 0.5rem; padding-bottom: 0.5rem;"><nav class="cz-muted" style="font-size: 0.85rem;"><a href="/studio">Studio</a> / <a href="/studio">Catalog</a>"#,
+        r#"<div class="cz-studio-crumbs"><a href="/studio">Studio</a><span class="cz-studio-crumbs-sep">/</span><a href="/studio">Catalog</a>"#,
     );
-    for (label, href) in crumbs {
-        out.push_str(" / ");
-        out.push_str(&format!(
-            r#"<a href="{}"><code>{}</code></a>"#,
-            html_escape(href),
-            html_escape(label)
-        ));
+    let last = crumbs.len().saturating_sub(1);
+    for (i, (label, href)) in crumbs.iter().enumerate() {
+        out.push_str(r#"<span class="cz-studio-crumbs-sep">/</span>"#);
+        if i == last {
+            // Last crumb is the current location -- styled distinctly,
+            // not a link.
+            out.push_str(&format!(
+                r#"<span class="cz-studio-crumbs-current">{}</span>"#,
+                html_escape(label)
+            ));
+        } else {
+            out.push_str(&format!(
+                r#"<a href="{}"><code style="font-size: 0.78rem;">{}</code></a>"#,
+                html_escape(href),
+                html_escape(label)
+            ));
+        }
     }
-    out.push_str("</nav></section>");
+    out.push_str("</div>");
     out
+}
+
+/// Sidebar for drill-down pages. Shows a "← All warehouses" link
+/// back to /studio, plus the current warehouse highlighted. Future
+/// iteration can expand to show namespaces/tables inline; for now
+/// we keep it lean to avoid an extra HTTP roundtrip per page load.
+fn render_drilldown_sidebar(current_warehouse: Option<&str>) -> String {
+    let wh_item = current_warehouse
+        .map(|wh| {
+            format!(
+                r#"<li class="cz-tree-item"><a class="cz-tree-row cz-tree-active" href="/studio/catalog/{enc}"><span class="cz-tree-icon">⬢</span><span class="cz-tree-label">{display}</span></a></li>"#,
+                enc = url_encode(wh),
+                display = html_escape(wh),
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        r#"<section class="cz-studio-sidebar-section">
+<div class="cz-studio-sidebar-eyebrow"><span>Catalog</span><a href="/studio" class="cz-studio-sidebar-action" title="Back to Studio">↩</a></div>
+<ul class="cz-tree">{wh_item}</ul>
+<p class="cz-studio-sidebar-note" style="margin-top: 0.75rem;">Click warehouse name to go up. Use the main pane to browse namespaces + tables.</p>
+</section>"#,
+    )
 }
 
 fn render_studio_namespace_list(
     localizer: &Localizer,
     warehouse: &str,
     result: Result<serde_json::Value, String>,
+    recovery_banner: Option<&str>,
 ) -> String {
     let crumbs = [(warehouse, &*format!("/studio/catalog/{warehouse}"))];
     let breadcrumbs = render_drilldown_breadcrumbs(&crumbs);
+    let sidebar = render_drilldown_sidebar(Some(warehouse));
     let csrf = auth::csrf_input();
-    let body_inner = match result {
+    let banner_html = recovery_banner
+        .map(|msg| {
+            format!(
+                r#"<div class="cz-studio-banner"><strong>State-mismatch recovery:</strong> {}</div>"#,
+                html_escape(msg)
+            )
+        })
+        .unwrap_or_default();
+
+    let (list_html, namespace_count) = match result {
         Ok(v) => {
-            // Iceberg REST: `{"namespaces": [["finance"], ["finance","raw"], ...]}`
             let namespaces = v
                 .get("namespaces")
                 .and_then(|n| n.as_array())
                 .cloned()
                 .unwrap_or_default();
             if namespaces.is_empty() {
-                r#"<p class="cz-muted">No namespaces in this warehouse yet. Use the form below to create your first one.</p>"#.to_string()
+                (
+                    r##"<div class="cz-studio-empty">
+<span class="cz-studio-empty-icon">⊕</span>
+<div class="cz-studio-empty-title">No namespaces yet</div>
+<p class="cz-studio-empty-text">Namespaces group related tables — think of them like databases or schemas. Use dotted names (<code>finance.raw</code>) for nested namespaces.</p>
+<a href="#cz-modal-new-namespace" class="cz-btn-primary">+ Create your first namespace</a>
+</div>"##.to_string(),
+                    0,
+                )
             } else {
                 let items: String = namespaces
                     .iter()
@@ -2005,10 +2045,10 @@ fn render_studio_namespace_list(
                         }
                         let qualified = segments.join(".");
                         Some(format!(
-                            r#"<li style="padding: 0.3rem 0; display: flex; align-items: center; justify-content: space-between; gap: 0.5rem;">
-<a href="/studio/catalog/{wh}/{ns}" style="text-decoration: none;"><code>{ns_display}</code></a>
+                            r#"<li class="cz-studio-list-item">
+<a href="/studio/catalog/{wh}/{ns}"><span style="opacity:0.6;">▸</span><code>{ns_display}</code></a>
 <form method="post" action="/studio/catalog/{wh}/{ns}/delete" style="margin: 0;" onsubmit="return confirm('Delete namespace {ns_display}? This is destructive and fails if the namespace has tables.');">{csrf}
-<button type="submit" class="cz-btn" style="font-size: 0.72rem; padding: 0.15rem 0.5rem; background: rgba(255,99,99,0.1); border-color: rgba(255,99,99,0.3);">Delete</button>
+<button type="submit" class="cz-btn-danger">Delete</button>
 </form>
 </li>"#,
                             wh = url_encode(warehouse),
@@ -2018,36 +2058,65 @@ fn render_studio_namespace_list(
                         ))
                     })
                     .collect();
-                format!(r#"<ul style="list-style: none; padding: 0; margin: 0;">{items}</ul>"#)
+                let count = namespaces.len();
+                (
+                    format!(r#"<ul class="cz-studio-list">{items}</ul>"#),
+                    count,
+                )
             }
         }
-        Err(e) => format!(
-            r#"<pre style="background: rgba(255,99,99,0.08); border: 1px solid rgba(255,99,99,0.25); border-radius: 0.4rem; padding: 0.75rem; overflow-x: auto; white-space: pre-wrap; font-size: 0.85rem;">{}</pre>"#,
-            html_escape(&e)
-        ),
+        Err(e) => (format!(r#"<pre class="cz-studio-error">{}</pre>"#, html_escape(&e)), 0),
     };
-    let create_form = format!(
-        r#"<form method="post" action="/studio/catalog/{wh}/namespaces/create" style="margin-top: 1rem; padding-top: 1rem; border-top: 1px solid rgba(255,255,255,0.06);">{csrf}
-<label for="ns-create-name" style="font-size: 0.82rem; display: block; margin-bottom: 0.25rem;">New namespace</label>
-<div style="display: flex; gap: 0.5rem; align-items: stretch;">
-<input id="ns-create-name" name="name" class="cz-input" type="text" placeholder="finance" required style="flex: 1; font-family: ui-monospace, monospace; font-size: 0.85rem;" />
-<button type="submit" class="cz-btn cz-btn-primary">Create</button>
+
+    let create_modal = format!(
+        r##"<div id="cz-modal-new-namespace" class="cz-modal-overlay" role="dialog" aria-labelledby="cz-modal-new-namespace-title" aria-modal="true">
+<a href="#" class="cz-modal-overlay-backdrop" aria-label="Close"></a>
+<div class="cz-modal">
+<a href="#" class="cz-modal-close" aria-label="Close">×</a>
+<h2 id="cz-modal-new-namespace-title" class="cz-modal-title">New namespace</h2>
+<p class="cz-modal-subtitle">Namespaces group related tables — think of them like databases or schemas. Dotted names like <code>finance.raw</code> become nested namespaces.</p>
+<form method="post" action="/studio/catalog/{wh}/namespaces/create">{csrf}
+<div class="cz-modal-field">
+<label for="ns-create-name">Namespace name</label>
+<input id="ns-create-name" name="name" class="cz-input" type="text" placeholder="finance" required autofocus />
+<p class="cz-modal-field-hint">Iceberg stores nested namespaces as arrays (<code>["finance", "raw"]</code>); the dotted form is just shorthand.</p>
 </div>
-<p class="cz-muted" style="margin: 0.4rem 0 0; font-size: 0.75rem;">Dotted names like <code>finance.raw</code> become nested namespaces (<code>["finance", "raw"]</code> in Iceberg's array model).</p>
-</form>"#,
+<div class="cz-modal-actions">
+<a href="#" class="cz-btn-ghost">Cancel</a>
+<button type="submit" class="cz-btn-primary">Create namespace</button>
+</div>
+</form>
+</div>
+</div>"##,
         wh = url_encode(warehouse),
         csrf = csrf,
     );
-    let body = format!(
-        r#"{breadcrumbs}
-<section class="cz-section" style="max-width: 60rem;">
-<div class="cz-card">
-<h2 style="margin-top: 0;">Namespaces in <code>{wh}</code></h2>
-{body_inner}
-{create_form}
+
+    let count_label = match namespace_count {
+        0 => "".to_string(),
+        n => format!(r#" <span class="cz-studio-results-count">({n})</span>"#),
+    };
+
+    let main_html = format!(
+        r##"{breadcrumbs}
+{banner_html}
+<div class="cz-studio-actions" style="margin-bottom: 0.5rem;">
+<div>
+<h1 class="cz-studio-pane-title" style="margin: 0;">Namespaces in <code>{wh}</code>{count_label}</h1>
+<p class="cz-studio-pane-subtitle" style="margin: 0.25rem 0 0;">Iceberg namespaces group tables. Click a namespace to drill into its tables.</p>
 </div>
-</section>"#,
+<span class="cz-studio-actions-spacer"></span>
+<a href="#cz-modal-new-namespace" class="cz-btn-primary">+ New namespace</a>
+</div>
+{list_html}
+{create_modal}"##,
         wh = html_escape(warehouse),
+    );
+    let body = format!(
+        r#"<div class="cz-studio-shell">
+<aside class="cz-studio-sidebar">{sidebar}</aside>
+<main class="cz-studio-main">{main_html}</main>
+</div>"#
     );
     render_shell(
         localizer,
@@ -2069,27 +2138,36 @@ fn render_studio_table_list(
         (namespace, &*ns_href),
     ];
     let breadcrumbs = render_drilldown_breadcrumbs(&crumbs);
+    let sidebar = render_drilldown_sidebar(Some(warehouse));
     let csrf = auth::csrf_input();
-    let body_inner = match result {
+
+    let (list_html, table_count) = match result {
         Ok(v) => {
-            // Iceberg REST: `{"identifiers": [{"namespace": [...], "name": "..."}, ...]}`
             let tables = v
                 .get("identifiers")
                 .and_then(|n| n.as_array())
                 .cloned()
                 .unwrap_or_default();
             if tables.is_empty() {
-                r#"<p class="cz-muted">No tables in this namespace yet. Use the form below to create one.</p>"#.to_string()
+                (
+                    r##"<div class="cz-studio-empty">
+<span class="cz-studio-empty-icon">▤</span>
+<div class="cz-studio-empty-title">No tables yet</div>
+<p class="cz-studio-empty-text">Define a table with a name and a list of typed columns (one per line). Iceberg primitives like <code>long</code>, <code>string</code>, <code>timestamp</code> are accepted.</p>
+<a href="#cz-modal-new-table" class="cz-btn-primary">+ Create your first table</a>
+</div>"##.to_string(),
+                    0,
+                )
             } else {
                 let items: String = tables
                     .iter()
                     .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
                     .map(|name| {
                         format!(
-                            r#"<li style="padding: 0.3rem 0; display: flex; align-items: center; justify-content: space-between; gap: 0.5rem;">
-<a href="/studio/catalog/{wh}/{ns}/{tbl}" style="text-decoration: none;"><code>{tbl_display}</code></a>
+                            r#"<li class="cz-studio-list-item">
+<a href="/studio/catalog/{wh}/{ns}/{tbl}"><span style="opacity:0.6;">▤</span><code>{tbl_display}</code></a>
 <form method="post" action="/studio/catalog/{wh}/{ns}/{tbl}/delete" style="margin: 0;" onsubmit="return confirm('Delete table {tbl_display}? This is destructive.');">{csrf}
-<button type="submit" class="cz-btn" style="font-size: 0.72rem; padding: 0.15rem 0.5rem; background: rgba(255,99,99,0.1); border-color: rgba(255,99,99,0.3);">Delete</button>
+<button type="submit" class="cz-btn-danger">Delete</button>
 </form>
 </li>"#,
                             wh = url_encode(warehouse),
@@ -2100,38 +2178,71 @@ fn render_studio_table_list(
                         )
                     })
                     .collect();
-                format!(r#"<ul style="list-style: none; padding: 0; margin: 0;">{items}</ul>"#)
+                let count = tables.len();
+                (
+                    format!(r#"<ul class="cz-studio-list">{items}</ul>"#),
+                    count,
+                )
             }
         }
-        Err(e) => format!(
-            r#"<pre style="background: rgba(255,99,99,0.08); border: 1px solid rgba(255,99,99,0.25); border-radius: 0.4rem; padding: 0.75rem; overflow-x: auto; white-space: pre-wrap; font-size: 0.85rem;">{}</pre>"#,
-            html_escape(&e)
-        ),
+        Err(e) => (format!(r#"<pre class="cz-studio-error">{}</pre>"#, html_escape(&e)), 0),
     };
-    let create_form = format!(
-        r#"<form method="post" action="/studio/catalog/{wh}/{ns}/tables/create" style="margin-top: 1rem; padding-top: 1rem; border-top: 1px solid rgba(255,255,255,0.06);">{csrf}
-<label for="tbl-create-name" style="font-size: 0.82rem; display: block; margin-bottom: 0.25rem;">New table -- name</label>
-<input id="tbl-create-name" name="name" class="cz-input" type="text" placeholder="customers" required style="width: 100%; font-family: ui-monospace, monospace; font-size: 0.85rem; margin-bottom: 0.5rem;" />
-<label for="tbl-create-cols" style="font-size: 0.82rem; display: block; margin-bottom: 0.25rem;">Columns (one per line, <code>name:type</code>)</label>
-<textarea id="tbl-create-cols" name="columns" rows="5" class="cz-input" placeholder="id:long&#10;name:string&#10;email:string&#10;created_at:timestamp" required style="width: 100%; font-family: ui-monospace, monospace; font-size: 0.82rem;"></textarea>
-<p class="cz-muted" style="margin: 0.3rem 0 0.5rem; font-size: 0.72rem;">Iceberg primitives: <code>long</code>, <code>int</code>, <code>string</code>, <code>boolean</code>, <code>double</code>, <code>float</code>, <code>date</code>, <code>timestamp</code>, <code>timestamptz</code>, <code>binary</code>. Blank lines + lines starting with <code>#</code> are ignored.</p>
-<button type="submit" class="cz-btn cz-btn-primary">Create table</button>
-</form>"#,
+
+    let create_modal = format!(
+        r##"<div id="cz-modal-new-table" class="cz-modal-overlay" role="dialog" aria-labelledby="cz-modal-new-table-title" aria-modal="true">
+<a href="#" class="cz-modal-overlay-backdrop" aria-label="Close"></a>
+<div class="cz-modal" style="max-width: 36rem;">
+<a href="#" class="cz-modal-close" aria-label="Close">×</a>
+<h2 id="cz-modal-new-table-title" class="cz-modal-title">New table in <code>{ns_display}</code></h2>
+<p class="cz-modal-subtitle">Define an Iceberg table — a name and a list of typed columns, one per line.</p>
+<form method="post" action="/studio/catalog/{wh}/{ns}/tables/create">{csrf}
+<div class="cz-modal-field">
+<label for="tbl-create-name">Table name</label>
+<input id="tbl-create-name" name="name" class="cz-input" type="text" placeholder="customers" required autofocus />
+</div>
+<div class="cz-modal-field">
+<label for="tbl-create-cols">Columns (<code>name:type</code>, one per line)</label>
+<textarea id="tbl-create-cols" name="columns" rows="8" class="cz-input" placeholder="id:long&#10;name:string&#10;email:string&#10;created_at:timestamp" required style="font-size: 0.82rem; line-height: 1.5;"></textarea>
+<p class="cz-modal-field-hint">Iceberg primitives: <code>long</code>, <code>int</code>, <code>string</code>, <code>boolean</code>, <code>double</code>, <code>float</code>, <code>date</code>, <code>timestamp</code>, <code>timestamptz</code>, <code>binary</code>. Blank lines + <code>#</code> comments are ignored.</p>
+</div>
+<div class="cz-modal-actions">
+<a href="#" class="cz-btn-ghost">Cancel</a>
+<button type="submit" class="cz-btn-primary">Create table</button>
+</div>
+</form>
+</div>
+</div>"##,
         wh = url_encode(warehouse),
         ns = url_encode(namespace),
+        ns_display = html_escape(namespace),
         csrf = csrf,
     );
-    let body = format!(
-        r#"{breadcrumbs}
-<section class="cz-section" style="max-width: 60rem;">
-<div class="cz-card">
-<h2 style="margin-top: 0;">Tables in <code>{wh}</code>.<code>{ns}</code></h2>
-{body_inner}
-{create_form}
+
+    let count_label = match table_count {
+        0 => "".to_string(),
+        n => format!(r#" <span class="cz-studio-results-count">({n})</span>"#),
+    };
+
+    let main_html = format!(
+        r##"{breadcrumbs}
+<div class="cz-studio-actions" style="margin-bottom: 0.5rem;">
+<div>
+<h1 class="cz-studio-pane-title" style="margin: 0;">Tables in <code>{wh}</code>.<code>{ns}</code>{count_label}</h1>
+<p class="cz-studio-pane-subtitle" style="margin: 0.25rem 0 0;">Iceberg tables under this namespace. Click a table to inspect its schema.</p>
 </div>
-</section>"#,
+<span class="cz-studio-actions-spacer"></span>
+<a href="#cz-modal-new-table" class="cz-btn-primary">+ New table</a>
+</div>
+{list_html}
+{create_modal}"##,
         wh = html_escape(warehouse),
         ns = html_escape(namespace),
+    );
+    let body = format!(
+        r#"<div class="cz-studio-shell">
+<aside class="cz-studio-sidebar">{sidebar}</aside>
+<main class="cz-studio-main">{main_html}</main>
+</div>"#
     );
     render_shell(
         localizer,
@@ -2156,12 +2267,9 @@ fn render_studio_table_detail(
         (table, &*tbl_href),
     ];
     let breadcrumbs = render_drilldown_breadcrumbs(&crumbs);
+    let sidebar = render_drilldown_sidebar(Some(warehouse));
     let body_inner = match result {
         Ok(v) => {
-            // Iceberg REST table-load response is large; show the
-            // most operator-relevant pieces (schema + location +
-            // current snapshot) inline and the full raw JSON in a
-            // collapsible <details> block.
             let location = v
                 .get("metadata")
                 .and_then(|m| m.get("location"))
@@ -2174,6 +2282,11 @@ fn render_studio_table_detail(
                 .or_else(|| v.get("current-snapshot-id"))
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| "(none)".to_string());
+            let format_version = v
+                .get("metadata")
+                .and_then(|m| m.get("format-version"))
+                .map(|x| x.to_string())
+                .unwrap_or_else(|| "(unknown)".to_string());
             let schema_html = v
                 .get("metadata")
                 .and_then(|m| m.get("schemas"))
@@ -2196,7 +2309,7 @@ fn render_studio_table_detail(
                                 .map(|r| if r { "NOT NULL" } else { "NULL OK" })
                                 .unwrap_or("?");
                             format!(
-                                "<tr><td><code>{}</code></td><td><code>{}</code></td><td class=\"cz-muted\">{}</td></tr>",
+                                "<tr><td>{}</td><td>{}</td><td class=\"cz-muted\">{}</td></tr>",
                                 html_escape(name),
                                 html_escape(&ty),
                                 nullable
@@ -2204,56 +2317,60 @@ fn render_studio_table_detail(
                         })
                         .collect();
                     format!(
-                        r#"<table class="cz-table" style="width: 100%; border-collapse: collapse; font-size: 0.85rem;">
+                        r#"<table class="cz-studio-schema">
 <thead><tr><th>Column</th><th>Type</th><th>Nullable</th></tr></thead>
 <tbody>{rows}</tbody>
 </table>"#
                     )
                 })
                 .unwrap_or_else(|| {
-                    r#"<p class="cz-muted">No schema found in table metadata.</p>"#.to_string()
+                    r#"<div class="cz-studio-results-empty">No schema found in table metadata.</div>"#
+                        .to_string()
                 });
             let raw_json = serde_json::to_string_pretty(&v)
                 .unwrap_or_else(|_| "(could not pretty-print)".to_string());
-            let prefill_sql = format!(
-                "SELECT * FROM {namespace}.{table} LIMIT 100",
-            );
+            let prefill_sql = format!("SELECT * FROM {namespace}.{table} LIMIT 100");
             format!(
                 r#"<dl class="cz-dl">
 <dt>Location</dt><dd><code>{loc}</code></dd>
 <dt>Current snapshot</dt><dd><code>{snap}</code></dd>
+<dt>Format version</dt><dd><code>{fmt}</code></dd>
 </dl>
-<h3 style="margin-top: 1.2rem;">Schema</h3>
+<h2 class="cz-studio-section-heading">Schema</h2>
 {schema_html}
-<p style="margin-top: 1rem;"><a href="/studio?sql={prefill_enc}" class="cz-btn">Pre-fill SELECT * in editor</a>
-<span class="cz-muted" style="margin-left: 0.5rem; font-size: 0.78rem;">Querying this Iceberg table from Databend requires a Databend `[[catalog]]` block pointing at Lakekeeper -- deferred to phase 1.6.</span></p>
-<details style="margin-top: 1.5rem;">
-<summary class="cz-muted" style="cursor: pointer; font-size: 0.82rem;">Raw Iceberg metadata (JSON)</summary>
-<pre style="margin-top: 0.5rem; padding: 0.75rem; background: rgba(0,0,0,0.25); border-radius: 0.4rem; overflow-x: auto; font-size: 0.78rem;">{raw}</pre>
+<div class="cz-studio-actions" style="margin-top: 1.25rem;">
+<a href="/studio?sql={prefill_enc}" class="cz-btn-primary">Pre-fill SELECT * in editor</a>
+<span class="cz-studio-actions-spacer"></span>
+<span class="cz-studio-editor-hint" style="margin: 0;">Querying this Iceberg table from Databend needs a <code>[[catalog]]</code> block pointing at Lakekeeper — deferred to phase 1.6.</span>
+</div>
+<details style="margin-top: 1.75rem;">
+<summary class="cz-studio-raw-summary">Raw Iceberg metadata (JSON)</summary>
+<pre class="cz-studio-raw">{raw}</pre>
 </details>"#,
                 loc = html_escape(location),
                 snap = html_escape(&current_snapshot),
+                fmt = html_escape(&format_version),
                 schema_html = schema_html,
                 prefill_enc = url_encode(&prefill_sql),
                 raw = html_escape(&raw_json),
             )
         }
-        Err(e) => format!(
-            r#"<pre style="background: rgba(255,99,99,0.08); border: 1px solid rgba(255,99,99,0.25); border-radius: 0.4rem; padding: 0.75rem; overflow-x: auto; white-space: pre-wrap; font-size: 0.85rem;">{}</pre>"#,
-            html_escape(&e)
-        ),
+        Err(e) => format!(r#"<pre class="cz-studio-error">{}</pre>"#, html_escape(&e)),
     };
-    let body = format!(
+    let main_html = format!(
         r#"{breadcrumbs}
-<section class="cz-section" style="max-width: 60rem;">
-<div class="cz-card">
-<h2 style="margin-top: 0;"><code>{wh}</code>.<code>{ns}</code>.<code>{tbl}</code></h2>
-{body_inner}
-</div>
-</section>"#,
+<h1 class="cz-studio-pane-title"><code>{wh}</code>.<code>{ns}</code>.<code>{tbl}</code></h1>
+<p class="cz-studio-pane-subtitle">Iceberg table metadata — schema, location, current snapshot. Use the editor to query rows.</p>
+{body_inner}"#,
         wh = html_escape(warehouse),
         ns = html_escape(namespace),
         tbl = html_escape(table),
+    );
+    let body = format!(
+        r#"<div class="cz-studio-shell">
+<aside class="cz-studio-sidebar">{sidebar}</aside>
+<main class="cz-studio-main">{main_html}</main>
+</div>"#
     );
     render_shell(
         localizer,
@@ -3484,108 +3601,124 @@ fn render_studio_bootstrap_form(
     let no_lakekeeper = localizer.t("ui-studio-error-no-lakekeeper");
     let csrf = auth::csrf_input();
 
+    if !has_lakekeeper {
+        let body = format!(
+            r#"<div class="cz-setup-shell">
+<p class="cz-setup-eyebrow">Catalog setup</p>
+<h1 class="cz-setup-title">{title}</h1>
+<div class="cz-setup-card">
+<p style="margin: 0; color: var(--muted); line-height: 1.6;">{message}</p>
+<div class="cz-setup-actions">
+<a href="/studio" class="cz-btn-ghost">Back to Studio</a>
+</div>
+</div>
+</div>"#,
+            title = html_escape(&title),
+            message = html_escape(&no_lakekeeper),
+        );
+        return render_shell(localizer, &title, NavLink::Studio, &body);
+    }
+
     let result_block = match result {
         None => String::new(),
         Some(Ok(msg)) => format!(
-            r#"<div class="cz-card" style="background: rgba(80, 220, 120, 0.06); border: 1px solid rgba(80, 220, 120, 0.3); margin-bottom: 1rem;">
-<h3 style="margin-top: 0;">Bootstrap succeeded</h3>
-<pre style="white-space: pre-wrap; margin: 0; font-size: 0.85rem;">{}</pre>
+            r#"<div class="cz-setup-result-ok">
+<p class="cz-setup-result-title">Bootstrap succeeded</p>
+<pre class="cz-setup-result-body">{}</pre>
 </div>"#,
             html_escape(&msg)
         ),
         Some(Err(msg)) => format!(
-            r#"<div class="cz-card" style="background: rgba(255, 99, 99, 0.06); border: 1px solid rgba(255, 99, 99, 0.3); margin-bottom: 1rem;">
-<h3 style="margin-top: 0;">Bootstrap failed</h3>
-<pre style="white-space: pre-wrap; margin: 0; font-size: 0.85rem;">{}</pre>
+            r#"<div class="cz-setup-result-err">
+<p class="cz-setup-result-title">Bootstrap failed</p>
+<pre class="cz-setup-result-body">{}</pre>
 </div>"#,
             html_escape(&msg)
         ),
     };
 
-    if !has_lakekeeper {
-        let body = format!(
-            r#"<section class="cz-hero"><h1>{title}</h1></section>
-<section class="cz-section" style="max-width: 50rem;">
-<div class="cz-card"><p>{}</p></div>
-</section>"#,
-            html_escape(&no_lakekeeper)
-        );
-        return render_shell(localizer, &title, NavLink::Studio, &body);
-    }
+    let prefill_bucket = if prefill.bucket.is_empty() {
+        "lakekeeper-default"
+    } else {
+        &prefill.bucket
+    };
 
     let body = format!(
-        r#"<section class="cz-hero">
-<h1>{title}</h1>
-<p>{intro}</p>
-</section>
-<section class="cz-section" style="max-width: 50rem;">
+        r#"<div class="cz-setup-shell">
+<p class="cz-setup-eyebrow">Catalog setup</p>
+<h1 class="cz-setup-title">{title}</h1>
+<p class="cz-setup-subtitle">{intro}</p>
 {result_block}
-<div class="cz-card">
-<form method="post" action="/studio/bootstrap" style="display: flex; flex-direction: column; gap: 0.85rem;">
+<form method="post" action="/studio/bootstrap" class="cz-setup-card">
 {csrf}
-<div>
-<label for="bs-project" style="font-size: 0.85rem;">Project name</label>
-<input id="bs-project" name="project_name" class="cz-input" type="text" value="computeza-default" required style="width: 100%; font-family: ui-monospace, monospace;" />
+<div class="cz-setup-section">
+<p class="cz-setup-section-title">Catalog identity</p>
+<p class="cz-setup-section-hint">Name the Lakekeeper project + warehouse that Studio will browse. Defaults are fine for single-tenant installs.</p>
+<div class="cz-setup-field">
+<label for="bs-project">Project name</label>
+<input id="bs-project" name="project_name" class="cz-input" type="text" value="computeza-default" required />
 </div>
-<div>
-<label for="bs-warehouse" style="font-size: 0.85rem;">Warehouse name</label>
-<input id="bs-warehouse" name="warehouse_name" class="cz-input" type="text" value="default" required style="width: 100%; font-family: ui-monospace, monospace;" />
+<div class="cz-setup-field">
+<label for="bs-warehouse">Warehouse name</label>
+<input id="bs-warehouse" name="warehouse_name" class="cz-input" type="text" value="default" required />
 </div>
-<hr style="border: none; border-top: 1px solid rgba(255,255,255,0.06); margin: 0.25rem 0;" />
-<p class="cz-muted" style="margin: 0; font-size: 0.78rem;">S3 storage (point at the local Garage instance, or any S3-compatible endpoint).</p>
-<div>
-<label for="bs-s3-endpoint" style="font-size: 0.85rem;">S3 endpoint</label>
-<input id="bs-s3-endpoint" name="s3_endpoint" class="cz-input" type="text" value="{s3_endpoint}" required style="width: 100%; font-family: ui-monospace, monospace;" />
 </div>
-<div>
-<label for="bs-s3-region" style="font-size: 0.85rem;">Region</label>
-<input id="bs-s3-region" name="s3_region" class="cz-input" type="text" value="garage" required style="width: 100%; font-family: ui-monospace, monospace;" />
-<p class="cz-muted" style="margin: 0.3rem 0 0; font-size: 0.72rem;">Default is <code>garage</code> -- Garage uses this region name for SigV4 signatures by default. Using anything else (like <code>us-east-1</code>) makes Garage reject Lakekeeper's auth headers as "unexpected scope". If your Garage cluster was deployed with <code>s3_region</code> set explicitly in its config, match that value here.</p>
+
+<div class="cz-setup-section">
+<p class="cz-setup-section-title">S3 storage</p>
+<p class="cz-setup-section-hint">Where Lakekeeper writes Iceberg metadata + data files. Point at the local Garage instance, or any S3-compatible endpoint.</p>
+<div class="cz-setup-field">
+<label for="bs-s3-endpoint">S3 endpoint</label>
+<input id="bs-s3-endpoint" name="s3_endpoint" class="cz-input" type="text" value="{s3_endpoint}" required />
 </div>
-<div>
-<label for="bs-s3-bucket" style="font-size: 0.85rem;">Bucket</label>
-<input id="bs-s3-bucket" name="s3_bucket" class="cz-input" type="text" value="{prefill_bucket}" required style="width: 100%; font-family: ui-monospace, monospace;" />
+<div class="cz-setup-field">
+<label for="bs-s3-region">Region</label>
+<input id="bs-s3-region" name="s3_region" class="cz-input" type="text" value="garage" required />
+<p class="cz-setup-field-hint">Default <code>garage</code> matches Garage's SigV4 default region. <code>us-east-1</code> here makes Garage reject Lakekeeper with <em>unexpected scope</em>. Match your Garage <code>s3_region</code> if explicitly set.</p>
 </div>
-<div>
-<label for="bs-s3-ak" style="font-size: 0.85rem;">Access key ID</label>
-<input id="bs-s3-ak" name="s3_access_key" class="cz-input" type="text" required placeholder="GK..." value="{prefill_key_id}" style="width: 100%; font-family: ui-monospace, monospace;" />
-<p class="cz-muted" style="margin: 0.3rem 0 0; font-size: 0.72rem;"><strong>This is the auto-generated Access Key ID from Garage</strong> (looks like <code>GK4cf9b7d2e9a4b78...</code>), NOT the human-friendly alias you chose. Get it by running these commands on the Garage host in order:</p>
-<pre style="margin: 0.3rem 0 0; padding: 0.4rem 0.6rem; background: rgba(0,0,0,0.25); border-radius: 0.3rem; font-size: 0.72rem; overflow-x: auto;"># Set an alias once -- our installer ships `garage` as `computeza-garage`
-# to avoid clashing with distro packages of the same name. The CLI also
-# needs `-c &lt;config&gt;` to find the running daemon&apos;s admin endpoint + token.
+<div class="cz-setup-field">
+<label for="bs-s3-bucket">Bucket</label>
+<input id="bs-s3-bucket" name="s3_bucket" class="cz-input" type="text" value="{prefill_bucket}" required />
+</div>
+</div>
+
+<div class="cz-setup-section">
+<p class="cz-setup-section-title">S3 credentials</p>
+<p class="cz-setup-section-hint">Lakekeeper signs every metadata write with these. v0.1 will auto-mint them — for now paste the values <code>garage key info</code> prints.</p>
+<div class="cz-setup-field">
+<label for="bs-s3-ak">Access key ID</label>
+<input id="bs-s3-ak" name="s3_access_key" class="cz-input" type="text" required placeholder="GK..." value="{prefill_key_id}" />
+<p class="cz-setup-field-hint">The auto-generated Access Key ID (looks like <code>GK4cf9b7d2e9a4b78...</code>), <strong>not</strong> the human alias.</p>
+<pre class="cz-setup-help"># installer ships garage as `computeza-garage` to avoid distro clashes
 alias gg=&quot;sudo /usr/local/bin/computeza-garage -c /var/lib/computeza/garage/garage.toml&quot;
 
-# === STEP 0: one-time cluster bootstrap (skip if `gg layout show` lists
-# `Status: active`) ============================================================
-# Garage refuses all data operations until its single-node layout is
-# applied. v0.1 will auto-run these at install time; for now run them
-# once per fresh Garage install:
-gg status                                      # copy the local Node ID (16-hex prefix)
-gg layout assign &lt;node-id&gt; -z dc1 -c 10G       # 10 GiB capacity, zone dc1
-gg layout apply --version 1                    # commit the layout
+# one-time cluster layout (skip if `gg layout show` shows Status: active)
+gg status                                      # copy local Node ID
+gg layout assign &lt;node-id&gt; -z dc1 -c 10G
+gg layout apply --version 1
 
-# === STEP 1: create key + bucket + grant + read credentials ==================
-gg key create lakekeeper                       # positional name; --name is rejected in Garage 0.9+
+# key + bucket + grant + read credentials
+gg key create lakekeeper
 gg bucket create lakekeeper-default
 gg bucket allow lakekeeper-default --read --write --owner --key lakekeeper
-gg key info lakekeeper        # &lt;-- copy &quot;Key ID&quot; + &quot;Secret key&quot; from this output</pre>
-<p class="cz-muted" style="margin: 0.3rem 0 0; font-size: 0.72rem;">The last command prints two opaque strings. Paste the <strong>Key ID</strong> here and the <strong>Secret key</strong> below. The alias <code>lakekeeper</code> is only for your records on the Garage side; Lakekeeper signs requests with the generated Key ID. v0.1 will auto-mint these via Garage's admin API.</p>
+gg key info lakekeeper                         # &lt;-- copy Key ID + Secret key</pre>
 </div>
-<div>
-<label for="bs-s3-sk" style="font-size: 0.85rem;">Secret access key</label>
-<input id="bs-s3-sk" name="s3_secret_access_key" class="cz-input" type="password" required placeholder="opaque base64-ish string from `garage key info`" value="{prefill_secret}" style="width: 100%; font-family: ui-monospace, monospace;" />
+<div class="cz-setup-field">
+<label for="bs-s3-sk">Secret access key</label>
+<input id="bs-s3-sk" name="s3_secret_access_key" class="cz-input" type="password" required placeholder="opaque base64-ish string from `garage key info`" value="{prefill_secret}" />
 </div>
-<div>
-<button type="submit" class="cz-btn cz-btn-primary">Run bootstrap</button>
-<a href="/studio" class="cz-btn" style="margin-left: 0.5rem;">Cancel</a>
+</div>
+
+<div class="cz-setup-actions">
+<a href="/studio" class="cz-btn-ghost">Cancel</a>
+<button type="submit" class="cz-btn-primary">Run bootstrap</button>
 </div>
 </form>
-</div>
-</section>"#,
+</div>"#,
         title = html_escape(&title),
         intro = html_escape(&intro),
         s3_endpoint = html_escape(suggested_s3_endpoint),
-        prefill_bucket = html_escape(if prefill.bucket.is_empty() { "lakekeeper-default" } else { &prefill.bucket }),
+        prefill_bucket = html_escape(prefill_bucket),
         prefill_key_id = html_escape(&prefill.key_id),
         prefill_secret = html_escape(&prefill.secret),
         csrf = csrf,

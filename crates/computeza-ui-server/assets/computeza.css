@@ -1190,34 +1190,57 @@ details > summary::-webkit-details-marker { display: none; }
   line-height: 1.55;
 }
 
-/* Modal dialog */
+/* Modal dialog -- CSS :target driven, no JS needed.
+   Open: <a href="#cz-modal-foo">. Close: <a href="#">. */
 .cz-modal-overlay {
   position: fixed;
   inset: 0;
   background: rgba(10, 10, 26, 0.7);
   backdrop-filter: blur(4px);
   display: none;
-  align-items: center;
+  align-items: flex-start;
   justify-content: center;
   z-index: 1000;
-  padding: 1rem;
+  padding: 4rem 1rem 2rem;
+  overflow-y: auto;
 }
+.cz-modal-overlay:target,
 .cz-modal-overlay[data-open="true"] {
   display: flex;
 }
+.cz-modal-overlay-backdrop {
+  position: absolute;
+  inset: 0;
+  cursor: pointer;
+}
 .cz-modal {
+  position: relative;
   background: var(--navy-2);
   border: 1px solid var(--line);
   border-radius: var(--radius);
   box-shadow: var(--shadow-card);
   width: 100%;
-  max-width: 30rem;
+  max-width: 32rem;
   padding: 1.5rem 1.75rem;
+  z-index: 1;
 }
+.cz-modal-close {
+  position: absolute;
+  top: 0.75rem;
+  right: 1rem;
+  font-size: 1.4rem;
+  line-height: 1;
+  color: var(--muted);
+  text-decoration: none;
+  padding: 0.25rem 0.5rem;
+  border-radius: 0.3rem;
+}
+.cz-modal-close:hover { color: var(--ink); background: var(--navy-3); }
 .cz-modal-title {
   font-size: 1.1rem;
   font-weight: 600;
   margin: 0 0 0.4rem;
+  color: var(--ink);
 }
 .cz-modal-subtitle {
   font-size: 0.82rem;
@@ -1225,11 +1248,34 @@ details > summary::-webkit-details-marker { display: none; }
   margin: 0 0 1.25rem;
   line-height: 1.55;
 }
+.cz-modal-field {
+  margin-bottom: 0.95rem;
+}
+.cz-modal-field label {
+  display: block;
+  font-size: 0.78rem;
+  font-weight: 500;
+  color: var(--ink);
+  margin-bottom: 0.35rem;
+}
+.cz-modal-field .cz-input {
+  width: 100%;
+  font-family: 'Geist Mono', ui-monospace, monospace;
+  font-size: 0.85rem;
+}
+.cz-modal-field-hint {
+  font-size: 0.72rem;
+  color: var(--muted);
+  margin: 0.35rem 0 0;
+  line-height: 1.5;
+}
 .cz-modal-actions {
   display: flex;
   justify-content: flex-end;
   gap: 0.5rem;
-  margin-top: 1.25rem;
+  margin-top: 1.5rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--line);
 }
 
 /* Recovery banner (state-mismatch warning) */
@@ -1283,6 +1329,200 @@ details > summary::-webkit-details-marker { display: none; }
 .cz-studio-sidebar .cz-input {
   font-size: 0.78rem;
   padding: 0.35rem 0.5rem;
+}
+
+/* Table-detail blocks: schema, raw JSON, key/value summary */
+.cz-studio-section-heading {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  font-weight: 500;
+  margin: 1.75rem 0 0.6rem;
+}
+.cz-studio-schema {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: 'Geist Mono', ui-monospace, monospace;
+  font-size: 0.82rem;
+  background: var(--navy-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.cz-studio-schema thead { background: var(--navy-3); }
+.cz-studio-schema th {
+  text-align: left;
+  padding: 0.55rem 0.9rem;
+  font-weight: 500;
+  color: var(--muted);
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  border-bottom: 1px solid var(--line);
+}
+.cz-studio-schema td {
+  padding: 0.5rem 0.9rem;
+  border-bottom: 1px solid var(--line);
+  color: var(--ink);
+}
+.cz-studio-schema tr:last-child td { border-bottom: none; }
+.cz-studio-schema tr:hover td { background: var(--navy-3); }
+.cz-studio-schema td.cz-muted { color: var(--muted); font-size: 0.72rem; letter-spacing: 0.04em; text-transform: uppercase; }
+.cz-studio-raw {
+  margin: 0.6rem 0 0;
+  padding: 0.9rem 1rem;
+  background: var(--navy-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow-x: auto;
+  font-family: 'Geist Mono', ui-monospace, monospace;
+  font-size: 0.74rem;
+  line-height: 1.55;
+  color: var(--ink);
+  max-height: 32rem;
+}
+.cz-studio-raw-summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.78rem;
+  padding: 0.4rem 0;
+  user-select: none;
+}
+.cz-studio-raw-summary:hover { color: var(--lavender); }
+
+/* Setup wizard (Lakekeeper bootstrap form) */
+.cz-setup-shell {
+  max-width: 44rem;
+  margin: 0 auto;
+  padding: 2.5rem 1.5rem 4rem;
+}
+.cz-setup-eyebrow {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-weight: 500;
+  color: var(--lavender);
+  margin: 0 0 0.5rem;
+}
+.cz-setup-title {
+  font-family: 'Geist', system-ui, sans-serif;
+  font-size: 1.65rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  margin: 0 0 0.5rem;
+  color: var(--ink);
+}
+.cz-setup-subtitle {
+  font-size: 0.92rem;
+  color: var(--muted);
+  margin: 0 0 2rem;
+  line-height: 1.6;
+}
+.cz-setup-card {
+  background: var(--navy-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 1.75rem;
+  margin-bottom: 1rem;
+  box-shadow: var(--shadow-card);
+}
+.cz-setup-section {
+  margin-bottom: 1.5rem;
+  padding-bottom: 1.5rem;
+  border-bottom: 1px solid var(--line);
+}
+.cz-setup-section:last-of-type {
+  border-bottom: none;
+  padding-bottom: 0;
+  margin-bottom: 0;
+}
+.cz-setup-section-title {
+  font-size: 0.74rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--muted);
+  font-weight: 500;
+  margin: 0 0 0.25rem;
+}
+.cz-setup-section-hint {
+  font-size: 0.82rem;
+  color: var(--muted);
+  margin: 0 0 1.1rem;
+  line-height: 1.55;
+}
+.cz-setup-field {
+  margin-bottom: 0.95rem;
+}
+.cz-setup-field:last-child { margin-bottom: 0; }
+.cz-setup-field label {
+  display: block;
+  font-size: 0.78rem;
+  font-weight: 500;
+  color: var(--ink);
+  margin-bottom: 0.35rem;
+}
+.cz-setup-field .cz-input {
+  width: 100%;
+  font-family: 'Geist Mono', ui-monospace, monospace;
+  font-size: 0.85rem;
+}
+.cz-setup-field-hint {
+  font-size: 0.72rem;
+  color: var(--muted);
+  margin: 0.35rem 0 0;
+  line-height: 1.5;
+}
+.cz-setup-help {
+  margin: 0.6rem 0 0;
+  padding: 0.7rem 0.9rem;
+  background: var(--navy-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  font-family: 'Geist Mono', ui-monospace, monospace;
+  font-size: 0.72rem;
+  line-height: 1.6;
+  color: var(--muted);
+  overflow-x: auto;
+  white-space: pre;
+}
+.cz-setup-actions {
+  display: flex;
+  gap: 0.55rem;
+  align-items: center;
+  justify-content: flex-end;
+  padding-top: 1.25rem;
+  border-top: 1px solid var(--line);
+  margin-top: 1.5rem;
+}
+.cz-setup-result-ok {
+  background: rgba(168, 232, 196, 0.06);
+  border: 1px solid rgba(168, 232, 196, 0.3);
+  border-radius: var(--radius);
+  padding: 1rem 1.1rem;
+  margin: 0 0 1rem;
+  color: var(--ok);
+}
+.cz-setup-result-err {
+  background: var(--fail-faint);
+  border: 1px solid rgba(255, 157, 166, 0.3);
+  border-radius: var(--radius);
+  padding: 1rem 1.1rem;
+  margin: 0 0 1rem;
+  color: var(--fail);
+}
+.cz-setup-result-title {
+  font-weight: 600;
+  margin: 0 0 0.4rem;
+  font-size: 0.95rem;
+  color: var(--ink);
+}
+.cz-setup-result-body {
+  margin: 0;
+  font-family: 'Geist Mono', ui-monospace, monospace;
+  font-size: 0.78rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
 }
 
 /* Sidebar collapse toggle (mobile-friendly future) */
