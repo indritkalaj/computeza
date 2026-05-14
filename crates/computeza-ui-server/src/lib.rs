@@ -657,23 +657,23 @@ pub fn router_with_state(state: AppState) -> Router {
             get(studio_bootstrap_form_handler).post(studio_bootstrap_submit_handler),
         )
         // Iceberg-REST catalog drill-down (phase 1.5):
-        //   /studio/catalog/:warehouse                       -> namespace list
-        //   /studio/catalog/:warehouse/:namespace            -> table list
-        //   /studio/catalog/:warehouse/:namespace/:table     -> table detail
+        //   /studio/catalog/{warehouse}                       -> namespace list
+        //   /studio/catalog/{warehouse}/{namespace}           -> table list
+        //   /studio/catalog/{warehouse}/{namespace}/{table}   -> table detail
         // All three hit Lakekeeper's /catalog/v1/* surface and
         // surface response bodies verbatim on non-2xx so URL-pattern
         // drift across Lakekeeper releases is debuggable from the
         // page itself.
         .route(
-            "/studio/catalog/:warehouse",
+            "/studio/catalog/{warehouse}",
             get(studio_catalog_warehouse_handler),
         )
         .route(
-            "/studio/catalog/:warehouse/:namespace",
+            "/studio/catalog/{warehouse}/{namespace}",
             get(studio_catalog_namespace_handler),
         )
         .route(
-            "/studio/catalog/:warehouse/:namespace/:table",
+            "/studio/catalog/{warehouse}/{namespace}/{table}",
             get(studio_catalog_table_handler),
         )
         .route(
@@ -681,7 +681,7 @@ pub fn router_with_state(state: AppState) -> Router {
             get(install_hub_handler).post(install_all_handler),
         )
         .route(
-            "/install/:slug/retry-bootstrap",
+            "/install/{slug}/retry-bootstrap",
             post(retry_bootstrap_handler),
         )
         .route(
@@ -3098,7 +3098,7 @@ async fn auto_bootstrap_lakekeeper(
     }])
 }
 
-/// POST /install/:slug/retry-bootstrap — re-run the post-install
+/// POST /install/{slug}/retry-bootstrap — re-run the post-install
 /// bootstrap step for a single component without doing a full
 /// re-install. Use case: install completed cleanly (daemon up,
 /// systemd unit registered, install-config persisted) but the
