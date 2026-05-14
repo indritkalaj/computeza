@@ -1077,24 +1077,26 @@ enum LakekeeperState {
 /// warehouse UUID, not the human-friendly name. The /studio drill-
 /// down routes carry the name in their URL (so operators see
 /// `default` in the breadcrumb, not a 36-char UUID). This helper
-/// resolves a name to its UUID via vault.
+/// resolves a name to its UUID via a three-tier strategy:
 ///
-/// Rules:
-///   - If the input already looks like a UUID (36 chars, 4
-///     hyphens, hex), pass through unchanged. Operators who paste
-///     a UUID directly into the URL get the literal request.
-///   - Otherwise look up `lakekeeper/default-warehouse-id` from
-///     vault. v0.1 supports a single bootstrap warehouse so we
-///     only key by the default-name slot. Multi-warehouse routing
-///     adds a `lakekeeper/warehouse-id-by-name/<n>` shape later.
-///   - If neither matches, return the input verbatim. Lakekeeper
-///     will surface `WarehouseIdIsNotUUID` which the drill-down
-///     page's error block renders inline (visible iteration
-///     surface).
+///   1. If the input already looks like a UUID, pass through.
+///   2. Look up `lakekeeper/default-warehouse-id` from vault
+///      (populated by a prior successful bootstrap).
+///   3. Auto-discover via the Iceberg REST config endpoint:
+///      `GET /catalog/v1/config?warehouse=<name>` returns
+///      `{"overrides": {"prefix": "<uuid>"}}`. This is the
+///      standard Iceberg-REST way to resolve a warehouse name to
+///      its opaque prefix; engines do this on every connection.
+///      The discovered prefix is cached back to the vault.
+///
+/// If all three fail, returns the input verbatim and Lakekeeper's
+/// `WarehouseIdIsNotUUID` error surfaces in the drill-down page.
 async fn resolve_warehouse_id_or_pass(
     name_or_uuid: &str,
+    base_url: Option<&str>,
     secrets: Option<&computeza_secrets::SecretsStore>,
 ) -> String {
+    // Tier 1: literal UUID.
     if name_or_uuid.len() == 36
         && name_or_uuid.chars().filter(|c| *c == '-').count() == 4
         && name_or_uuid
@@ -1103,12 +1105,64 @@ async fn resolve_warehouse_id_or_pass(
     {
         return name_or_uuid.to_string();
     }
+    // Tier 2: vault cache (set by bootstrap or prior auto-discover).
     if let Some(s) = secrets {
         if let Ok(Some(v)) = s.get("lakekeeper/default-warehouse-id").await {
             use secrecy::ExposeSecret;
             let id = v.expose_secret().to_string();
             if !id.trim().is_empty() {
                 return id;
+            }
+        }
+    }
+    // Tier 3: auto-discover via Iceberg REST `/catalog/v1/config`.
+    // Standard Iceberg-REST behaviour: pass the warehouse name as
+    // a query param, get the prefix back in the `overrides` block.
+    if let Some(url) = base_url {
+        if let Ok(client) = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+        {
+            let cfg_url = format!(
+                "{}/catalog/v1/config?warehouse={}",
+                url.trim_end_matches('/'),
+                url_encode(name_or_uuid)
+            );
+            if let Ok(resp) = client.get(&cfg_url).send().await {
+                let status = resp.status();
+                if let Ok(text) = resp.text().await {
+                    tracing::info!(
+                        url = %cfg_url,
+                        status = status.as_u16(),
+                        body = %text,
+                        "resolve_warehouse_id: /catalog/v1/config probe"
+                    );
+                    if status.is_success() {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                            let prefix = v
+                                .get("overrides")
+                                .and_then(|o| o.get("prefix"))
+                                .or_else(|| v.get("prefix"))
+                                .and_then(|p| p.as_str());
+                            if let Some(p) = prefix {
+                                if !p.trim().is_empty() {
+                                    // Cache for next time. Best-effort.
+                                    if let Some(s) = secrets {
+                                        let _ = s
+                                            .put("lakekeeper/default-warehouse-id", p)
+                                            .await;
+                                    }
+                                    tracing::info!(
+                                        warehouse_name = %name_or_uuid,
+                                        prefix = %p,
+                                        "resolve_warehouse_id: discovered via /catalog/v1/config; cached to vault"
+                                    );
+                                    return p.to_string();
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1440,7 +1494,7 @@ async fn studio_catalog_warehouse_handler(
     };
     // Resolve human-friendly name -> UUID (Lakekeeper's catalog
     // REST refuses non-UUID prefixes with `WarehouseIdIsNotUUID`).
-    let wh_id = resolve_warehouse_id_or_pass(&warehouse, state.secrets.as_deref()).await;
+    let wh_id = resolve_warehouse_id_or_pass(&warehouse, Some(&base_url), state.secrets.as_deref()).await;
     let path = format!("/catalog/v1/{}/namespaces", url_encode(&wh_id));
     let result = get_lakekeeper_catalog_json(&base_url, &path).await;
     Html(render_studio_namespace_list(&l, &warehouse, result))
@@ -1461,7 +1515,7 @@ async fn studio_catalog_namespace_handler(
             "Lakekeeper is not registered.",
         ));
     };
-    let wh_id = resolve_warehouse_id_or_pass(&warehouse, state.secrets.as_deref()).await;
+    let wh_id = resolve_warehouse_id_or_pass(&warehouse, Some(&base_url), state.secrets.as_deref()).await;
     // Multi-level namespaces ("finance.raw") become %1F-separated
     // (unit-separator) in the Iceberg REST URL spec. Single-level
     // is the common case in v0.0.x; we still encode for safety.
@@ -1495,7 +1549,7 @@ async fn studio_catalog_table_handler(
             "Lakekeeper is not registered.",
         ));
     };
-    let wh_id = resolve_warehouse_id_or_pass(&warehouse, state.secrets.as_deref()).await;
+    let wh_id = resolve_warehouse_id_or_pass(&warehouse, Some(&base_url), state.secrets.as_deref()).await;
     let ns_encoded = namespace.split('.').collect::<Vec<_>>().join("%1F");
     let path = format!(
         "/catalog/v1/{}/namespaces/{}/tables/{}",
@@ -1575,7 +1629,7 @@ async fn studio_catalog_namespace_create_handler(
     if segments.is_empty() {
         return axum::response::Redirect::to(&format!("/studio/catalog/{warehouse}"));
     }
-    let wh_id = resolve_warehouse_id_or_pass(&warehouse, state.secrets.as_deref()).await;
+    let wh_id = resolve_warehouse_id_or_pass(&warehouse, Some(&base_url), state.secrets.as_deref()).await;
     let path = format!("/catalog/v1/{}/namespaces", url_encode(&wh_id));
     let body = serde_json::json!({
         "namespace": segments,
@@ -1601,7 +1655,7 @@ async fn studio_catalog_namespace_delete_handler(
     let Some(base_url) = discover_lakekeeper_endpoint(state.store.as_deref()).await else {
         return axum::response::Redirect::to(&format!("/studio/catalog/{warehouse}"));
     };
-    let wh_id = resolve_warehouse_id_or_pass(&warehouse, state.secrets.as_deref()).await;
+    let wh_id = resolve_warehouse_id_or_pass(&warehouse, Some(&base_url), state.secrets.as_deref()).await;
     let ns_encoded = namespace.split('.').collect::<Vec<_>>().join("%1F");
     let path = format!(
         "/catalog/v1/{}/namespaces/{}",
@@ -1680,7 +1734,7 @@ async fn studio_catalog_table_create_handler(
         );
         return axum::response::Redirect::to(&redirect_to);
     }
-    let wh_id = resolve_warehouse_id_or_pass(&warehouse, state.secrets.as_deref()).await;
+    let wh_id = resolve_warehouse_id_or_pass(&warehouse, Some(&base_url), state.secrets.as_deref()).await;
     let ns_encoded = namespace.split('.').collect::<Vec<_>>().join("%1F");
     let path = format!(
         "/catalog/v1/{}/namespaces/{}/tables",
@@ -1722,7 +1776,7 @@ async fn studio_catalog_table_delete_handler(
     let Some(base_url) = discover_lakekeeper_endpoint(state.store.as_deref()).await else {
         return axum::response::Redirect::to(&redirect_to);
     };
-    let wh_id = resolve_warehouse_id_or_pass(&warehouse, state.secrets.as_deref()).await;
+    let wh_id = resolve_warehouse_id_or_pass(&warehouse, Some(&base_url), state.secrets.as_deref()).await;
     let ns_encoded = namespace.split('.').collect::<Vec<_>>().join("%1F");
     let path = format!(
         "/catalog/v1/{}/namespaces/{}/tables/{}",
