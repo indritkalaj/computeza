@@ -1606,6 +1606,16 @@ fn render_studio_page(
     fail to load, the textarea stays visible and the form works
     unchanged.
 -->
+<div id="cz-sql-toolbar" style="display: none; align-items: center; gap: 0.5rem; margin-bottom: 0.4rem;">
+  <label for="cz-sql-theme" class="cz-muted" style="font-size: 0.78rem;">Theme:</label>
+  <select id="cz-sql-theme" class="cz-input" style="width: auto; padding: 0.25rem 0.5rem; font-size: 0.78rem;">
+    <option value="darcula">Darcula</option>
+    <option value="tokyo-night-storm">Tokyo Night Storm</option>
+    <option value="nord">Nord</option>
+    <option value="material-dark">Material Dark</option>
+    <option value="forest">Forest</option>
+  </select>
+</div>
 <textarea id="cz-sql-textarea" name="sql" rows="8" class="cz-input" style="font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.9rem; width: 100%;" placeholder="{sql_placeholder}">{sql_value}</textarea>
 <div id="cz-sql-cm6" data-initial="{sql_value_attr}" style="display: none; height: 16rem; border: 1px solid rgba(255,255,255,0.08); border-radius: 0.4rem; overflow: hidden;"></div>
 <p class="cz-muted" style="margin: 0.4rem 0 0.6rem; font-size: 0.78rem;">{sql_help}</p>
@@ -1645,11 +1655,17 @@ fn render_studio_page(
 // every other SQL IDE.
 
 import {{ EditorView, basicSetup }} from "https://esm.sh/codemirror@6.0.1";
-import {{ EditorState }} from "https://esm.sh/@codemirror/state@6.4.1";
+import {{ EditorState, Compartment }} from "https://esm.sh/@codemirror/state@6.4.1";
 import {{ keymap }} from "https://esm.sh/@codemirror/view@6.30.0";
 import {{ sql }} from "https://esm.sh/@codemirror/lang-sql@6.7.1";
 import {{ autocompletion }} from "https://esm.sh/@codemirror/autocomplete@6.18.0";
 import {{ darcula }} from "https://esm.sh/@uiw/codemirror-theme-darcula@4.23.0";
+// fsegurai theme set -- four extra dark schemes the operator can pick
+// from. esm.sh resolves the named export per the package's index.
+import {{ tokyoNightStorm }} from "https://esm.sh/@fsegurai/codemirror-theme-tokyo-night-storm@6.2.0";
+import {{ nord }} from "https://esm.sh/@fsegurai/codemirror-theme-nord@6.2.0";
+import {{ materialDark }} from "https://esm.sh/@fsegurai/codemirror-theme-material-dark@6.2.0";
+import {{ forest }} from "https://esm.sh/@fsegurai/codemirror-theme-forest@6.2.0";
 
 (function() {{
   var mount = document.getElementById("cz-sql-cm6");
@@ -1731,7 +1747,7 @@ import {{ darcula }} from "https://esm.sh/@uiw/codemirror-theme-darcula@4.23.0";
   ]);
 
   // Override CM6 sizing + monospace font to match the surrounding
-  // page. Darcula theme handles colors; this just sizes the
+  // page. The active theme handles colors; this just sizes the
   // container and picks the same font stack the textarea uses.
   var sizingTheme = EditorView.theme({{
     "&": {{
@@ -1746,6 +1762,26 @@ import {{ darcula }} from "https://esm.sh/@uiw/codemirror-theme-darcula@4.23.0";
     }},
   }});
 
+  // Theme registry. Keys match the <select> option values; values
+  // are the imported CM6 theme extensions. Darcula is the default.
+  var themes = {{
+    "darcula": darcula,
+    "tokyo-night-storm": tokyoNightStorm,
+    "nord": nord,
+    "material-dark": materialDark,
+    "forest": forest,
+  }};
+  var THEME_STORAGE_KEY = "cz-sql-theme";
+  var savedTheme = null;
+  try {{ savedTheme = window.localStorage.getItem(THEME_STORAGE_KEY); }} catch(e) {{ /* localStorage may be blocked */ }}
+  var initialThemeKey = (savedTheme && themes[savedTheme]) ? savedTheme : "darcula";
+
+  // Compartment wraps the theme so we can swap it at runtime
+  // without rebuilding the editor view. Each call to
+  // themeCompartment.reconfigure(newExt) dispatched as an effect
+  // replaces the previous theme atomically.
+  var themeCompartment = new Compartment();
+
   var view = new EditorView({{
     parent: mount,
     state: EditorState.create({{
@@ -1753,7 +1789,7 @@ import {{ darcula }} from "https://esm.sh/@uiw/codemirror-theme-darcula@4.23.0";
       extensions: [
         basicSetup,
         sql(),
-        darcula,
+        themeCompartment.of(themes[initialThemeKey]),
         completionExt,
         submitKeymap,
         sizingTheme,
@@ -1761,6 +1797,25 @@ import {{ darcula }} from "https://esm.sh/@uiw/codemirror-theme-darcula@4.23.0";
       ],
     }}),
   }});
+
+  // Wire the <select> change event. Reveal the toolbar only after
+  // the editor has mounted successfully (so JS-disabled fallback
+  // doesn't show a non-functional theme picker).
+  var toolbar = document.getElementById("cz-sql-toolbar");
+  var themeSelect = document.getElementById("cz-sql-theme");
+  if (toolbar && themeSelect) {{
+    themeSelect.value = initialThemeKey;
+    themeSelect.addEventListener("change", function() {{
+      var key = themeSelect.value;
+      var ext = themes[key];
+      if (!ext) return;
+      view.dispatch({{
+        effects: themeCompartment.reconfigure(ext),
+      }});
+      try {{ window.localStorage.setItem(THEME_STORAGE_KEY, key); }} catch(e) {{ /* ignore */ }}
+    }});
+    toolbar.style.display = "flex";
+  }}
 
   // Swap textarea for CM6. Keep textarea in the DOM so the form
   // submission still finds its `name="sql"` field; we just stop
