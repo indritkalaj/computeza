@@ -1991,7 +1991,8 @@ async fn run_lakekeeper_bootstrap(
 
     // --- Step 1: create project (idempotent-ish: if a project of
     // the same name exists, Lakekeeper typically returns 409; we
-    // treat 409 as success and continue with the warehouse step).
+    // treat 409 as success and look up the existing project's ID
+    // for the warehouse step).
     let project_url = format!("{}/management/v1/project", base_url.trim_end_matches('/'));
     let project_body = serde_json::json!({
         "project-name": form.project_name,
@@ -2018,6 +2019,75 @@ async fn run_lakekeeper_bootstrap(
         ));
     }
 
+    // Resolve the project's UUID -- Lakekeeper's warehouse-create
+    // API takes `project-id` (a UUID), not `project-name`. The name
+    // is only a display label. Two paths:
+    //   - 201 fresh-create: project-id is in the create response.
+    //     Try a few likely field names since Lakekeeper drifts on
+    //     casing across releases (project-id, projectId, id).
+    //   - 409 already-existed: list projects and find the one whose
+    //     name matches. Same field-name fallback applies.
+    let parse_project_id = |body: &str| -> Option<String> {
+        let v: serde_json::Value = serde_json::from_str(body).ok()?;
+        v.get("project-id")
+            .or_else(|| v.get("projectId"))
+            .or_else(|| v.get("id"))
+            .and_then(|x| x.as_str())
+            .map(str::to_string)
+    };
+    let project_id: String = if !project_existed {
+        parse_project_id(&project_text).ok_or_else(|| {
+            format!(
+                "POST {project_url} returned 2xx but no `project-id` (tried `project-id`, `projectId`, `id`) was found in the response body:\n{project_text}"
+            )
+        })?
+    } else {
+        // List projects to find the one matching our name.
+        let list_resp = client
+            .get(&project_url)
+            .send()
+            .await
+            .map_err(|e| format!("GET {project_url} (project list): {e}"))?;
+        let list_text = list_resp
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("(could not read body: {e})"));
+        let list_v: serde_json::Value = serde_json::from_str(&list_text).map_err(|e| {
+            format!(
+                "GET {project_url} body did not parse as JSON: {e}\nbody: {list_text}"
+            )
+        })?;
+        // Try a few container shapes: `{"projects": [...]}`, bare array, or `{"data": [...]}`
+        let arr = list_v
+            .get("projects")
+            .or_else(|| list_v.get("data"))
+            .and_then(|x| x.as_array())
+            .cloned()
+            .or_else(|| list_v.as_array().cloned())
+            .unwrap_or_default();
+        arr.iter()
+            .find(|p| {
+                p.get("project-name")
+                    .or_else(|| p.get("projectName"))
+                    .or_else(|| p.get("name"))
+                    .and_then(|n| n.as_str())
+                    == Some(form.project_name.as_str())
+            })
+            .and_then(|p| {
+                p.get("project-id")
+                    .or_else(|| p.get("projectId"))
+                    .or_else(|| p.get("id"))
+                    .and_then(|x| x.as_str())
+                    .map(str::to_string)
+            })
+            .ok_or_else(|| {
+                format!(
+                    "project `{}` returned 409 (already exists) but could not be found in the list at GET {project_url}.\nbody: {list_text}",
+                    form.project_name
+                )
+            })?
+    };
+
     // --- Step 2: create warehouse with S3 storage profile +
     // credentials pointing at Garage.
     //
@@ -2035,7 +2105,12 @@ async fn run_lakekeeper_bootstrap(
     let warehouse_url = format!("{}/management/v1/warehouse", base_url.trim_end_matches('/'));
     let warehouse_body = serde_json::json!({
         "warehouse-name": form.warehouse_name,
-        "project-name": form.project_name,
+        // Lakekeeper resolves projects by UUID, not name. Sending
+        // `project-name` here makes Lakekeeper default project-id
+        // to the nil UUID and reject with ProjectNotFound. The
+        // project-id was captured above from the create-or-list
+        // response.
+        "project-id": project_id,
         "storage-profile": {
             "type": "s3",
             "bucket": form.s3_bucket,
