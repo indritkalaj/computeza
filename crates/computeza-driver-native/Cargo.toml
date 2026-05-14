@@ -18,6 +18,11 @@ async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# secrecy::SecretString is used by the BootstrapArtifact return type
+# (linux::post_install_bootstrap convention) so artifacts carrying
+# Garage's lakekeeper-key secret can't accidentally land in a Display
+# impl / log line on the journey to ui-server's vault writer.
+secrecy = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
