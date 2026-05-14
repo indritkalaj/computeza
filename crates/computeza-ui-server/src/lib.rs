@@ -1576,23 +1576,66 @@ async fn studio_catalog_warehouse_handler(
     // but we have bootstrap state in vault, re-fire the bootstrap
     // and retry. Triggered by NoSuchWarehouse or WarehouseIdIsNotUUID
     // errors -- both mean "this prefix doesn't resolve to a warehouse".
+    let mut recovery_report: Option<String> = None;
     if let (Err(e), Some(secrets)) = (&result, state.secrets.as_deref()) {
         let lkstr = e.to_lowercase();
         if lkstr.contains("nosuchwarehouse") || lkstr.contains("warehouseidisnotuuid") {
-            if let Some(recovered_id) =
-                try_recover_missing_warehouse(&warehouse, &base_url, secrets, state.store.as_deref())
-                    .await
+            tracing::warn!(
+                warehouse = %warehouse,
+                "studio drill-down: state mismatch detected; running auto-recovery"
+            );
+            match try_recover_missing_warehouse(
+                &warehouse,
+                &base_url,
+                secrets,
+                state.store.as_deref(),
+            )
+            .await
             {
-                wh_id = recovered_id;
-                result = get_lakekeeper_catalog_json(
-                    &base_url,
-                    &format!("/catalog/v1/{}/namespaces", url_encode(&wh_id)),
-                )
-                .await;
+                Some(recovered_id) => {
+                    tracing::info!(
+                        warehouse = %warehouse,
+                        prefix = %recovered_id,
+                        "studio drill-down: auto-recovery succeeded; retrying namespaces call"
+                    );
+                    wh_id = recovered_id;
+                    result = get_lakekeeper_catalog_json(
+                        &base_url,
+                        &format!("/catalog/v1/{}/namespaces", url_encode(&wh_id)),
+                    )
+                    .await;
+                    recovery_report = Some(format!(
+                        "Auto-recover: Lakekeeper had lost the warehouse `{warehouse}`. Re-bootstrapped from vault state (warehouse UUID is now {wh_id}). If you're seeing this banner repeatedly, it means Lakekeeper's persistence is getting wiped between requests -- check that postgres is up + that you're not uninstalling Lakekeeper between page loads."
+                    ));
+                }
+                None => {
+                    recovery_report = Some(format!(
+                        "Auto-recover attempted but failed. Lakekeeper says the warehouse `{warehouse}` doesn't exist, and re-running the bootstrap from vault state didn't fix it. Most likely cause: the Garage credentials in vault are stale (e.g. you rotated the Garage key without re-bootstrapping). Visit /studio/bootstrap to manually provision -- the form is pre-filled from vault and you can update the access-key/secret if they've changed.",
+                    ));
+                }
             }
         }
     }
-    Html(render_studio_namespace_list(&l, &warehouse, result))
+    let mut final_html = render_studio_namespace_list(&l, &warehouse, result);
+    if let Some(report) = recovery_report {
+        // Inject the recovery banner right after the breadcrumbs.
+        // The banner is colored amber (warning) regardless of
+        // whether the recovery succeeded -- both cases warrant
+        // operator attention.
+        let banner = format!(
+            r#"<section class="cz-section" style="max-width: 60rem; padding-top: 0;"><div class="cz-card" style="background: rgba(255, 193, 7, 0.06); border: 1px solid rgba(255, 193, 7, 0.3);"><p style="margin: 0; font-size: 0.85rem;"><strong>State-mismatch recovery:</strong> {}</p></div></section>"#,
+            html_escape(&report)
+        );
+        // Insert after the breadcrumb nav -- find first </section> close.
+        if let Some(idx) = final_html.find("</nav></section>") {
+            let after = idx + "</nav></section>".len();
+            final_html.insert_str(after, &banner);
+        } else {
+            // Fallback: prepend to the body.
+            final_html = format!("{banner}{final_html}");
+        }
+    }
+    Html(final_html)
 }
 
 async fn studio_catalog_namespace_handler(
