@@ -1073,6 +1073,48 @@ enum LakekeeperState {
 /// but no warehouse names can be extracted -- the raw body lands
 /// in the catalog pane so URL-pattern + response-shape drift is
 /// debuggable from /studio directly.
+/// Lakekeeper's `/catalog/v1/{prefix}/*` endpoints require the
+/// warehouse UUID, not the human-friendly name. The /studio drill-
+/// down routes carry the name in their URL (so operators see
+/// `default` in the breadcrumb, not a 36-char UUID). This helper
+/// resolves a name to its UUID via vault.
+///
+/// Rules:
+///   - If the input already looks like a UUID (36 chars, 4
+///     hyphens, hex), pass through unchanged. Operators who paste
+///     a UUID directly into the URL get the literal request.
+///   - Otherwise look up `lakekeeper/default-warehouse-id` from
+///     vault. v0.1 supports a single bootstrap warehouse so we
+///     only key by the default-name slot. Multi-warehouse routing
+///     adds a `lakekeeper/warehouse-id-by-name/<n>` shape later.
+///   - If neither matches, return the input verbatim. Lakekeeper
+///     will surface `WarehouseIdIsNotUUID` which the drill-down
+///     page's error block renders inline (visible iteration
+///     surface).
+async fn resolve_warehouse_id_or_pass(
+    name_or_uuid: &str,
+    secrets: Option<&computeza_secrets::SecretsStore>,
+) -> String {
+    if name_or_uuid.len() == 36
+        && name_or_uuid.chars().filter(|c| *c == '-').count() == 4
+        && name_or_uuid
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() || c == '-')
+    {
+        return name_or_uuid.to_string();
+    }
+    if let Some(s) = secrets {
+        if let Ok(Some(v)) = s.get("lakekeeper/default-warehouse-id").await {
+            use secrecy::ExposeSecret;
+            let id = v.expose_secret().to_string();
+            if !id.trim().is_empty() {
+                return id;
+            }
+        }
+    }
+    name_or_uuid.to_string()
+}
+
 /// Wrapper around `probe_lakekeeper` that falls back to the vault
 /// when Lakekeeper's warehouse-list returns empty. Reason: in some
 /// Lakekeeper configurations the warehouse-list endpoint is
@@ -1396,12 +1438,10 @@ async fn studio_catalog_warehouse_handler(
             "Lakekeeper is not registered in the metadata store. Install Lakekeeper from /install first.",
         ));
     };
-    // Iceberg REST: list namespaces under the warehouse. Path
-    // pattern is `/catalog/v1/{warehouse}/namespaces` per the
-    // Iceberg REST spec; some Lakekeeper releases may expect the
-    // warehouse UUID here instead of the name. Pass through what
-    // we get verbatim.
-    let path = format!("/catalog/v1/{}/namespaces", url_encode(&warehouse));
+    // Resolve human-friendly name -> UUID (Lakekeeper's catalog
+    // REST refuses non-UUID prefixes with `WarehouseIdIsNotUUID`).
+    let wh_id = resolve_warehouse_id_or_pass(&warehouse, state.secrets.as_deref()).await;
+    let path = format!("/catalog/v1/{}/namespaces", url_encode(&wh_id));
     let result = get_lakekeeper_catalog_json(&base_url, &path).await;
     Html(render_studio_namespace_list(&l, &warehouse, result))
 }
@@ -1421,13 +1461,14 @@ async fn studio_catalog_namespace_handler(
             "Lakekeeper is not registered.",
         ));
     };
+    let wh_id = resolve_warehouse_id_or_pass(&warehouse, state.secrets.as_deref()).await;
     // Multi-level namespaces ("finance.raw") become %1F-separated
     // (unit-separator) in the Iceberg REST URL spec. Single-level
     // is the common case in v0.0.x; we still encode for safety.
     let ns_encoded = namespace.split('.').collect::<Vec<_>>().join("%1F");
     let path = format!(
         "/catalog/v1/{}/namespaces/{}/tables",
-        url_encode(&warehouse),
+        url_encode(&wh_id),
         ns_encoded
     );
     let result = get_lakekeeper_catalog_json(&base_url, &path).await;
@@ -1454,10 +1495,11 @@ async fn studio_catalog_table_handler(
             "Lakekeeper is not registered.",
         ));
     };
+    let wh_id = resolve_warehouse_id_or_pass(&warehouse, state.secrets.as_deref()).await;
     let ns_encoded = namespace.split('.').collect::<Vec<_>>().join("%1F");
     let path = format!(
         "/catalog/v1/{}/namespaces/{}/tables/{}",
-        url_encode(&warehouse),
+        url_encode(&wh_id),
         ns_encoded,
         url_encode(&table)
     );
@@ -1533,7 +1575,8 @@ async fn studio_catalog_namespace_create_handler(
     if segments.is_empty() {
         return axum::response::Redirect::to(&format!("/studio/catalog/{warehouse}"));
     }
-    let path = format!("/catalog/v1/{}/namespaces", url_encode(&warehouse));
+    let wh_id = resolve_warehouse_id_or_pass(&warehouse, state.secrets.as_deref()).await;
+    let path = format!("/catalog/v1/{}/namespaces", url_encode(&wh_id));
     let body = serde_json::json!({
         "namespace": segments,
         "properties": {},
@@ -1558,10 +1601,11 @@ async fn studio_catalog_namespace_delete_handler(
     let Some(base_url) = discover_lakekeeper_endpoint(state.store.as_deref()).await else {
         return axum::response::Redirect::to(&format!("/studio/catalog/{warehouse}"));
     };
+    let wh_id = resolve_warehouse_id_or_pass(&warehouse, state.secrets.as_deref()).await;
     let ns_encoded = namespace.split('.').collect::<Vec<_>>().join("%1F");
     let path = format!(
         "/catalog/v1/{}/namespaces/{}",
-        url_encode(&warehouse),
+        url_encode(&wh_id),
         ns_encoded
     );
     if let Err(e) =
@@ -1636,10 +1680,11 @@ async fn studio_catalog_table_create_handler(
         );
         return axum::response::Redirect::to(&redirect_to);
     }
+    let wh_id = resolve_warehouse_id_or_pass(&warehouse, state.secrets.as_deref()).await;
     let ns_encoded = namespace.split('.').collect::<Vec<_>>().join("%1F");
     let path = format!(
         "/catalog/v1/{}/namespaces/{}/tables",
-        url_encode(&warehouse),
+        url_encode(&wh_id),
         ns_encoded
     );
     let body = serde_json::json!({
@@ -1677,10 +1722,11 @@ async fn studio_catalog_table_delete_handler(
     let Some(base_url) = discover_lakekeeper_endpoint(state.store.as_deref()).await else {
         return axum::response::Redirect::to(&redirect_to);
     };
+    let wh_id = resolve_warehouse_id_or_pass(&warehouse, state.secrets.as_deref()).await;
     let ns_encoded = namespace.split('.').collect::<Vec<_>>().join("%1F");
     let path = format!(
         "/catalog/v1/{}/namespaces/{}/tables/{}",
-        url_encode(&warehouse),
+        url_encode(&wh_id),
         ns_encoded,
         url_encode(&table)
     );
@@ -2856,14 +2902,14 @@ async fn studio_bootstrap_submit_handler(
     };
     let outcome = run_lakekeeper_bootstrap(&lakekeeper_url, &form).await;
     // On success, persist BOTH the Garage credentials AND the
-    // warehouse name to vault so:
+    // warehouse name + UUID to vault so:
     //   1. subsequent auto-bootstrap re-runs find the same values
     //   2. probe_lakekeeper_with_vault_fallback finds the warehouse
     //      name even if Lakekeeper's warehouse-list returns empty
-    //      (which it does in some auth / project-scope configs)
-    // Idempotent on re-submits; key facts the catalog pane needs
-    // to render the drill-down link.
-    if outcome.is_ok() {
+    //   3. drill-down handlers can resolve `name -> UUID` before
+    //      hitting Lakekeeper's /catalog/v1/{uuid}/* endpoints
+    //      (which reject names with "WarehouseIdIsNotUUID")
+    if let Ok(ok) = &outcome {
         if let Some(secrets) = state.secrets.as_deref() {
             let _ = secrets
                 .put("garage/lakekeeper-key-id", &form.s3_access_key)
@@ -2877,14 +2923,25 @@ async fn studio_bootstrap_submit_handler(
             let _ = secrets
                 .put("lakekeeper/default-warehouse-name", &form.warehouse_name)
                 .await;
+            if let Some(id) = &ok.warehouse_id {
+                let _ = secrets
+                    .put("lakekeeper/default-warehouse-id", id)
+                    .await;
+            }
         }
     }
+    // Convert LakekeeperBootstrapOk -> String for the render
+    // function which only cares about the human message.
+    let display_outcome: Result<String, String> = match outcome {
+        Ok(ok) => Ok(ok.message),
+        Err(e) => Err(e),
+    };
     Html(render_studio_bootstrap_form(
         &l,
         true,
         &form.s3_endpoint,
         &prefill,
-        Some(outcome),
+        Some(display_outcome),
     ))
 }
 
@@ -2936,10 +2993,21 @@ async fn discover_garage_endpoint(
 /// a detailed error string the operator can use to adjust the
 /// form. Best-effort: never panics, surfaces HTTP body verbatim on
 /// non-2xx.
+/// Result type for `run_lakekeeper_bootstrap`: a success message
+/// for inline display plus the warehouse UUID we captured (or
+/// looked up) for the just-created warehouse. The UUID is what
+/// Lakekeeper's Iceberg REST `/catalog/v1/{warehouse-id}/*`
+/// endpoints expect as the URL prefix; the human-readable name is
+/// only a display label on the management side.
+struct LakekeeperBootstrapOk {
+    message: String,
+    warehouse_id: Option<String>,
+}
+
 async fn run_lakekeeper_bootstrap(
     base_url: &str,
     form: &StudioBootstrapForm,
-) -> Result<String, String> {
+) -> Result<LakekeeperBootstrapOk, String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
@@ -3116,23 +3184,78 @@ async fn run_lakekeeper_bootstrap(
             }
         ));
     }
-    let _ = warehouse_existed; // used by success path below; reads silenced when unused
 
-    Ok(format!(
-        "Lakekeeper bootstrap succeeded:\n\
-         - Project: `{}` ({})\n\
-         - Warehouse: `{}` -> S3 bucket `{}` at {}\n\
-         \n\
-         The /studio catalog pane will now show this warehouse. \
-         Drilling into namespaces + tables inside it lands in \
-         phase 1.5 (the Iceberg-REST drill-down URLs depend on the \
-         Lakekeeper release; deferred until empirically verified).",
-        form.project_name,
-        if project_existed { "already existed; reused" } else { "created" },
-        form.warehouse_name,
-        form.s3_bucket,
-        form.s3_endpoint,
-    ))
+    // Capture the warehouse UUID. Lakekeeper's create-warehouse
+    // response shape includes the UUID on the 201/200 path; on a
+    // 409 (warehouse already existed) we need to look it up via
+    // the management API. Tolerant of field-name drift:
+    // `warehouse-id` / `warehouseId` / `id`.
+    let parse_warehouse_id = |body: &str| -> Option<String> {
+        let v: serde_json::Value = serde_json::from_str(body).ok()?;
+        v.get("warehouse-id")
+            .or_else(|| v.get("warehouseId"))
+            .or_else(|| v.get("id"))
+            .and_then(|x| x.as_str())
+            .map(str::to_string)
+    };
+    let warehouse_id: Option<String> = if !warehouse_existed {
+        parse_warehouse_id(&warehouse_text)
+    } else {
+        // 409 path: look up the existing warehouse by name. List
+        // warehouses scoped to the project we just created/reused.
+        let list_url = format!(
+            "{}/management/v1/warehouse?project-id={}",
+            base_url.trim_end_matches('/'),
+            project_id
+        );
+        let id_from_list = match client.get(&list_url).send().await {
+            Ok(r) if r.status().is_success() => r.text().await.ok(),
+            _ => None,
+        };
+        id_from_list.and_then(|text| {
+            let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+            let arr = v
+                .get("warehouses")
+                .or_else(|| v.get("data"))
+                .and_then(|x| x.as_array())
+                .cloned()
+                .or_else(|| v.as_array().cloned())
+                .unwrap_or_default();
+            arr.iter()
+                .find(|w| {
+                    w.get("name")
+                        .or_else(|| w.get("warehouse-name"))
+                        .or_else(|| w.get("warehouseName"))
+                        .and_then(|n| n.as_str())
+                        == Some(form.warehouse_name.as_str())
+                })
+                .and_then(|w| {
+                    w.get("warehouse-id")
+                        .or_else(|| w.get("warehouseId"))
+                        .or_else(|| w.get("id"))
+                        .and_then(|x| x.as_str())
+                        .map(str::to_string)
+                })
+        })
+    };
+
+    Ok(LakekeeperBootstrapOk {
+        message: format!(
+            "Lakekeeper bootstrap succeeded:\n\
+             - Project: `{}` ({})\n\
+             - Warehouse: `{}` -> S3 bucket `{}` at {}\n\
+             - Warehouse UUID: {}\n\
+             \n\
+             The /studio catalog pane will now show this warehouse with a clickable drill-down.",
+            form.project_name,
+            if project_existed { "already existed; reused" } else { "created" },
+            form.warehouse_name,
+            form.s3_bucket,
+            form.s3_endpoint,
+            warehouse_id.as_deref().unwrap_or("(could not capture; iceberg-REST drill-down may not work)"),
+        ),
+        warehouse_id,
+    })
 }
 
 fn render_studio_bootstrap_form(
@@ -3612,14 +3735,23 @@ async fn auto_bootstrap_lakekeeper(
         s3_access_key: key_id,
         s3_secret_access_key: secret,
     };
-    run_lakekeeper_bootstrap(&lakekeeper_url, &form).await?;
+    let ok = run_lakekeeper_bootstrap(&lakekeeper_url, &form).await?;
 
-    Ok(vec![computeza_driver_native::linux::BootstrapArtifact {
+    let mut artifacts = vec![computeza_driver_native::linux::BootstrapArtifact {
         vault_key: "lakekeeper/default-warehouse-name".to_string(),
         value: SecretString::from("default".to_string()),
         label: "Lakekeeper default warehouse name".to_string(),
         display_inline: false,
-    }])
+    }];
+    if let Some(id) = ok.warehouse_id {
+        artifacts.push(computeza_driver_native::linux::BootstrapArtifact {
+            vault_key: "lakekeeper/default-warehouse-id".to_string(),
+            value: SecretString::from(id),
+            label: "Lakekeeper default warehouse UUID".to_string(),
+            display_inline: false,
+        });
+    }
+    Ok(artifacts)
 }
 
 /// POST /install/{slug}/retry-bootstrap — re-run the post-install
