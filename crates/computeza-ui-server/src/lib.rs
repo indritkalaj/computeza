@@ -1035,30 +1035,44 @@ async fn discover_databend_endpoint(
     Some(spec.endpoint.base_url)
 }
 
-/// What we learned from talking to the local Lakekeeper. Three
-/// states map to three different UX paths -- "not reachable" wants
+/// What we learned from talking to the local Lakekeeper. Four
+/// states map to four different UX paths -- "not reachable" wants
 /// /status; "no warehouses" wants the bootstrap docs; "has
-/// warehouses" wants the browse-namespaces flow (v0.1).
+/// warehouses" wants the browse-namespaces flow; "unexpected" is
+/// the diagnostic escape hatch when Lakekeeper returns 2xx but the
+/// body doesn't match the shape we expect (so URL-pattern drift
+/// across releases is debuggable from the page itself).
 #[derive(Debug, Clone)]
 enum LakekeeperState {
-    /// `/management/v1/warehouse` failed (Lakekeeper unreachable,
-    /// 5xx, malformed JSON).
+    /// `/management/v1/warehouse` or the project-list call failed
+    /// (Lakekeeper unreachable, 5xx, malformed JSON).
     Unreachable,
     /// Lakekeeper is up but has no warehouses configured. v0.0.x
-    /// doesn't auto-bootstrap; the operator must run the manual
-    /// curl recipe documented in AGENTS.md "Deferred work".
+    /// + v0.1 auto-bootstrap covers this; manual recovery is the
+    /// /studio/bootstrap form.
     NoWarehouses,
-    /// At least one warehouse exists. v0.0.x lists their names;
-    /// v0.1 lands per-warehouse namespace + table browsing (the
-    /// Iceberg REST API under each warehouse is URL-prefixed and
-    /// requires bootstrapped storage credentials to write).
+    /// At least one warehouse exists. The strings are the warehouse
+    /// NAMES that the drill-down routes use as URL prefixes when
+    /// hitting `/catalog/v1/{warehouse}/...`.
     HasWarehouses(Vec<String>),
+    /// Lakekeeper responded with 2xx but the response body didn't
+    /// parse into the warehouse-list shape we expected. Carries
+    /// the raw body so the operator (or future iterations) can see
+    /// what Lakekeeper actually sent. Surfaces in the catalog pane
+    /// as a diagnostic block.
+    UnexpectedShape(String),
 }
 
-/// Probe Lakekeeper for its warehouse list. Uses the same
-/// management API the reconciler hits at `/management/v1/warehouse`
-/// (the Iceberg REST catalog API is gated behind a bootstrap step
-/// that v0.0.x doesn't automate -- see AGENTS.md "Deferred work").
+/// Probe Lakekeeper for its warehouse list. Lakekeeper's
+/// `/management/v1/warehouse` endpoint is project-scoped: without
+/// a project-id query param it returns nothing useful. The right
+/// shape is "list projects, then list warehouses per project,
+/// aggregate names".
+///
+/// Falls through to `UnexpectedShape` if Lakekeeper returns 2xx
+/// but no warehouse names can be extracted -- the raw body lands
+/// in the catalog pane so URL-pattern + response-shape drift is
+/// debuggable from /studio directly.
 async fn probe_lakekeeper(base_url: &str) -> LakekeeperState {
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
@@ -1068,45 +1082,140 @@ async fn probe_lakekeeper(base_url: &str) -> LakekeeperState {
         Err(_) => return LakekeeperState::Unreachable,
     };
 
-    let url = format!("{}/management/v1/warehouse", base_url.trim_end_matches('/'));
-    let resp = match client.get(&url).send().await {
+    // Step 1: list projects (no scope; we want all of them).
+    let proj_url = format!("{}/management/v1/project", base_url.trim_end_matches('/'));
+    let proj_resp = match client.get(&proj_url).send().await {
         Ok(r) if r.status().is_success() => r,
         _ => return LakekeeperState::Unreachable,
     };
-    let body: serde_json::Value = match resp.json().await {
-        Ok(b) => b,
+    let proj_text = match proj_resp.text().await {
+        Ok(t) => t,
         Err(_) => return LakekeeperState::Unreachable,
     };
-    // Lakekeeper returns either `{"warehouses": [...]}` (current
-    // shape) or a bare array on older releases.
-    let warehouses = body
-        .get("warehouses")
-        .and_then(|w| w.as_array())
+    let proj_v: serde_json::Value = match serde_json::from_str(&proj_text) {
+        Ok(v) => v,
+        Err(_) => {
+            return LakekeeperState::UnexpectedShape(format!(
+                "GET {proj_url} returned 2xx but body was not JSON:\n{proj_text}"
+            ));
+        }
+    };
+    let project_ids: Vec<String> = proj_v
+        .get("projects")
+        .or_else(|| proj_v.get("data"))
+        .and_then(|x| x.as_array())
         .cloned()
-        .or_else(|| body.as_array().cloned())
-        .unwrap_or_default();
-    if warehouses.is_empty() {
-        return LakekeeperState::NoWarehouses;
-    }
-    let names: Vec<String> = warehouses
+        .or_else(|| proj_v.as_array().cloned())
+        .unwrap_or_default()
         .iter()
-        .filter_map(|w| {
-            w.get("name")
+        .filter_map(|p| {
+            p.get("project-id")
+                .or_else(|| p.get("projectId"))
+                .or_else(|| p.get("id"))
+                .and_then(|x| x.as_str())
+                .map(str::to_string)
+        })
+        .collect();
+
+    // Step 2: for each project (or unscoped if no projects), hit
+    // the warehouse-list endpoint. Aggregate names. Keep the last
+    // raw body for the UnexpectedShape fallback.
+    let mut endpoints: Vec<String> = project_ids
+        .iter()
+        .map(|pid| {
+            format!(
+                "{}/management/v1/warehouse?project-id={}",
+                base_url.trim_end_matches('/'),
+                pid
+            )
+        })
+        .collect();
+    if endpoints.is_empty() {
+        endpoints.push(format!(
+            "{}/management/v1/warehouse",
+            base_url.trim_end_matches('/')
+        ));
+    }
+
+    let mut all_names: Vec<String> = Vec::new();
+    let mut last_raw_body: Option<String> = None;
+
+    for url in &endpoints {
+        let resp = match client.get(url).send().await {
+            Ok(r) if r.status().is_success() => r,
+            _ => continue,
+        };
+        let text = match resp.text().await {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        last_raw_body = Some(text.clone());
+        let v: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let warehouses = v
+            .get("warehouses")
+            .or_else(|| v.get("data"))
+            .and_then(|x| x.as_array())
+            .cloned()
+            .or_else(|| v.as_array().cloned())
+            .unwrap_or_default();
+        for w in &warehouses {
+            let name = w
+                .get("name")
+                .or_else(|| w.get("warehouse-name"))
+                .or_else(|| w.get("warehouseName"))
                 .and_then(|n| n.as_str())
                 .map(str::to_string)
                 .or_else(|| {
-                    w.get("warehouse-name")
+                    w.get("warehouse-id")
+                        .or_else(|| w.get("warehouseId"))
+                        .or_else(|| w.get("id"))
                         .and_then(|n| n.as_str())
                         .map(str::to_string)
-                })
-                .or_else(|| {
-                    w.get("id")
-                        .and_then(|n| n.as_str())
-                        .map(str::to_string)
-                })
-        })
-        .collect();
-    LakekeeperState::HasWarehouses(names)
+                });
+            if let Some(n) = name {
+                if !all_names.contains(&n) {
+                    all_names.push(n);
+                }
+            }
+        }
+    }
+
+    if !all_names.is_empty() {
+        return LakekeeperState::HasWarehouses(all_names);
+    }
+    // No names parsed. If Lakekeeper returned a body that looks
+    // meaningful but didn't match our shapes, expose it for
+    // debugging. An empty-array response (`[]`, `{"warehouses":[]}`,
+    // etc.) is the honest "no warehouses" state.
+    let looks_empty = match &last_raw_body {
+        None => true,
+        Some(b) => {
+            let t = b.trim();
+            t.is_empty()
+                || t == "[]"
+                || t == "{}"
+                || t.contains("\"warehouses\":[]")
+                || t.contains("\"data\":[]")
+        }
+    };
+    if looks_empty {
+        LakekeeperState::NoWarehouses
+    } else {
+        LakekeeperState::UnexpectedShape(format!(
+            "Lakekeeper returned 2xx from one or more warehouse-list endpoints, but the response \
+             body didn't match the expected `{{\"warehouses\": [...]}}` shape with `name` / \
+             `warehouse-name` fields per entry.\n\n\
+             Tried endpoints (in order):\n  - {endpoints}\n\n\
+             Last response body:\n{body}\n\n\
+             To fix: adjust the field-name candidates in probe_lakekeeper() in \
+             crates/computeza-ui-server/src/lib.rs to match the actual shape above.",
+            endpoints = endpoints.join("\n  - "),
+            body = last_raw_body.unwrap_or_default(),
+        ))
+    }
 }
 
 // ============================================================
@@ -2270,6 +2379,11 @@ fn render_studio_page(
                     note = html_escape(&lk_warehouses_note),
                 )
             }
+            LakekeeperState::UnexpectedShape(raw) => format!(
+                r#"<p class="cz-muted" style="margin-bottom: 0.5rem;">Lakekeeper is up but the warehouse-list response shape isn't one we know how to parse. Raw response below -- paste it back so we can adjust the parser.</p>
+<pre style="background: rgba(255, 193, 7, 0.06); border: 1px solid rgba(255, 193, 7, 0.3); border-radius: 0.4rem; padding: 0.6rem 0.75rem; font-size: 0.72rem; overflow-x: auto; white-space: pre-wrap;">{}</pre>"#,
+                html_escape(&raw)
+            ),
         }
     };
 
