@@ -1119,54 +1119,127 @@ async fn resolve_warehouse_id_or_pass(
     // Standard Iceberg-REST behaviour: pass the warehouse name as
     // a query param, get the prefix back in the `overrides` block.
     if let Some(url) = base_url {
-        if let Ok(client) = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-        {
-            let cfg_url = format!(
-                "{}/catalog/v1/config?warehouse={}",
-                url.trim_end_matches('/'),
-                url_encode(name_or_uuid)
-            );
-            if let Ok(resp) = client.get(&cfg_url).send().await {
-                let status = resp.status();
-                if let Ok(text) = resp.text().await {
-                    tracing::info!(
-                        url = %cfg_url,
-                        status = status.as_u16(),
-                        body = %text,
-                        "resolve_warehouse_id: /catalog/v1/config probe"
-                    );
-                    if status.is_success() {
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                            let prefix = v
-                                .get("overrides")
-                                .and_then(|o| o.get("prefix"))
-                                .or_else(|| v.get("prefix"))
-                                .and_then(|p| p.as_str());
-                            if let Some(p) = prefix {
-                                if !p.trim().is_empty() {
-                                    // Cache for next time. Best-effort.
-                                    if let Some(s) = secrets {
-                                        let _ = s
-                                            .put("lakekeeper/default-warehouse-id", p)
-                                            .await;
-                                    }
-                                    tracing::info!(
-                                        warehouse_name = %name_or_uuid,
-                                        prefix = %p,
-                                        "resolve_warehouse_id: discovered via /catalog/v1/config; cached to vault"
-                                    );
-                                    return p.to_string();
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        if let Some(prefix) = try_discover_via_config(name_or_uuid, url, secrets).await {
+            return prefix;
         }
     }
     name_or_uuid.to_string()
+}
+
+/// Hit /catalog/v1/config?warehouse=<name>; parse the
+/// `overrides.prefix`; cache to vault. Returns None on any failure
+/// (404 NoSuchWarehouseException, wrong shape, network error,
+/// missing prefix field). Used by both the resolver and the
+/// recovery path.
+async fn try_discover_via_config(
+    name: &str,
+    base_url: &str,
+    secrets: Option<&computeza_secrets::SecretsStore>,
+) -> Option<String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .ok()?;
+    let cfg_url = format!(
+        "{}/catalog/v1/config?warehouse={}",
+        base_url.trim_end_matches('/'),
+        url_encode(name)
+    );
+    let resp = client.get(&cfg_url).send().await.ok()?;
+    let status = resp.status();
+    let text = resp.text().await.ok()?;
+    tracing::info!(
+        url = %cfg_url,
+        status = status.as_u16(),
+        body = %text,
+        "try_discover_via_config: /catalog/v1/config probe"
+    );
+    if !status.is_success() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let prefix = v
+        .get("overrides")
+        .and_then(|o| o.get("prefix"))
+        .or_else(|| v.get("prefix"))
+        .and_then(|p| p.as_str())?
+        .to_string();
+    if prefix.trim().is_empty() {
+        return None;
+    }
+    if let Some(s) = secrets {
+        let _ = s.put("lakekeeper/default-warehouse-id", &prefix).await;
+    }
+    tracing::info!(
+        warehouse_name = %name,
+        prefix = %prefix,
+        "try_discover_via_config: discovered + cached"
+    );
+    Some(prefix)
+}
+
+/// Auto-recovery: called when the resolver couldn't find a UUID
+/// AND a subsequent catalog-REST call returned a "warehouse not
+/// found" error. If the vault has Garage credentials (= bootstrap
+/// state from a previous successful run), re-fire the Lakekeeper
+/// bootstrap to re-create the warehouse, then retry discovery.
+///
+/// Returns Some(uuid) on successful recovery, None otherwise.
+/// Logs verbosely so the operator can see what happened in the
+/// server console.
+async fn try_recover_missing_warehouse(
+    name: &str,
+    base_url: &str,
+    secrets: &computeza_secrets::SecretsStore,
+    store: Option<&computeza_state::SqliteStore>,
+) -> Option<String> {
+    use secrecy::ExposeSecret;
+    // Pre-flight: bootstrap state must exist in vault. If it
+    // doesn't, this is a fresh install that hasn't been bootstrapped
+    // yet -- not our job to autostart.
+    let key_id = secrets.get("garage/lakekeeper-key-id").await.ok().flatten()?;
+    let secret = secrets.get("garage/lakekeeper-secret").await.ok().flatten()?;
+    let bucket = secrets
+        .get("garage/lakekeeper-bucket")
+        .await
+        .ok()
+        .flatten()
+        .map(|v| v.expose_secret().to_string())
+        .unwrap_or_else(|| "lakekeeper-default".to_string());
+    let garage_endpoint = discover_garage_endpoint(store)
+        .await
+        .map(|u| u.replace(":3903", ":3900"))
+        .unwrap_or_else(|| "http://127.0.0.1:3900".to_string());
+
+    tracing::warn!(
+        warehouse_name = %name,
+        "Lakekeeper says warehouse missing but vault has bootstrap state; auto-recovering"
+    );
+    let form = StudioBootstrapForm {
+        project_name: "computeza-default".to_string(),
+        warehouse_name: name.to_string(),
+        s3_endpoint: garage_endpoint,
+        s3_region: "garage".to_string(),
+        s3_bucket: bucket,
+        s3_access_key: key_id.expose_secret().to_string(),
+        s3_secret_access_key: secret.expose_secret().to_string(),
+    };
+    match run_lakekeeper_bootstrap(base_url, &form).await {
+        Ok(ok) => {
+            if let Some(id) = &ok.warehouse_id {
+                let _ = secrets.put("lakekeeper/default-warehouse-id", id).await;
+                tracing::info!(prefix = %id, "auto-recover: bootstrap re-ran successfully; warehouse UUID now in vault");
+                return Some(id.clone());
+            }
+            // Bootstrap succeeded but didn't capture UUID -- retry
+            // discovery via /catalog/v1/config to pick it up.
+            try_discover_via_config(name, base_url, Some(secrets)).await
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "auto-recover: bootstrap re-run failed");
+            None
+        }
+    }
 }
 
 /// Wrapper around `probe_lakekeeper` that falls back to the vault
@@ -1494,9 +1567,31 @@ async fn studio_catalog_warehouse_handler(
     };
     // Resolve human-friendly name -> UUID (Lakekeeper's catalog
     // REST refuses non-UUID prefixes with `WarehouseIdIsNotUUID`).
-    let wh_id = resolve_warehouse_id_or_pass(&warehouse, Some(&base_url), state.secrets.as_deref()).await;
-    let path = format!("/catalog/v1/{}/namespaces", url_encode(&wh_id));
-    let result = get_lakekeeper_catalog_json(&base_url, &path).await;
+    let mut wh_id =
+        resolve_warehouse_id_or_pass(&warehouse, Some(&base_url), state.secrets.as_deref()).await;
+    let mut result =
+        get_lakekeeper_catalog_json(&base_url, &format!("/catalog/v1/{}/namespaces", url_encode(&wh_id)))
+            .await;
+    // Auto-recovery: if Lakekeeper says the warehouse doesn't exist
+    // but we have bootstrap state in vault, re-fire the bootstrap
+    // and retry. Triggered by NoSuchWarehouse or WarehouseIdIsNotUUID
+    // errors -- both mean "this prefix doesn't resolve to a warehouse".
+    if let (Err(e), Some(secrets)) = (&result, state.secrets.as_deref()) {
+        let lkstr = e.to_lowercase();
+        if lkstr.contains("nosuchwarehouse") || lkstr.contains("warehouseidisnotuuid") {
+            if let Some(recovered_id) =
+                try_recover_missing_warehouse(&warehouse, &base_url, secrets, state.store.as_deref())
+                    .await
+            {
+                wh_id = recovered_id;
+                result = get_lakekeeper_catalog_json(
+                    &base_url,
+                    &format!("/catalog/v1/{}/namespaces", url_encode(&wh_id)),
+                )
+                .await;
+            }
+        }
+    }
     Html(render_studio_namespace_list(&l, &warehouse, result))
 }
 
