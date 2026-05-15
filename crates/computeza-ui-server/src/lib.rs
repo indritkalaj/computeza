@@ -1221,6 +1221,14 @@ async fn resolve_warehouse_id_fresh(
 /// (404 NoSuchWarehouseException, wrong shape, network error,
 /// missing prefix field). Used by both the resolver and the
 /// recovery path.
+/// Nil/default project UUID. Lakekeeper's `LAKEKEEPER__ENABLE_DEFAULT_PROJECT`
+/// (default true) makes the nil project the implicit landing zone for
+/// warehouses created without explicit project context. Every
+/// Iceberg-REST request out of Studio sends this as the
+/// `x-project-id` header so the read path matches the write path
+/// (bootstrap's `POST /management/v1/warehouse` also sends it).
+const LAKEKEEPER_NIL_PROJECT: &str = "00000000-0000-0000-0000-000000000000";
+
 async fn try_discover_via_config(
     name: &str,
     base_url: &str,
@@ -1235,7 +1243,16 @@ async fn try_discover_via_config(
         base_url.trim_end_matches('/'),
         url_encode(name)
     );
-    let resp = client.get(&cfg_url).send().await.ok()?;
+    // x-project-id keeps every Iceberg-REST request inside the nil
+    // project so we see the warehouses our bootstrap created there.
+    // Without the header Lakekeeper may default-route to a different
+    // project context and 404 even when the warehouse exists.
+    let resp = client
+        .get(&cfg_url)
+        .header("x-project-id", LAKEKEEPER_NIL_PROJECT)
+        .send()
+        .await
+        .ok()?;
     let status = resp.status();
     let text = resp.text().await.ok()?;
     tracing::info!(
@@ -1632,6 +1649,7 @@ async fn get_lakekeeper_catalog_json(
     let url = format!("{}{}", base_url.trim_end_matches('/'), path);
     let resp = client
         .get(&url)
+        .header("x-project-id", LAKEKEEPER_NIL_PROJECT)
         .send()
         .await
         .map_err(|e| format!("GET {url}: {e}"))?;
@@ -1853,7 +1871,9 @@ async fn lakekeeper_catalog_mutate(
         .build()
         .map_err(|e| format!("building HTTP client: {e}"))?;
     let url = format!("{}{}", base_url.trim_end_matches('/'), path);
-    let mut req = client.request(method.clone(), &url);
+    let mut req = client
+        .request(method.clone(), &url)
+        .header("x-project-id", LAKEKEEPER_NIL_PROJECT);
     if let Some(b) = body {
         req = req.json(&b);
     }
@@ -5629,7 +5649,9 @@ async fn run_lakekeeper_bootstrap(
     //
     // Without step (a), step (b) returns ProjectNotFound for the
     // nil UUID -- which is exactly the bug we were hitting before.
-    const NIL_PROJECT_ID: &str = "00000000-0000-0000-0000-000000000000";
+    // Same nil-project UUID the Iceberg-REST read paths send as
+    // x-project-id (see LAKEKEEPER_NIL_PROJECT). Kept in sync.
+    const NIL_PROJECT_ID: &str = LAKEKEEPER_NIL_PROJECT;
     let bootstrap_url = format!("{}/management/v1/bootstrap", base_url.trim_end_matches('/'));
     // Body shape from Lakekeeper docs: accept_terms_of_use is
     // required; is_operator marks this caller as the system
