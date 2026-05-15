@@ -123,9 +123,23 @@ pub async fn install(
     progress.set_phase(InstallPhase::DetectingBinaries);
     progress.set_message("Ensuring bundled Temurin JRE 21".to_string());
     fs::create_dir_all(&opts.root_dir).await?;
-    let jre_home = prerequisites::ensure_bundled_temurin_jre(&opts.root_dir, progress)
+    // ensure_bundled_temurin_jre returns the path to the `java`
+    // binary (<jre-root>/bin/java), not the JRE root itself. Walk
+    // two parents up to get JAVA_HOME (= <jre-root>) for systemd's
+    // JAVA_HOME/PATH environment.
+    let java_bin = prerequisites::ensure_bundled_temurin_jre(&opts.root_dir, progress)
         .await
         .map_err(|e| ServiceError::Io(std::io::Error::other(format!("bundle JRE: {e}"))))?;
+    let jre_home = java_bin
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+        .ok_or_else(|| {
+            ServiceError::Io(std::io::Error::other(format!(
+                "could not derive JAVA_HOME from java binary path {}",
+                java_bin.display()
+            )))
+        })?;
 
     // Step 2: write Trino's etc/ config files BEFORE invoking
     // install_service so the unpacked tarball's etc/ subdir is
