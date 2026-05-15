@@ -116,7 +116,7 @@ pub async fn install(
     // helper is idempotent -- if the JRE is already extracted under
     // <root>/jre/ from a previous install, this is fast.
     progress.set_phase(InstallPhase::DetectingBinaries);
-    progress.set_message("Ensuring bundled Temurin JRE 21".to_string());
+    progress.set_message("Ensuring bundled Temurin JRE 25".to_string());
     fs::create_dir_all(&opts.root_dir).await?;
     // Trino 470 needs Java 22+. We bundle Java 25 LTS (separate
     // from xtable's Java 21 bundle so Spark's runtime support
