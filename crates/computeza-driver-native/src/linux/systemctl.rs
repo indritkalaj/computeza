@@ -86,6 +86,14 @@ pub async fn stop(unit: &str) -> Result<(), SystemctlError> {
     run(&["stop", unit]).await
 }
 
+/// Convenience: `systemctl reset-failed <unit>`. Clears the failure
+/// state of a unit that's been restart-looping so a freshly-rewritten
+/// systemd unit gets a clean slate to start from. Best-effort: a
+/// unit that isn't loaded or isn't in a failed state still exits 0.
+pub async fn reset_failed(unit: &str) -> Result<(), SystemctlError> {
+    run(&["reset-failed", unit]).await
+}
+
 /// Tail the systemd journal for a single unit. Used to enrich the
 /// `enable_now` failure path so the operator doesn't have to ssh in
 /// and run journalctl themselves. Best-effort: a missing journalctl

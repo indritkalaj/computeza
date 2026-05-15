@@ -268,6 +268,19 @@ pub async fn install(
     progress.set_phase(InstallPhase::RegisteringService);
     progress.set_message(format!("Writing systemd unit {}", opts.unit_name));
     let launcher_path = bin_dir.join("launcher");
+    // Resolve the system's python3 once at install time. systemd
+    // doesn't expand PATH for ExecStart, so we need an absolute
+    // path. We invoke python3 directly against the launcher script
+    // (bypassing the script's shebang entirely) so the install
+    // works on distros where /usr/bin/python doesn't exist.
+    let python3 = detect_python3().await.ok_or_else(|| {
+        ServiceError::Io(std::io::Error::other(
+            "python3 not found on PATH (looked in /usr/bin/python3, /usr/local/bin/python3, \
+             $(which python3)). Install python3 from your distro's package manager \
+             (e.g. `sudo apt install python3` on Debian/Ubuntu) and re-run the Trino install.",
+        ))
+    })?;
+    info!(python3 = %python3.display(), "trino: invoking launcher via python3");
     let unit_body = format!(
         "[Unit]\n\
          Description=Computeza-managed Trino SQL engine\n\
@@ -278,7 +291,7 @@ pub async fn install(
          Type=simple\n\
          Environment=\"JAVA_HOME={jre_home}\"\n\
          Environment=\"PATH={jre_home}/bin:/usr/bin:/bin\"\n\
-         ExecStart={launcher} run\n\
+         ExecStart={python3} {launcher} run\n\
          WorkingDirectory={install}\n\
          Restart=on-failure\n\
          RestartSec=5\n\
@@ -289,6 +302,7 @@ pub async fn install(
          [Install]\n\
          WantedBy=multi-user.target\n",
         jre_home = jre_home.display(),
+        python3 = python3.display(),
         launcher = launcher_path.display(),
         install = install_dir.display(),
     );
@@ -300,6 +314,11 @@ pub async fn install(
     progress.set_phase(InstallPhase::StartingService);
     progress.set_message(format!("Starting {}", opts.unit_name));
     let _ = super::systemctl::stop(&opts.unit_name).await;
+    // Clear any restart-loop failure state from a prior bad install
+    // (typically: launcher's #!/usr/bin/env python on a system
+    // without python). Otherwise systemd remembers the prior
+    // 'failed' state and refuses to start until reset-failed.
+    let _ = super::systemctl::reset_failed(&opts.unit_name).await;
     super::systemctl::enable_now(&opts.unit_name).await?;
 
     progress.set_phase(InstallPhase::WaitingForReady);
@@ -390,6 +409,39 @@ async fn write_file(path: &Path, contents: &str) -> std::io::Result<()> {
     f.write_all(contents.as_bytes()).await?;
     f.flush().await?;
     Ok(())
+}
+
+/// Resolve an absolute path to a usable `python3` binary for the
+/// systemd unit's `ExecStart`. systemd does NOT expand `$PATH` for
+/// `ExecStart=`, so a bare `python3` would 127-loop. We check the
+/// two standard locations first (cheap stat calls), then fall back
+/// to `command -v` for non-standard installs (Homebrew on Linux,
+/// asdf, pyenv, etc.). Returns None if no python3 is installed at
+/// all -- the caller surfaces an install-time error.
+async fn detect_python3() -> Option<PathBuf> {
+    for candidate in ["/usr/bin/python3", "/usr/local/bin/python3"] {
+        if fs::try_exists(candidate).await.unwrap_or(false) {
+            return Some(PathBuf::from(candidate));
+        }
+    }
+    // Last-resort: shell out to `command -v python3` so we pick up
+    // ~/.local/bin, /opt/*/bin, pyenv shims, etc. that aren't in
+    // the standard locations.
+    use tokio::process::Command;
+    if let Ok(out) = Command::new("sh")
+        .arg("-c")
+        .arg("command -v python3")
+        .output()
+        .await
+    {
+        if out.status.success() {
+            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !path.is_empty() && std::path::Path::new(&path).is_absolute() {
+                return Some(PathBuf::from(path));
+            }
+        }
+    }
+    None
 }
 
 /// Discover the unpacked `trino-server-<v>/` directory inside a
