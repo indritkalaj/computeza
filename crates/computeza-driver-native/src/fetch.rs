@@ -157,7 +157,17 @@ pub async fn fetch_and_extract(
     }
 
     fs::create_dir_all(&extracted_root).await?;
-    let zip_path = extracted_root.join("download.zip");
+    // Single generic filename regardless of upstream wire format.
+    // The on-disk extension matches the actual encoding so an
+    // operator inspecting `/var/lib/computeza/<comp>/binaries/<v>/`
+    // isn't misled into thinking a .tar.gz is a .zip.
+    let archive_name = match bundle.kind {
+        ArchiveKind::Zip => "download.zip",
+        ArchiveKind::TarGz => "download.tar.gz",
+        ArchiveKind::TarXz => "download.tar.xz",
+        ArchiveKind::Raw => "download.bin",
+    };
+    let zip_path = extracted_root.join(archive_name);
 
     info!(
         url = bundle.url,
@@ -340,6 +350,27 @@ fn extract_tar_gz(archive_path: &Path, dest: &Path) -> Result<(), FetchError> {
             ),
         });
     }
+
+    // On Linux the system `tar` binary handles every PAX/GNU
+    // extension reliably -- which the Rust `tar` crate doesn't.
+    // Trino's 782MB server tarball contains long plugin paths +
+    // hardlinks that trip the Rust crate's iterator with the
+    // opaque "failed to iterate over archive" error; system tar
+    // unpacks the same file without complaint. We try system tar
+    // first and only fall back to the Rust crate if the binary
+    // is missing (which on a Linux box where systemd-managed
+    // services are installable is essentially never).
+    #[cfg(target_os = "linux")]
+    {
+        match extract_via_system_tar(archive_path, dest) {
+            Ok(()) => return Ok(()),
+            Err(FetchError::Io(e)) if e.kind() == io::ErrorKind::NotFound => {
+                warn!("system tar not found; falling back to Rust tar crate");
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
     let file = std::fs::File::open(archive_path)?;
     let decoder = flate2::read::GzDecoder::new(file);
     let mut archive = tar::Archive::new(decoder);
@@ -347,6 +378,36 @@ fn extract_tar_gz(archive_path: &Path, dest: &Path) -> Result<(), FetchError> {
         path: archive_path.to_path_buf(),
         message: format!("{e} (file size: {file_size} bytes)"),
     })?;
+    Ok(())
+}
+
+/// Shell out to the system `tar` binary. Linux distributions ship
+/// GNU tar which handles every wire format Trino, Lakekeeper, and
+/// xtable bundles contain -- PAX extensions, long names, hardlinks,
+/// the lot. Pure-Rust `tar` crate trips on some of these and the
+/// failure mode is opaque ("failed to iterate over archive" with
+/// no detail), so we use system tar as the primary path on Linux.
+#[cfg(target_os = "linux")]
+fn extract_via_system_tar(archive_path: &Path, dest: &Path) -> Result<(), FetchError> {
+    use std::process::Command;
+    std::fs::create_dir_all(dest)?;
+    let out = Command::new("tar")
+        .arg("-xzf")
+        .arg(archive_path)
+        .arg("-C")
+        .arg(dest)
+        .output()?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        return Err(FetchError::Extract {
+            path: archive_path.to_path_buf(),
+            message: format!(
+                "system tar exit {}: {}",
+                out.status.code().map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
+                stderr.lines().take(5).collect::<Vec<_>>().join(" / ")
+            ),
+        });
+    }
     Ok(())
 }
 
