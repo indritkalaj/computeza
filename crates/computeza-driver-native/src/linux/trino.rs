@@ -253,46 +253,43 @@ pub async fn install(
     );
 
     // Trino bin/ layout has changed across versions:
-    //   * Trino <=442: bin/launcher is a SHELL wrapper that
-    //     kernel-execs bin/launcher.py (the real Python entrypoint).
-    //   * Trino 470+: bin/launcher is the Python entrypoint
-    //     directly (no shell wrapper, no .py sibling).
-    // Both flavours use a `#!/usr/bin/env python` shebang, which
-    // exits 127 on distros without the unversioned `python` binary
-    // (Ubuntu 20.04+, Debian 11+, RHEL 9+).
-    //
-    // Belt-and-braces fix: probe for `launcher.py`, fall back to
-    // `launcher`. Rewrite the picked script's shebang from `python`
-    // to `python3` so direct CLI use works. systemd ExecStart
-    // invokes the picked script via `python3 <path> run`, bypassing
-    // the shebang entirely (see Step 3 below).
+    //   * Trino <=442: bin/launcher.py is the Python entrypoint
+    //     (with bin/launcher as a shell wrapper).
+    //   * Trino 470+: bin/launcher is a SHELL script that finds java
+    //     and execs the server JAR directly (no Python anywhere).
+    // We pick the right entrypoint and decide whether to wrap with
+    // python3 based on its actual shebang. For older Python
+    // launchers we ALSO patch `#!/usr/bin/env python` ->
+    // `#!/usr/bin/env python3` so direct CLI use works on distros
+    // without the unversioned `python` binary.
     let launcher_py_path = bin_dir.join("launcher.py");
     let launcher_bare = bin_dir.join("launcher");
-    let python_entry = if fs::try_exists(&launcher_py_path).await.unwrap_or(false)
-        && fs::read_to_string(&launcher_py_path)
-            .await
-            .map(|s| !s.starts_with("#!/bin/"))
-            .unwrap_or(false)
-    {
-        // Trino <=442 layout: launcher.py is the Python script.
+    let entry = if fs::try_exists(&launcher_py_path).await.unwrap_or(false) {
         launcher_py_path.clone()
     } else {
-        // Trino 470+ layout: launcher IS the Python script.
         launcher_bare.clone()
     };
-    if let Ok(body) = fs::read_to_string(&python_entry).await {
-        if body.starts_with("#!/usr/bin/env python\n")
-            || body.starts_with("#!/usr/bin/env python\r\n")
-        {
-            let patched = body.replacen(
-                "#!/usr/bin/env python",
-                "#!/usr/bin/env python3",
-                1,
-            );
-            fs::write(&python_entry, patched).await?;
-            info!(path = %python_entry.display(), "trino: patched python shebang to python3");
+    let entry_kind = detect_launcher_kind(&entry).await;
+    if matches!(entry_kind, LauncherKind::Python) {
+        if let Ok(body) = fs::read_to_string(&entry).await {
+            if body.starts_with("#!/usr/bin/env python\n")
+                || body.starts_with("#!/usr/bin/env python\r\n")
+            {
+                let patched = body.replacen(
+                    "#!/usr/bin/env python",
+                    "#!/usr/bin/env python3",
+                    1,
+                );
+                fs::write(&entry, patched).await?;
+                info!(path = %entry.display(), "trino: patched python shebang to python3");
+            }
         }
     }
+    info!(
+        path = %entry.display(),
+        kind = ?entry_kind,
+        "trino: launcher entry resolved"
+    );
 
     // Step 3: systemd unit. Trino's `launcher run` is the foreground
     // invocation systemd-managed services should use; `launcher
@@ -300,21 +297,29 @@ pub async fn install(
     // tracking. PATH/JAVA_HOME point at the bundled JRE.
     progress.set_phase(InstallPhase::RegisteringService);
     progress.set_message(format!("Writing systemd unit {}", opts.unit_name));
-    // Use whichever Python entrypoint the bundle ships (probed above).
-    let launcher_path = python_entry.clone();
-    // Resolve the system's python3 once at install time. systemd
-    // doesn't expand PATH for ExecStart, so we need an absolute
-    // path. We invoke python3 directly against the launcher script
-    // (bypassing the script's shebang entirely) so the install
-    // works on distros where /usr/bin/python doesn't exist.
-    let python3 = detect_python3().await.ok_or_else(|| {
-        ServiceError::Io(std::io::Error::other(
-            "python3 not found on PATH (looked in /usr/bin/python3, /usr/local/bin/python3, \
-             $(which python3)). Install python3 from your distro's package manager \
-             (e.g. `sudo apt install python3` on Debian/Ubuntu) and re-run the Trino install.",
-        ))
-    })?;
-    info!(python3 = %python3.display(), "trino: invoking launcher via python3");
+    // Compose ExecStart based on what kind of launcher we picked:
+    //   * Python: prepend an absolute /usr/bin/python3 to bypass the
+    //     `#!/usr/bin/env python` shebang on python-less distros.
+    //   * Shell:  execute the shell launcher directly via its own
+    //     shebang (Trino 470's launcher is shell + handles java
+    //     discovery + exec internally).
+    let exec_start = match entry_kind {
+        LauncherKind::Python => {
+            let python3 = detect_python3().await.ok_or_else(|| {
+                ServiceError::Io(std::io::Error::other(
+                    "python3 not found on PATH (looked in /usr/bin/python3, /usr/local/bin/python3, \
+                     $(which python3)). Install python3 from your distro's package manager \
+                     (e.g. `sudo apt install python3` on Debian/Ubuntu) and re-run the Trino install.",
+                ))
+            })?;
+            info!(python3 = %python3.display(), "trino: invoking launcher via python3");
+            format!("{} {} run", python3.display(), entry.display())
+        }
+        LauncherKind::Shell | LauncherKind::Unknown => {
+            info!(launcher = %entry.display(), "trino: invoking shell launcher directly");
+            format!("{} run", entry.display())
+        }
+    };
     let unit_body = format!(
         "[Unit]\n\
          Description=Computeza-managed Trino SQL engine\n\
@@ -325,7 +330,7 @@ pub async fn install(
          Type=simple\n\
          Environment=\"JAVA_HOME={jre_home}\"\n\
          Environment=\"PATH={jre_home}/bin:/usr/bin:/bin\"\n\
-         ExecStart={python3} {launcher} run\n\
+         ExecStart={exec_start}\n\
          WorkingDirectory={install}\n\
          Restart=on-failure\n\
          RestartSec=5\n\
@@ -336,8 +341,7 @@ pub async fn install(
          [Install]\n\
          WantedBy=multi-user.target\n",
         jre_home = jre_home.display(),
-        python3 = python3.display(),
-        launcher = launcher_path.display(),
+        exec_start = exec_start,
         install = install_dir.display(),
     );
     let unit_path = PathBuf::from("/etc/systemd/system").join(&opts.unit_name);
@@ -443,6 +447,41 @@ async fn write_file(path: &Path, contents: &str) -> std::io::Result<()> {
     f.write_all(contents.as_bytes()).await?;
     f.flush().await?;
     Ok(())
+}
+
+/// What kind of script is `bin/launcher` (or `bin/launcher.py`)?
+/// Drives whether the systemd ExecStart prepends `python3` (Python
+/// entrypoint, Trino <=442 layout) or runs the file directly via
+/// its own shebang (shell launcher, Trino 470+ layout).
+#[derive(Debug, Clone, Copy)]
+enum LauncherKind {
+    Python,
+    Shell,
+    /// Couldn't read the file or read no shebang. We treat this as
+    /// "shell" since that's the safer default with modern Trino;
+    /// the error surfaces in journalctl if our guess is wrong.
+    Unknown,
+}
+
+async fn detect_launcher_kind(path: &Path) -> LauncherKind {
+    let Ok(body) = fs::read_to_string(path).await else {
+        return LauncherKind::Unknown;
+    };
+    let first_line = body.lines().next().unwrap_or("");
+    if first_line.starts_with("#!/usr/bin/env python")
+        || first_line.starts_with("#!/usr/bin/python")
+        || first_line.contains("python")
+    {
+        LauncherKind::Python
+    } else if first_line.starts_with("#!/bin/sh")
+        || first_line.starts_with("#!/bin/bash")
+        || first_line.starts_with("#!/usr/bin/env sh")
+        || first_line.starts_with("#!/usr/bin/env bash")
+    {
+        LauncherKind::Shell
+    } else {
+        LauncherKind::Unknown
+    }
 }
 
 /// Resolve an absolute path to a usable `python3` binary for the
