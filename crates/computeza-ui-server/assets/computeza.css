@@ -1698,7 +1698,7 @@ details > summary::-webkit-details-marker { display: none; }
 .cz-studio-results-header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  gap: 0.75rem;
   margin-bottom: 0.6rem;
 }
 .cz-studio-results-eyebrow {
