@@ -1140,12 +1140,30 @@ async fn resolve_warehouse_id_or_pass(
         return name_or_uuid.to_string();
     }
     // Tier 2: vault cache (set by bootstrap or prior auto-discover).
+    //
+    // PER-NAME key so multiple warehouses don't trample each other's
+    // cache. The legacy `lakekeeper/default-warehouse-id` singleton
+    // key is read as a fallback for backward compat (set by older
+    // bootstrap runs); new writes go to the per-name key.
     if let Some(s) = secrets {
-        if let Ok(Some(v)) = s.get("lakekeeper/default-warehouse-id").await {
-            use secrecy::ExposeSecret;
+        use secrecy::ExposeSecret;
+        let by_name_key = format!("lakekeeper/warehouse-id-by-name/{name_or_uuid}");
+        if let Ok(Some(v)) = s.get(&by_name_key).await {
             let id = v.expose_secret().to_string();
             if !id.trim().is_empty() {
                 return id;
+            }
+        }
+        // Legacy singleton fallback: only honor it when the
+        // requested name is the historic "default" warehouse,
+        // otherwise we'd hand back a different warehouse's UUID
+        // and confuse Lakekeeper (the exact bug per-name keys fix).
+        if name_or_uuid == "default" {
+            if let Ok(Some(v)) = s.get("lakekeeper/default-warehouse-id").await {
+                let id = v.expose_secret().to_string();
+                if !id.trim().is_empty() {
+                    return id;
+                }
             }
         }
     }
@@ -1239,7 +1257,15 @@ async fn try_discover_via_config(
         return None;
     }
     if let Some(s) = secrets {
-        let _ = s.put("lakekeeper/default-warehouse-id", &prefix).await;
+        // Per-name cache so multiple warehouses don't share a slot.
+        // Also write the legacy singleton key when the resolved
+        // name is "default" so older code paths reading that key
+        // keep working.
+        let by_name_key = format!("lakekeeper/warehouse-id-by-name/{name}");
+        let _ = s.put(&by_name_key, &prefix).await;
+        if name == "default" {
+            let _ = s.put("lakekeeper/default-warehouse-id", &prefix).await;
+        }
     }
     tracing::info!(
         warehouse_name = %name,
@@ -9501,6 +9527,7 @@ async fn state_info_handler(State(state): State<AppState>) -> Json<serde_json::V
         "garage-instance",
         "lakekeeper-instance",
         "databend-instance",
+        "sail-instance",
         "qdrant-instance",
         "restate-instance",
         "greptime-instance",
@@ -9553,6 +9580,7 @@ async fn state_page_handler(State(state): State<AppState>) -> Html<String> {
         ("garage-instance", "garage"),
         ("lakekeeper-instance", "lakekeeper"),
         ("databend-instance", "databend"),
+        ("sail-instance", "sail"),
         ("qdrant-instance", "qdrant"),
         ("restate-instance", "restate"),
         ("greptime-instance", "greptime"),
@@ -9622,6 +9650,7 @@ async fn status_handler(State(state): State<AppState>) -> Html<String> {
         ("garage-instance", "garage"),
         ("lakekeeper-instance", "lakekeeper"),
         ("databend-instance", "databend"),
+        ("sail-instance", "sail"),
         ("qdrant-instance", "qdrant"),
         ("restate-instance", "restate"),
         ("greptime-instance", "greptime"),
@@ -9769,6 +9798,7 @@ async fn home_handler(State(state): State<AppState>) -> Html<String> {
                 "garage-instance",
                 "lakekeeper-instance",
                 "databend-instance",
+                "sail-instance",
                 "qdrant-instance",
                 "restate-instance",
                 "greptime-instance",
@@ -11600,6 +11630,7 @@ pub fn render_components(localizer: &Localizer) -> String {
         ("lakekeeper", "catalog", "Apache-2.0", "ok"),
         ("xtable", "format-translation", "Apache-2.0", "ok"),
         ("databend", "sql-engine", "Elastic-2.0 / Apache-2.0", "warn"),
+        ("sail", "spark-engine", "Apache-2.0", "ok"),
         ("qdrant", "vector", "Apache-2.0", "ok"),
         ("restate", "workflows", "BSL-1.1", "warn"),
         ("greptime", "observability", "Apache-2.0", "ok"),
