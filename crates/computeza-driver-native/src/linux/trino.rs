@@ -586,7 +586,10 @@ pub async fn write_iceberg_rest_catalog_file(
          # (or any S3-compatible store). path-style is required\n\
          # for non-AWS endpoints; the region must match Garage's\n\
          # configured s3_region (Garage's default is `garage`).\n\
-         fs.s3.enabled=true\n\
+         # Trino 459+ uses `fs.native-s3.enabled` to flip on the\n\
+         # native S3 filesystem; without it every s3.* key is\n\
+         # silently dropped as 'not used'.\n\
+         fs.native-s3.enabled=true\n\
          s3.endpoint={s3_endpoint}\n\
          s3.region={s3_region}\n\
          s3.path-style-access=true\n\

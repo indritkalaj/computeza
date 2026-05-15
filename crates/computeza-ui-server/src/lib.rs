@@ -5843,7 +5843,7 @@ async fn wire_trino_iceberg_catalog(
                 \"iceberg.catalog.type\" = 'rest', \
                 \"iceberg.rest-catalog.uri\" = '{uri}', \
                 \"iceberg.rest-catalog.warehouse\" = '{warehouse}', \
-                \"fs.s3.enabled\" = 'true', \
+                \"fs.native-s3.enabled\" = 'true', \
                 \"s3.endpoint\" = '{s3_endpoint}', \
                 \"s3.region\" = '{s3_region}', \
                 \"s3.path-style-access\" = 'true', \
