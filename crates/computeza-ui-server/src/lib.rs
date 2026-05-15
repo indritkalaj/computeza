@@ -1147,12 +1147,25 @@ async fn resolve_warehouse_id_or_pass(
     // cache. The legacy `lakekeeper/default-warehouse-id` singleton
     // key is read as a fallback for backward compat (set by older
     // bootstrap runs); new writes go to the per-name key.
+    //
+    // Only trust cached values that LOOK LIKE A UUID -- earlier
+    // bootstrap iterations cached the human warehouse name when
+    // the first CREATE CATALOG candidate succeeded with the name,
+    // which would hand the catalog-REST drill-down a non-UUID
+    // prefix and trigger Lakekeeper's "WarehouseIdIsNotUUID" 400.
+    // Skipping non-UUID cache values forces a /catalog/v1/config
+    // round-trip in Tier 3 which returns the real prefix.
+    fn looks_like_uuid(s: &str) -> bool {
+        s.len() == 36
+            && s.chars().filter(|c| *c == '-').count() == 4
+            && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+    }
     if let Some(s) = secrets {
         use secrecy::ExposeSecret;
         let by_name_key = format!("lakekeeper/warehouse-id-by-name/{name_or_uuid}");
         if let Ok(Some(v)) = s.get(&by_name_key).await {
             let id = v.expose_secret().to_string();
-            if !id.trim().is_empty() {
+            if looks_like_uuid(id.trim()) {
                 return id;
             }
         }
@@ -1163,7 +1176,7 @@ async fn resolve_warehouse_id_or_pass(
         if name_or_uuid == "default" {
             if let Ok(Some(v)) = s.get("lakekeeper/default-warehouse-id").await {
                 let id = v.expose_secret().to_string();
-                if !id.trim().is_empty() {
+                if looks_like_uuid(id.trim()) {
                     return id;
                 }
             }
@@ -5909,10 +5922,35 @@ async fn wire_trino_iceberg_catalog(
                     warehouse = %candidate,
                     "wire_trino: CREATE CATALOG succeeded -- caching this prefix to vault"
                 );
+                // Only cache UUID-shaped candidates. Trino's
+                // Iceberg-REST client resolves name -> UUID via
+                // /catalog/v1/config under the hood, so the human
+                // name often works as the `warehouse` config and
+                // arrives here first. But Lakekeeper's catalog REST
+                // refuses non-UUID prefixes on every path under
+                // /catalog/v1/<prefix>/*, so we MUST cache the UUID
+                // or the drill-down 400s. If the working candidate
+                // is the name, do a /v1/config probe to fetch the
+                // UUID and cache that instead.
+                let candidate_is_uuid = candidate.len() == 36
+                    && candidate.chars().filter(|c| *c == '-').count() == 4
+                    && candidate.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
                 if let Some(s) = secrets {
-                    let _ = s
-                        .put("lakekeeper/default-warehouse-id", candidate)
-                        .await;
+                    let to_cache = if candidate_is_uuid {
+                        Some(candidate.clone())
+                    } else {
+                        try_discover_via_config(&form.warehouse_name, lakekeeper_url, Some(s)).await
+                    };
+                    if let Some(uuid) = to_cache {
+                        let _ = s
+                            .put("lakekeeper/default-warehouse-id", &uuid)
+                            .await;
+                        let by_name_key = format!(
+                            "lakekeeper/warehouse-id-by-name/{}",
+                            form.warehouse_name,
+                        );
+                        let _ = s.put(&by_name_key, &uuid).await;
+                    }
                 }
                 return TrinoWiringOutcome::Wired { catalog_name };
             }
