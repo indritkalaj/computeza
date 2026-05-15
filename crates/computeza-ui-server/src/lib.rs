@@ -2298,11 +2298,17 @@ async fn build_studio_full_sidebar(state: &AppState, focus: SidebarFocus<'_>) ->
     let tree_html = render_studio_tree_sidebar(&tree, focus);
     let history = load_studio_history(state.store.as_deref()).await;
     let recent_html = render_sidebar_recent_queries(&history, "Reload query");
+    // Recent is collapsed by default. <details> remembers per-page
+    // state in the URL via :target if we want; for now it's a fresh
+    // collapsed view on every render so operators always start with
+    // a clean rail. Click the eyebrow to expand.
     format!(
         r#"{tree_html}
 <section class="cz-studio-sidebar-section">
-<div class="cz-studio-sidebar-eyebrow"><span>Recent ({n})</span></div>
-{recent_html}
+<details class="cz-studio-recent-details">
+<summary class="cz-studio-sidebar-eyebrow cz-studio-recent-summary"><span><span class="cz-studio-recent-chevron"></span>Recent ({n})</span></summary>
+<div class="cz-studio-recent-body">{recent_html}</div>
+</details>
 </section>"#,
         n = history.entries.len(),
     )
@@ -7071,6 +7077,14 @@ async fn dispatch_uninstall_with_config(
                     .map(|r| format_uninstall_summary(&r.steps, &r.warnings))
                     .map_err(|e| format!("{e}"))
             }
+            "trino" => {
+                let mut opts = linux::trino::UninstallOptions::default();
+                apply_uninstall_config_overrides(config, &mut opts.unit_name, &mut opts.root_dir);
+                linux::trino::uninstall(opts)
+                    .await
+                    .map(|r| format_uninstall_summary(&r.steps, &r.warnings))
+                    .map_err(|e| format!("{e}"))
+            }
             "xtable" => {
                 let mut opts = linux::xtable::UninstallOptions::default();
                 apply_uninstall_config_overrides(config, &mut opts.unit_name, &mut opts.root_dir);
@@ -7116,6 +7130,7 @@ async fn dispatch_install(
         "grafana" => run_grafana_install_with_progress(progress, config).await?,
         "restate" => run_restate_install_with_progress(progress, config).await?,
         "databend" => run_databend_install_with_progress(progress, config).await?,
+        "trino" => run_trino_install_with_progress(progress, config).await?,
         "sail" => run_sail_install_with_progress(progress, config).await?,
         "xtable" => run_xtable_install_with_progress(progress, config).await?,
         other => {
@@ -8395,6 +8410,52 @@ async fn run_sail_install_with_progress(
 }
 
 // ============================================================
+// Trino install path -- tarball + bundled Temurin JRE 21
+// ============================================================
+
+#[cfg(target_os = "linux")]
+async fn run_trino_install_with_progress(
+    progress: &ProgressHandle,
+    config: &InstallConfig,
+) -> Result<(String, u16), String> {
+    use computeza_driver_native::linux::trino;
+    let mut opts = trino::InstallOptions::default();
+    if let Some(p) = config.port {
+        opts.port = p;
+    }
+    if let Some(d) = &config.root_dir {
+        opts.root_dir = std::path::PathBuf::from(d);
+    }
+    if let Some(s) = &config.service_name {
+        opts.unit_name = format!("{s}.service");
+    }
+    if let Some(v) = &config.version {
+        opts.version = Some(v.clone());
+    }
+    match trino::install(opts, progress).await {
+        Ok(r) => Ok((
+            format!(
+                "trino bin_dir: {}\nunit_path: {}\ncoordinator HTTP port: {}\nClient URL: http://127.0.0.1:{}",
+                r.bin_dir.display(),
+                r.unit_path.display(),
+                r.port,
+                r.port,
+            ),
+            r.port,
+        )),
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn run_trino_install_with_progress(
+    _progress: &ProgressHandle,
+    _config: &InstallConfig,
+) -> Result<(String, u16), String> {
+    Err("Trino install requires a supported Linux host.".into())
+}
+
+// ============================================================
 // xtable install path -- Maven-resolve + bundled Temurin JRE
 // ============================================================
 
@@ -9644,6 +9705,7 @@ async fn state_info_handler(State(state): State<AppState>) -> Json<serde_json::V
         "garage-instance",
         "lakekeeper-instance",
         "databend-instance",
+        "trino-instance",
         "sail-instance",
         "qdrant-instance",
         "restate-instance",
@@ -9697,6 +9759,7 @@ async fn state_page_handler(State(state): State<AppState>) -> Html<String> {
         ("garage-instance", "garage"),
         ("lakekeeper-instance", "lakekeeper"),
         ("databend-instance", "databend"),
+        ("trino-instance", "trino"),
         ("sail-instance", "sail"),
         ("qdrant-instance", "qdrant"),
         ("restate-instance", "restate"),
@@ -9767,6 +9830,7 @@ async fn status_handler(State(state): State<AppState>) -> Html<String> {
         ("garage-instance", "garage"),
         ("lakekeeper-instance", "lakekeeper"),
         ("databend-instance", "databend"),
+        ("trino-instance", "trino"),
         ("sail-instance", "sail"),
         ("qdrant-instance", "qdrant"),
         ("restate-instance", "restate"),
@@ -9915,6 +9979,7 @@ async fn home_handler(State(state): State<AppState>) -> Html<String> {
                 "garage-instance",
                 "lakekeeper-instance",
                 "databend-instance",
+                "trino-instance",
                 "sail-instance",
                 "qdrant-instance",
                 "restate-instance",
@@ -11747,6 +11812,7 @@ pub fn render_components(localizer: &Localizer) -> String {
         ("lakekeeper", "catalog", "Apache-2.0", "ok"),
         ("xtable", "format-translation", "Apache-2.0", "ok"),
         ("databend", "sql-engine", "Elastic-2.0 / Apache-2.0", "warn"),
+        ("trino", "sql-engine", "Apache-2.0", "ok"),
         ("sail", "spark-engine", "Apache-2.0", "ok"),
         ("qdrant", "vector", "Apache-2.0", "ok"),
         ("restate", "workflows", "BSL-1.1", "warn"),
@@ -12166,6 +12232,19 @@ const COMPONENTS: &[ComponentEntry] = &[
         available: true,
     },
     ComponentEntry {
+        slug: "trino",
+        name_key: "component-trino-name",
+        role_key: "component-trino-role",
+        // Linux install live: downloads the trino-server tarball from
+        // the Trino GitHub releases, bundles Temurin JRE 21, generates
+        // etc/{node,config,jvm,log}.properties, registers a systemd
+        // unit running `bin/launcher run`. Studio's SQL editor routes
+        // all SQL queries here; Iceberg-REST catalogs are configured
+        // at bootstrap time via etc/catalog/<warehouse>.properties.
+        // Apache 2.0 licensed.
+        available: true,
+    },
+    ComponentEntry {
         slug: "sail",
         name_key: "component-sail-name",
         role_key: "component-sail-role",
@@ -12259,11 +12338,18 @@ const INSTALL_ORDER: &[&str] = &[
     "grafana",
     "restate",
     "databend",
-    // Sail comes after lakekeeper so its bootstrap step can find a
-    // running Iceberg-REST catalog when wire_sail_iceberg_catalog
-    // fires. After Databend so the two engines spin up roughly
-    // in parallel from the operator's perspective on the install
-    // results page.
+    // Trino comes after lakekeeper so its bootstrap step can write
+    // the Iceberg-REST catalog properties file against a running
+    // Lakekeeper. Trino replaces Databend as Studio's default SQL
+    // engine; Databend stays installable for operators who pick it
+    // explicitly, but the auto-router on /studio/sql/execute routes
+    // SQL to Trino when both are present.
+    "trino",
+    // Sail comes after the SQL engines so its bootstrap step can
+    // find a running Iceberg-REST catalog when wire_sail_iceberg_catalog
+    // fires. After Databend + Trino so all three engines spin up
+    // roughly in parallel from the operator's perspective on the
+    // install results page.
     "sail",
     // xtable goes last because the dataset config it eventually
     // reads (datasets.yaml under <root>) typically references
@@ -12288,6 +12374,7 @@ fn canonical_defaults_for(slug: &str) -> (u16, String) {
         "greptime" => 4000,
         "lakekeeper" => 8181,
         "databend" => 8000,
+        "trino" => 8088,
         "sail" => 50051,
         "grafana" => 3000,
         "restate" => 8081,

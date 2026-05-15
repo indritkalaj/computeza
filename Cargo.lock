@@ -554,6 +554,7 @@ dependencies = [
  "computeza-reconciler-qdrant",
  "computeza-reconciler-restate",
  "computeza-reconciler-sail",
+ "computeza-reconciler-trino",
  "computeza-secrets",
  "computeza-state",
  "computeza-ui-server",
@@ -909,6 +910,22 @@ dependencies = [
 
 [[package]]
 name = "computeza-reconciler-sail"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "computeza-core",
+ "computeza-state",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "computeza-reconciler-trino"
 version = "0.0.1"
 dependencies = [
  "anyhow",

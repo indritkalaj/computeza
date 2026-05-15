@@ -764,6 +764,25 @@ async fn reconcile_tick(
                 let _ = reconciler.observe(&ctx).await;
             }
         }
+
+        // ---- trino-instance ----
+        {
+            use computeza_reconciler_trino::{TrinoReconciler, TrinoSpec};
+            let rows = store.list("trino-instance", None).await.unwrap_or_default();
+            for sr in rows {
+                let spec: TrinoSpec = match serde_json::from_value(sr.spec.clone()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(error = %e, name = %sr.key.name, "trino spec deserialize failed");
+                        continue;
+                    }
+                };
+                let reconciler: TrinoReconciler<NoOpDriver> =
+                    TrinoReconciler::new(spec.endpoint.clone())
+                        .with_state(store.clone(), &sr.key.name);
+                let _ = reconciler.observe(&ctx).await;
+            }
+        }
     }
 }
 

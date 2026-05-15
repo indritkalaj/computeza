@@ -225,6 +225,37 @@ body.cz-sidenav-open { padding-left: 220px; }
   font-weight: 900;
   content: "\f0c9"; /* fa-bars */
 }
+
+/* Recent-queries panel in the catalog sidebar: collapsible <details>,
+   closed by default so the rail stays compact on first load. Click
+   the eyebrow row to expand; the chevron rotates open. */
+.cz-studio-recent-details > summary {
+  list-style: none;
+  cursor: pointer;
+  user-select: none;
+}
+.cz-studio-recent-details > summary::-webkit-details-marker { display: none; }
+.cz-studio-recent-summary {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+.cz-studio-recent-chevron::before {
+  font-family: "Font Awesome 6 Free";
+  font-weight: 900;
+  content: "\f054"; /* fa-chevron-right */
+  font-size: 0.62rem;
+  margin-right: 0.3rem;
+  display: inline-block;
+  transition: transform 120ms ease;
+  vertical-align: middle;
+}
+.cz-studio-recent-details[open] > summary .cz-studio-recent-chevron::before {
+  transform: rotate(90deg);
+}
+.cz-studio-recent-body {
+  margin-top: 0.4rem;
+}
 body.cz-sidenav-open .cz-sidenav-toggle::before {
   content: "\f100"; /* fa-angles-left */
 }

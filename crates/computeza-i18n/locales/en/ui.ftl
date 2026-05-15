@@ -575,6 +575,9 @@ component-databend-role   = Columnar SQL, vector, full-text search, geospatial
 component-sail-name       = Sail
 component-sail-role       = Spark-API distributed compute (Python / DataFrame / Spark Connect)
 
+component-trino-name      = Trino
+component-trino-role      = Distributed SQL engine with first-class Iceberg-REST support (Studio's default SQL surface)
+
 component-qdrant-name     = Qdrant
 component-qdrant-role     = Production RAG vector retrieval API
 
