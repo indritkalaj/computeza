@@ -2911,6 +2911,78 @@ struct StudioQuery {
     flash: Option<String>,
 }
 
+/// In-memory snapshot of the workspace-files state for one render
+/// pass: the full file list (for the tree), the subset open as tabs
+/// (in operator-chosen order), and which one is currently focused.
+/// The editor's textarea is pre-filled with the active file's content
+/// when no explicit `?sql=` override is present.
+struct StudioFilesView {
+    all: Vec<computeza_state::StudioFile>,
+    open: Vec<computeza_state::StudioFile>,
+    active_id: Option<String>,
+    flash: Option<String>,
+}
+
+impl StudioFilesView {
+    fn active_file(&self) -> Option<&computeza_state::StudioFile> {
+        let id = self.active_id.as_deref()?;
+        self.open.iter().find(|f| f.id == id)
+    }
+    fn open_csv(&self) -> String {
+        self.open
+            .iter()
+            .map(|f| f.id.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+/// Build the StudioFilesView from the current request query. Handles
+/// missing store gracefully (returns an empty view, so the editor
+/// works without persisted files).
+async fn build_studio_files_view(
+    state: &AppState,
+    q: &StudioQuery,
+) -> StudioFilesView {
+    let Some(store) = state.store.as_deref() else {
+        return StudioFilesView {
+            all: Vec::new(),
+            open: Vec::new(),
+            active_id: None,
+            flash: q.flash.clone(),
+        };
+    };
+    let all = store.studio_files_list().await.unwrap_or_default();
+    // Parse the `open` csv and resolve each id against `all`. Ids
+    // that aren't found (deleted file with stale URL) are silently
+    // dropped so the tab strip stays consistent with reality.
+    let requested_ids: Vec<String> = q
+        .open
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let open: Vec<computeza_state::StudioFile> = requested_ids
+        .into_iter()
+        .filter_map(|id| all.iter().find(|f| f.id == id).cloned())
+        .collect();
+    // Active id must be present in `open`. If not, fall back to the
+    // last id in `open` (most recently added tab) so the editor isn't
+    // showing a tab strip with nothing highlighted.
+    let active_id = match q.active.as_deref() {
+        Some(id) if open.iter().any(|f| f.id == id) => Some(id.to_string()),
+        _ => open.last().map(|f| f.id.clone()),
+    };
+    StudioFilesView {
+        all,
+        open,
+        active_id,
+        flash: q.flash.clone(),
+    }
+}
+
 async fn studio_handler(
     State(state): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<StudioQuery>,
@@ -2923,7 +2995,16 @@ async fn studio_handler(
         None => LakekeeperState::Unreachable,
     };
     let history = load_studio_history(state.store.as_deref()).await;
-    let sql_prefill = q.sql.unwrap_or_default();
+    let files = build_studio_files_view(&state, &q).await;
+    // sql_prefill priority: explicit ?sql= override beats the active
+    // file's content. Lets the catalog "Pre-fill SELECT *" deep link
+    // overwrite the editor body even when a file tab is open.
+    let sql_prefill = q.sql.clone().unwrap_or_else(|| {
+        files
+            .active_file()
+            .map(|f| f.content.clone())
+            .unwrap_or_default()
+    });
     let sidebar = build_studio_full_sidebar(&state, SidebarFocus::default()).await;
     Html(render_studio_page(
         &l,
@@ -2934,6 +3015,7 @@ async fn studio_handler(
         &sql_prefill,
         None,
         &sidebar,
+        &files,
     ))
 }
 
@@ -2943,6 +3025,13 @@ async fn studio_handler(
 #[derive(serde::Deserialize)]
 struct StudioSqlForm {
     sql: String,
+    /// Tab state forwarded through the run-query POST so the
+    /// editor returns to the same set of open tabs (with the same
+    /// active id) after the redirect-less re-render.
+    #[serde(default)]
+    open: String,
+    #[serde(default)]
+    active: String,
 }
 
 // Note: a previous iteration of this file shipped a
@@ -3328,6 +3417,7 @@ fn build_cptz_archive(files: &[computeza_state::StudioFile]) -> std::result::Res
     Ok(buf)
 }
 
+#[allow(dead_code)] // Wired in once the axum 0.8 body extractor settles -- see TODO above.
 async fn import_cptz_archive(
     store: &computeza_state::SqliteStore,
     bytes: &[u8],
@@ -3587,6 +3677,16 @@ async fn studio_sql_execute_handler(
     };
     let history = load_studio_history(state.store.as_deref()).await;
     let sidebar = build_studio_full_sidebar(&state, SidebarFocus::default()).await;
+    // Rebuild the files view from the form's forwarded tab state so
+    // the renderer re-emits the same tabs / active highlight after
+    // a Run round-trip.
+    let post_q = StudioQuery {
+        sql: None,
+        open: if form.open.is_empty() { None } else { Some(form.open.clone()) },
+        active: if form.active.is_empty() { None } else { Some(form.active.clone()) },
+        flash: None,
+    };
+    let files = build_studio_files_view(&state, &post_q).await;
     Html(render_studio_page(
         &l,
         lakekeeper.is_some(),
@@ -3596,6 +3696,7 @@ async fn studio_sql_execute_handler(
         &form.sql,
         Some(routed),
         &sidebar,
+        &files,
     ))
 }
 
@@ -4003,6 +4104,113 @@ async fn execute_sql_against_databend(base_url: &str, sql: &str) -> SqlOutcome {
     SqlOutcome::Ok { columns, rows }
 }
 
+/// Render the middle "Workspace files" pane. Builds a flat tree
+/// from the path prefixes -- folders are implicit. Each row links
+/// to /studio?open=...&active=<id> which the next render uses to
+/// drop the file's content into the editor and highlight its tab.
+fn render_studio_files_pane(files: &StudioFilesView) -> String {
+    let csrf = auth::csrf_input();
+    let open_csv = files.open_csv();
+    // Eyebrow + action buttons (new / import / export-archive).
+    // New uses the editor's current `sql` value as content, so the
+    // operator's in-progress query becomes the first commit. That's
+    // wired via inline JS that fills a hidden field; without JS the
+    // new file is empty and the operator can paste later.
+    let actions = format!(
+        r##"<div class="cz-studio-files-actions">
+<form method="post" action="/studio/files/new" style="margin:0;display:inline;" id="cz-file-new-form">{csrf}
+<input type="hidden" name="open" value="{open_csv}" />
+<input type="hidden" name="content" id="cz-file-new-content" value="" />
+<button type="submit" title="New file (uses current editor body)">+</button>
+</form>
+<a href="/studio/files/export-archive" title="Export workspace as .cptz">⇩</a>
+</div>"##,
+        csrf = csrf,
+        open_csv = html_escape(&open_csv),
+    );
+    let eyebrow = format!(
+        r#"<div class="cz-studio-files-eyebrow"><span>Files ({n})</span>{actions}</div>"#,
+        n = files.all.len(),
+        actions = actions,
+    );
+    // Tree: group by leading folder segment (first '/' after the
+    // root). Files at the top level go under "Untitled". Deeper
+    // nesting is collapsed to a single level for v1.
+    let mut groups: std::collections::BTreeMap<String, Vec<&computeza_state::StudioFile>> =
+        std::collections::BTreeMap::new();
+    for f in &files.all {
+        let trimmed = f.path.trim_start_matches('/');
+        let folder = match trimmed.split_once('/') {
+            Some((dir, _)) if !dir.is_empty() => dir.to_string(),
+            _ => "root".to_string(),
+        };
+        groups.entry(folder).or_default().push(f);
+    }
+    let tree_html: String = if files.all.is_empty() {
+        r#"<div class="cz-studio-file-empty">No saved files yet. Click <strong>+</strong> to save your current editor body as a file, or import a .cptz archive (coming soon).</div>"#.to_string()
+    } else {
+        groups
+            .iter()
+            .map(|(folder, items)| {
+                let folder_label = if folder == "root" { "/".to_string() } else { format!("/{folder}/") };
+                let rows: String = items
+                    .iter()
+                    .map(|f| {
+                        let basename = f
+                            .path
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or(&f.path)
+                            .to_string();
+                        let is_active = files.active_id.as_deref() == Some(f.id.as_str());
+                        let active = if is_active { " cz-tree-active" } else { "" };
+                        let mut next_open: Vec<&str> = files
+                            .open
+                            .iter()
+                            .map(|f| f.id.as_str())
+                            .collect();
+                        if !next_open.contains(&f.id.as_str()) {
+                            next_open.push(&f.id);
+                        }
+                        let next_open_csv = next_open.join(",");
+                        format!(
+                            r#"<a class="cz-studio-file-row{active}" href="/studio?open={open}&active={id}"><span class="cz-tree-label" title="{path}">{label}</span></a>"#,
+                            open = url_encode(&next_open_csv),
+                            id = url_encode(&f.id),
+                            path = html_escape(&f.path),
+                            label = html_escape(&basename),
+                        )
+                    })
+                    .collect();
+                format!(
+                    r#"<div class="cz-studio-file-folder">{folder_label}</div>{rows}"#,
+                    folder_label = html_escape(&folder_label),
+                )
+            })
+            .collect()
+    };
+    format!(
+        r##"{eyebrow}
+{tree_html}
+<script>
+// Mirror the textarea body into the New-file form's hidden content
+// field so clicking "+" saves the current editor body, not an
+// empty file. Picks up Monaco's value too when Monaco is mounted
+// (the editor copies its buffer into the textarea on submit; we
+// just read the textarea at click time).
+(function() {{
+  var form = document.getElementById("cz-file-new-form");
+  var hidden = document.getElementById("cz-file-new-content");
+  var ta = document.getElementById("cz-sql-textarea");
+  if (!form || !hidden || !ta) return;
+  form.addEventListener("submit", function() {{
+    hidden.value = ta.value;
+  }});
+}})();
+</script>"##
+    )
+}
+
 /// Render the two-pane studio page. Pure-server template; the
 /// only JS on the page is the existing CSRF auto-fill from
 /// render_shell + the Monaco loader at the bottom. The catalog
@@ -4072,6 +4280,7 @@ fn render_studio_page(
     sql_prefill: &str,
     result: Option<RoutedOutcome>,
     sidebar_html: &str,
+    files: &StudioFilesView,
 ) -> String {
     let title = localizer.t("ui-studio-title");
     let sql_placeholder = localizer.t("ui-studio-sql-placeholder");
@@ -4234,6 +4443,82 @@ fn render_studio_page(
         QueryLanguage::Sql => "SQL → Databend",
         QueryLanguage::Python => "Python → Sail",
     };
+    let csrf_str = auth::csrf_input();
+    let open_csv = files.open_csv();
+    let active_id = files.active_id.clone().unwrap_or_default();
+    // Tab strip above the editor. The "scratch" tab is always
+    // present so the editor never has a blank tab strip; clicking
+    // it deselects any file (active=) and the editor body becomes
+    // the raw sql_prefill (no file context).
+    let tabs_html = {
+        let scratch_active = files.active_id.is_none();
+        let scratch_class = if scratch_active { " cz-studio-tab-active" } else { "" };
+        let mut html = format!(
+            r#"<div class="cz-studio-tabs"><a class="cz-studio-tab cz-studio-tab-scratch{scratch_class}" href="/studio?open={open}"><span class="cz-studio-tab-label">scratch</span></a>"#,
+            open = url_encode(&open_csv),
+        );
+        for f in &files.open {
+            let is_active = files.active_id.as_deref() == Some(f.id.as_str());
+            let active = if is_active { " cz-studio-tab-active" } else { "" };
+            let basename = f.path.rsplit('/').next().unwrap_or(&f.path);
+            // Close button: posts to delete handler? No -- close just
+            // removes the tab from the open csv, doesn't delete the
+            // file. So it's a link, not a form.
+            let next_open: String = files
+                .open
+                .iter()
+                .filter(|x| x.id != f.id)
+                .map(|x| x.id.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            html.push_str(&format!(
+                r##"<a class="cz-studio-tab{active}" href="/studio?open={open}&active={id}"><span class="cz-studio-tab-label" title="{path}">{label}</span><a class="cz-studio-tab-close" href="/studio?open={next_open}" title="Close tab (doesn't delete file)">×</a></a>"##,
+                open = url_encode(&open_csv),
+                next_open = url_encode(&next_open),
+                id = url_encode(&f.id),
+                path = html_escape(&f.path),
+                label = html_escape(basename),
+            ));
+        }
+        html.push_str(r#"<div class="cz-studio-tabs-flex"></div></div>"#);
+        html
+    };
+    // Flash banner after a file action.
+    let flash_html = files
+        .flash
+        .as_deref()
+        .map(|m| {
+            format!(
+                r#"<div class="cz-studio-banner" style="margin: 0.5rem 0 0;"><strong>Notice:</strong> {}</div>"#,
+                html_escape(m)
+            )
+        })
+        .unwrap_or_default();
+    // Save / rename / delete / duplicate buttons -- only meaningful
+    // when a file is active. Each is a tiny form that POSTs to the
+    // matching handler. The Save button is the highlight: its
+    // formaction overrides the parent form's /studio/sql/execute
+    // so the same textarea content can be saved instead of run.
+    let save_button_html = match files.active_file() {
+        Some(f) => format!(
+            r##"<button type="submit" class="cz-btn-ghost" formaction="/studio/files/{id}/save" formmethod="post" title="Save current editor body to {path}">Save</button>"##,
+            id = url_encode(&f.id),
+            path = html_escape(&f.path),
+        ),
+        None => String::new(),
+    };
+    let file_actions_html = match files.active_file() {
+        Some(f) => format!(
+            r##"<form method="post" action="/studio/files/{id}/duplicate" style="margin:0;display:inline;">{csrf}<input type="hidden" name="open" value="{open}" /><button type="submit" class="cz-btn-ghost" title="Duplicate {path}">Duplicate</button></form>
+<form method="post" action="/studio/files/{id}/delete" style="margin:0;display:inline;" onsubmit="return confirm('Delete {path}? This cannot be undone.');">{csrf}<input type="hidden" name="open" value="{open}" /><button type="submit" class="cz-btn-danger" title="Delete {path}">Delete</button></form>
+<a href="/studio/files/{id}/export" class="cz-btn-ghost" title="Download {path}">Export</a>"##,
+            csrf = csrf_str,
+            id = url_encode(&f.id),
+            open = html_escape(&open_csv),
+            path = html_escape(&f.path),
+        ),
+        None => String::new(),
+    };
     let main_html = format!(
         r##"<div class="cz-studio-crumbs">
 <a href="/studio">Studio</a><span class="cz-studio-crumbs-sep">/</span><span class="cz-studio-crumbs-current">Editor</span>
@@ -4249,17 +4534,23 @@ fn render_studio_page(
 <select disabled><option>default</option></select>
 </label>
 </div>
+{tabs_html}
+{flash_html}
 <form method="post" action="/studio/sql/execute" id="cz-sql-form">
 {csrf}
+<input type="hidden" name="open" value="{open_csv}" />
+<input type="hidden" name="active" value="{active_id}" />
 <div class="cz-studio-editor-toolbar">
 <span id="cz-sql-lang-pill" class="cz-studio-engine-pill" data-lang="{lang_attr}">{lang_label}</span>
 <span class="cz-studio-actions-spacer"></span>
+{file_actions_html}
 </div>
 <div class="cz-studio-editor-wrap">
 <textarea id="cz-sql-textarea" name="sql" class="cz-studio-editor-textarea" placeholder="{sql_placeholder}">{sql_value}</textarea>
 <div id="cz-sql-monaco" data-initial="{sql_value_attr}" style="display: none; height: 18rem;"></div>
 </div>
 <div class="cz-studio-actions">
+{save_button_html}
 <button type="submit" class="cz-btn-primary">{sql_run}</button>
 <span class="cz-studio-editor-hint" style="margin-left: 0.25rem;">Ctrl/Cmd+Enter to run.</span>
 <div class="cz-studio-actions-spacer"></div>
@@ -4314,11 +4605,21 @@ fn render_studio_page(
         results_html = results_html,
         lang_attr = match initial_language { QueryLanguage::Sql => "sql", QueryLanguage::Python => "python" },
         lang_label = initial_lang_label,
+        tabs_html = tabs_html,
+        flash_html = flash_html,
+        open_csv = html_escape(&open_csv),
+        active_id = html_escape(&active_id),
+        save_button_html = save_button_html,
+        file_actions_html = file_actions_html,
     );
+
+    // ---- Files pane (middle column) ---------------------------------
+    let files_pane_html = render_studio_files_pane(files);
 
     let body = format!(
         r#"<div class="cz-studio-shell">
 <aside class="cz-studio-sidebar">{sidebar_html}</aside>
+<aside class="cz-studio-files">{files_pane_html}</aside>
 <main class="cz-studio-main">{main_html}</main>
 </div>
 <script>

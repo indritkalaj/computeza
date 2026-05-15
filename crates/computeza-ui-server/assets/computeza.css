@@ -809,13 +809,170 @@ a.cz-card:hover {
 
 .cz-studio-shell {
   display: grid;
-  grid-template-columns: 240px 1fr;
+  /* Three panes: catalog tree | workspace files | editor.
+     Drilldown pages collapse to two by omitting the .cz-studio-files
+     div from their body, which the auto-fit grid handles cleanly. */
+  grid-template-columns: 220px 220px 1fr;
   gap: 1px;
   min-height: calc(100vh - 56px);
   background: var(--line);
   margin: 0;
   border-top: 1px solid var(--line);
 }
+/* Drilldown pages only emit two panes (sidebar + main), so the
+   grid falls back to a 2-col layout. The :has() rule keeps the
+   shell working without inline overrides. */
+.cz-studio-shell:not(:has(> .cz-studio-files)) {
+  grid-template-columns: 240px 1fr;
+}
+
+/* Workspace files pane (middle) -- list + actions for SQL / Python
+   snippets the operator authors inside Studio. */
+.cz-studio-files {
+  background: var(--navy);
+  border-right: 1px solid var(--line);
+  padding: 1rem 0.55rem;
+  overflow-y: auto;
+  max-height: calc(100vh - 56px);
+  font-size: 0.78rem;
+}
+.cz-studio-files-eyebrow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 0.5rem 0.5rem;
+  font-family: 'Geist Mono', ui-monospace, monospace;
+  font-size: 0.7rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+.cz-studio-files-actions {
+  display: flex;
+  gap: 0.25rem;
+}
+.cz-studio-files-actions button,
+.cz-studio-files-actions a {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 0.95rem;
+  line-height: 1;
+  transition: all 0.12s ease;
+  text-decoration: none;
+}
+.cz-studio-files-actions button:hover,
+.cz-studio-files-actions a:hover {
+  color: var(--ink);
+  background: var(--navy-3);
+  border-color: var(--line);
+}
+
+/* File tree rows -- folder + file lines */
+.cz-studio-file-folder {
+  font-family: 'Geist Mono', ui-monospace, monospace;
+  font-size: 0.72rem;
+  color: var(--muted);
+  padding: 0.35rem 0.5rem 0.15rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.cz-studio-file-row {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.3rem 0.5rem;
+  border-radius: 5px;
+  color: var(--ink);
+  text-decoration: none;
+  font-family: 'Geist Mono', ui-monospace, monospace;
+  font-size: 0.78rem;
+  transition: background 0.1s ease;
+}
+.cz-studio-file-row:hover { background: var(--navy-3); }
+.cz-studio-file-row.cz-tree-active {
+  background: var(--navy-3);
+  color: var(--lavender);
+}
+.cz-studio-file-row .cz-tree-label {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cz-studio-file-empty {
+  padding: 1rem 0.5rem;
+  font-size: 0.72rem;
+  color: var(--muted);
+  font-style: italic;
+  line-height: 1.5;
+}
+
+/* Tabs strip above the editor -- Chrome-like, server-rendered.
+   Each tab is an <a> that navigates with the new active id; the
+   close button is a tiny inline form so closing is a POST. */
+.cz-studio-tabs {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  background: var(--navy-2);
+  border: 1px solid var(--line);
+  border-bottom: none;
+  border-radius: var(--radius) var(--radius) 0 0;
+  overflow-x: auto;
+  min-height: 2.2rem;
+}
+.cz-studio-tab {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.4rem 0.75rem;
+  border-right: 1px solid var(--line);
+  background: var(--navy-2);
+  color: var(--muted);
+  text-decoration: none;
+  font-family: 'Geist Mono', ui-monospace, monospace;
+  font-size: 0.74rem;
+  white-space: nowrap;
+  min-width: 0;
+  max-width: 18rem;
+}
+.cz-studio-tab:hover { background: var(--navy-3); color: var(--ink); }
+.cz-studio-tab.cz-studio-tab-active {
+  background: var(--navy);
+  color: var(--ink);
+  border-bottom: 2px solid var(--lavender);
+}
+.cz-studio-tab-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 1;
+  min-width: 0;
+}
+.cz-studio-tab-close {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 0;
+  width: 1rem;
+  height: 1rem;
+  line-height: 1;
+  font-size: 1rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 3px;
+}
+.cz-studio-tab-close:hover { background: var(--navy-3); color: var(--ink); }
+.cz-studio-tabs-flex { flex: 1; }
+/* "scratch" tab when no file is active -- runs queries without
+   saving them. Always present so the editor never goes blank. */
+.cz-studio-tab-scratch { font-style: italic; }
 
 .cz-studio-sidebar {
   background: var(--navy);
