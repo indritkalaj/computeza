@@ -4300,11 +4300,21 @@ gg key info lakekeeper                         # &lt;-- copy Key ID + Secret key
     render_shell(localizer, &title, NavLink::Studio, &body)
 }
 
-async fn install_hub_handler(State(state): State<AppState>) -> Html<String> {
+async fn install_hub_handler(State(state): State<AppState>) -> Response {
     let l = Localizer::english();
     let active = active_jobs(&state);
+    // If an install is already in flight, auto-resume the wizard
+    // instead of showing the picker. A page-refresh during install
+    // used to dump the operator back to the form -- visually
+    // identical to "start over" even though the background task was
+    // still running -- so they'd hit Install again and double-fire.
+    // Now the GET lands directly on /install/job/{id} where the
+    // progress bars + poller pick up where they left off.
+    if let Some(j) = active.first() {
+        return Redirect303(format!("/install/job/{}", j.id)).into_response();
+    }
     let installed = compute_installed_slugs(state.store.as_deref()).await;
-    Html(render_install_hub(&l, &active, &installed))
+    Html(render_install_hub(&l, &active, &installed)).into_response()
 }
 
 /// Read the metadata store and return the set of slugs that currently
