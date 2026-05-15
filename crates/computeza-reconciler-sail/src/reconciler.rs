@@ -160,17 +160,23 @@ impl<D: Driver + 'static> Reconciler for SailReconciler<D> {
 mod tests {
     use super::*;
 
-    fn r(host: &str, port: u16) -> SailReconciler<NoOpDriver> {
+    fn r(base_url: &str) -> SailReconciler<NoOpDriver> {
         SailReconciler::new(SailEndpoint {
-            host: host.into(),
-            port,
+            base_url: base_url.into(),
+            insecure_skip_tls_verify: false,
         })
     }
 
     #[test]
     fn endpoint_builds_spark_connect_uri() {
-        let rec = r("127.0.0.1", 50051);
+        let rec = r("http://127.0.0.1:50051");
         assert_eq!(rec.endpoint.spark_connect_uri(), "sc://127.0.0.1:50051");
         assert_eq!(rec.endpoint.tcp_target(), "127.0.0.1:50051");
+    }
+
+    #[test]
+    fn endpoint_falls_back_when_base_url_malformed() {
+        let rec = r("");
+        assert_eq!(rec.endpoint.spark_connect_uri(), "sc://127.0.0.1:50051");
     }
 }
