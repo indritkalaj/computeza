@@ -5722,8 +5722,17 @@ async fn run_lakekeeper_bootstrap(
             "aws-secret-access-key": form.s3_secret_access_key,
         },
     });
+    // x-project-id header MUST be present. Lakekeeper resolves the
+    // warehouse's owning project from the header context; the
+    // `project-id` field in the body is ignored when auth is
+    // disabled. Without this header, the warehouse goes into an
+    // implicit project that's NOT the nil default, so subsequent
+    // /catalog/v1/<warehouse-id>/... lookups (Iceberg-REST default
+    // project context) return NoSuchWarehouseException -- exactly
+    // the symptom we've been chasing.
     let warehouse_resp = client
         .post(&warehouse_url)
+        .header("x-project-id", &project_id)
         .json(&warehouse_body)
         .send()
         .await
@@ -5778,7 +5787,12 @@ async fn run_lakekeeper_bootstrap(
             base_url.trim_end_matches('/'),
             project_id
         );
-        let id_from_list = match client.get(&list_url).send().await {
+        let id_from_list = match client
+            .get(&list_url)
+            .header("x-project-id", &project_id)
+            .send()
+            .await
+        {
             Ok(r) if r.status().is_success() => r.text().await.ok(),
             _ => None,
         };
