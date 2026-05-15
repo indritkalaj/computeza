@@ -1154,21 +1154,52 @@ a.cz-card:hover {
 
 .cz-studio-shell {
   display: grid;
-  /* Three panes: catalog tree | workspace files | editor.
-     Drilldown pages collapse to two by omitting the .cz-studio-files
-     div from their body, which the auto-fit grid handles cleanly. */
-  grid-template-columns: 220px 220px 1fr;
-  gap: 1px;
+  /* Five tracks: catalog tree | splitter | workspace files |
+     splitter | editor. Track widths come from CSS variables so JS
+     can resize via drag without rewriting the entire template.
+     Drilldown pages emit fewer panes; the :has() rule below
+     reshapes accordingly. */
+  --cz-studio-sidebar-w: 220px;
+  --cz-studio-files-w: 220px;
+  grid-template-columns:
+    var(--cz-studio-sidebar-w)
+    4px
+    var(--cz-studio-files-w)
+    4px
+    1fr;
   min-height: calc(100vh - 48px);
   background: var(--line);
   margin: 0;
   border-top: 1px solid var(--line);
 }
-/* Drilldown pages only emit two panes (sidebar + main), so the
-   grid falls back to a 2-col layout. The :has() rule keeps the
-   shell working without inline overrides. */
+/* Drilldown pages only emit two panes (sidebar + main), no files
+   pane, no second splitter. Collapse the template to 3 tracks. */
 .cz-studio-shell:not(:has(> .cz-studio-files)) {
-  grid-template-columns: 240px 1fr;
+  grid-template-columns: var(--cz-studio-sidebar-w) 4px 1fr;
+}
+
+/* Drag-to-resize splitters between studio panels. Operator grabs
+   the 4-px-wide strip between two panes, drags horizontally, the
+   adjacent panel resizes via CSS variable update. Width persists
+   in localStorage (cz-studio-sidebar-w / cz-studio-files-w). */
+.cz-studio-splitter {
+  background: transparent;
+  cursor: col-resize;
+  position: relative;
+  z-index: 5;
+  transition: background-color 0.15s ease;
+}
+.cz-studio-splitter:hover,
+.cz-studio-splitter.cz-studio-splitter-active {
+  background: var(--lavender);
+}
+/* Wider hit-area than the visual handle so the operator doesn't
+   have to be pixel-precise. */
+.cz-studio-splitter::before {
+  content: "";
+  position: absolute;
+  top: 0; bottom: 0;
+  left: -3px; right: -3px;
 }
 
 /* Workspace files pane (middle) -- list + actions for SQL / Python
@@ -1773,42 +1804,84 @@ details > summary::-webkit-details-marker { display: none; }
   background: rgba(158, 232, 224, 0.08);
   border-color: rgba(158, 232, 224, 0.5);
 }
-.cz-studio-lang-pill select {
-  appearance: none;
-  -webkit-appearance: none;
-  -moz-appearance: none;
+/* Custom dropdown -- we control 100% of the styling. Native
+   <select> popovers in Chrome/Safari/Firefox ignore most CSS
+   rules on <option> elements and inherit from the OS theme,
+   which produces unreadable white-on-white popovers on
+   light-themed Windows. Replaced with a button + div menu. */
+.cz-studio-lang-pill {
+  position: relative;
+}
+.cz-studio-lang-pill-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
   background: transparent;
   border: 0;
   outline: 0;
-  padding: 0.25rem 1.8rem 0.25rem 0.65rem;
+  padding: 0.28rem 0.65rem;
   color: inherit;
   font: inherit;
   text-transform: inherit;
   letter-spacing: inherit;
   cursor: pointer;
-  /* color-scheme: dark tells the browser to render the native
-     dropdown popover (options + scrollbar + highlight) in dark
-     mode. Without it the OS theme leaks through and the option
-     popover comes out white-on-white-ish on light/auto Windows
-     themes -- the rendered list is technically themed, just
-     unreadable. */
-  color-scheme: dark;
-  /* Chevron rendered as an inline SVG background so we don't need
-     a separate icon font here. */
-  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'><path d='M3 4.5l3 3 3-3' fill='none' stroke='currentColor' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/></svg>");
-  background-repeat: no-repeat;
-  background-position: right 0.55rem center;
-  background-size: 10px 10px;
+  border-radius: inherit;
 }
-/* Most browsers ignore custom CSS on <option> elements (Chrome,
-   Safari, Firefox); the page palette below is a best-effort hint
-   for browsers that DO honour it. The robust path is the
-   color-scheme: dark declaration on the parent select. */
-.cz-studio-lang-pill select option {
-  background-color: var(--navy-1);
-  color: var(--ink);
+.cz-studio-lang-pill-button i {
+  font-size: 0.7em;
+  opacity: 0.7;
+  transition: transform 0.12s ease;
+}
+.cz-studio-lang-pill-button[aria-expanded="true"] i {
+  transform: rotate(180deg);
+}
+.cz-studio-lang-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  min-width: 14rem;
+  background: var(--navy-1);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.55);
+  padding: 0.3rem 0;
+  z-index: 200;
   text-transform: none;
   letter-spacing: normal;
+}
+.cz-studio-lang-menu[hidden] {
+  display: none;
+}
+.cz-studio-lang-option {
+  display: flex;
+  align-items: baseline;
+  gap: 0.4rem;
+  width: 100%;
+  background: transparent;
+  border: 0;
+  color: var(--ink);
+  text-align: left;
+  padding: 0.5rem 0.95rem;
+  font-family: 'Geist Mono', ui-monospace, monospace;
+  font-size: 0.78rem;
+  cursor: pointer;
+}
+.cz-studio-lang-option:hover,
+.cz-studio-lang-option:focus-visible {
+  background: rgba(196, 184, 232, 0.1);
+  color: var(--lavender);
+  outline: 0;
+}
+.cz-studio-lang-option-label {
+  font-weight: 500;
+}
+.cz-studio-lang-option-hint {
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+.cz-studio-lang-option:hover .cz-studio-lang-option-hint {
+  color: var(--lavender);
+  opacity: 0.85;
 }
 
 /* Editor toolbar above the textarea -- holds the language pill */

@@ -4983,13 +4983,25 @@ fn render_studio_page(
 <input type="hidden" name="open" value="{open_csv}" />
 <input type="hidden" name="active" value="{active_id}" />
 <div class="cz-studio-editor-toolbar">
-<label class="cz-studio-lang-pill" data-lang="{lang_attr}" title="Force the routing engine. 'Auto' uses the first keyword to decide.">
-  <select id="cz-sql-lang-select" name="language">
-    <option value="auto" selected>Auto-detect → {lang_label}</option>
-    <option value="sql">SQL → Trino</option>
-    <option value="python">Python → Sail</option>
-  </select>
-</label>
+<div class="cz-studio-lang-pill" data-lang="{lang_attr}" title="Force the routing engine. 'Auto' uses the first keyword to decide.">
+  <button type="button" id="cz-sql-lang-toggle" class="cz-studio-lang-pill-button" aria-haspopup="menu" aria-expanded="false">
+    <span id="cz-sql-lang-current">Auto-detect → {lang_label}</span>
+    <i class="fa-solid fa-chevron-down" aria-hidden="true"></i>
+  </button>
+  <input type="hidden" name="language" id="cz-sql-lang-value" value="auto" />
+  <div id="cz-sql-lang-menu" class="cz-studio-lang-menu" role="menu" hidden>
+    <button type="button" class="cz-studio-lang-option" data-value="auto" role="menuitem">
+      <span class="cz-studio-lang-option-label">Auto-detect</span>
+      <span class="cz-studio-lang-option-hint">→ <span class="cz-sql-lang-auto-target">{lang_label}</span></span>
+    </button>
+    <button type="button" class="cz-studio-lang-option" data-value="sql" role="menuitem">
+      <span class="cz-studio-lang-option-label">SQL → Trino</span>
+    </button>
+    <button type="button" class="cz-studio-lang-option" data-value="python" role="menuitem">
+      <span class="cz-studio-lang-option-label">Python → Sail</span>
+    </button>
+  </div>
+</div>
 <span class="cz-studio-actions-spacer"></span>
 {file_actions_html}
 </div>
@@ -5015,10 +5027,15 @@ fn render_studio_page(
 // non-comment line; if it starts with a SQL reserved word it's SQL,
 // otherwise Python.
 (function() {{
-  var label = document.querySelector(".cz-studio-lang-pill");
-  var select = document.getElementById("cz-sql-lang-select");
+  var pill = document.querySelector(".cz-studio-lang-pill");
+  var toggle = document.getElementById("cz-sql-lang-toggle");
+  var menu = document.getElementById("cz-sql-lang-menu");
+  var hidden = document.getElementById("cz-sql-lang-value");
+  var currentLabel = document.getElementById("cz-sql-lang-current");
+  var autoTarget = document.querySelector(".cz-sql-lang-auto-target");
   var ta = document.getElementById("cz-sql-textarea");
-  if (!label || !select || !ta) return;
+  if (!pill || !toggle || !menu || !hidden || !currentLabel || !ta) return;
+
   var SQL_HEADS = [
     "SELECT","WITH","INSERT","UPDATE","DELETE","MERGE","CREATE","DROP",
     "ALTER","TRUNCATE","USE","SHOW","DESCRIBE","DESC","EXPLAIN","GRANT",
@@ -5036,34 +5053,67 @@ fn render_studio_page(
     }}
     return "sql";
   }}
-  function paint() {{
-    // The auto-detect option label always shows what the heuristic
-    // would pick for the CURRENT buffer -- never the user's override.
-    // Mixing the two would flip the auto-option label to "SQL"
-    // every time the user manually picked Python with an empty
-    // editor, which made the UI feel broken.
-    var heuristic = detect(ta.value);
-    var autoOpt = select.querySelector('option[value="auto"]');
-    if (autoOpt) {{
-      autoOpt.textContent = "Auto-detect → " + (heuristic === "sql" ? "SQL → Trino" : "Python → Sail");
-    }}
-    // The pill's color (data-lang) reflects what WILL actually run
-    // -- the user's override if any, otherwise the heuristic.
-    var effective = select.value === "auto" ? heuristic : select.value;
-    label.dataset.lang = effective;
+
+  function labelFor(val, heuristic) {{
+    if (val === "sql") return "SQL → Trino";
+    if (val === "python") return "Python → Sail";
+    return "Auto-detect → " + (heuristic === "sql" ? "SQL → Trino" : "Python → Sail");
   }}
+
+  function paint() {{
+    var heuristic = detect(ta.value);
+    if (autoTarget) {{
+      autoTarget.textContent = heuristic === "sql" ? "SQL → Trino" : "Python → Sail";
+    }}
+    currentLabel.textContent = labelFor(hidden.value, heuristic);
+    // Pill color: user override beats heuristic.
+    pill.dataset.lang = hidden.value === "auto" ? heuristic : hidden.value;
+  }}
+
+  function closeMenu() {{
+    menu.hidden = true;
+    toggle.setAttribute("aria-expanded", "false");
+  }}
+  function openMenu() {{
+    menu.hidden = false;
+    toggle.setAttribute("aria-expanded", "true");
+  }}
+
+  toggle.addEventListener("click", function (e) {{
+    e.preventDefault();
+    e.stopPropagation();
+    if (menu.hidden) openMenu(); else closeMenu();
+  }});
+
+  menu.querySelectorAll(".cz-studio-lang-option").forEach(function (opt) {{
+    opt.addEventListener("click", function (e) {{
+      e.preventDefault();
+      e.stopPropagation();
+      hidden.value = opt.getAttribute("data-value");
+      closeMenu();
+      paint();
+      try {{ localStorage.setItem("cz-studio-lang", hidden.value); }} catch (_) {{}}
+    }});
+  }});
+
+  // Click outside -> close.
+  document.addEventListener("click", function (e) {{
+    if (!pill.contains(e.target)) closeMenu();
+  }});
+  // Esc -> close.
+  document.addEventListener("keydown", function (e) {{
+    if (e.key === "Escape" && !menu.hidden) closeMenu();
+  }});
+
   ta.addEventListener("input", paint);
-  select.addEventListener("change", paint);
-  // Persist the operator's explicit choice across reloads.
+
+  // Restore persisted choice.
   try {{
     var saved = localStorage.getItem("cz-studio-lang");
-    if (saved && (saved === "auto" || saved === "sql" || saved === "python")) {{
-      select.value = saved;
+    if (saved === "auto" || saved === "sql" || saved === "python") {{
+      hidden.value = saved;
     }}
   }} catch (_) {{}}
-  select.addEventListener("change", function () {{
-    try {{ localStorage.setItem("cz-studio-lang", select.value); }} catch (_) {{}}
-  }});
   paint();
 }})();
 </script>"##,
@@ -5286,7 +5336,11 @@ window.czDownloadCsv = function (e) {{
     // want to intercept the actual Run-query submit, identified by
     // the submitter's lack of a custom formaction.
     var submitter = e.submitter;
-    if (submitter && submitter.getAttribute("formaction")) return;
+    if (submitter && submitter.getAttribute("formaction")) {{
+      console.log("[czRun] non-run submitter -> letting form submit normally");
+      return;
+    }}
+    console.log("[czRun] intercepting submit, posting via fetch");
     e.preventDefault();
     // Manually sync Monaco -> textarea before reading FormData.
     // Monaco's own submit listener does this too, but it's
@@ -5299,7 +5353,10 @@ window.czDownloadCsv = function (e) {{
         var editors = monaco.editor.getEditors();
         if (editors && editors.length > 0) {{
           var ta = document.getElementById("cz-sql-textarea");
-          if (ta) ta.value = editors[0].getValue();
+          if (ta) {{
+            ta.value = editors[0].getValue();
+            console.log("[czRun] synced Monaco -> textarea, length=" + ta.value.length);
+          }}
         }}
       }}
     }} catch (_) {{ /* Monaco may not have loaded; textarea is fine */ }}
