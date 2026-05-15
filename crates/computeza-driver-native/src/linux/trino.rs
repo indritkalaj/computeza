@@ -180,8 +180,13 @@ pub async fn install(
     );
     // jvm.config is consumed verbatim by Trino's launcher script.
     // -Xmx2G keeps the heap modest for dev installs; production
-    // workloads should bump this. Other args are Trino's
-    // recommended starting set from the deployment guide.
+    // workloads should bump this. Args are Trino's recommended
+    // starting set from the deployment guide, with two flags
+    // dropped that Java 25 no longer accepts:
+    //   * -XX:+UnlockDiagnosticVMOptions
+    //   * -XX:GCLockerRetryAllocationCount=32
+    // (The latter was a Java 22 band-aid for a specific GC issue;
+    // Java 25 removed both the symptom and the flag.)
     let jvm_config = "-server\n\
                       -Xmx2G\n\
                       -XX:InitialRAMPercentage=80\n\
@@ -196,10 +201,7 @@ pub async fn install(
                       -XX:PerBytecodeRecompilationCutoff=10000\n\
                       -Djdk.attach.allowAttachSelf=true\n\
                       -Djdk.nio.maxCachedBufferSize=2000000\n\
-                      -Dfile.encoding=UTF-8\n\
-                      # Defensive opens for Trino's reflection-heavy code paths.\n\
-                      -XX:+UnlockDiagnosticVMOptions\n\
-                      -XX:GCLockerRetryAllocationCount=32\n"
+                      -Dfile.encoding=UTF-8\n"
         .to_string();
     let log_properties = "io.trino=INFO\n".to_string();
 
