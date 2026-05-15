@@ -181,8 +181,20 @@ pub async fn install(
 
     let pysail_spec = format!("pysail=={version}");
     let pyspark_spec = format!("pyspark-client=={DEFAULT_PYSPARK_CLIENT_VERSION}");
+    // Also install PyIceberg + PyArrow so Studio's PyIceberg
+    // execution path has a working catalog client in the same
+    // venv. PyIceberg's a pure-Python wheel; PyArrow ships as a
+    // platform wheel. Pinning ranges (not exact) so a security
+    // patch upstream lands without a Computeza release.
+    let pyiceberg_spec = "pyiceberg[pyarrow,s3fs]>=0.10";
     let out = Command::new(&venv_pip)
-        .args(["install", "--no-cache-dir", &pysail_spec, &pyspark_spec])
+        .args([
+            "install",
+            "--no-cache-dir",
+            &pysail_spec,
+            &pyspark_spec,
+            pyiceberg_spec,
+        ])
         .output()
         .await
         .map_err(|e| ServiceError::Io(std::io::Error::other(format!("pip install: {e}"))))?;
@@ -190,10 +202,10 @@ pub async fn install(
         let stderr = String::from_utf8_lossy(&out.stderr);
         let stdout = String::from_utf8_lossy(&out.stdout);
         return Err(ServiceError::Io(std::io::Error::other(format!(
-            "pip install pysail+pyspark-client failed. Common causes:\n  \
+            "pip install pysail+pyspark-client+pyiceberg failed. Common causes:\n  \
              - No network access from the install host\n  \
              - PySail wheel not available for this CPU arch (only x86_64 + aarch64 ship today)\n  \
-             - Python version mismatch (PySail requires Python 3.10+)\n\n\
+             - Python version mismatch (PySail requires Python 3.10+, PyIceberg 3.9+)\n\n\
              stderr:\n{stderr}\n\nstdout:\n{stdout}"
         ))));
     }
