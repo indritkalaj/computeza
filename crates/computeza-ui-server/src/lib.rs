@@ -4167,18 +4167,33 @@ async fn execute_sql_against_databend(base_url: &str, sql: &str) -> SqlOutcome {
 fn render_studio_files_pane(files: &StudioFilesView) -> String {
     let csrf = auth::csrf_input();
     let open_csv = files.open_csv();
-    // Eyebrow + action buttons (new / import / export-archive).
-    // New uses the editor's current `sql` value as content, so the
-    // operator's in-progress query becomes the first commit. That's
-    // wired via inline JS that fills a hidden field; without JS the
-    // new file is empty and the operator can paste later.
+    // Eyebrow + action buttons (new / export-archive).
+    // The "new file" form has a path input so the operator picks
+    // both the name AND the file type (extension drives both syntax
+    // highlighting in Monaco and the SQL-vs-Python routing on Run).
+    // The hidden content field is populated client-side from the
+    // editor textarea -- so + saves the current editor body, not an
+    // empty file.
     let actions = format!(
         r##"<div class="cz-studio-files-actions">
-<form method="post" action="/studio/files/new" style="margin:0;display:inline;" id="cz-file-new-form">{csrf}
+<details style="position: relative; margin: 0; display: inline-block;">
+<summary title="New file" style="list-style: none; cursor: pointer; padding: 2px 6px; border-radius: 4px;">+</summary>
+<form method="post" action="/studio/files/new" id="cz-file-new-form" style="position: absolute; right: 0; top: 1.6rem; background: var(--navy-2); border: 1px solid var(--line); border-radius: var(--radius); padding: 0.6rem; z-index: 50; min-width: 16rem; box-shadow: var(--shadow-card);">
+{csrf}
 <input type="hidden" name="open" value="{open_csv}" />
 <input type="hidden" name="content" id="cz-file-new-content" value="" />
-<button type="submit" title="New file (uses current editor body)">+</button>
+<label style="display:block; font-size:0.7rem; color:var(--muted); margin-bottom:0.3rem;">Path</label>
+<input type="text" name="path" class="cz-input" placeholder="/sql/my-query.sql" style="width:100%; font-family:'Geist Mono', ui-monospace, monospace; font-size:0.78rem; margin-bottom:0.5rem;" />
+<div style="display:flex; gap:0.3rem; flex-wrap:wrap; margin-bottom:0.5rem;">
+<button type="button" class="cz-btn-ghost" style="font-size:0.7rem; padding:0.2rem 0.45rem;" onclick="document.querySelector('#cz-file-new-form input[name=path]').value='/sql/untitled.sql'">.sql</button>
+<button type="button" class="cz-btn-ghost" style="font-size:0.7rem; padding:0.2rem 0.45rem;" onclick="document.querySelector('#cz-file-new-form input[name=path]').value='/python/untitled.py'">.py</button>
+<button type="button" class="cz-btn-ghost" style="font-size:0.7rem; padding:0.2rem 0.45rem;" onclick="document.querySelector('#cz-file-new-form input[name=path]').value='/notes/untitled.txt'">.txt</button>
+<button type="button" class="cz-btn-ghost" style="font-size:0.7rem; padding:0.2rem 0.45rem;" onclick="document.querySelector('#cz-file-new-form input[name=path]').value='/scratch/untitled.md'">.md</button>
+</div>
+<p style="font-size:0.66rem; color:var(--muted); margin:0 0 0.5rem; line-height:1.4;">Empty path → /untitled.sql. Use a path like <code>/python/x.py</code> to put it under a folder; the extension drives syntax + run-routing.</p>
+<button type="submit" class="cz-btn-primary" style="font-size:0.74rem; padding:0.3rem 0.7rem; width:100%;">Create file</button>
 </form>
+</details>
 <a href="/studio/files/export-archive" title="Export workspace as .cptz">⇩</a>
 </div>"##,
         csrf = csrf,
@@ -4229,8 +4244,31 @@ fn render_studio_files_pane(files: &StudioFilesView) -> String {
                             next_open.push(&f.id);
                         }
                         let next_open_csv = next_open.join(",");
+                        // Hover-revealed actions on the row: rename
+                        // (opens a one-line form), duplicate, export
+                        // download, delete. Forms are inline + tiny;
+                        // each posts to its handler with the current
+                        // tab state forwarded so the file panel
+                        // re-renders consistently.
                         format!(
-                            r#"<a class="cz-studio-file-row{active}" href="/studio?open={open}&active={id}"><span class="cz-tree-label" title="{path}">{label}</span></a>"#,
+                            r##"<div class="cz-studio-file-row-wrap">
+<a class="cz-studio-file-row{active}" href="/studio?open={open}&active={id}"><span class="cz-tree-label" title="{path}">{label}</span></a>
+<div class="cz-studio-file-row-actions">
+<details style="display:inline-block; position:relative; margin:0;">
+<summary title="Rename" style="list-style:none; cursor:pointer; padding:1px 4px; border-radius:3px;">✎</summary>
+<form method="post" action="/studio/files/{id}/rename" style="position:absolute; right:0; top:1.4rem; background:var(--navy-2); border:1px solid var(--line); border-radius:var(--radius); padding:0.4rem; z-index:50; min-width:14rem; box-shadow:var(--shadow-card);">
+{csrf}
+<input type="hidden" name="open" value="{open}" />
+<input type="text" name="path" value="{path}" class="cz-input" style="width:100%; font-family:'Geist Mono',ui-monospace,monospace; font-size:0.74rem; margin-bottom:0.35rem;" />
+<button type="submit" class="cz-btn-primary" style="font-size:0.7rem; padding:0.2rem 0.5rem; width:100%;">Rename</button>
+</form>
+</details>
+<form method="post" action="/studio/files/{id}/duplicate" style="margin:0;display:inline;">{csrf}<input type="hidden" name="open" value="{open}" /><button type="submit" title="Duplicate">⎘</button></form>
+<a href="/studio/files/{id}/export" title="Download">⬇</a>
+<form method="post" action="/studio/files/{id}/delete" style="margin:0;display:inline;" onsubmit="return confirm('Delete {label}? This cannot be undone.');">{csrf}<input type="hidden" name="open" value="{open}" /><button type="submit" title="Delete" class="cz-file-row-delete">✕</button></form>
+</div>
+</div>"##,
+                            csrf = csrf,
                             open = url_encode(&next_open_csv),
                             id = url_encode(&f.id),
                             path = html_escape(&f.path),
@@ -5285,19 +5323,32 @@ async fn wire_databend_iceberg_catalog(
     };
     let catalog_name = sanitize_sql_identifier(&form.warehouse_name);
     let rest_address = format!("{}/catalog", lakekeeper_url.trim_end_matches('/'));
-    // Resolve name -> UUID. Use the VAULT-first resolver so we get
-    // the UUID that drill-down already validated as reachable via
-    // recovery. The /v1/config fresh path can return a different
-    // UUID when Lakekeeper has multiple warehouses with the same
-    // name (e.g. one orphaned from a previous bootstrap that
-    // recovery couldn't clean up); only the vault entry reflects
-    // "this is the UUID that actually answers queries".
-    let warehouse_uuid =
+
+    // Build a multi-strategy list of candidate WAREHOUSE values.
+    // Lakekeeper accepts different prefix formats depending on its
+    // configuration (single-project vs multi-project) and version,
+    // and operators have been reporting 404s where ONE candidate
+    // works but not another. Trying all of them gives the operator
+    // the best chance of a working CREATE CATALOG without manual
+    // intervention.
+    //
+    // Order: human name -> vault-cached UUID -> /v1/config-discovered
+    // prefix. Dedup so we don't waste a Databend round-trip.
+    let mut candidates: Vec<String> = Vec::with_capacity(3);
+    candidates.push(form.warehouse_name.clone());
+    let vault_uuid =
         resolve_warehouse_id_or_pass(&form.warehouse_name, Some(lakekeeper_url), secrets).await;
-    // Drop first so re-running the bootstrap with new credentials
-    // refreshes the catalog binding. Best-effort: if the catalog
-    // doesn't exist yet the DROP is a no-op (Databend's IF EXISTS
-    // handles that).
+    if !candidates.iter().any(|c| c == &vault_uuid) {
+        candidates.push(vault_uuid);
+    }
+    if let Some(probed) = try_discover_via_config(&form.warehouse_name, lakekeeper_url, secrets).await {
+        if !candidates.iter().any(|c| c == &probed) {
+            candidates.push(probed);
+        }
+    }
+
+    // Drop the existing catalog once before trying candidates so
+    // re-runs don't trip over a stale binding.
     let drop_sql = format!("DROP CATALOG IF EXISTS {catalog_name}");
     if let SqlOutcome::Err(e) = execute_sql_against_databend(&databend_url, &drop_sql).await {
         tracing::info!(
@@ -5306,28 +5357,85 @@ async fn wire_databend_iceberg_catalog(
             "wire_databend: DROP CATALOG IF EXISTS returned err (treating as ignorable)"
         );
     }
-    let create_sql = format!(
-        "CREATE CATALOG {name} TYPE = ICEBERG CONNECTION = (\
-            TYPE = 'rest', \
-            ADDRESS = '{address}', \
-            WAREHOUSE = '{warehouse}', \
-            \"s3.endpoint\" = '{s3_endpoint}', \
-            \"s3.access-key-id\" = '{ak}', \
-            \"s3.secret-access-key\" = '{sk}', \
-            \"s3.region\" = '{region}'\
-        )",
-        name = catalog_name,
-        address = sql_quote(&rest_address),
-        warehouse = sql_quote(&warehouse_uuid),
-        s3_endpoint = sql_quote(&form.s3_endpoint),
-        ak = sql_quote(&form.s3_access_key),
-        sk = sql_quote(&form.s3_secret_access_key),
-        region = sql_quote(&form.s3_region),
-    );
-    match execute_sql_against_databend(&databend_url, &create_sql).await {
-        SqlOutcome::Ok { .. } => DatabendWiringOutcome::Wired { catalog_name },
-        SqlOutcome::Err(e) => DatabendWiringOutcome::Failed { reason: e },
+
+    // Try each candidate. First success wins. Capture every failure
+    // so we can surface a useful diagnostic if all of them 404.
+    let mut attempts: Vec<(String, String)> = Vec::with_capacity(candidates.len());
+    for candidate in &candidates {
+        let create_sql = format!(
+            "CREATE CATALOG {name} TYPE = ICEBERG CONNECTION = (\
+                TYPE = 'rest', \
+                ADDRESS = '{address}', \
+                WAREHOUSE = '{warehouse}', \
+                \"s3.endpoint\" = '{s3_endpoint}', \
+                \"s3.access-key-id\" = '{ak}', \
+                \"s3.secret-access-key\" = '{sk}', \
+                \"s3.region\" = '{region}'\
+            )",
+            name = catalog_name,
+            address = sql_quote(&rest_address),
+            warehouse = sql_quote(candidate),
+            s3_endpoint = sql_quote(&form.s3_endpoint),
+            ak = sql_quote(&form.s3_access_key),
+            sk = sql_quote(&form.s3_secret_access_key),
+            region = sql_quote(&form.s3_region),
+        );
+        tracing::info!(
+            catalog = %catalog_name,
+            warehouse = %candidate,
+            "wire_databend: trying CREATE CATALOG with this WAREHOUSE candidate"
+        );
+        match execute_sql_against_databend(&databend_url, &create_sql).await {
+            SqlOutcome::Ok { .. } => {
+                tracing::info!(
+                    catalog = %catalog_name,
+                    warehouse = %candidate,
+                    "wire_databend: CREATE CATALOG succeeded -- caching this prefix to vault"
+                );
+                // Cache the working prefix so the next wire skips
+                // the trial loop. Idempotent.
+                if let Some(s) = secrets {
+                    let _ = s
+                        .put("lakekeeper/default-warehouse-id", candidate)
+                        .await;
+                }
+                return DatabendWiringOutcome::Wired { catalog_name };
+            }
+            SqlOutcome::Err(e) => {
+                tracing::warn!(
+                    catalog = %catalog_name,
+                    warehouse = %candidate,
+                    error = %e,
+                    "wire_databend: CREATE CATALOG failed for this candidate; trying next"
+                );
+                attempts.push((candidate.clone(), e));
+                // Re-DROP between attempts so leftover state from a
+                // partial CREATE doesn't poison the next attempt.
+                let _ = execute_sql_against_databend(&databend_url, &drop_sql).await;
+            }
+        }
     }
+    // All candidates failed. Build a verbose error so the operator
+    // can see what we tried + the raw Databend response each time.
+    let mut reason = String::from(
+        "Databend rejected CREATE CATALOG for every candidate WAREHOUSE value we tried. ",
+    );
+    reason.push_str(&format!("Tried {} candidates:\n", attempts.len()));
+    for (cand, err) in &attempts {
+        reason.push_str(&format!(
+            "\n--- WAREHOUSE = '{cand}' ---\n{}\n",
+            err.chars().take(800).collect::<String>()
+        ));
+    }
+    reason.push_str(
+        "\n--- next steps ---\n\
+         1. Reset Lakekeeper: stop computeza-lakekeeper, drop+recreate the \
+         lakekeeper Postgres database, restart, re-run /studio/bootstrap.\n\
+         2. If that fixes it, the original warehouse rows were corrupt.\n\
+         3. If it doesn't, check that the Databend version in /components \
+         accepts Iceberg-REST catalogs (TYPE='rest'); Databend 1.2.880+ should.",
+    );
+    DatabendWiringOutcome::Failed { reason }
 }
 
 /// Sanitize a warehouse name into an S3 key prefix.
@@ -9138,7 +9246,7 @@ async fn install_rollback_handler(
             n = installed.len()
         )
     };
-    Html(render_install_result(&l, !any_failed, &final_summary)).into_response()
+    Html(render_uninstall_result(&l, !any_failed, &final_summary)).into_response()
 }
 
 /// GET /api/install/job/{id} -- JSON snapshot of progress, polled by
@@ -15671,6 +15779,27 @@ pub fn render_setup_already_done(localizer: &Localizer) -> String {
 #[must_use]
 pub fn render_install_result(localizer: &Localizer, success: bool, detail: &str) -> String {
     render_install_result_with_credentials(localizer, success, detail, &[], None, None)
+}
+
+/// Sibling of `render_install_result` for the rollback / uninstall
+/// flow. Identical layout but the page title + outcome label say
+/// "Uninstall" so the operator isn't confused by the install-flavored
+/// chrome on what's really a teardown.
+pub fn render_uninstall_result(localizer: &Localizer, success: bool, detail: &str) -> String {
+    let mut body = render_install_result_with_credentials(
+        localizer, success, detail, &[], None, None,
+    );
+    // Swap install-flavored strings for uninstall ones. Cheap
+    // string-replace -- the localizer keys we'd otherwise add
+    // (ui-uninstall-result-title etc.) would proliferate every time
+    // an install-result tweak landed without a paired uninstall-
+    // result tweak, so a focused fixup at the render edge keeps
+    // the two pages in sync by construction.
+    body = body
+        .replace(">Install result<", ">Uninstall results<")
+        .replace(">Install completed.<", ">Uninstall and removal of components completed.<")
+        .replace(">Install failed.<", ">Uninstall completed with errors.<");
+    body
 }
 
 /// Variant of [`render_install_result`] that also displays one-time

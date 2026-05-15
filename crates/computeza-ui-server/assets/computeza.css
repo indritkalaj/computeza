@@ -881,6 +881,48 @@ a.cz-card:hover {
   text-transform: uppercase;
   letter-spacing: 0.05em;
 }
+.cz-studio-file-row-wrap {
+  position: relative;
+}
+.cz-studio-file-row-wrap:hover .cz-studio-file-row-actions { opacity: 1; pointer-events: auto; }
+.cz-studio-file-row-actions {
+  position: absolute;
+  right: 0.35rem;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  gap: 0.15rem;
+  align-items: center;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease;
+  background: linear-gradient(to right, transparent, var(--navy-3) 30%);
+  padding-left: 1.2rem;
+}
+.cz-studio-file-row-actions button,
+.cz-studio-file-row-actions a,
+.cz-studio-file-row-actions summary {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 1px 4px;
+  font-size: 0.78rem;
+  line-height: 1;
+  border-radius: 3px;
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+}
+.cz-studio-file-row-actions button:hover,
+.cz-studio-file-row-actions a:hover,
+.cz-studio-file-row-actions summary:hover {
+  color: var(--ink);
+  background: var(--navy);
+}
+.cz-studio-file-row-actions .cz-file-row-delete:hover {
+  color: var(--fail);
+}
 .cz-studio-file-row {
   display: flex;
   align-items: center;

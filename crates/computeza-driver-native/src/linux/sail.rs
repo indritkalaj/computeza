@@ -93,30 +93,58 @@ pub async fn install(
     tokio::fs::create_dir_all(&opts.root_dir).await?;
 
     // --- Step 1: python3 venv -------------------------------------
-    // Bail loudly if python3 isn't installed -- the operator can fix
-    // this with one apt-get and re-run install. Mentioning the
-    // distro-specific package name in the error saves a Google.
+    // Auto-install python3 + python3-venv if missing. Computeza
+    // already runs as root for the install path (writing /etc/systemd
+    // /var/lib/computeza/...) so the apt-get / dnf is no escalation.
+    progress.set_message("Ensuring python3 + python3-venv".to_string());
+    if let Err(e) = ensure_python_runtime().await {
+        return Err(ServiceError::Io(std::io::Error::other(format!(
+            "python3 / python3-venv install failed: {e}\n\n\
+             Manual fix:\n  \
+             Debian/Ubuntu: sudo apt install python3 python3-venv\n  \
+             Fedora/RHEL:   sudo dnf install python3 python3-pip"
+        ))));
+    }
     let py = system_python().await.ok_or_else(|| {
         ServiceError::Io(std::io::Error::other(
-            "python3 not found on PATH. Install it first:\n  \
-             Debian/Ubuntu: sudo apt install python3 python3-venv\n  \
-             Fedora/RHEL:   sudo dnf install python3 python3-pip\n\
-             Sail is distributed as a PyPI wheel and needs a Python interpreter.",
+            "python3 still not found after auto-install attempt. \
+             Install manually: sudo apt install python3 python3-venv (Debian/Ubuntu) \
+             or sudo dnf install python3 python3-pip (Fedora/RHEL).",
         ))
     })?;
 
     progress.set_message(format!("Creating venv {}", venv_dir.display()));
-    let out = Command::new(&py)
+    let mut out = Command::new(&py)
         .args(["-m", "venv", venv_dir.to_str().unwrap_or("")])
         .output()
         .await
         .map_err(|e| ServiceError::Io(std::io::Error::other(format!("venv: {e}"))))?;
+    // First venv attempt failed -- typical cause is the version-
+    // specific python3.X-venv package not pulled in by the bare
+    // python3-venv meta-package. Auto-install python3<MAJ>-venv and
+    // retry once before surfacing the manual-fix error.
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        if let Some(versioned_pkg) = extract_versioned_venv_pkg_hint(&stderr) {
+            tracing::warn!(
+                pkg = %versioned_pkg,
+                "sail install: venv failed; installing version-specific package and retrying"
+            );
+            let _ = apt_install(&versioned_pkg).await;
+            out = Command::new(&py)
+                .args(["-m", "venv", venv_dir.to_str().unwrap_or("")])
+                .output()
+                .await
+                .map_err(|e| ServiceError::Io(std::io::Error::other(format!("venv retry: {e}"))))?;
+        }
+    }
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         let stdout = String::from_utf8_lossy(&out.stdout);
         return Err(ServiceError::Io(std::io::Error::other(format!(
-            "python3 -m venv failed. Most likely cause: python3-venv package is missing.\n  \
-             Debian/Ubuntu fix: sudo apt install python3-venv\n\n\
+            "python3 -m venv failed.\n  \
+             Manual fix: sudo apt install python3-venv (or the version-specific \
+             python3.X-venv shown in the error below).\n\n\
              stderr:\n{stderr}\n\nstdout:\n{stdout}"
         ))));
     }
@@ -275,6 +303,114 @@ pub async fn detect_installed() -> Vec<crate::detect::DetectedInstall> {
 /// in that case).
 pub fn installed_venv_python(root_dir: &std::path::Path) -> PathBuf {
     root_dir.join("venv").join("bin").join("python3")
+}
+
+/// Detect the host package manager + install python3 and the venv
+/// module if either is missing. Best-effort: returns Err only when
+/// we know there's no Python AND no working package manager to fix
+/// it. Errors include both the package manager's output and a
+/// human-readable hint.
+async fn ensure_python_runtime() -> std::result::Result<(), String> {
+    // Already installed? `python3 -m venv --help` exits 0 only when
+    // both the interpreter AND the venv module are present, which
+    // is exactly the combination we need.
+    if Command::new("python3")
+        .args(["-m", "venv", "--help"])
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    // apt (Debian/Ubuntu) -- common case for our managed Linux
+    // install path. dnf path is the fallback for RHEL/Fedora family.
+    if Command::new("apt-get").arg("--version").output().await.map(|o| o.status.success()).unwrap_or(false) {
+        // Run apt-get update first so we don't fail on stale indexes.
+        // Lockfile-busy is rare for this short window; we don't
+        // attempt to wait for /var/lib/dpkg/lock-frontend.
+        let _ = Command::new("apt-get")
+            .args(["update", "-qq"])
+            .env("DEBIAN_FRONTEND", "noninteractive")
+            .output()
+            .await;
+        for pkg in ["python3", "python3-venv", "python3-pip"] {
+            apt_install(pkg).await?;
+        }
+        return Ok(());
+    }
+    if Command::new("dnf").arg("--version").output().await.map(|o| o.status.success()).unwrap_or(false) {
+        let out = Command::new("dnf")
+            .args(["install", "-y", "python3", "python3-pip"])
+            .output()
+            .await
+            .map_err(|e| format!("dnf install: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "dnf install python3 python3-pip exited {}: {}",
+                out.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        return Ok(());
+    }
+    Err(
+        "no package manager (apt-get/dnf) detected; install python3 + python3-venv manually \
+         and re-run the Sail install"
+            .into(),
+    )
+}
+
+/// Best-effort `apt-get install -y <pkg>` with `DEBIAN_FRONTEND=
+/// noninteractive` so it never prompts. Returns the apt error
+/// verbatim on non-zero exit so the operator sees what apt actually
+/// said.
+async fn apt_install(pkg: &str) -> std::result::Result<(), String> {
+    let out = Command::new("apt-get")
+        .args(["install", "-y", "-qq", pkg])
+        .env("DEBIAN_FRONTEND", "noninteractive")
+        .output()
+        .await
+        .map_err(|e| format!("apt-get install {pkg}: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "apt-get install {pkg} exited {}: {}",
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(())
+}
+
+/// Parse Debian's venv-failure stderr for the suggested versioned
+/// package name. The system installs the `python3-venv` meta-package
+/// but the resolver may still need `python3.X-venv` for the active
+/// Python version. The error message includes the right package
+/// name -- we extract it rather than guess from `python3 --version`.
+///
+/// Example stderr:
+///   The virtual environment was not created successfully because
+///   ensurepip is not available.  On Debian/Ubuntu systems, you need
+///   to install the python3-venv package using the following command.
+///       apt install python3.14-venv
+fn extract_versioned_venv_pkg_hint(stderr: &str) -> Option<String> {
+    for line in stderr.lines() {
+        let t = line.trim();
+        // Look for "apt install python3.X-venv" or similar.
+        if let Some(rest) = t.strip_prefix("apt install ") {
+            let pkg = rest.split_whitespace().next()?;
+            if pkg.starts_with("python3") && pkg.ends_with("-venv") {
+                return Some(pkg.to_string());
+            }
+        }
+        if let Some(rest) = t.strip_prefix("apt-get install ") {
+            let pkg = rest.split_whitespace().next()?;
+            if pkg.starts_with("python3") && pkg.ends_with("-venv") {
+                return Some(pkg.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Discover the system's `python3` binary. PySail ships wheels for
