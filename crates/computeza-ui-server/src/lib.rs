@@ -7598,7 +7598,19 @@ async fn install_rollback_handler(
         }
     }
 
-    Html(render_install_result(&l, !any_failed, &summary)).into_response()
+    let final_summary = if any_failed {
+        format!(
+            "Uninstall completed with errors. See per-component log below.\n\n{summary}"
+        )
+    } else {
+        format!(
+            "Uninstall and removal of components completed.\n\n\
+             {n} component(s) torn down in reverse dependency order. \
+             Per-component details below.\n\n{summary}",
+            n = installed.len()
+        )
+    };
+    Html(render_install_result(&l, !any_failed, &final_summary)).into_response()
 }
 
 /// GET /api/install/job/{id} -- JSON snapshot of progress, polled by
