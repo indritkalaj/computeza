@@ -1189,8 +1189,95 @@ async fn resolve_warehouse_id_or_pass(
         if let Some(prefix) = try_discover_via_config(name_or_uuid, url, secrets).await {
             return prefix;
         }
+        // Tier 4: Lakekeeper management API. /v1/config can be
+        // gated, fail silently, or return a different shape across
+        // releases. The management endpoint is what bootstrap uses
+        // to CREATE warehouses, so we know it works in our deploy.
+        // List warehouses in the nil project, find the row matching
+        // `name`, return its UUID. This is the bulletproof fallback
+        // that fixes the `WarehouseIdIsNotUUID. Got: {s}` loop when
+        // /v1/config is broken on Lakekeeper's side.
+        if let Some(prefix) = try_discover_via_management(name_or_uuid, url, secrets).await {
+            return prefix;
+        }
     }
+    tracing::warn!(
+        name = name_or_uuid,
+        "resolve_warehouse_id_or_pass: all tiers exhausted, returning name verbatim (drill-down will 400)"
+    );
     name_or_uuid.to_string()
+}
+
+/// Hit Lakekeeper's `/management/v1/warehouse?project-id=<nil>`,
+/// list every warehouse in the nil project, look up the one
+/// matching `name`, return its UUID. Caches the result to vault
+/// under both the per-name and singleton keys so future drill-downs
+/// hit the cache instead of doing this round trip.
+///
+/// Returns None when:
+///   - Management endpoint is unreachable / non-200
+///   - Response shape doesn't contain a `warehouses` array
+///   - No warehouse in the list matches `name`
+async fn try_discover_via_management(
+    name: &str,
+    base_url: &str,
+    secrets: Option<&computeza_secrets::SecretsStore>,
+) -> Option<String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .ok()?;
+    let url = format!(
+        "{}/management/v1/warehouse?project-id={}",
+        base_url.trim_end_matches('/'),
+        LAKEKEEPER_NIL_PROJECT,
+    );
+    let resp = client
+        .get(&url)
+        .header("x-project-id", LAKEKEEPER_NIL_PROJECT)
+        .send()
+        .await
+        .ok()?;
+    let status = resp.status();
+    let text = resp.text().await.ok()?;
+    if !status.is_success() {
+        tracing::info!(
+            url = %url,
+            status = status.as_u16(),
+            body = %text,
+            "try_discover_via_management: non-2xx response"
+        );
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    // Lakekeeper 0.12.x shape: {"warehouses": [{"id": "<uuid>",
+    // "name": "<human>", ...}, ...]}.
+    let arr = v.get("warehouses").and_then(|a| a.as_array())?;
+    for w in arr {
+        let wname = w.get("name").and_then(|n| n.as_str()).unwrap_or("");
+        if wname == name {
+            let id = w.get("id").and_then(|i| i.as_str()).map(str::to_string)?;
+            tracing::info!(
+                warehouse_name = name,
+                prefix = %id,
+                "try_discover_via_management: resolved name -> UUID via management API"
+            );
+            if let Some(s) = secrets {
+                let by_name_key = format!("lakekeeper/warehouse-id-by-name/{name}");
+                let _ = s.put(&by_name_key, &id).await;
+                if name == "default" {
+                    let _ = s.put("lakekeeper/default-warehouse-id", &id).await;
+                }
+            }
+            return Some(id);
+        }
+    }
+    tracing::warn!(
+        warehouse_name = name,
+        body = %text,
+        "try_discover_via_management: name not found in /management/v1/warehouse"
+    );
+    None
 }
 
 /// Force-fresh resolve. Skips the vault cache and hits /v1/config.
