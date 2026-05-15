@@ -82,7 +82,9 @@ pub async fn install(
         .clone()
         .unwrap_or_else(|| DEFAULT_PYSAIL_VERSION.to_string());
     let venv_dir = opts.root_dir.join("venv");
-    let venv_python = venv_dir.join("bin").join("python3");
+    // venv's pip + sail are referenced directly; the venv python
+    // path is exposed via installed_venv_python() for the studio
+    // executor and not needed inline here.
     let venv_pip = venv_dir.join("bin").join("pip");
     let venv_sail = venv_dir.join("bin").join("sail");
 
