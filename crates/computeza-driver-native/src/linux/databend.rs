@@ -196,10 +196,20 @@ pub async fn install(
              #     legitimate caller anyway.\n\
              # v0.1 switches to `auth_type = sha256_password` with a\n\
              # vault-stored secret (see AGENTS.md \"Deferred work\").\n\
+             #\n\
+             # `default_role = account-admin` is CRITICAL: without it the\n\
+             # user resolves to the built-in `public` role which has zero\n\
+             # privileges, so every CREATE CATALOG / CREATE DATABASE /\n\
+             # GRANT call returns the terse \"X cannot be created\" error\n\
+             # with no nested detail (Databend's privilege check runs\n\
+             # before any engine work). account-admin is Databend's\n\
+             # parent-of-all role; matches the install-time root-user\n\
+             # convention every other component uses.\n\
              [[query.users]]\n\
              name = \"root\"\n\
              hostname = \"127.0.0.1\"\n\
              auth_type = \"no_password\"\n\
+             default_role = \"account-admin\"\n\
              \n\
              [meta]\n\
              endpoints = [\"127.0.0.1:{meta_grpc}\"]\n\
