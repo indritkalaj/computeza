@@ -1154,52 +1154,21 @@ a.cz-card:hover {
 
 .cz-studio-shell {
   display: grid;
-  /* Five tracks: catalog tree | splitter | workspace files |
-     splitter | editor. Track widths come from CSS variables so JS
-     can resize via drag without rewriting the entire template.
-     Drilldown pages emit fewer panes; the :has() rule below
-     reshapes accordingly. */
-  --cz-studio-sidebar-w: 220px;
-  --cz-studio-files-w: 220px;
-  grid-template-columns:
-    var(--cz-studio-sidebar-w)
-    4px
-    var(--cz-studio-files-w)
-    4px
-    1fr;
+  /* Three panes: catalog tree | workspace files | editor.
+     Drilldown pages collapse to two by omitting the .cz-studio-files
+     div from their body, which the auto-fit grid handles cleanly. */
+  grid-template-columns: 220px 220px 1fr;
+  gap: 1px;
   min-height: calc(100vh - 48px);
   background: var(--line);
   margin: 0;
   border-top: 1px solid var(--line);
 }
-/* Drilldown pages only emit two panes (sidebar + main), no files
-   pane, no second splitter. Collapse the template to 3 tracks. */
+/* Drilldown pages only emit two panes (sidebar + main), so the
+   grid falls back to a 2-col layout. The :has() rule keeps the
+   shell working without inline overrides. */
 .cz-studio-shell:not(:has(> .cz-studio-files)) {
-  grid-template-columns: var(--cz-studio-sidebar-w) 4px 1fr;
-}
-
-/* Drag-to-resize splitters between studio panels. Operator grabs
-   the 4-px-wide strip between two panes, drags horizontally, the
-   adjacent panel resizes via CSS variable update. Width persists
-   in localStorage (cz-studio-sidebar-w / cz-studio-files-w). */
-.cz-studio-splitter {
-  background: transparent;
-  cursor: col-resize;
-  position: relative;
-  z-index: 5;
-  transition: background-color 0.15s ease;
-}
-.cz-studio-splitter:hover,
-.cz-studio-splitter.cz-studio-splitter-active {
-  background: var(--lavender);
-}
-/* Wider hit-area than the visual handle so the operator doesn't
-   have to be pixel-precise. */
-.cz-studio-splitter::before {
-  content: "";
-  position: absolute;
-  top: 0; bottom: 0;
-  left: -3px; right: -3px;
+  grid-template-columns: 240px 1fr;
 }
 
 /* Workspace files pane (middle) -- list + actions for SQL / Python
