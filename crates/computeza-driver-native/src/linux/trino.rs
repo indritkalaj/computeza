@@ -252,25 +252,35 @@ pub async fn install(
         "trino: wrote node/config/jvm/log properties"
     );
 
-    // Trino's bin/ has two files:
-    //   * bin/launcher    -- a shell wrapper that just execs launcher.py
-    //   * bin/launcher.py -- the real Python launcher with a
-    //                        `#!/usr/bin/env python` shebang
-    // Modern Linux distros (Ubuntu 20.04+, Debian 11+, RHEL 9+)
-    // only ship `python3` -- the unversioned `python` binary is
-    // gone unless the operator explicitly installs
-    // `python-is-python3`. Without intervention the service unit
-    // fails with `env: 'python': No such file or directory` (exit
-    // 127) when the shell wrapper kernel-execs launcher.py.
+    // Trino bin/ layout has changed across versions:
+    //   * Trino <=442: bin/launcher is a SHELL wrapper that
+    //     kernel-execs bin/launcher.py (the real Python entrypoint).
+    //   * Trino 470+: bin/launcher is the Python entrypoint
+    //     directly (no shell wrapper, no .py sibling).
+    // Both flavours use a `#!/usr/bin/env python` shebang, which
+    // exits 127 on distros without the unversioned `python` binary
+    // (Ubuntu 20.04+, Debian 11+, RHEL 9+).
     //
-    // Belt-and-braces fix:
-    //   1. Rewrite launcher.py's shebang from `python` to `python3`
-    //      so direct CLI invocation of the script works.
-    //   2. systemd ExecStart invokes `python3 bin/launcher.py run`
-    //      directly, bypassing the shell wrapper AND the script's
-    //      shebang entirely (see Step 3 below).
-    let launcher_py = bin_dir.join("launcher.py");
-    if let Ok(body) = fs::read_to_string(&launcher_py).await {
+    // Belt-and-braces fix: probe for `launcher.py`, fall back to
+    // `launcher`. Rewrite the picked script's shebang from `python`
+    // to `python3` so direct CLI use works. systemd ExecStart
+    // invokes the picked script via `python3 <path> run`, bypassing
+    // the shebang entirely (see Step 3 below).
+    let launcher_py_path = bin_dir.join("launcher.py");
+    let launcher_bare = bin_dir.join("launcher");
+    let python_entry = if fs::try_exists(&launcher_py_path).await.unwrap_or(false)
+        && fs::read_to_string(&launcher_py_path)
+            .await
+            .map(|s| !s.starts_with("#!/bin/"))
+            .unwrap_or(false)
+    {
+        // Trino <=442 layout: launcher.py is the Python script.
+        launcher_py_path.clone()
+    } else {
+        // Trino 470+ layout: launcher IS the Python script.
+        launcher_bare.clone()
+    };
+    if let Ok(body) = fs::read_to_string(&python_entry).await {
         if body.starts_with("#!/usr/bin/env python\n")
             || body.starts_with("#!/usr/bin/env python\r\n")
         {
@@ -279,8 +289,8 @@ pub async fn install(
                 "#!/usr/bin/env python3",
                 1,
             );
-            fs::write(&launcher_py, patched).await?;
-            info!("trino: patched bin/launcher.py shebang to python3");
+            fs::write(&python_entry, patched).await?;
+            info!(path = %python_entry.display(), "trino: patched python shebang to python3");
         }
     }
 
@@ -290,14 +300,11 @@ pub async fn install(
     // tracking. PATH/JAVA_HOME point at the bundled JRE.
     progress.set_phase(InstallPhase::RegisteringService);
     progress.set_message(format!("Writing systemd unit {}", opts.unit_name));
-    // launcher.py is the real Python entrypoint. bin/launcher is a
-    // shell wrapper that kernel-execs launcher.py; we skip the
-    // wrapper because invoking python3 on a shell script fails
-    // with `SyntaxError: Missing parentheses in call to 'exec'`.
-    let launcher_path = bin_dir.join("launcher.py");
+    // Use whichever Python entrypoint the bundle ships (probed above).
+    let launcher_path = python_entry.clone();
     // Resolve the system's python3 once at install time. systemd
     // doesn't expand PATH for ExecStart, so we need an absolute
-    // path. We invoke python3 directly against launcher.py
+    // path. We invoke python3 directly against the launcher script
     // (bypassing the script's shebang entirely) so the install
     // works on distros where /usr/bin/python doesn't exist.
     let python3 = detect_python3().await.ok_or_else(|| {
