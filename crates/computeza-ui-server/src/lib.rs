@@ -1148,6 +1148,37 @@ async fn resolve_warehouse_id_or_pass(
     name_or_uuid.to_string()
 }
 
+/// Force-fresh resolve. Bypasses the vault cache and goes straight
+/// to /catalog/v1/config so the returned UUID is guaranteed to
+/// reflect Lakekeeper's CURRENT state, not a stale cache from a
+/// re-bootstrap that minted a new UUID. Used by wire_databend_*
+/// and persist_sail_* which fire CREATE CATALOG / persist config:
+/// trusting a stale UUID there makes the engine 404 against
+/// Lakekeeper on every query.
+async fn resolve_warehouse_id_fresh(
+    name_or_uuid: &str,
+    base_url: &str,
+    secrets: Option<&computeza_secrets::SecretsStore>,
+) -> String {
+    // If the input is already shaped like a UUID, trust the caller
+    // -- they passed an authoritative ID, no point re-discovering.
+    if name_or_uuid.len() == 36
+        && name_or_uuid.chars().filter(|c| *c == '-').count() == 4
+        && name_or_uuid
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() || c == '-')
+    {
+        return name_or_uuid.to_string();
+    }
+    // Always hit /catalog/v1/config. Falls through to the input name
+    // unchanged on 404 / network error so the caller sees a clear
+    // engine-side error rather than a silent succeed-with-stale-data.
+    if let Some(prefix) = try_discover_via_config(name_or_uuid, base_url, secrets).await {
+        return prefix;
+    }
+    name_or_uuid.to_string()
+}
+
 /// Hit /catalog/v1/config?warehouse=<name>; parse the
 /// `overrides.prefix`; cache to vault. Returns None on any failure
 /// (404 NoSuchWarehouseException, wrong shape, network error,
@@ -4316,7 +4347,7 @@ enum SailCatalogOutcome {
 async fn persist_sail_catalog_config(
     store: Option<&computeza_state::SqliteStore>,
     secrets: Option<&computeza_secrets::SecretsStore>,
-    _lakekeeper_url: &str,
+    lakekeeper_url: &str,
     form: &StudioBootstrapForm,
     warehouse_uuid: Option<String>,
 ) -> SailCatalogOutcome {
@@ -4331,7 +4362,16 @@ async fn persist_sail_catalog_config(
         };
     };
     let catalog_name = sanitize_sql_identifier(&form.warehouse_name);
-    let uuid = warehouse_uuid.unwrap_or_else(|| form.warehouse_name.clone());
+    // Prefer the caller-supplied UUID (bootstrap captured it from the
+    // create-response, authoritative); otherwise do a FRESH discovery
+    // against Lakekeeper. Falling back to the warehouse NAME is the
+    // last resort -- Spark Connect will 404 with NoSuchWarehouse and
+    // surface a useful error.
+    let uuid = if let Some(id) = warehouse_uuid {
+        id
+    } else {
+        resolve_warehouse_id_fresh(&form.warehouse_name, lakekeeper_url, Some(secrets)).await
+    };
     // Persist as individual keys so a future "rotate one field" can
     // touch a single vault entry. Lakekeeper-REST URL stays as a
     // discoverable endpoint (not persisted) -- the executor reads
@@ -4433,10 +4473,13 @@ async fn wire_databend_iceberg_catalog(
     };
     let catalog_name = sanitize_sql_identifier(&form.warehouse_name);
     let rest_address = format!("{}/catalog", lakekeeper_url.trim_end_matches('/'));
-    // Resolve name -> UUID. Lakekeeper's Iceberg-REST API keys
-    // catalogs by UUID; sending the human name makes /v1/config 404.
+    // Resolve name -> UUID via FRESH discovery (skipping the vault
+    // cache). A stale vault UUID from a previous bootstrap would
+    // make Databend 404 against Lakekeeper on every query -- exactly
+    // the bug reported when "Connect to SQL" succeeded but SELECT
+    // hit NoSuchWarehouseException.
     let warehouse_uuid =
-        resolve_warehouse_id_or_pass(&form.warehouse_name, Some(lakekeeper_url), secrets).await;
+        resolve_warehouse_id_fresh(&form.warehouse_name, lakekeeper_url, secrets).await;
     // Drop first so re-running the bootstrap with new credentials
     // refreshes the catalog binding. Best-effort: if the catalog
     // doesn't exist yet the DROP is a no-op (Databend's IF EXISTS
