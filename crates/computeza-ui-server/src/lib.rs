@@ -3139,6 +3139,11 @@ struct StudioSqlForm {
     open: String,
     #[serde(default)]
     active: String,
+    /// Explicit language override from the editor's language
+    /// dropdown. "sql" / "python" force the routing; "auto" (or
+    /// missing) falls back to the heuristic in `detect_query_language`.
+    #[serde(default)]
+    language: String,
 }
 
 // Note: a previous iteration of this file shipped a
@@ -3733,7 +3738,15 @@ async fn studio_sql_execute_handler(
     // Detect what kind of query this is and route accordingly.
     // SQL goes to Trino; Python (or anything we can't confidently
     // call SQL) goes to Sail via the venv's Python interpreter.
-    let language = detect_query_language(&form.sql);
+    // The editor's language dropdown (auto / SQL / Python) lets the
+    // operator override the heuristic when its guess is wrong --
+    // e.g. a Python snippet that starts with `WITH ...` would
+    // otherwise misroute as SQL.
+    let language = match form.language.as_str() {
+        "sql" => QueryLanguage::Sql,
+        "python" => QueryLanguage::Python,
+        _ => detect_query_language(&form.sql),
+    };
     let routed = match language {
         QueryLanguage::Sql => {
             let outcome = match &trino {
@@ -4869,7 +4882,13 @@ fn render_studio_page(
 <input type="hidden" name="open" value="{open_csv}" />
 <input type="hidden" name="active" value="{active_id}" />
 <div class="cz-studio-editor-toolbar">
-<span id="cz-sql-lang-pill" class="cz-studio-engine-pill" data-lang="{lang_attr}">{lang_label}</span>
+<label class="cz-studio-lang-pill" data-lang="{lang_attr}" title="Force the routing engine. 'Auto' uses the first keyword to decide.">
+  <select id="cz-sql-lang-select" name="language">
+    <option value="auto" selected>Auto-detect → {lang_label}</option>
+    <option value="sql">SQL → Trino</option>
+    <option value="python">Python → Sail</option>
+  </select>
+</label>
 <span class="cz-studio-actions-spacer"></span>
 {file_actions_html}
 </div>
@@ -4895,9 +4914,10 @@ fn render_studio_page(
 // non-comment line; if it starts with a SQL reserved word it's SQL,
 // otherwise Python.
 (function() {{
-  var pill = document.getElementById("cz-sql-lang-pill");
+  var label = document.querySelector(".cz-studio-lang-pill");
+  var select = document.getElementById("cz-sql-lang-select");
   var ta = document.getElementById("cz-sql-textarea");
-  if (!pill || !ta) return;
+  if (!label || !select || !ta) return;
   var SQL_HEADS = [
     "SELECT","WITH","INSERT","UPDATE","DELETE","MERGE","CREATE","DROP",
     "ALTER","TRUNCATE","USE","SHOW","DESCRIBE","DESC","EXPLAIN","GRANT",
@@ -4915,12 +4935,31 @@ fn render_studio_page(
     }}
     return "sql";
   }}
+  function effective() {{
+    return select.value === "auto" ? detect(ta.value) : select.value;
+  }}
   function paint() {{
-    var lang = detect(ta.value);
-    pill.dataset.lang = lang;
-    pill.textContent = lang === "sql" ? "SQL → Trino" : "Python → Sail";
+    var lang = effective();
+    label.dataset.lang = lang;
+    // Update the auto-detect option's label so the user can see
+    // what the heuristic resolves to without changing modes.
+    var autoOpt = select.querySelector('option[value="auto"]');
+    if (autoOpt) {{
+      autoOpt.textContent = "Auto-detect → " + (lang === "sql" ? "SQL → Trino" : "Python → Sail");
+    }}
   }}
   ta.addEventListener("input", paint);
+  select.addEventListener("change", paint);
+  // Persist the operator's explicit choice across reloads.
+  try {{
+    var saved = localStorage.getItem("cz-studio-lang");
+    if (saved && (saved === "auto" || saved === "sql" || saved === "python")) {{
+      select.value = saved;
+    }}
+  }} catch (_) {{}}
+  select.addEventListener("change", function () {{
+    try {{ localStorage.setItem("cz-studio-lang", select.value); }} catch (_) {{}}
+  }});
   paint();
 }})();
 </script>"##,
