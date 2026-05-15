@@ -86,7 +86,7 @@ pub async fn install(
     let venv_pip = venv_dir.join("bin").join("pip");
     let venv_sail = venv_dir.join("bin").join("sail");
 
-    progress.set_phase(InstallPhase::Preparing);
+    progress.set_phase(InstallPhase::DetectingBinaries);
     progress.set_message(format!("Preparing {}", opts.root_dir.display()));
     tokio::fs::create_dir_all(&opts.root_dir).await?;
 
@@ -122,7 +122,7 @@ pub async fn install(
     // --- Step 2: pip install pysail ------------------------------
     // Upgrade pip first so the wheel resolver doesn't 404 on newer
     // metadata formats (PySail uses PEP 621 + PEP 660).
-    progress.set_phase(InstallPhase::Fetching);
+    progress.set_phase(InstallPhase::Downloading);
     progress.set_message(format!("pip install pysail=={version}"));
     let out = Command::new(&venv_pip)
         .args(["install", "--upgrade", "pip"])
@@ -164,7 +164,7 @@ pub async fn install(
     }
 
     // --- Step 3: systemd unit ------------------------------------
-    progress.set_phase(InstallPhase::Configuring);
+    progress.set_phase(InstallPhase::RegisteringService);
     progress.set_message(format!("Writing systemd unit {}", opts.unit_name));
     let unit_body = format!(
         "[Unit]\n\
