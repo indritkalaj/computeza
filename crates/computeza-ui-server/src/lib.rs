@@ -5328,9 +5328,14 @@ window.czDownloadCsv = function (e) {{
 // new page in the background, and swap ONLY the .cz-studio-results
 // div. Fallback: if JS or fetch fails, the form submits normally.
 (function () {{
+  console.log("[czRun] init: starting AJAX wire-up");
   var form = document.getElementById("cz-sql-form");
   var results = document.querySelector(".cz-studio-results");
-  if (!form || !results || typeof fetch !== "function" || typeof DOMParser !== "function") return;
+  if (!form) {{ console.warn("[czRun] init: form #cz-sql-form NOT FOUND"); return; }}
+  if (!results) {{ console.warn("[czRun] init: .cz-studio-results NOT FOUND"); return; }}
+  if (typeof fetch !== "function") {{ console.warn("[czRun] init: fetch API missing"); return; }}
+  if (typeof DOMParser !== "function") {{ console.warn("[czRun] init: DOMParser missing"); return; }}
+  console.log("[czRun] init: wiring submit listener on form, action=" + form.action);
   form.addEventListener("submit", function (e) {{
     // Save buttons share the form via formaction=/save -- we only
     // want to intercept the actual Run-query submit, identified by
