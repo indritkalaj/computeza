@@ -1846,17 +1846,31 @@ details > summary::-webkit-details-marker { display: none; }
   cursor: not-allowed;
   opacity: 0.7;
 }
+/* Scroll container: caps height + scrolls both axes when the result
+   set is wide (100+ columns) or tall (many rows). Sticky table
+   header keeps column labels visible during vertical scroll, same
+   pattern as Databricks's .display(). */
+.cz-studio-results-table-wrap {
+  max-height: 32rem;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--navy-2);
+}
 .cz-studio-results-table {
-  width: 100%;
+  width: max-content;
+  min-width: 100%;
   border-collapse: collapse;
   font-size: 0.82rem;
   font-family: 'Geist Mono', ui-monospace, monospace;
-  background: var(--navy-2);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  overflow: hidden;
 }
 .cz-studio-results-table thead {
+  background: var(--navy-3);
+}
+.cz-studio-results-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
   background: var(--navy-3);
 }
 .cz-studio-results-table th {
@@ -1868,17 +1882,38 @@ details > summary::-webkit-details-marker { display: none; }
   text-transform: uppercase;
   letter-spacing: 0.05em;
   border-bottom: 1px solid var(--line);
+  white-space: nowrap;
 }
 .cz-studio-results-table td {
   padding: 0.5rem 0.9rem;
   border-bottom: 1px solid var(--line);
   color: var(--ink);
+  /* Cells don't wrap by default -- wide tables get a horizontal
+     scrollbar instead of collapsed columns. Operators can pick
+     any cell and read it as-is. */
+  white-space: nowrap;
+  max-width: 32rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cz-studio-results-table td:hover {
+  /* Allow inspection of truncated content on hover via the native
+     tooltip on the cell. We populate that on render -- see below
+     in render_studio_results.) */
 }
 .cz-studio-results-table tr:last-child td {
   border-bottom: none;
 }
 .cz-studio-results-table tr:hover td {
   background: var(--navy-3);
+}
+
+/* AJAX-loading state: dim the panel while a Run-query fetch is
+   in flight so the operator gets feedback even on a fast query. */
+.cz-studio-results.cz-studio-results-loading {
+  opacity: 0.45;
+  transition: opacity 0.15s ease-out;
+  pointer-events: none;
 }
 .cz-studio-results-empty {
   padding: 2rem 1.25rem;

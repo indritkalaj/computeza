@@ -4796,9 +4796,10 @@ fn render_studio_page(
 <span class="cz-studio-results-eyebrow">Results</span>
 <span class="cz-studio-results-count">{row_count_fmt} row{plural} · {duration_label}</span>
 <span class="cz-studio-actions-spacer"></span>
-<a href="#" class="cz-studio-results-action" onclick="czCopyResults(event);" title="Copy results as TSV"><i class="fa-solid fa-copy"></i></a>
+<a href="#" class="cz-studio-results-action" onclick="czDownloadCsv(event);" title="Download as CSV"><i class="fa-solid fa-download"></i></a>
+<a href="#" class="cz-studio-results-action" onclick="czCopyResults(event);" title="Copy as TSV"><i class="fa-solid fa-copy"></i></a>
 </div>
-<div style="overflow-x: auto;">
+<div class="cz-studio-results-table-wrap">
 <table class="cz-studio-results-table" id="cz-results-table">
 <thead><tr>{header}</tr></thead>
 <tbody>{body_rows}</tbody>
@@ -5236,6 +5237,88 @@ window.czCopyResults = function (e) {{
     }});
   }}
 }};
+
+// ---------- Download results as CSV ----------
+window.czDownloadCsv = function (e) {{
+  if (e) e.preventDefault();
+  var table = document.getElementById("cz-results-table");
+  if (!table) return;
+  var rows = [];
+  table.querySelectorAll("tr").forEach(function (tr) {{
+    var cells = [];
+    tr.querySelectorAll("th,td").forEach(function (c) {{
+      // RFC 4180: quote every field, double internal quotes.
+      var v = c.textContent.replace(/"/g, '""');
+      cells.push('"' + v + '"');
+    }});
+    rows.push(cells.join(","));
+  }});
+  // Prepend a UTF-8 BOM so Excel opens it with the right encoding.
+  var csv = "﻿" + rows.join("\r\n");
+  var blob = new Blob([csv], {{ type: "text/csv;charset=utf-8" }});
+  var url = URL.createObjectURL(blob);
+  var ts = new Date().toISOString().replace(/[:.]/g, "-").replace("T", "_").slice(0, 19);
+  var a = document.createElement("a");
+  a.href = url;
+  a.download = "computeza-results-" + ts + ".csv";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(function () {{ URL.revokeObjectURL(url); }}, 1000);
+}};
+
+// ---------- AJAX form submit: replace just the results panel ----------
+// The Run-query form used to do a full-page POST + re-render of the
+// entire studio shell -- sidebar, file tree, editor, results. That
+// caused a visible white-flash and lost client-side state (editor
+// scroll position, dropdown choice). Hijack the submit, fetch the
+// new page in the background, and swap ONLY the .cz-studio-results
+// div. Fallback: if JS or fetch fails, the form submits normally.
+(function () {{
+  var form = document.getElementById("cz-sql-form");
+  var results = document.querySelector(".cz-studio-results");
+  if (!form || !results || typeof fetch !== "function" || typeof DOMParser !== "function") return;
+  form.addEventListener("submit", function (e) {{
+    // Save buttons share the form via formaction=/save -- we only
+    // want to intercept the actual Run-query submit, identified by
+    // the submitter's lack of a custom formaction.
+    var submitter = e.submitter;
+    if (submitter && submitter.getAttribute("formaction")) return;
+    e.preventDefault();
+    // Visual cue while the request is in flight: dim the panel +
+    // disable the Run button so a double-click can't fire twice.
+    results.classList.add("cz-studio-results-loading");
+    var runBtn = form.querySelector('button[type="submit"]:not([formaction])');
+    if (runBtn) runBtn.disabled = true;
+    var data = new FormData(form);
+    fetch(form.action, {{
+      method: "POST",
+      body: data,
+      credentials: "same-origin",
+      headers: {{ "Accept": "text/html" }}
+    }})
+      .then(function (r) {{ return r.text(); }})
+      .then(function (html) {{
+        var doc = new DOMParser().parseFromString(html, "text/html");
+        var fresh = doc.querySelector(".cz-studio-results");
+        if (fresh) {{
+          results.innerHTML = fresh.innerHTML;
+        }} else {{
+          // Fallback to full reload if the response didn't include
+          // a results panel (auth redirect, etc).
+          window.location.reload();
+        }}
+      }})
+      .catch(function () {{
+        // Network blip -- let the form fall through to a normal POST.
+        form.submit();
+      }})
+      .finally(function () {{
+        results.classList.remove("cz-studio-results-loading");
+        if (runBtn) runBtn.disabled = false;
+      }});
+  }});
+}})();
 </script>
 <script>
 // Monaco editor progressive enhancement.
