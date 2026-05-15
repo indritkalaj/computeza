@@ -6726,6 +6726,20 @@ async fn finalize_managed_install_after_success(
                 // should be populated by the time we hit this code.
                 Some(auto_bootstrap_lakekeeper(secrets, store).await)
             }
+            "trino" => {
+                // Trino runs anonymous in v0.0.x -- the post-install
+                // hook emits connection metadata (HTTP URL, JDBC URL,
+                // default user) so the credentials.json export has
+                // everything an external SQL client needs.
+                let port = config.port.unwrap_or(
+                    computeza_driver_native::linux::trino::DEFAULT_PORT,
+                );
+                Some(
+                    computeza_driver_native::linux::trino::post_install_bootstrap(port)
+                        .await
+                        .map_err(|e| e.to_string()),
+                )
+            }
             _ => None,
         };
         if let Some(result) = bootstrap_result {

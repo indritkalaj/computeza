@@ -314,12 +314,38 @@ fn extract_zip(archive_path: &Path, dest: &Path) -> Result<(), FetchError> {
 }
 
 fn extract_tar_gz(archive_path: &Path, dest: &Path) -> Result<(), FetchError> {
+    // Read the first 8 bytes so an "extract failed" can tell the
+    // operator at a glance whether the downloaded file is even a
+    // gzip stream, an HTML error page, or empty. The gzip magic
+    // is 0x1f 0x8b -- anything else means the upstream URL didn't
+    // actually serve a tar.gz (CDN redirect dropped, mirror down,
+    // hot link block, etc.).
+    let file_size = std::fs::metadata(archive_path).map(|m| m.len()).unwrap_or(0);
+    let head: [u8; 8] = {
+        let mut buf = [0u8; 8];
+        if let Ok(mut f) = std::fs::File::open(archive_path) {
+            use std::io::Read;
+            let _ = f.read(&mut buf);
+        }
+        buf
+    };
+    if head[0] != 0x1f || head[1] != 0x8b {
+        return Err(FetchError::Extract {
+            path: archive_path.to_path_buf(),
+            message: format!(
+                "downloaded file is not a gzip stream (got {file_size} bytes; \
+                 first 8 = {head:02x?}). The upstream URL may have redirected \
+                 to an HTML error page, or the mirror is rate-limiting. \
+                 Try `curl -I` on the bundle URL to confirm the response shape."
+            ),
+        });
+    }
     let file = std::fs::File::open(archive_path)?;
     let decoder = flate2::read::GzDecoder::new(file);
     let mut archive = tar::Archive::new(decoder);
     archive.unpack(dest).map_err(|e| FetchError::Extract {
         path: archive_path.to_path_buf(),
-        message: e.to_string(),
+        message: format!("{e} (file size: {file_size} bytes)"),
     })?;
     Ok(())
 }

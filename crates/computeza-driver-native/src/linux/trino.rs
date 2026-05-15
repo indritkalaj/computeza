@@ -469,3 +469,38 @@ pub struct TrinoIcebergRestConfig {
     pub s3_access_key: String,
     pub s3_secret_key: String,
 }
+
+/// Post-install bootstrap for Trino. v0.0.x runs unauthenticated --
+/// the coordinator only checks `X-Trino-User` for query attribution,
+/// so there's no password to mint. We still surface connection
+/// details (HTTP coordinator URL, JDBC URL, default user) into the
+/// credentials.json export so operators have everything they need
+/// to point an external client at the cluster without digging
+/// through docs.
+pub async fn post_install_bootstrap(
+    port: u16,
+) -> Result<Vec<super::BootstrapArtifact>, super::BootstrapError> {
+    use secrecy::SecretString;
+    let http_url = format!("http://127.0.0.1:{port}");
+    let jdbc_url = format!("jdbc:trino://127.0.0.1:{port}");
+    let mut out = Vec::with_capacity(3);
+    out.push(super::BootstrapArtifact {
+        vault_key: "trino/coordinator-url".into(),
+        value: SecretString::from(http_url),
+        label: "Trino coordinator HTTP URL".into(),
+        display_inline: true,
+    });
+    out.push(super::BootstrapArtifact {
+        vault_key: "trino/jdbc-url".into(),
+        value: SecretString::from(jdbc_url),
+        label: "Trino JDBC URL".into(),
+        display_inline: true,
+    });
+    out.push(super::BootstrapArtifact {
+        vault_key: "trino/default-user".into(),
+        value: SecretString::from("computeza".to_string()),
+        label: "Trino default user (no password required in v0.0.x)".into(),
+        display_inline: true,
+    });
+    Ok(out)
+}
