@@ -10900,6 +10900,36 @@ pub fn render_shell(
   }});
 }})();
 
+// Timestamp display preference. Any element with data-ts-utc="<ISO8601>"
+// gets its text rewritten to the operator's chosen format (UTC default
+// or browser-local time). The /account page lets the operator toggle
+// between the two; the choice is stored in localStorage under
+// cz-tz-mode = "utc" | "local". Renderers opt in by emitting
+// data-ts-utc="..." on the element that displays the timestamp.
+window.czRewriteTimestamps = function () {{
+  var mode = "utc";
+  try {{ mode = localStorage.getItem("cz-tz-mode") || "utc"; }} catch (_) {{}}
+  var nodes = document.querySelectorAll("[data-ts-utc]");
+  for (var i = 0; i < nodes.length; i++) {{
+    var n = nodes[i];
+    var iso = n.getAttribute("data-ts-utc");
+    if (!iso) continue;
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) continue;
+    if (mode === "local") {{
+      // Format: 2026-05-15 12:34:56 (local TZ offset implied).
+      var pad = function (n) {{ return n < 10 ? "0" + n : "" + n; }};
+      n.textContent = d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate())
+        + " " + pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+      n.title = iso + " (UTC)";
+    }} else {{
+      n.textContent = iso;
+      n.title = "";
+    }}
+  }}
+}};
+window.czRewriteTimestamps();
+
 // Password-field show/hide toggle. For every <input type="password">
 // rendered on the page, we wrap the input in a relative-positioned
 // span and inject a small clickable "eye" button. Clicking flips the
@@ -14683,22 +14713,74 @@ pub fn render_account(localizer: &Localizer, session: &auth::Session) -> String 
     let logout = localizer.t("ui-nav-logout");
 
     let body = format!(
-        r#"<section class="cz-hero" style="text-align: center;">
+        r##"<section class="cz-hero" style="text-align: center;">
 <h1>{title}</h1>
 <p>{intro}</p>
 </section>
-<section class="cz-section" style="max-width: 32rem; margin: 0 auto;">
+<section class="cz-section" style="max-width: 36rem; margin: 0 auto;">
 <div class="cz-card">
+<h2 style="margin-top: 0; font-size: 1rem;">Identity</h2>
 <dl class="cz-dl">
 <dt>{username_label}</dt><dd><code>{username}</code></dd>
-<dt>{session_since}</dt><dd><code>{created_at}</code></dd>
+<dt>{session_since}</dt><dd><code data-ts-utc="{created_at}">{created_at}</code></dd>
 </dl>
 <form method="post" action="/logout" style="margin-top: 1.25rem;">
 <input type="hidden" name="csrf_token" value="" />
 <button type="submit" class="cz-btn cz-btn-danger">{logout}</button>
 </form>
 </div>
-</section>"#,
+
+<div class="cz-card" style="margin-top: 1rem;">
+<h2 style="margin-top: 0; font-size: 1rem;">Display preferences</h2>
+<p class="cz-muted" style="margin: 0 0 1rem; font-size: 0.85rem; line-height: 1.5;">Controls how timestamps render across Computeza. Persisted in this browser only -- doesn't affect other operators or other devices. Server-side audit + log files always remain UTC for forensic consistency.</p>
+<fieldset id="cz-tz-mode-fieldset" style="border: 1px solid var(--line); border-radius: var(--radius); padding: 0.85rem 1rem; margin: 0;">
+<legend style="font-size: 0.75rem; color: var(--muted); padding: 0 0.4rem;">Timestamp display</legend>
+<label style="display: flex; align-items: center; gap: 0.6rem; padding: 0.35rem 0; cursor: pointer;">
+<input type="radio" name="cz-tz-mode" value="utc" checked />
+<span><strong>UTC</strong> — default; matches audit log entries exactly.</span>
+</label>
+<label style="display: flex; align-items: center; gap: 0.6rem; padding: 0.35rem 0; cursor: pointer;">
+<input type="radio" name="cz-tz-mode" value="local" />
+<span><strong>Local time</strong> — convert UTC to this browser's timezone (<code id="cz-tz-detected">detecting…</code>).</span>
+</label>
+</fieldset>
+<p class="cz-muted" style="margin: 0.85rem 0 0; font-size: 0.78rem;">Status: <strong id="cz-tz-status">UTC</strong></p>
+</div>
+</section>
+
+<script>
+// Detect the browser timezone and reflect the persisted preference.
+// Stored under cz-tz-mode = "utc" | "local"; the global rewriter
+// (in the shell footer) reads the same key on every page so the
+// preference applies everywhere there's a [data-ts-utc] element.
+(function () {{
+  var KEY = "cz-tz-mode";
+  var detectedEl = document.getElementById("cz-tz-detected");
+  var statusEl = document.getElementById("cz-tz-status");
+  var tz;
+  try {{ tz = Intl.DateTimeFormat().resolvedOptions().timeZone; }} catch (_) {{}}
+  if (detectedEl) detectedEl.textContent = tz || "browser default";
+  var current = "utc";
+  try {{ current = localStorage.getItem(KEY) || "utc"; }} catch (_) {{}}
+  document.querySelectorAll('input[name="cz-tz-mode"]').forEach(function (r) {{
+    r.checked = (r.value === current);
+    r.addEventListener("change", function () {{
+      try {{ localStorage.setItem(KEY, r.value); }} catch (_) {{}}
+      paintStatus();
+      // Re-run the page-wide rewriter so existing timestamps update
+      // without a refresh.
+      if (window.czRewriteTimestamps) window.czRewriteTimestamps();
+    }});
+  }});
+  function paintStatus() {{
+    var mode = "utc";
+    try {{ mode = localStorage.getItem(KEY) || "utc"; }} catch (_) {{}}
+    if (!statusEl) return;
+    statusEl.textContent = mode === "local" ? ("Local (" + (tz || "browser") + ")") : "UTC";
+  }}
+  paintStatus();
+}})();
+</script>"##,
         title = html_escape(&title),
         intro = html_escape(&intro),
         username_label = html_escape(&username_label),
