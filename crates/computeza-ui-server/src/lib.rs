@@ -5349,6 +5349,14 @@ async fn dispatch_uninstall_with_config(
                     .map(|r| format_uninstall_summary(&r.steps, &r.warnings))
                     .map_err(|e| format!("{e}"))
             }
+            "sail" => {
+                let mut opts = linux::sail::UninstallOptions::default();
+                apply_uninstall_config_overrides(config, &mut opts.unit_name, &mut opts.root_dir);
+                linux::sail::uninstall(opts)
+                    .await
+                    .map(|r| format_uninstall_summary(&r.steps, &r.warnings))
+                    .map_err(|e| format!("{e}"))
+            }
             "xtable" => {
                 let mut opts = linux::xtable::UninstallOptions::default();
                 apply_uninstall_config_overrides(config, &mut opts.unit_name, &mut opts.root_dir);
@@ -5394,6 +5402,7 @@ async fn dispatch_install(
         "grafana" => run_grafana_install_with_progress(progress, config).await?,
         "restate" => run_restate_install_with_progress(progress, config).await?,
         "databend" => run_databend_install_with_progress(progress, config).await?,
+        "sail" => run_sail_install_with_progress(progress, config).await?,
         "xtable" => run_xtable_install_with_progress(progress, config).await?,
         other => {
             return Err(format!(
@@ -6623,6 +6632,52 @@ async fn run_databend_install_with_progress(
     _config: &InstallConfig,
 ) -> Result<(String, u16), String> {
     Err("Databend install requires a supported Linux host.".into())
+}
+
+// ============================================================
+// Sail install path -- pip-into-venv + Spark Connect gRPC
+// ============================================================
+
+#[cfg(target_os = "linux")]
+async fn run_sail_install_with_progress(
+    progress: &ProgressHandle,
+    config: &InstallConfig,
+) -> Result<(String, u16), String> {
+    use computeza_driver_native::linux::sail;
+    let mut opts = sail::InstallOptions::default();
+    if let Some(p) = config.port {
+        opts.port = p;
+    }
+    if let Some(d) = &config.root_dir {
+        opts.root_dir = std::path::PathBuf::from(d);
+    }
+    if let Some(s) = &config.service_name {
+        opts.unit_name = format!("{s}.service");
+    }
+    if let Some(v) = &config.version {
+        opts.version = Some(v.clone());
+    }
+    match sail::install(opts, progress).await {
+        Ok(r) => Ok((
+            format!(
+                "venv bin_dir: {}\nunit_path: {}\nSpark Connect (gRPC) port: {}\nClient URI: sc://127.0.0.1:{}",
+                r.bin_dir.display(),
+                r.unit_path.display(),
+                r.port,
+                r.port,
+            ),
+            r.port,
+        )),
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn run_sail_install_with_progress(
+    _progress: &ProgressHandle,
+    _config: &InstallConfig,
+) -> Result<(String, u16), String> {
+    Err("Sail install requires a supported Linux host.".into())
 }
 
 // ============================================================
@@ -10209,6 +10264,19 @@ const COMPONENTS: &[ComponentEntry] = &[
         available: true,
     },
     ComponentEntry {
+        slug: "sail",
+        name_key: "component-sail-name",
+        role_key: "component-sail-role",
+        // Linux install live: creates a Python venv under
+        // /var/lib/computeza/sail/venv, `pip install`s pysail +
+        // pyspark-client into it, registers a systemd unit running
+        // `<venv>/bin/sail spark server --port 50051`. Spark Connect
+        // (gRPC) endpoint. Studio routes Python/Spark queries here
+        // and SQL queries to Databend -- both engines share the same
+        // Lakekeeper Iceberg catalog. Apache 2.0 licensed.
+        available: true,
+    },
+    ComponentEntry {
         slug: "qdrant",
         name_key: "component-qdrant-name",
         role_key: "component-qdrant-role",
@@ -10289,6 +10357,12 @@ const INSTALL_ORDER: &[&str] = &[
     "grafana",
     "restate",
     "databend",
+    // Sail comes after lakekeeper so its bootstrap step can find a
+    // running Iceberg-REST catalog when wire_sail_iceberg_catalog
+    // fires. After Databend so the two engines spin up roughly
+    // in parallel from the operator's perspective on the install
+    // results page.
+    "sail",
     // xtable goes last because the dataset config it eventually
     // reads (datasets.yaml under <root>) typically references
     // upstream sources living in other components (garage / lakekeeper).
@@ -10312,6 +10386,7 @@ fn canonical_defaults_for(slug: &str) -> (u16, String) {
         "greptime" => 4000,
         "lakekeeper" => 8181,
         "databend" => 8000,
+        "sail" => 50051,
         "grafana" => 3000,
         "restate" => 8081,
         "xtable" => 8090,

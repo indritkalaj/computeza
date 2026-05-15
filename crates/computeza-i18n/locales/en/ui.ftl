@@ -568,6 +568,9 @@ component-xtable-role     = Iceberg <-> Delta <-> Hudi metadata sync (Java sidec
 component-databend-name   = Databend
 component-databend-role   = Columnar SQL, vector, full-text search, geospatial
 
+component-sail-name       = Sail
+component-sail-role       = Spark-API distributed compute (Python / DataFrame / Spark Connect)
+
 component-qdrant-name     = Qdrant
 component-qdrant-role     = Production RAG vector retrieval API
 

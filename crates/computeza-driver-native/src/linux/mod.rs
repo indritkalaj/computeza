@@ -107,4 +107,5 @@ pub mod lakekeeper;
 pub mod openfga;
 pub mod qdrant;
 pub mod restate;
+pub mod sail;
 pub mod xtable;

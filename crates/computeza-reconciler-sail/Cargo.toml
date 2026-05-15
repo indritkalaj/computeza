@@ -1,0 +1,24 @@
+[package]
+name = "computeza-reconciler-sail"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Sail reconciler -- manages the Spark-API distributed compute engine (Spark Connect)"
+
+[lints]
+workspace = true
+
+[dependencies]
+computeza-core = { workspace = true }
+computeza-state = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }

@@ -575,7 +575,7 @@ async fn single_subdir_containing(dir: &Path, binary_name: &str) -> Option<PathB
     }
 }
 
-async fn wait_for_port(host: &str, port: u16, timeout: Duration) -> Result<(), ServiceError> {
+pub(super) async fn wait_for_port(host: &str, port: u16, timeout: Duration) -> Result<(), ServiceError> {
     let deadline = Instant::now() + timeout;
     let addr = format!("{host}:{port}");
     loop {

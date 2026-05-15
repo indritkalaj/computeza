@@ -57,3 +57,4 @@ computeza-secrets.salt
 *.pid
 .cache/
 .claude/
+/gov_doc

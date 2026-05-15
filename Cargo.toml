@@ -135,6 +135,7 @@ computeza-reconciler-kanidm     = { path = "crates/computeza-reconciler-kanidm" 
 computeza-reconciler-garage     = { path = "crates/computeza-reconciler-garage" }
 computeza-reconciler-lakekeeper = { path = "crates/computeza-reconciler-lakekeeper" }
 computeza-reconciler-databend   = { path = "crates/computeza-reconciler-databend" }
+computeza-reconciler-sail       = { path = "crates/computeza-reconciler-sail" }
 computeza-reconciler-qdrant     = { path = "crates/computeza-reconciler-qdrant" }
 computeza-reconciler-restate    = { path = "crates/computeza-reconciler-restate" }
 computeza-reconciler-greptime   = { path = "crates/computeza-reconciler-greptime" }

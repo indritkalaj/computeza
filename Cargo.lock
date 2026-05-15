@@ -543,7 +543,16 @@ dependencies = [
  "computeza-driver-native",
  "computeza-i18n",
  "computeza-license",
+ "computeza-reconciler-databend",
+ "computeza-reconciler-garage",
+ "computeza-reconciler-grafana",
+ "computeza-reconciler-greptime",
+ "computeza-reconciler-kanidm",
+ "computeza-reconciler-lakekeeper",
+ "computeza-reconciler-openfga",
  "computeza-reconciler-postgres",
+ "computeza-reconciler-qdrant",
+ "computeza-reconciler-restate",
  "computeza-secrets",
  "computeza-state",
  "computeza-ui-server",
@@ -645,6 +654,7 @@ dependencies = [
  "liblzma",
  "rcgen",
  "reqwest",
+ "secrecy",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -894,6 +904,22 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "computeza-reconciler-sail"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "computeza-core",
+ "computeza-state",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
