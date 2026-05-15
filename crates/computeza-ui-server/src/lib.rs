@@ -1160,13 +1160,19 @@ async fn resolve_warehouse_id_or_pass(
     name_or_uuid.to_string()
 }
 
-/// Force-fresh resolve. Bypasses the vault cache and goes straight
-/// to /catalog/v1/config so the returned UUID is guaranteed to
-/// reflect Lakekeeper's CURRENT state, not a stale cache from a
-/// re-bootstrap that minted a new UUID. Used by wire_databend_*
-/// and persist_sail_* which fire CREATE CATALOG / persist config:
-/// trusting a stale UUID there makes the engine 404 against
-/// Lakekeeper on every query.
+/// Force-fresh resolve. Skips the vault cache and hits /v1/config.
+///
+/// Originally added to fix "wire-databend used a stale UUID", but
+/// turned out to be the wrong fix: when Lakekeeper has multiple
+/// warehouses with the same name (e.g. one orphaned by failed
+/// recovery), /v1/config picks one of them, which may not be the
+/// one drill-down successfully recovered. Vault is now authoritative
+/// because drill-down auto-recovery writes the working UUID there.
+///
+/// Kept for callers that explicitly want to bust the cache (e.g.
+/// post-uninstall-reinstall flows where vault and Lakekeeper have
+/// diverged on purpose).
+#[allow(dead_code)]
 async fn resolve_warehouse_id_fresh(
     name_or_uuid: &str,
     base_url: &str,
@@ -1908,14 +1914,64 @@ async fn studio_catalog_wire_databend_handler(
         s3_access_key: key_id.expose_secret().to_string(),
         s3_secret_access_key: secret_key.expose_secret().to_string(),
     };
-    match wire_databend_iceberg_catalog(
+    // First attempt -- uses the vault-cached UUID (set by drill-down
+    // auto-recovery, so usually fresh + reachable).
+    let attempt = wire_databend_iceberg_catalog(
         state.store.as_deref(),
         state.secrets.as_deref(),
         &lakekeeper_url,
         &form,
     )
-    .await
-    {
+    .await;
+
+    // If the first attempt 404s with NoSuchWarehouse, the cached
+    // UUID is pointing at a deleted warehouse. Same auto-recovery
+    // path drill-down uses: re-run bootstrap, capture the new UUID,
+    // retry. Single retry only -- if recovery itself fails, surface
+    // the original error so the operator has full context.
+    let final_outcome = match attempt {
+        DatabendWiringOutcome::Failed { ref reason }
+            if reason.to_lowercase().contains("nosuchwarehouse")
+                || reason.to_lowercase().contains("warehouseidisnotuuid") =>
+        {
+            tracing::warn!(
+                warehouse = %warehouse,
+                first_error = %reason,
+                "wire-databend: NoSuchWarehouse on first attempt; running auto-recovery"
+            );
+            match try_recover_missing_warehouse(
+                &warehouse,
+                &lakekeeper_url,
+                secrets,
+                state.store.as_deref(),
+            )
+            .await
+            {
+                Some(recovered_id) => {
+                    tracing::info!(
+                        warehouse = %warehouse,
+                        prefix = %recovered_id,
+                        "wire-databend: auto-recovery succeeded; retrying CREATE CATALOG with fresh UUID"
+                    );
+                    // try_recover_missing_warehouse persists the new
+                    // UUID under lakekeeper/default-warehouse-id, so
+                    // the next wire_databend call reads it via the
+                    // same vault tier.
+                    wire_databend_iceberg_catalog(
+                        state.store.as_deref(),
+                        state.secrets.as_deref(),
+                        &lakekeeper_url,
+                        &form,
+                    )
+                    .await
+                }
+                None => attempt,
+            }
+        }
+        other => other,
+    };
+
+    match final_outcome {
         DatabendWiringOutcome::Wired { catalog_name } => axum::response::Redirect::to(&format!(
             "{base_redirect}?wired={}",
             url_encode(&format!(
@@ -5118,15 +5174,15 @@ async fn persist_sail_catalog_config(
         };
     };
     let catalog_name = sanitize_sql_identifier(&form.warehouse_name);
-    // Prefer the caller-supplied UUID (bootstrap captured it from the
-    // create-response, authoritative); otherwise do a FRESH discovery
-    // against Lakekeeper. Falling back to the warehouse NAME is the
-    // last resort -- Spark Connect will 404 with NoSuchWarehouse and
-    // surface a useful error.
+    // Prefer the caller-supplied UUID (bootstrap captured it from
+    // Lakekeeper's create-response). Otherwise use the vault-first
+    // resolver so we get the UUID drill-down auto-recovery has
+    // validated -- matches what Databend wire path uses.
     let uuid = if let Some(id) = warehouse_uuid {
         id
     } else {
-        resolve_warehouse_id_fresh(&form.warehouse_name, lakekeeper_url, Some(secrets)).await
+        resolve_warehouse_id_or_pass(&form.warehouse_name, Some(lakekeeper_url), Some(secrets))
+            .await
     };
     // Persist as individual keys so a future "rotate one field" can
     // touch a single vault entry. Lakekeeper-REST URL stays as a
@@ -5229,13 +5285,15 @@ async fn wire_databend_iceberg_catalog(
     };
     let catalog_name = sanitize_sql_identifier(&form.warehouse_name);
     let rest_address = format!("{}/catalog", lakekeeper_url.trim_end_matches('/'));
-    // Resolve name -> UUID via FRESH discovery (skipping the vault
-    // cache). A stale vault UUID from a previous bootstrap would
-    // make Databend 404 against Lakekeeper on every query -- exactly
-    // the bug reported when "Connect to SQL" succeeded but SELECT
-    // hit NoSuchWarehouseException.
+    // Resolve name -> UUID. Use the VAULT-first resolver so we get
+    // the UUID that drill-down already validated as reachable via
+    // recovery. The /v1/config fresh path can return a different
+    // UUID when Lakekeeper has multiple warehouses with the same
+    // name (e.g. one orphaned from a previous bootstrap that
+    // recovery couldn't clean up); only the vault entry reflects
+    // "this is the UUID that actually answers queries".
     let warehouse_uuid =
-        resolve_warehouse_id_fresh(&form.warehouse_name, lakekeeper_url, secrets).await;
+        resolve_warehouse_id_or_pass(&form.warehouse_name, Some(lakekeeper_url), secrets).await;
     // Drop first so re-running the bootstrap with new credentials
     // refreshes the catalog binding. Best-effort: if the catalog
     // doesn't exist yet the DROP is a no-op (Databend's IF EXISTS
