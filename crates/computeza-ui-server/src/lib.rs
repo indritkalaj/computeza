@@ -4181,6 +4181,13 @@ user_code = sys.stdin.read()
 
 from pyspark.sql import SparkSession
 builder = SparkSession.builder.remote("sc://{host}:{port}")
+# Pick the first registered catalog as Spark's defaultCatalog so
+# unqualified names (CREATE SCHEMA analytics_py, etc.) land in our
+# Iceberg-REST catalog instead of Spark's session catalog. Sail's
+# catalog router doesn't reliably interpret <catalog>.<schema>
+# multi-part names so the defaultCatalog hint matters more here
+# than on upstream Spark.
+_first_catalog = None
 for name, cfg in catalog_cfg.items():
     prefix = "spark.sql.catalog." + name
     builder = builder.config(prefix, "org.apache.iceberg.spark.SparkCatalog")
@@ -4193,6 +4200,10 @@ for name, cfg in catalog_cfg.items():
     builder = builder.config(prefix + ".s3.secret-access-key", cfg.get("s3-secret-access-key", ""))
     builder = builder.config(prefix + ".s3.region", cfg.get("s3-region", "garage"))
     builder = builder.config(prefix + ".s3.path-style-access", "true")
+    if _first_catalog is None:
+        _first_catalog = name
+if _first_catalog is not None:
+    builder = builder.config("spark.sql.defaultCatalog", _first_catalog)
 spark = builder.getOrCreate()
 
 try:
