@@ -40,6 +40,9 @@ axum = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+# Workspace file-browser .cptz archive bundle (just a ZIP with a
+# manifest.json + files/ tree).
+zip = { workspace = true }
 # Tower middleware glue for the session-cookie auth layer.
 tower = { workspace = true }
 tower-http = { workspace = true }

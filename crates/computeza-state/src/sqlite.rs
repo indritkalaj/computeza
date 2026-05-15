@@ -35,6 +35,20 @@ const SCHEMA_STATEMENTS: &[&str] = &[
         UNIQUE(kind, name, workspace)
     )"#,
     r#"CREATE INDEX IF NOT EXISTS resources_by_kind ON resources(kind)"#,
+    // Studio workspace files: operator-authored SQL / Python /
+    // arbitrary text snippets. `path` is the slash-separated tree
+    // location ("/sql/finance/customer-summary.sql"); folders are
+    // implicit from path segments. Stored as TEXT so we can index +
+    // diff cleanly; binary files belong in object storage, not
+    // here.
+    r#"CREATE TABLE IF NOT EXISTS studio_files (
+        id TEXT PRIMARY KEY NOT NULL,
+        path TEXT NOT NULL UNIQUE,
+        content TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )"#,
+    r#"CREATE INDEX IF NOT EXISTS studio_files_by_path ON studio_files(path)"#,
 ];
 
 /// SQLite-backed state store.
@@ -73,6 +87,158 @@ impl SqliteStore {
         debug!(path, "opened sqlite state store");
         Ok(Self { pool })
     }
+
+    // ============================================================
+    // Studio files (workspace file browser)
+    // ============================================================
+    //
+    // CRUD on the studio_files table. Inherent methods on
+    // SqliteStore rather than a trait so the Postgres backend can
+    // adopt the same shape later without touching every reconciler
+    // that uses the generic Store trait.
+
+    /// List every file, ordered by path. The flat list is what the
+    /// UI tree-builder folds into a hierarchy. Cheap because the
+    /// table has a path index + studio rarely accumulates more than
+    /// a handful of files (operator-authored, not log-volume).
+    pub async fn studio_files_list(&self) -> Result<Vec<StudioFile>> {
+        let rows = sqlx::query(
+            "SELECT id, path, content, created_at, updated_at \
+             FROM studio_files ORDER BY path",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(studio_file_from_row).collect()
+    }
+
+    /// Fetch one file by id. Returns Ok(None) on miss -- callers
+    /// surface that as a 404; an outright Err only fires on real
+    /// SQLite trouble.
+    pub async fn studio_files_get(&self, id: &str) -> Result<Option<StudioFile>> {
+        let row = sqlx::query(
+            "SELECT id, path, content, created_at, updated_at \
+             FROM studio_files WHERE id = ?1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(studio_file_from_row).transpose()
+    }
+
+    /// Resolve a path to its file. Used by import (overwrite-if-exists)
+    /// and by the studio editor's "save by name" path.
+    pub async fn studio_files_get_by_path(&self, path: &str) -> Result<Option<StudioFile>> {
+        let row = sqlx::query(
+            "SELECT id, path, content, created_at, updated_at \
+             FROM studio_files WHERE path = ?1",
+        )
+        .bind(path)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(studio_file_from_row).transpose()
+    }
+
+    /// Create a new file. Returns the populated record. Fails with
+    /// PathConflict if the path already exists -- callers can choose
+    /// to update-in-place instead.
+    pub async fn studio_files_create(
+        &self,
+        path: &str,
+        content: &str,
+    ) -> Result<StudioFile> {
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO studio_files (id, path, content, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?4)",
+        )
+        .bind(&id)
+        .bind(path)
+        .bind(content)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(StudioFile {
+            id,
+            path: path.to_string(),
+            content: content.to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+        })
+    }
+
+    /// Update content and/or path. Either field is optional. Returns
+    /// Ok(None) when the id doesn't exist.
+    pub async fn studio_files_update(
+        &self,
+        id: &str,
+        path: Option<&str>,
+        content: Option<&str>,
+    ) -> Result<Option<StudioFile>> {
+        let existing = match self.studio_files_get(id).await? {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let now = Utc::now().to_rfc3339();
+        let new_path = path.unwrap_or(&existing.path);
+        let new_content = content.unwrap_or(&existing.content);
+        sqlx::query(
+            "UPDATE studio_files SET path = ?1, content = ?2, updated_at = ?3 \
+             WHERE id = ?4",
+        )
+        .bind(new_path)
+        .bind(new_content)
+        .bind(&now)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(Some(StudioFile {
+            id: id.to_string(),
+            path: new_path.to_string(),
+            content: new_content.to_string(),
+            created_at: existing.created_at,
+            updated_at: now,
+        }))
+    }
+
+    /// Delete by id. Returns Ok(true) if a row was removed, Ok(false)
+    /// otherwise -- callers may choose to surface either as 200 OK.
+    pub async fn studio_files_delete(&self, id: &str) -> Result<bool> {
+        let n = sqlx::query("DELETE FROM studio_files WHERE id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(n > 0)
+    }
+}
+
+/// One row of the studio_files table -- a single operator-authored
+/// SQL / Python / text snippet.
+#[derive(Clone, Debug)]
+pub struct StudioFile {
+    /// Stable UUID. Used in URLs (?open=<id>&active=<id>) so renames
+    /// don't break bookmarks.
+    pub id: String,
+    /// Slash-separated tree location, e.g. "/sql/finance/customers.sql".
+    /// UNIQUE in SQLite -- two files can't share a path.
+    pub path: String,
+    /// File body. Text-only; binary belongs in object storage.
+    pub content: String,
+    /// RFC3339 string; the UI parses lazily for display.
+    pub created_at: String,
+    /// RFC3339 string.
+    pub updated_at: String,
+}
+
+fn studio_file_from_row(row: sqlx::sqlite::SqliteRow) -> Result<StudioFile> {
+    Ok(StudioFile {
+        id: row.try_get("id")?,
+        path: row.try_get("path")?,
+        content: row.try_get("content")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
 }
 
 /// Convert `Option<String>` workspace to the on-disk representation: the

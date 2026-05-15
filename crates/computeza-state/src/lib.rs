@@ -40,5 +40,5 @@ mod sqlite;
 mod store;
 
 pub use error::{Result, StateError};
-pub use sqlite::SqliteStore;
+pub use sqlite::{SqliteStore, StudioFile};
 pub use store::{ResourceKey, Store, StoredResource};

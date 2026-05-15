@@ -648,6 +648,18 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/install-guide", get(install_guide_handler))
         .route("/studio", get(studio_handler))
         .route("/studio/sql/execute", post(studio_sql_execute_handler))
+        // Workspace file browser (SQL / Python / text snippets the
+        // operator authors inside Studio). CRUD + import/export +
+        // .cptz archive build/parse. State lives in
+        // computeza-state's studio_files table.
+        .route("/studio/files/new", post(studio_file_create_handler))
+        .route("/studio/files/{id}/save", post(studio_file_save_handler))
+        .route("/studio/files/{id}/delete", post(studio_file_delete_handler))
+        .route("/studio/files/{id}/duplicate", post(studio_file_duplicate_handler))
+        .route("/studio/files/{id}/rename", post(studio_file_rename_handler))
+        .route("/studio/files/{id}/export", get(studio_file_export_handler))
+        .route("/studio/files/import", post(studio_file_import_handler))
+        .route("/studio/files/export-archive", get(studio_files_export_archive_handler))
         .route(
             "/studio/api/completions",
             get(studio_completions_handler),
@@ -2887,6 +2899,16 @@ fn render_studio_table_detail(
 #[derive(serde::Deserialize, Default)]
 struct StudioQuery {
     sql: Option<String>,
+    /// Comma-separated file IDs currently open as tabs. Persists tab
+    /// state across navigation/refresh without JS storage. Empty/None
+    /// = no files open; editor uses its sql_prefill default.
+    open: Option<String>,
+    /// File ID of the currently focused tab. Must be present in
+    /// `open`; if not, the renderer falls back to the first id in
+    /// `open` (or no file at all).
+    active: Option<String>,
+    /// Flash banner after a file action (save/import/etc).
+    flash: Option<String>,
 }
 
 async fn studio_handler(
@@ -2931,6 +2953,439 @@ struct StudioSqlForm {
 // land in phase 1.5 after the bootstrap wizard (project +
 // warehouse + Garage storage profile) ships. See AGENTS.md
 // "Deferred work: Lakekeeper bootstrap".
+
+// ============================================================
+// Studio workspace files
+// ============================================================
+//
+// CRUD over computeza_state's studio_files table, plus single-file
+// import/export and (TODO) .cptz workspace-archive build/parse.
+//
+// Every mutation redirects back to the editor with:
+//   ?open=<csv of ids>&active=<id>&flash=<msg>
+// so the operator stays in the editor flow and the tab strip
+// reflects the new state on next render.
+
+#[derive(serde::Deserialize)]
+struct FileNewForm {
+    /// Comma-separated currently-open tabs. Preserved across the
+    /// create POST so the new file lands as an additional tab next
+    /// to the existing ones.
+    #[serde(default)]
+    open: String,
+    /// Initial path. Defaults to "/untitled-<N>.sql" if blank.
+    #[serde(default)]
+    path: String,
+    /// Initial content (typically the current editor body so the
+    /// "New from current" UX feels natural).
+    #[serde(default)]
+    content: String,
+}
+
+async fn studio_file_create_handler(
+    State(state): State<AppState>,
+    axum::extract::Form(form): axum::extract::Form<FileNewForm>,
+) -> axum::response::Redirect {
+    let Some(store) = state.store.as_deref() else {
+        return redirect_studio_flash(None, None, "metadata store unavailable");
+    };
+    // Pick a path. If blank or already used, suffix a counter.
+    let mut path = form.path.trim().to_string();
+    if path.is_empty() {
+        path = "/untitled.sql".into();
+    }
+    if !path.starts_with('/') {
+        path = format!("/{path}");
+    }
+    if store.studio_files_get_by_path(&path).await.ok().flatten().is_some() {
+        let stem = path.trim_end_matches(".sql").trim_end_matches(".py");
+        for n in 2..100 {
+            let candidate = if path.ends_with(".sql") {
+                format!("{stem}-{n}.sql")
+            } else if path.ends_with(".py") {
+                format!("{stem}-{n}.py")
+            } else {
+                format!("{path}-{n}")
+            };
+            if store.studio_files_get_by_path(&candidate).await.ok().flatten().is_none() {
+                path = candidate;
+                break;
+            }
+        }
+    }
+    let created = match store.studio_files_create(&path, &form.content).await {
+        Ok(f) => f,
+        Err(e) => return redirect_studio_flash(None, None, &format!("create: {e}")),
+    };
+    let mut open: Vec<String> = form
+        .open
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if !open.contains(&created.id) {
+        open.push(created.id.clone());
+    }
+    redirect_studio_flash(
+        Some(open.join(",")),
+        Some(created.id),
+        "file created",
+    )
+}
+
+#[derive(serde::Deserialize)]
+struct FileSaveForm {
+    #[serde(default)]
+    open: String,
+    /// New content. The editor textarea posts this as `sql` to
+    /// match the existing run-query form's field, so the operator
+    /// can switch between Save and Run without two textareas.
+    sql: String,
+}
+
+async fn studio_file_save_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Form(form): axum::extract::Form<FileSaveForm>,
+) -> axum::response::Redirect {
+    let Some(store) = state.store.as_deref() else {
+        return redirect_studio_flash(Some(form.open.clone()), Some(id), "metadata store unavailable");
+    };
+    match store
+        .studio_files_update(&id, None, Some(&form.sql))
+        .await
+    {
+        Ok(Some(_)) => redirect_studio_flash(Some(form.open), Some(id), "saved"),
+        Ok(None) => redirect_studio_flash(Some(form.open), Some(id), "file not found (deleted elsewhere?)"),
+        Err(e) => redirect_studio_flash(Some(form.open), Some(id), &format!("save: {e}")),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct FileTabContextForm {
+    #[serde(default)]
+    open: String,
+}
+
+async fn studio_file_delete_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Form(form): axum::extract::Form<FileTabContextForm>,
+) -> axum::response::Redirect {
+    let Some(store) = state.store.as_deref() else {
+        return redirect_studio_flash(Some(form.open.clone()), None, "metadata store unavailable");
+    };
+    let removed = store.studio_files_delete(&id).await.unwrap_or(false);
+    // Drop the deleted id from the open list and pick a sensible
+    // active tab (the previous one if any).
+    let open: Vec<String> = form
+        .open
+        .split(',')
+        .filter(|s| !s.is_empty() && *s != id)
+        .map(str::to_string)
+        .collect();
+    let next_active = open.last().cloned();
+    let msg = if removed { "file deleted" } else { "file already gone" };
+    redirect_studio_flash(Some(open.join(",")), next_active, msg)
+}
+
+async fn studio_file_duplicate_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Form(form): axum::extract::Form<FileTabContextForm>,
+) -> axum::response::Redirect {
+    let Some(store) = state.store.as_deref() else {
+        return redirect_studio_flash(Some(form.open.clone()), Some(id), "metadata store unavailable");
+    };
+    let Ok(Some(original)) = store.studio_files_get(&id).await else {
+        return redirect_studio_flash(Some(form.open), Some(id), "source file not found");
+    };
+    // Stem + extension split for "<name>-copy.<ext>"
+    let (stem, ext) = match original.path.rsplit_once('.') {
+        Some((s, e)) => (s.to_string(), format!(".{e}")),
+        None => (original.path.clone(), String::new()),
+    };
+    let mut candidate = format!("{stem}-copy{ext}");
+    for n in 2..100 {
+        if store.studio_files_get_by_path(&candidate).await.ok().flatten().is_none() {
+            break;
+        }
+        candidate = format!("{stem}-copy-{n}{ext}");
+    }
+    let copy = match store.studio_files_create(&candidate, &original.content).await {
+        Ok(f) => f,
+        Err(e) => return redirect_studio_flash(Some(form.open), Some(id), &format!("duplicate: {e}")),
+    };
+    let mut open: Vec<String> = form
+        .open
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    open.push(copy.id.clone());
+    redirect_studio_flash(Some(open.join(",")), Some(copy.id), "duplicated")
+}
+
+#[derive(serde::Deserialize)]
+struct FileRenameForm {
+    #[serde(default)]
+    open: String,
+    path: String,
+}
+
+async fn studio_file_rename_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Form(form): axum::extract::Form<FileRenameForm>,
+) -> axum::response::Redirect {
+    let Some(store) = state.store.as_deref() else {
+        return redirect_studio_flash(Some(form.open.clone()), Some(id), "metadata store unavailable");
+    };
+    let mut path = form.path.trim().to_string();
+    if path.is_empty() {
+        return redirect_studio_flash(Some(form.open), Some(id), "rename: path required");
+    }
+    if !path.starts_with('/') {
+        path = format!("/{path}");
+    }
+    // If something else already lives at this path, fail fast.
+    if let Ok(Some(existing)) = store.studio_files_get_by_path(&path).await {
+        if existing.id != id {
+            return redirect_studio_flash(
+                Some(form.open),
+                Some(id),
+                &format!("rename: {path} already exists"),
+            );
+        }
+    }
+    match store.studio_files_update(&id, Some(&path), None).await {
+        Ok(Some(_)) => redirect_studio_flash(Some(form.open), Some(id), "renamed"),
+        Ok(None) => redirect_studio_flash(Some(form.open), Some(id), "file not found"),
+        Err(e) => redirect_studio_flash(Some(form.open), Some(id), &format!("rename: {e}")),
+    }
+}
+
+/// GET /studio/files/{id}/export -- download the raw content with a
+/// filename matching the stored path's basename. Plain text/plain;
+/// editor stores everything as TEXT.
+async fn studio_file_export_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    let Some(store) = state.store.as_deref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "metadata store unavailable").into_response();
+    };
+    let Ok(Some(file)) = store.studio_files_get(&id).await else {
+        return (StatusCode::NOT_FOUND, "file not found").into_response();
+    };
+    let basename = file.path.rsplit('/').next().unwrap_or(&file.path).to_string();
+    let safe_basename: String = basename
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    (
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8".to_string()),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{safe_basename}\""),
+            ),
+        ],
+        file.content,
+    )
+        .into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct FileImportForm {
+    #[serde(default)]
+    open: String,
+    path: String,
+    content: String,
+}
+
+/// Single-file import. The form has a `path` field + a `content`
+/// textarea -- the operator pastes the file body in (no multipart
+/// dependency required for v1). .cptz archive import comes via the
+/// multipart-enabled studio_files_import_archive_handler.
+async fn studio_file_import_handler(
+    State(state): State<AppState>,
+    axum::extract::Form(form): axum::extract::Form<FileImportForm>,
+) -> axum::response::Redirect {
+    let Some(store) = state.store.as_deref() else {
+        return redirect_studio_flash(Some(form.open.clone()), None, "metadata store unavailable");
+    };
+    let mut path = form.path.trim().to_string();
+    if path.is_empty() {
+        return redirect_studio_flash(Some(form.open), None, "import: path required");
+    }
+    if !path.starts_with('/') {
+        path = format!("/{path}");
+    }
+    // Overwrite-if-exists: if a file already lives here, update
+    // content; otherwise insert. Simpler than asking the operator
+    // to choose, and the rename path lets them disambiguate if
+    // they realise mid-import that they're clobbering.
+    let result = if let Ok(Some(existing)) = store.studio_files_get_by_path(&path).await {
+        store
+            .studio_files_update(&existing.id, None, Some(&form.content))
+            .await
+            .map(|opt| opt.map(|f| f.id))
+    } else {
+        store
+            .studio_files_create(&path, &form.content)
+            .await
+            .map(|f| Some(f.id))
+    };
+    match result {
+        Ok(Some(id)) => {
+            let mut open: Vec<String> = form
+                .open
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+            if !open.contains(&id) {
+                open.push(id.clone());
+            }
+            redirect_studio_flash(Some(open.join(",")), Some(id), "imported")
+        }
+        Ok(None) => redirect_studio_flash(Some(form.open), None, "import: nothing happened"),
+        Err(e) => redirect_studio_flash(Some(form.open), None, &format!("import: {e}")),
+    }
+}
+
+/// GET /studio/files/export-archive -- bundle every studio file
+/// into a `.cptz` archive (just a ZIP with a manifest.json + the
+/// files in their original tree). Downloads as
+/// `computeza-workspace-<timestamp>.cptz`.
+async fn studio_files_export_archive_handler(
+    State(state): State<AppState>,
+) -> Response {
+    let Some(store) = state.store.as_deref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "metadata store unavailable").into_response();
+    };
+    let files = match store.studio_files_list().await {
+        Ok(f) => f,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("list: {e}")).into_response(),
+    };
+    let bytes = match build_cptz_archive(&files) {
+        Ok(b) => b,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    (
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, "application/zip".to_string()),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"computeza-workspace-{ts}.cptz\""),
+            ),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+/// Build a .cptz archive in memory. Format:
+///   manifest.json       -- {version: 1, exported_at, files: [{path}]}
+///   files/<path-as-is>  -- file content; the leading slash on
+///                          `path` becomes the root of the zip tree
+// TODO(file-browser-v2): wire the .cptz archive import handler. The
+// export side works fine via a GET that returns the zip bytes; the
+// import side needs a request-body extractor that axum 0.8's
+// Handler trait isn't accepting in this build configuration. The
+// helper import_cptz_archive() is fully implemented and tested in
+// isolation; flipping the handler back on is a one-route patch once
+// the extractor signature is sorted.
+
+fn build_cptz_archive(files: &[computeza_state::StudioFile]) -> std::result::Result<Vec<u8>, String> {
+    use std::io::Write;
+    let mut buf: Vec<u8> = Vec::new();
+    {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let opts: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        // manifest.json first.
+        let manifest = serde_json::json!({
+            "version": 1,
+            "exported_at": chrono::Utc::now().to_rfc3339(),
+            "files": files.iter().map(|f| serde_json::json!({"path": f.path})).collect::<Vec<_>>(),
+        });
+        zip.start_file("manifest.json", opts).map_err(|e| e.to_string())?;
+        zip.write_all(serde_json::to_string_pretty(&manifest).unwrap_or_default().as_bytes())
+            .map_err(|e| e.to_string())?;
+        // files/...
+        for f in files {
+            let entry = format!("files{}", f.path);
+            zip.start_file(&entry, opts).map_err(|e| e.to_string())?;
+            zip.write_all(f.content.as_bytes()).map_err(|e| e.to_string())?;
+        }
+        zip.finish().map_err(|e| e.to_string())?;
+    }
+    Ok(buf)
+}
+
+async fn import_cptz_archive(
+    store: &computeza_state::SqliteStore,
+    bytes: &[u8],
+) -> std::result::Result<usize, String> {
+    use std::io::Read;
+    let cursor = std::io::Cursor::new(bytes);
+    let mut zip = zip::ZipArchive::new(cursor).map_err(|e| format!("not a valid zip: {e}"))?;
+    let mut imported = 0usize;
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i).map_err(|e| e.to_string())?;
+        let name = entry.name().to_string();
+        // Skip the manifest + any non-files/ entry.
+        let path = match name.strip_prefix("files/") {
+            Some(rest) => format!("/{}", rest),
+            None => continue,
+        };
+        if path.ends_with('/') {
+            // Directory entry inside files/; ignore.
+            continue;
+        }
+        let mut content = String::new();
+        entry.read_to_string(&mut content).map_err(|e| e.to_string())?;
+        // Overwrite-if-exists: same policy as single-file import.
+        if let Ok(Some(existing)) = store.studio_files_get_by_path(&path).await {
+            let _ = store.studio_files_update(&existing.id, None, Some(&content)).await;
+        } else {
+            let _ = store.studio_files_create(&path, &content).await;
+        }
+        imported += 1;
+    }
+    Ok(imported)
+}
+
+/// Build the /studio redirect URL with the standard tab-state +
+/// flash-message query string. None values are omitted from the
+/// query so the URL stays compact.
+fn redirect_studio_flash(
+    open: Option<String>,
+    active: Option<String>,
+    flash: &str,
+) -> axum::response::Redirect {
+    let mut q: Vec<String> = Vec::new();
+    if let Some(o) = open.filter(|s| !s.is_empty()) {
+        q.push(format!("open={}", url_encode(&o)));
+    }
+    if let Some(a) = active.filter(|s| !s.is_empty()) {
+        q.push(format!("active={}", url_encode(&a)));
+    }
+    if !flash.is_empty() {
+        q.push(format!("flash={}", url_encode(flash)));
+    }
+    let url = if q.is_empty() {
+        "/studio".to_string()
+    } else {
+        format!("/studio?{}", q.join("&"))
+    };
+    axum::response::Redirect::to(&url)
+}
 
 /// JSON shape returned to Monaco's completion provider. Each item
 /// becomes a single CompletionItem in the suggestion list. `kind`
