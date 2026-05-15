@@ -181,19 +181,12 @@ pub async fn install(
 
     let pysail_spec = format!("pysail=={version}");
     let pyspark_spec = format!("pyspark-client=={DEFAULT_PYSPARK_CLIENT_VERSION}");
-    // Also install PyIceberg + PyArrow so Studio's PyIceberg
-    // execution path has a working catalog client in the same
-    // venv. PyIceberg's a pure-Python wheel; PyArrow ships as a
-    // platform wheel. Pinning ranges (not exact) so a security
-    // patch upstream lands without a Computeza release.
-    let pyiceberg_spec = "pyiceberg[pyarrow,s3fs]>=0.10";
     let out = Command::new(&venv_pip)
         .args([
             "install",
             "--no-cache-dir",
             &pysail_spec,
             &pyspark_spec,
-            pyiceberg_spec,
         ])
         .output()
         .await
@@ -202,12 +195,53 @@ pub async fn install(
         let stderr = String::from_utf8_lossy(&out.stderr);
         let stdout = String::from_utf8_lossy(&out.stdout);
         return Err(ServiceError::Io(std::io::Error::other(format!(
-            "pip install pysail+pyspark-client+pyiceberg failed. Common causes:\n  \
+            "pip install pysail+pyspark-client failed. Common causes:\n  \
              - No network access from the install host\n  \
              - PySail wheel not available for this CPU arch (only x86_64 + aarch64 ship today)\n  \
-             - Python version mismatch (PySail requires Python 3.10+, PyIceberg 3.9+)\n\n\
+             - Python version mismatch (PySail requires Python 3.10+)\n\n\
              stderr:\n{stderr}\n\nstdout:\n{stdout}"
         ))));
+    }
+
+    // Install PyIceberg + PyArrow as a SEPARATE pip invocation with
+    // --only-binary so pip refuses source builds. PyIceberg ships a
+    // C extension (`decoder_fast`) -- on bleeding-edge interpreters
+    // like Python 3.14 (released Oct 2025) the maintainers haven't
+    // yet published manylinux wheels, and pip falls back to a
+    // source build that fails without python3-dev headers. Forcing
+    // binary-only either succeeds against a published wheel or
+    // returns a clear "no compatible wheel" message instead of an
+    // opaque compile failure deep in the install log.
+    //
+    // Failure here is non-fatal: Sail still works without PyIceberg
+    // (Studio's PyIceberg execution path will pip-install it on
+    // first use with a clearer error path).
+    let pyiceberg_out = Command::new(&venv_pip)
+        .args([
+            "install",
+            "--no-cache-dir",
+            "--only-binary",
+            ":all:",
+            "pyiceberg[pyarrow,s3fs]>=0.10",
+        ])
+        .output()
+        .await;
+    match pyiceberg_out {
+        Ok(o) if o.status.success() => {
+            tracing::info!("sail install: PyIceberg installed from wheels");
+        }
+        Ok(o) => {
+            tracing::warn!(
+                stderr = %String::from_utf8_lossy(&o.stderr),
+                "sail install: PyIceberg wheel not available for this Python; \
+                 Studio's PyIceberg path will be unavailable until you switch to a \
+                 Python with published wheels (3.10-3.13) or install python3-dev + \
+                 retry from a shell."
+            );
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "sail install: PyIceberg pip invocation failed to spawn");
+        }
     }
 
     // Sanity-check the binary exists where we expect.

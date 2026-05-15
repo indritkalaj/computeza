@@ -797,6 +797,14 @@ pub fn router_with_state(state: AppState) -> Router {
             "/install/restate/uninstall",
             get(uninstall_restate_confirm_handler).post(uninstall_restate_handler),
         )
+        .route(
+            "/install/trino/uninstall",
+            get(uninstall_trino_confirm_handler).post(uninstall_trino_handler),
+        )
+        .route(
+            "/install/sail/uninstall",
+            get(uninstall_sail_confirm_handler).post(uninstall_sail_handler),
+        )
         .route("/install/{component}", get(install_component_handler))
         .route("/install/job/{id}", get(install_job_handler))
         .route(
@@ -4419,16 +4427,40 @@ user_code = sys.stdin.read()
 
 # Self-heal: install pyiceberg into the venv on the fly if it isn't
 # already there. Older Sail installs pre-dated the pip line change
-# that bundles PyIceberg, so the first PyIceberg query on those
-# would otherwise crash with ModuleNotFoundError.
+# that bundles PyIceberg. Force --only-binary so pip refuses source
+# builds (PyIceberg has a C extension that needs python3-dev to
+# compile from source -- not present on most distros' default
+# Python 3.14 install).
 try:
     import pyiceberg.catalog  # noqa: F401
 except ModuleNotFoundError:
-    print("[pyiceberg] first-use install (~30s) ...", file=sys.stderr)
-    subprocess.check_call([
-        sys.executable, "-m", "pip", "install", "--quiet",
-        "pyiceberg[pyarrow,s3fs]>=0.10",
-    ])
+    print("[pyiceberg] first-use install (~20s, wheel-only) ...", file=sys.stderr)
+    res = subprocess.run(
+        [
+            sys.executable, "-m", "pip", "install", "--quiet",
+            "--only-binary", ":all:",
+            "pyiceberg[pyarrow,s3fs]>=0.10",
+        ],
+        capture_output=True, text=True,
+    )
+    if res.returncode != 0:
+        print(
+            "\n[pyiceberg] No compatible wheel available for this Python "
+            f"({sys.version_info.major}.{sys.version_info.minor}).\n\n"
+            "PyIceberg ships pre-built wheels for Python 3.10-3.13. Your venv\n"
+            f"is on Python {sys.version_info.major}.{sys.version_info.minor}, which the upstream\n"
+            "maintainers haven't published wheels for yet. Two options:\n\n"
+            "  A. Build from source: `sudo apt install python3-dev` then re-run\n"
+            "     this query (pip will compile the C extension).\n"
+            "  B. Recreate the Sail venv against Python 3.13:\n"
+            "     `python3.13 -m venv /var/lib/computeza/sail/venv && \\\n"
+            "      /var/lib/computeza/sail/venv/bin/pip install pysail pyspark-client \\\n"
+            "      'pyiceberg[pyarrow,s3fs]>=0.10'`\n\n"
+            "Use Trino (SQL -> Trino in the editor) until either lands.\n\n"
+            f"pip stderr:\n{res.stderr}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     import pyiceberg.catalog  # noqa: F401
 
 from pyiceberg.catalog import load_catalog
@@ -9646,6 +9678,67 @@ async fn uninstall_restate_handler(State(state): State<AppState>) -> Response {
         Err(detail) => render_uninstall_result(&l, false, &detail),
     };
     Html(body).into_response()
+}
+
+async fn uninstall_trino_confirm_handler() -> Html<String> {
+    let l = Localizer::english();
+    Html(render_uninstall_generic_confirm(&l, "trino", "Trino"))
+}
+
+async fn uninstall_trino_handler(State(state): State<AppState>) -> Response {
+    let l = Localizer::english();
+    let result =
+        teardown_managed_uninstall("trino", state.store.as_deref(), state.secrets.as_deref())
+            .await;
+    let body = match result {
+        Ok(summary) => render_uninstall_result(&l, true, &summary),
+        Err(detail) => render_uninstall_result(&l, false, &detail),
+    };
+    Html(body).into_response()
+}
+
+async fn uninstall_sail_confirm_handler() -> Html<String> {
+    let l = Localizer::english();
+    Html(render_uninstall_generic_confirm(&l, "sail", "Sail"))
+}
+
+async fn uninstall_sail_handler(State(state): State<AppState>) -> Response {
+    let l = Localizer::english();
+    let result =
+        teardown_managed_uninstall("sail", state.store.as_deref(), state.secrets.as_deref())
+            .await;
+    let body = match result {
+        Ok(summary) => render_uninstall_result(&l, true, &summary),
+        Err(detail) => render_uninstall_result(&l, false, &detail),
+    };
+    Html(body).into_response()
+}
+
+/// Generic uninstall-confirm page. The per-component
+/// render_uninstall_<x>_confirm helpers are bespoke for components
+/// with custom warnings (Postgres tells the operator about data
+/// loss, Kanidm tells them about identity rotation, etc.). Trino
+/// + Sail don't need those special warnings, so they share this
+/// minimal renderer.
+fn render_uninstall_generic_confirm(l: &Localizer, slug: &str, label: &str) -> String {
+    let body = format!(
+        r#"<section class="cz-hero">
+<h1>Uninstall {label}</h1>
+<p>Stops the systemd unit, removes the binary + config, and drops the <code>{slug}-instance/local</code> row from the metadata store.</p>
+</section>
+<section class="cz-section">
+<div class="cz-card" style="border-color: var(--fail);">
+<p class="cz-card-body"><strong>This will stop {label} immediately.</strong> Catalog state in Lakekeeper / Postgres is untouched -- only this component's local install is removed.</p>
+<form method="post" action="/install/{slug}/uninstall" style="display: flex; gap: 0.75rem; margin-top: 1rem;">
+<button type="submit" class="cz-btn cz-btn-danger">Uninstall {label}</button>
+<a href="/install" class="cz-btn">Cancel</a>
+</form>
+</div>
+</section>"#,
+        label = html_escape(label),
+        slug = html_escape(slug),
+    );
+    render_shell(l, &format!("Uninstall {label}"), NavLink::Install, &body)
 }
 
 #[cfg(target_os = "linux")]
