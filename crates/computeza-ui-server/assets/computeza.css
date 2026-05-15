@@ -67,45 +67,175 @@ code, pre, .cz-mono {
   font-feature-settings: 'liga' 0;
 }
 
-/* ---------- Top navigation ---------- */
-.cz-nav {
-  position: sticky; top: 0; z-index: 10;
-  display: flex; align-items: center; gap: 2rem;
-  padding: 1rem 2rem;
+/* ============================================================
+   Chrome: slim top bar (brand + user) + fixed left rail
+   (icon-only nav with tooltips).
+   ============================================================ */
+
+/* Slim top bar -- only the brand wordmark + the account chip live
+   here in v0.1. Future: global search and tenant/region picker. */
+.cz-topbar {
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  height: 48px;
+  display: flex; align-items: center;
+  padding: 0 1rem 0 0;
   border-bottom: 1px solid var(--line);
-  background: rgba(10, 10, 26, 0.72);
+  background: rgba(10, 10, 26, 0.82);
   backdrop-filter: saturate(140%) blur(14px);
   -webkit-backdrop-filter: saturate(140%) blur(14px);
+  z-index: 100;
 }
+.cz-topbar-account {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 0.8rem;
+  padding: 0.4rem 0.75rem;
+  border-radius: var(--radius-sm);
+  text-decoration: none;
+  transition: all 120ms ease;
+}
+.cz-topbar-account:hover { color: var(--ink); background: var(--navy-3); }
+
 .cz-brand {
-  display: flex; align-items: center; gap: 0.75rem;
+  display: flex; align-items: center; gap: 0.6rem;
   font-weight: 600;
   letter-spacing: -0.02em;
-  font-size: 1.05rem;
+  font-size: 0.95rem;
   color: var(--ink);
+  text-decoration: none;
+  /* Pin the brand into the rail's column so logo + wordmark sit
+     above the rail icons, Databricks-style. */
+  width: 60px;
+  justify-content: center;
+  border-right: 1px solid var(--line);
+  height: 100%;
 }
-.cz-brand img { width: 28px; height: 28px; display: block; }
+.cz-brand img { width: 26px; height: 26px; display: block; }
+.cz-brand-text {
+  display: none; /* hidden when collapsed inside the 60px rail column */
+}
 .cz-brand:hover { color: var(--ink); }
 
-.cz-navlinks {
-  display: flex; gap: 0.5rem;
-  margin-left: auto;
+/* Fixed-width icon rail. Icons centered, tooltips via the
+   ::after pseudo-element on hover so we don't add a <span title>
+   on every link. */
+.cz-sidenav {
+  position: fixed;
+  top: 48px; left: 0; bottom: 0;
+  width: 60px;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  background: var(--navy);
+  border-right: 1px solid var(--line);
+  padding: 0.4rem 0;
+  z-index: 90;
+  overflow-y: auto;
 }
-.cz-navlinks a {
-  color: var(--muted);
-  font-size: 0.875rem;
-  padding: 0.4rem 0.8rem;
+.cz-sidenav-section {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.cz-sidenav-sep {
+  height: 1px;
+  background: var(--line);
+  margin: 0.5rem 0.75rem;
+}
+.cz-sidenav-spacer { flex: 1; }
+.cz-sidenav-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 38px;
+  margin: 0 0.4rem;
   border-radius: var(--radius-sm);
-  transition: background-color 120ms ease, color 120ms ease;
+  color: var(--muted);
+  font-family: 'Geist Mono', ui-monospace, monospace;
+  font-size: 1rem;
+  text-decoration: none;
+  transition: background-color 100ms ease, color 100ms ease;
 }
-.cz-navlinks a:hover { color: var(--ink); background: var(--navy-3); }
-.cz-navlinks a.cz-active { color: var(--ink); background: var(--navy-3); }
+.cz-sidenav-item:hover {
+  background: var(--navy-3);
+  color: var(--ink);
+}
+.cz-sidenav-item.cz-active {
+  background: var(--navy-3);
+  color: var(--lavender);
+  box-shadow: inset 2px 0 0 var(--lavender);
+}
+/* Tooltip: the rail's tight horizontal space means item labels
+   live in data-label and appear on hover to the right of the
+   icon. Pure CSS; no JS state. */
+.cz-sidenav-item::after {
+  content: attr(data-label);
+  position: absolute;
+  left: 100%;
+  top: 50%;
+  transform: translate(0.5rem, -50%);
+  background: var(--navy-2);
+  border: 1px solid var(--line);
+  color: var(--ink);
+  font-family: 'Geist', system-ui, sans-serif;
+  font-size: 0.78rem;
+  padding: 0.3rem 0.6rem;
+  border-radius: var(--radius-sm);
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 100ms ease;
+  z-index: 200;
+  box-shadow: var(--shadow-card);
+}
+.cz-sidenav-item:hover::after { opacity: 1; }
+
+/* Body offsets clear the fixed top-bar (48px) + side-rail (60px)
+   so every page-level content starts inside the chrome. The
+   Studio shell uses these as the basis for its own height
+   calculations via calc(100vh - 48px). */
+body {
+  margin: 0;
+  padding-top: 48px;
+  padding-left: 60px;
+}
+
+/* On phones, collapse the rail to a horizontal bottom strip so
+   tap targets stay reachable. */
+@media (max-width: 600px) {
+  .cz-sidenav {
+    top: auto;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    width: auto;
+    height: 56px;
+    flex-direction: row;
+    padding: 0;
+    border-right: none;
+    border-top: 1px solid var(--line);
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+  .cz-sidenav-section { flex-direction: row; }
+  .cz-sidenav-sep {
+    width: 1px;
+    height: auto;
+    margin: 0.5rem 0.25rem;
+  }
+  .cz-sidenav-spacer { display: none; }
+  .cz-sidenav-item { margin: 0.25rem; min-width: 44px; }
+  .cz-sidenav-item::after { display: none; }
+  body { padding-left: 0; padding-bottom: 56px; }
+}
 
 /* ---------- Page shell ---------- */
 .cz-page {
   max-width: 72rem;
   margin: 0 auto;
-  padding: 3.5rem 2rem 6rem;
+  padding: 2rem 2rem 6rem;
 }
 
 /* ---------- Eyebrow / mono tag ---------- */
@@ -861,7 +991,7 @@ a.cz-card:hover {
      div from their body, which the auto-fit grid handles cleanly. */
   grid-template-columns: 220px 220px 1fr;
   gap: 1px;
-  min-height: calc(100vh - 56px);
+  min-height: calc(100vh - 48px);
   background: var(--line);
   margin: 0;
   border-top: 1px solid var(--line);
@@ -880,7 +1010,7 @@ a.cz-card:hover {
   border-right: 1px solid var(--line);
   padding: 1rem 0.55rem;
   overflow-y: auto;
-  max-height: calc(100vh - 56px);
+  max-height: calc(100vh - 48px);
   font-size: 0.78rem;
 }
 .cz-studio-files-eyebrow {
@@ -1068,7 +1198,7 @@ a.cz-card:hover {
   border-right: 1px solid var(--line);
   padding: 1rem 0.6rem;
   overflow-y: auto;
-  max-height: calc(100vh - 56px);
+  max-height: calc(100vh - 48px);
   font-size: 0.78rem;
 }
 
@@ -1076,7 +1206,7 @@ a.cz-card:hover {
   background: var(--navy);
   padding: 1.25rem 1.75rem;
   overflow-y: auto;
-  max-height: calc(100vh - 56px);
+  max-height: calc(100vh - 48px);
   font-size: 0.86rem;
 }
 

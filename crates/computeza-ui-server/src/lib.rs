@@ -10814,28 +10814,37 @@ pub fn render_shell(
 <link rel="stylesheet" href="/static/computeza.css" />
 </head>
 <body>
-<nav class="cz-nav">
-  <a href="/" class="cz-brand">
+<div class="cz-topbar">
+  <a href="/" class="cz-brand" title="{app_title}">
     <img src="/static/brand/computeza-logo.svg" alt="" />
-    <span>{app_title}</span>
+    <span class="cz-brand-text">{app_title}</span>
   </a>
-  <div class="cz-navlinks">
-    <a href="/components" class="{nc}">{nav_components}</a>
-    <a href="/install-guide" class="{nig}">Install guide</a>
-    <a href="/install" class="{ni}">{nav_install}</a>
-    <a href="/studio" class="{nwks}">{nav_studio}</a>
-    <a href="/status" class="{ns}">{nav_status}</a>
-    <a href="/state" class="{nm}">{nav_state}</a>
-    <a href="/admin/secrets" class="{na}">{nav_secrets}</a>
-    <a href="/audit" class="{naud}">{nav_audit}</a>
-    <a href="/admin/operators" class="{nops}">{nav_admin_operators}</a>
-    <a href="/admin/groups" class="{ngrp}">{nav_admin_groups}</a>
-    <a href="/admin/tenants" class="{nwsp}">{nav_admin_tenants}</a>
-    <a href="/admin/branding" class="{nbrd}">{nav_admin_branding}</a>
-    <a href="/admin/license" class="{nlic}">{nav_admin_license}</a>
-    <a href="/compliance/eu-ai-act" class="{ncmp}">Compliance</a>
-    <a href="/account" class="{nacc}">{nav_account}</a>
+  <a href="/account" class="cz-topbar-account {nacc}">{nav_account}</a>
+</div>
+<nav class="cz-sidenav" aria-label="Primary navigation">
+  <div class="cz-sidenav-section">
+    <a href="/studio" class="cz-sidenav-item {nwks}" data-label="{nav_studio}">⌬</a>
+    <a href="/install" class="cz-sidenav-item {ni}" data-label="{nav_install}">↓</a>
+    <a href="/components" class="cz-sidenav-item {nc}" data-label="{nav_components}">▦</a>
+    <a href="/install-guide" class="cz-sidenav-item {nig}" data-label="Install guide">?</a>
   </div>
+  <div class="cz-sidenav-sep"></div>
+  <div class="cz-sidenav-section">
+    <a href="/status" class="cz-sidenav-item {ns}" data-label="{nav_status}">◉</a>
+    <a href="/state" class="cz-sidenav-item {nm}" data-label="{nav_state}">≣</a>
+    <a href="/audit" class="cz-sidenav-item {naud}" data-label="{nav_audit}">⌗</a>
+    <a href="/compliance/eu-ai-act" class="cz-sidenav-item {ncmp}" data-label="Compliance">⚖</a>
+  </div>
+  <div class="cz-sidenav-sep"></div>
+  <div class="cz-sidenav-section">
+    <a href="/admin/secrets" class="cz-sidenav-item {na}" data-label="{nav_secrets}">⚿</a>
+    <a href="/admin/operators" class="cz-sidenav-item {nops}" data-label="{nav_admin_operators}">☥</a>
+    <a href="/admin/groups" class="cz-sidenav-item {ngrp}" data-label="{nav_admin_groups}">⌬</a>
+    <a href="/admin/tenants" class="cz-sidenav-item {nwsp}" data-label="{nav_admin_tenants}">⌘</a>
+    <a href="/admin/branding" class="cz-sidenav-item {nbrd}" data-label="{nav_admin_branding}">◈</a>
+    <a href="/admin/license" class="cz-sidenav-item {nlic}" data-label="{nav_admin_license}">✦</a>
+  </div>
+  <div class="cz-sidenav-spacer"></div>
 </nav>
 <div id="cz-license-banner-mount"></div>
 <main class="cz-page">
