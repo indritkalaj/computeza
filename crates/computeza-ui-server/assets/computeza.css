@@ -1146,6 +1146,68 @@ details > summary::-webkit-details-marker { display: none; }
   font-size: 0.78rem;
   color: var(--muted);
 }
+.cz-studio-engine-pill {
+  font-family: 'Geist Mono', ui-monospace, monospace;
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 0.2rem 0.55rem;
+  border-radius: 999px;
+  background: var(--navy-3);
+  color: var(--lavender);
+  border: 1px solid rgba(196, 184, 232, 0.25);
+  white-space: nowrap;
+}
+/* SQL+Databend pill stays default lavender; Python+Sail uses a
+   distinct teal so the operator sees the auto-switch happen as
+   they type. */
+.cz-studio-engine-pill[data-lang="python"] {
+  color: #9ee8e0;
+  border-color: rgba(158, 232, 224, 0.3);
+}
+
+/* Editor toolbar above the textarea -- holds the language pill */
+.cz-studio-editor-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0.55rem;
+  background: var(--navy-2);
+  border: 1px solid var(--line);
+  border-bottom: none;
+  border-radius: var(--radius) var(--radius) 0 0;
+}
+.cz-studio-editor-toolbar + .cz-studio-editor-wrap {
+  border-radius: 0 0 var(--radius) var(--radius);
+}
+
+/* Tenant dropdown placeholder. Disabled today (single tenant); the
+   chrome is present so the upgrade path adds an item-list, not a
+   layout shift. */
+.cz-studio-tenant-select {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  font-size: 0.72rem;
+}
+.cz-studio-tenant-eyebrow {
+  font-family: 'Geist Mono', ui-monospace, monospace;
+  font-size: 0.62rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+.cz-studio-tenant-select select {
+  background: var(--navy-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  color: var(--ink);
+  font-size: 0.78rem;
+  padding: 0.3rem 0.55rem;
+  font-family: 'Geist Mono', ui-monospace, monospace;
+  cursor: not-allowed;
+  opacity: 0.7;
+}
 .cz-studio-results-table {
   width: 100%;
   border-collapse: collapse;

@@ -1039,6 +1039,22 @@ async fn discover_databend_endpoint(
     Some(spec.endpoint.base_url)
 }
 
+/// Sail's HTTP-ish base URL for liveness purposes. Spark Connect
+/// itself is gRPC, but the same host:port answers TCP probes, so we
+/// return the http://host:port form that the existing reconciler /
+/// status pages already render. The Studio Python executor reads
+/// the raw host + port from this URL to build the `sc://` URI.
+async fn discover_sail_endpoint(
+    store: Option<&computeza_state::SqliteStore>,
+) -> Option<String> {
+    use computeza_state::Store;
+    let store = store?;
+    let rows = store.list("sail-instance", None).await.ok()?;
+    let sr = rows.into_iter().next()?;
+    let spec: StudioEndpointSpec = serde_json::from_value(sr.spec).ok()?;
+    Some(spec.endpoint.base_url)
+}
+
 /// What we learned from talking to the local Lakekeeper. Four
 /// states map to four different UX paths -- "not reachable" wants
 /// /status; "no warehouses" wants the bootstrap docs; "has
@@ -3015,18 +3031,58 @@ async fn studio_sql_execute_handler(
     let l = Localizer::english();
     let lakekeeper = discover_lakekeeper_endpoint(state.store.as_deref()).await;
     let databend = discover_databend_endpoint(state.store.as_deref()).await;
-    let result = match &databend {
-        Some(url) => Some(execute_sql_against_databend(url, &form.sql).await),
-        None => None,
+    let sail = discover_sail_endpoint(state.store.as_deref()).await;
+
+    // Detect what kind of query this is and route accordingly.
+    // SQL goes to Databend; Python (or anything we can't confidently
+    // call SQL) goes to Sail via the venv's Python interpreter.
+    let language = detect_query_language(&form.sql);
+    let routed = match language {
+        QueryLanguage::Sql => {
+            let outcome = match &databend {
+                Some(url) => Some(execute_sql_against_databend(url, &form.sql).await),
+                None => None,
+            };
+            RoutedOutcome::Sql {
+                engine: ExecutedEngine::Databend,
+                outcome,
+            }
+        }
+        QueryLanguage::Python => {
+            let outcome = match &sail {
+                Some(url) => Some(
+                    execute_python_via_sail(url, &form.sql, state.secrets.as_deref()).await,
+                ),
+                None => None,
+            };
+            RoutedOutcome::Python {
+                engine: ExecutedEngine::Sail,
+                outcome,
+            }
+        }
     };
-    // Record the query into the studio history before rendering,
-    // so the history list shown to the operator includes the query
-    // they just ran (rather than the previous one).
+
+    // Record into history. row_count for SQL = result rows;
+    // for Python = lines-of-stdout so the badge is still useful.
     if !form.sql.trim().is_empty() {
-        let (ok, row_count) = match &result {
-            Some(SqlOutcome::Ok { rows, .. }) => (true, Some(rows.len())),
-            Some(SqlOutcome::Err(_)) => (false, None),
-            None => (false, None),
+        let (ok, row_count) = match &routed {
+            RoutedOutcome::Sql {
+                outcome: Some(SqlOutcome::Ok { rows, .. }),
+                ..
+            } => (true, Some(rows.len())),
+            RoutedOutcome::Sql {
+                outcome: Some(SqlOutcome::Err(_)),
+                ..
+            } => (false, None),
+            RoutedOutcome::Python {
+                outcome: Some(PythonOutcome::Ok { stdout, .. }),
+                ..
+            } => (true, Some(stdout.lines().count())),
+            RoutedOutcome::Python {
+                outcome: Some(PythonOutcome::Err { .. }),
+                ..
+            } => (false, None),
+            _ => (false, None),
         };
         record_studio_history(
             state.store.as_deref(),
@@ -3052,14 +3108,314 @@ async fn studio_sql_execute_handler(
         &lk_state,
         &history,
         &form.sql,
-        result,
+        Some(routed),
         &sidebar,
     ))
+}
+
+/// Which language did the operator actually type? Routing key:
+/// SQL goes to Databend; Python goes to Sail. Anything we can't
+/// confidently call SQL is treated as Python -- a wrong route shows
+/// a useful error from the wrong engine rather than silently
+/// pretending to succeed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryLanguage {
+    Sql,
+    Python,
+}
+
+/// Which engine produced an outcome. Surfaced on the result panel so
+/// the operator sees at a glance whether Databend or Sail ran the
+/// query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutedEngine {
+    Databend,
+    Sail,
+}
+
+impl ExecutedEngine {
+    fn label(&self) -> &'static str {
+        match self {
+            ExecutedEngine::Databend => "Databend (SQL)",
+            ExecutedEngine::Sail => "Sail (Spark Connect)",
+        }
+    }
+}
+
+/// Output of a routed query. Either SQL (which produces tabular rows
+/// or a typed error) or Python (which produces free-form stdout +
+/// stderr). The renderer picks the right shape.
+#[derive(Debug)]
+enum RoutedOutcome {
+    Sql {
+        engine: ExecutedEngine,
+        outcome: Option<SqlOutcome>,
+    },
+    Python {
+        engine: ExecutedEngine,
+        outcome: Option<PythonOutcome>,
+    },
+}
+
+/// PySpark / Python execution result. Both stdout and stderr captured
+/// so DataFrame.show() output (stdout) and runtime tracebacks (stderr)
+/// render side-by-side on the results panel.
+///
+/// The `Ok` variant is constructed only on Linux (where Sail can
+/// actually run) but the renderer matches on both unconditionally
+/// so the type stays uniform across platforms.
+#[derive(Debug)]
+#[allow(dead_code)]
+enum PythonOutcome {
+    Ok { stdout: String, stderr: String },
+    Err { stdout: String, stderr: String },
+}
+
+/// Parse `http(s)://host:port[/path]` into (host, port). Returns
+/// None if the input isn't shaped that way -- the caller falls back
+/// to its default. Avoids pulling in the url crate for a one-liner.
+/// Only called from execute_python_via_sail which is Linux-only.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_host_port(s: &str) -> Option<(String, u16)> {
+    let s = s
+        .strip_prefix("http://")
+        .or_else(|| s.strip_prefix("https://"))
+        .unwrap_or(s);
+    let s = s.split('/').next()?;
+    let (host, port) = s.rsplit_once(':')?;
+    let port: u16 = port.parse().ok()?;
+    Some((host.to_string(), port))
+}
+
+/// Heuristic SQL-vs-Python detector. Looks at the first non-blank,
+/// non-comment line and checks whether its first token is a SQL
+/// reserved word. Anything else is Python.
+///
+/// SQL keywords listed cover what both Databend and Spark SQL accept;
+/// expanding the list is cheap -- the trade-off is purely "does this
+/// line LOOK like SQL", not "is this valid SQL".
+fn detect_query_language(src: &str) -> QueryLanguage {
+    const SQL_HEADS: &[&str] = &[
+        "SELECT", "WITH", "INSERT", "UPDATE", "DELETE", "MERGE", "CREATE", "DROP",
+        "ALTER", "TRUNCATE", "USE", "SHOW", "DESCRIBE", "DESC", "EXPLAIN", "GRANT",
+        "REVOKE", "CALL", "REFRESH", "OPTIMIZE", "VACUUM", "ANALYZE", "COPY", "SET",
+    ];
+    for line in src.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        // SQL line comments
+        if t.starts_with("--") {
+            continue;
+        }
+        // Python line comments
+        if t.starts_with('#') {
+            return QueryLanguage::Python;
+        }
+        // First non-empty token, uppercased
+        let first = t.split_whitespace().next().unwrap_or("").to_uppercase();
+        // Trim trailing punctuation like SELECT, vs SELECT (...
+        let first = first.trim_end_matches(|c: char| !c.is_ascii_alphabetic());
+        return if SQL_HEADS.contains(&first) {
+            QueryLanguage::Sql
+        } else {
+            QueryLanguage::Python
+        };
+    }
+    // All-blank input: default to SQL so the empty-state messaging
+    // stays consistent with the historical behaviour.
+    QueryLanguage::Sql
+}
+
+/// Run user Python code against Sail by:
+///   1. Reading the Sail catalog config from vault (set by bootstrap).
+///   2. Generating a small wrapper script that opens a SparkSession
+///      pointed at sc://<sail-host>:<port> with every registered
+///      catalog wired in.
+///   3. Spawning `<sail-root>/venv/bin/python3` with the user code
+///      appended after the wrapper boilerplate.
+///   4. Capturing stdout + stderr verbatim.
+///
+/// Best-effort: missing vault entries, missing Sail venv, or a
+/// Python traceback all produce informative PythonOutcome::Err
+/// rather than 500s.
+#[cfg(not(target_os = "linux"))]
+async fn execute_python_via_sail(
+    _sail_base_url: &str,
+    _user_code: &str,
+    _secrets: Option<&computeza_secrets::SecretsStore>,
+) -> PythonOutcome {
+    PythonOutcome::Err {
+        stdout: String::new(),
+        stderr: "Sail (Python / Spark Connect) is Linux-only in v0.0.x.".into(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn execute_python_via_sail(
+    sail_base_url: &str,
+    user_code: &str,
+    secrets: Option<&computeza_secrets::SecretsStore>,
+) -> PythonOutcome {
+    use secrecy::ExposeSecret;
+    use tokio::io::AsyncWriteExt;
+
+    // Resolve the venv python path. The sail driver installs
+    // python3 + sail under <root>/venv/bin/.
+    let root = std::path::PathBuf::from("/var/lib/computeza/sail");
+    let venv_python = computeza_driver_native::linux::sail::installed_venv_python(&root);
+    if !tokio::fs::try_exists(&venv_python).await.unwrap_or(false) {
+        return PythonOutcome::Err {
+            stdout: String::new(),
+            stderr: format!(
+                "Sail venv Python interpreter not found at {}. Re-install Sail from /install.",
+                venv_python.display()
+            ),
+        };
+    }
+
+    // Parse the sail base URL into host + port for the sc:// URI.
+    // sail_base_url is shaped like "http://127.0.0.1:50051" -- a
+    // single split is cheaper than pulling in the url crate.
+    let (sail_host, sail_port) = parse_host_port(sail_base_url).unwrap_or_else(|| ("127.0.0.1".to_string(), 50051));
+
+    // Collect registered catalogs from vault.
+    let catalog_names = match secrets {
+        Some(s) => s
+            .get("sail/catalog-names")
+            .await
+            .ok()
+            .flatten()
+            .map(|v| {
+                v.expose_secret()
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    // Build a JSON map of {catalog_name: {warehouse-uuid, s3-*}} that
+    // the wrapper script reads via stdin. JSON avoids shell-quoting
+    // nightmares for embedded secrets.
+    let mut catalog_cfg: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    if let Some(s) = secrets {
+        for name in &catalog_names {
+            let prefix = format!("sail/catalog/{name}");
+            let mut entry = serde_json::Map::new();
+            for field in &[
+                "warehouse-uuid",
+                "s3-endpoint",
+                "s3-region",
+                "s3-access-key-id",
+                "s3-secret-access-key",
+            ] {
+                if let Ok(Some(v)) = s.get(&format!("{prefix}/{field}")).await {
+                    entry.insert((*field).into(), serde_json::Value::String(v.expose_secret().to_string()));
+                }
+            }
+            // Lakekeeper REST URI: read live, not from vault, so it
+            // tracks endpoint moves across reconciler runs.
+            if let Some(lk) = discover_lakekeeper_endpoint(None).await {
+                entry.insert("lakekeeper-rest-uri".into(), serde_json::Value::String(format!("{lk}/catalog")));
+            }
+            catalog_cfg.insert(name.clone(), serde_json::Value::Object(entry));
+        }
+    }
+    let catalog_cfg_json = serde_json::Value::Object(catalog_cfg).to_string();
+
+    // Wrapper script. Reads catalog config JSON from stdin to avoid
+    // arg-list-too-long / quoting issues; builds SparkSession with
+    // the Iceberg-REST catalog for every registered warehouse;
+    // execs user code with `spark` already in scope.
+    let wrapper = format!(
+        r#"
+import sys, json, traceback
+catalog_cfg = json.loads(sys.stdin.readline())
+user_code = sys.stdin.read()
+
+from pyspark.sql import SparkSession
+builder = SparkSession.builder.remote("sc://{host}:{port}")
+for name, cfg in catalog_cfg.items():
+    prefix = "spark.sql.catalog." + name
+    builder = builder.config(prefix, "org.apache.iceberg.spark.SparkCatalog")
+    builder = builder.config(prefix + ".type", "rest")
+    builder = builder.config(prefix + ".uri", cfg.get("lakekeeper-rest-uri", ""))
+    builder = builder.config(prefix + ".warehouse", cfg.get("warehouse-uuid", ""))
+    builder = builder.config(prefix + ".io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
+    builder = builder.config(prefix + ".s3.endpoint", cfg.get("s3-endpoint", ""))
+    builder = builder.config(prefix + ".s3.access-key-id", cfg.get("s3-access-key-id", ""))
+    builder = builder.config(prefix + ".s3.secret-access-key", cfg.get("s3-secret-access-key", ""))
+    builder = builder.config(prefix + ".s3.region", cfg.get("s3-region", "garage"))
+    builder = builder.config(prefix + ".s3.path-style-access", "true")
+spark = builder.getOrCreate()
+
+try:
+    exec(compile(user_code, "<studio>", "exec"), {{"spark": spark, "__name__": "__main__"}})
+except Exception:
+    traceback.print_exc()
+    sys.exit(1)
+"#,
+        host = sail_host,
+        port = sail_port,
+    );
+
+    // Spawn python3 wrapper, write stdin = JSON-config-line + user-code, capture stdout/stderr.
+    let mut child = match tokio::process::Command::new(&venv_python)
+        .arg("-c")
+        .arg(&wrapper)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return PythonOutcome::Err {
+                stdout: String::new(),
+                stderr: format!("spawn {}: {e}", venv_python.display()),
+            };
+        }
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        // First line = catalog config JSON, terminated by \n.
+        // Second segment = user code, EOF terminated.
+        let _ = stdin.write_all(catalog_cfg_json.as_bytes()).await;
+        let _ = stdin.write_all(b"\n").await;
+        let _ = stdin.write_all(user_code.as_bytes()).await;
+        // Drop stdin so the child's `sys.stdin.read()` returns.
+        drop(stdin);
+    }
+    let out = match tokio::time::timeout(std::time::Duration::from_secs(120), child.wait_with_output()).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            return PythonOutcome::Err {
+                stdout: String::new(),
+                stderr: format!("wait child: {e}"),
+            };
+        }
+        Err(_) => {
+            return PythonOutcome::Err {
+                stdout: String::new(),
+                stderr: "Sail Python query exceeded 120s timeout. If the query is expected to be long-running, run it via `<root>/venv/bin/sail spark client` from a shell instead.".into(),
+            };
+        }
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    if out.status.success() {
+        PythonOutcome::Ok { stdout, stderr }
+    } else {
+        PythonOutcome::Err { stdout, stderr }
+    }
 }
 
 /// Outcome of forwarding a SQL query to Databend. Either a
 /// successful result set (columns + rows of stringified values) or
 /// an error message we can render verbatim.
+#[derive(Debug)]
 enum SqlOutcome {
     Ok {
         columns: Vec<String>,
@@ -3228,7 +3584,7 @@ fn render_studio_page(
     lk_state: &LakekeeperState,
     history: &StudioHistory,
     sql_prefill: &str,
-    result: Option<SqlOutcome>,
+    result: Option<RoutedOutcome>,
     sidebar_html: &str,
 ) -> String {
     let title = localizer.t("ui-studio-title");
@@ -3269,20 +3625,39 @@ fn render_studio_page(
     );
 
     // ---- Main pane: results-first when a query just ran, else editor --
-    let results_html = match (has_databend, result) {
-        (false, _) => format!(
-            r#"<div class="cz-studio-results-empty">{}</div>"#,
-            html_escape(&err_no_databend)
-        ),
-        (true, None) => format!(
+    // Build a small engine badge so the operator can see at a glance
+    // which engine handled the query.
+    let engine_pill = |engine: ExecutedEngine| -> String {
+        format!(
+            r#"<span class="cz-studio-engine-pill">{}</span>"#,
+            html_escape(engine.label())
+        )
+    };
+    let results_html = match result {
+        None => format!(
             r#"<div class="cz-studio-results-empty">{}</div>"#,
             html_escape(&results_empty)
         ),
-        (true, Some(SqlOutcome::Err(msg))) => format!(
-            r#"<pre class="cz-studio-error">{}</pre>"#,
-            html_escape(&msg)
+        Some(RoutedOutcome::Sql {
+            outcome: None,
+            ..
+        }) => format!(
+            r#"<div class="cz-studio-results-empty">{}</div>"#,
+            html_escape(&err_no_databend)
         ),
-        (true, Some(SqlOutcome::Ok { columns, rows })) => {
+        Some(RoutedOutcome::Sql {
+            engine,
+            outcome: Some(SqlOutcome::Err(msg)),
+        }) => format!(
+            r#"<div class="cz-studio-results-header">{pill}</div>
+<pre class="cz-studio-error">{body}</pre>"#,
+            pill = engine_pill(engine),
+            body = html_escape(&msg)
+        ),
+        Some(RoutedOutcome::Sql {
+            engine,
+            outcome: Some(SqlOutcome::Ok { columns, rows }),
+        }) => {
             let header: String = columns
                 .iter()
                 .map(|c| format!("<th>{}</th>", html_escape(c)))
@@ -3300,6 +3675,7 @@ fn render_studio_page(
             let row_count = rows.len();
             format!(
                 r#"<div class="cz-studio-results-header">
+{pill}
 <span class="cz-studio-results-eyebrow">Results</span>
 <span class="cz-studio-results-count">{row_count} row{plural}</span>
 </div>
@@ -3310,18 +3686,89 @@ fn render_studio_page(
 </table>
 </div>"#,
                 plural = if row_count == 1 { "" } else { "s" },
+                pill = engine_pill(engine),
             )
         }
+        Some(RoutedOutcome::Python {
+            outcome: None,
+            ..
+        }) => format!(
+            r#"<div class="cz-studio-results-empty">Sail isn't installed. Install it from <a href="/install">/install</a> to run Python/Spark queries.</div>"#
+        ),
+        Some(RoutedOutcome::Python {
+            engine,
+            outcome: Some(PythonOutcome::Ok { stdout, stderr }),
+        }) => {
+            let stderr_block = if stderr.trim().is_empty() {
+                String::new()
+            } else {
+                format!(
+                    r#"<details style="margin-top: 0.75rem;"><summary class="cz-studio-raw-summary">stderr (warnings / Spark logs)</summary><pre class="cz-studio-raw">{}</pre></details>"#,
+                    html_escape(&stderr)
+                )
+            };
+            format!(
+                r#"<div class="cz-studio-results-header">{pill}<span class="cz-studio-results-eyebrow">stdout</span></div>
+<pre class="cz-studio-raw">{stdout}</pre>
+{stderr_block}"#,
+                pill = engine_pill(engine),
+                stdout = if stdout.trim().is_empty() {
+                    "(no output)".into()
+                } else {
+                    html_escape(&stdout)
+                }
+            )
+        }
+        Some(RoutedOutcome::Python {
+            engine,
+            outcome: Some(PythonOutcome::Err { stdout, stderr }),
+        }) => format!(
+            r#"<div class="cz-studio-results-header">{pill}</div>
+<pre class="cz-studio-error">{stderr}</pre>
+{stdout_block}"#,
+            pill = engine_pill(engine),
+            stderr = html_escape(&stderr),
+            stdout_block = if stdout.trim().is_empty() {
+                String::new()
+            } else {
+                format!(
+                    r#"<details style="margin-top: 0.75rem;"><summary class="cz-studio-raw-summary">stdout (partial output before failure)</summary><pre class="cz-studio-raw">{}</pre></details>"#,
+                    html_escape(&stdout)
+                )
+            }
+        ),
     };
+    let _ = has_databend;
 
+    // Pre-detect language for the current editor body so the UI
+    // shows the operator which engine WILL run when they hit Run.
+    // Updates client-side as they type via a small inline script.
+    let initial_language = detect_query_language(sql_prefill);
+    let initial_lang_label = match initial_language {
+        QueryLanguage::Sql => "SQL → Databend",
+        QueryLanguage::Python => "Python → Sail",
+    };
     let main_html = format!(
-        r#"<div class="cz-studio-crumbs">
-<a href="/studio">Studio</a><span class="cz-studio-crumbs-sep">/</span><span class="cz-studio-crumbs-current">SQL</span>
+        r##"<div class="cz-studio-crumbs">
+<a href="/studio">Studio</a><span class="cz-studio-crumbs-sep">/</span><span class="cz-studio-crumbs-current">Editor</span>
 </div>
-<h1 class="cz-studio-pane-title">SQL</h1>
-<p class="cz-studio-pane-subtitle">Run queries against the lakehouse engine (Databend). Use the catalog on the left to find tables. Ctrl/Cmd+Enter runs the current query.</p>
+<div class="cz-studio-actions" style="margin-bottom: 0.5rem;">
+<div>
+<h1 class="cz-studio-pane-title" style="margin: 0;">Query editor</h1>
+<p class="cz-studio-pane-subtitle" style="margin: 0.25rem 0 0;">Type SQL for Databend or Python (PySpark) for Sail — the editor auto-routes. Ctrl/Cmd+Enter runs.</p>
+</div>
+<span class="cz-studio-actions-spacer"></span>
+<label class="cz-studio-tenant-select" title="Multi-tenant + multi-region routing lands in v1.0. v0.0.x runs against a single tenant on the local cluster.">
+<span class="cz-studio-tenant-eyebrow">Tenant</span>
+<select disabled><option>default</option></select>
+</label>
+</div>
 <form method="post" action="/studio/sql/execute" id="cz-sql-form">
 {csrf}
+<div class="cz-studio-editor-toolbar">
+<span id="cz-sql-lang-pill" class="cz-studio-engine-pill" data-lang="{lang_attr}">{lang_label}</span>
+<span class="cz-studio-actions-spacer"></span>
+</div>
 <div class="cz-studio-editor-wrap">
 <textarea id="cz-sql-textarea" name="sql" class="cz-studio-editor-textarea" placeholder="{sql_placeholder}">{sql_value}</textarea>
 <div id="cz-sql-monaco" data-initial="{sql_value_attr}" style="display: none; height: 18rem;"></div>
@@ -3335,7 +3782,43 @@ fn render_studio_page(
 </form>
 <div class="cz-studio-results">
 {results_html}
-</div>"#,
+</div>
+<script>
+// Re-detect SQL vs Python on every keystroke and update the pill so
+// the operator sees which engine will pick up their query. Same
+// heuristic as the Rust-side detect_query_language: first non-blank
+// non-comment line; if it starts with a SQL reserved word it's SQL,
+// otherwise Python.
+(function() {{
+  var pill = document.getElementById("cz-sql-lang-pill");
+  var ta = document.getElementById("cz-sql-textarea");
+  if (!pill || !ta) return;
+  var SQL_HEADS = [
+    "SELECT","WITH","INSERT","UPDATE","DELETE","MERGE","CREATE","DROP",
+    "ALTER","TRUNCATE","USE","SHOW","DESCRIBE","DESC","EXPLAIN","GRANT",
+    "REVOKE","CALL","REFRESH","OPTIMIZE","VACUUM","ANALYZE","COPY","SET"
+  ];
+  function detect(src) {{
+    var lines = (src || "").split(/\r?\n/);
+    for (var i = 0; i < lines.length; i++) {{
+      var t = lines[i].trim();
+      if (!t) continue;
+      if (t.indexOf("--") === 0) continue;
+      if (t.indexOf("#") === 0) return "python";
+      var first = (t.split(/\s+/)[0] || "").toUpperCase().replace(/[^A-Z]/g, "");
+      return SQL_HEADS.indexOf(first) >= 0 ? "sql" : "python";
+    }}
+    return "sql";
+  }}
+  function paint() {{
+    var lang = detect(ta.value);
+    pill.dataset.lang = lang;
+    pill.textContent = lang === "sql" ? "SQL → Databend" : "Python → Sail";
+  }}
+  ta.addEventListener("input", paint);
+  paint();
+}})();
+</script>"##,
         csrf = csrf,
         sql_placeholder = html_escape(&sql_placeholder),
         sql_value = html_escape(sql_prefill),
@@ -3343,6 +3826,8 @@ fn render_studio_page(
         sql_run = html_escape(&sql_run),
         sql_help = html_escape(&sql_help),
         results_html = results_html,
+        lang_attr = match initial_language { QueryLanguage::Sql => "sql", QueryLanguage::Python => "python" },
+        lang_label = initial_lang_label,
     );
 
     let body = format!(
@@ -3646,41 +4131,62 @@ async fn studio_bootstrap_submit_handler(
             }
         }
     }
-    // After Lakekeeper succeeds, register this warehouse with
-    // Databend so the SQL editor can resolve
-    // `<warehouse>.<namespace>.<table>`. Best-effort: a missing
-    // Databend or a CREATE CATALOG syntax mismatch doesn't fail
-    // the bootstrap -- the operator can still use the catalog via
-    // REST/curl until they re-run bootstrap with Databend in place.
-    let databend_wiring = if outcome.is_ok() {
-        Some(
-            wire_databend_iceberg_catalog(
-                state.store.as_deref(),
-                state.secrets.as_deref(),
-                &lakekeeper_url,
-                &form,
-            )
-            .await,
+    // After Lakekeeper succeeds, register this warehouse with both
+    // engines:
+    //   1. Databend (SQL): fire CREATE CATALOG via Databend's HTTP
+    //      query handler.
+    //   2. Sail (Python / Spark Connect): there's no DDL equivalent
+    //      for Spark catalog config -- it's set per-SparkSession at
+    //      build time. We persist the catalog config to vault so the
+    //      Studio Python execution path can inject it into the
+    //      `SparkSession.builder.config(...)` chain on every query.
+    // Both are best-effort: a missing engine doesn't fail bootstrap.
+    let (databend_wiring, sail_wiring) = if outcome.is_ok() {
+        let dbw = wire_databend_iceberg_catalog(
+            state.store.as_deref(),
+            state.secrets.as_deref(),
+            &lakekeeper_url,
+            &form,
         )
+        .await;
+        let saw = persist_sail_catalog_config(
+            state.store.as_deref(),
+            state.secrets.as_deref(),
+            &lakekeeper_url,
+            &form,
+            outcome.as_ref().ok().and_then(|o| o.warehouse_id.clone()),
+        )
+        .await;
+        (Some(dbw), Some(saw))
     } else {
-        None
+        (None, None)
     };
     let display_outcome: Result<String, String> = match outcome {
         Ok(ok) => {
-            let wiring_line = match databend_wiring {
+            let databend_line = match databend_wiring {
                 Some(DatabendWiringOutcome::Wired { catalog_name }) => format!(
                     "\n - Databend SQL catalog `{catalog_name}` registered. Run \
                      `SELECT * FROM {catalog_name}.<schema>.<table>` in the \
-                     editor."
+                     SQL editor (queries auto-route to Databend)."
                 ),
-                Some(DatabendWiringOutcome::DatabendUnavailable) => "\n - Databend SQL wiring skipped: Databend isn't installed yet. Install it from /install and re-run bootstrap to expose this warehouse via SQL.".to_string(),
+                Some(DatabendWiringOutcome::DatabendUnavailable) => "\n - Databend SQL wiring skipped: Databend isn't installed. Install it from /install + re-run bootstrap to enable SQL queries.".to_string(),
                 Some(DatabendWiringOutcome::Failed { reason }) => format!(
-                    "\n - Databend SQL wiring FAILED: {reason}\n   The Iceberg-REST API still works (browse via the Studio catalog pane). \
-                     To retry, run a CREATE CATALOG statement manually in the SQL editor."
+                    "\n - Databend SQL wiring FAILED: {reason}\n   Re-run bootstrap or use the \"Connect to SQL\" button on the warehouse page."
                 ),
                 None => String::new(),
             };
-            Ok(format!("{}{}", ok.message, wiring_line))
+            let sail_line = match sail_wiring {
+                Some(SailCatalogOutcome::Configured { catalog_name }) => format!(
+                    "\n - Sail Spark catalog `{catalog_name}` configured. Write PySpark / DataFrame code \
+                     in the editor (queries auto-route to Sail)."
+                ),
+                Some(SailCatalogOutcome::SailUnavailable) => "\n - Sail Python wiring skipped: Sail isn't installed. Install it from /install + re-run bootstrap to enable Python/Spark queries.".to_string(),
+                Some(SailCatalogOutcome::ConfigPersistFailed { reason }) => format!(
+                    "\n - Sail Spark catalog config FAILED to persist: {reason}\n   Vault is degraded; this needs operator attention."
+                ),
+                None => String::new(),
+            };
+            Ok(format!("{}{}{}", ok.message, databend_line, sail_line))
         }
         Err(e) => Err(e),
     };
@@ -3784,6 +4290,106 @@ fn sanitize_sql_identifier(name: &str) -> String {
         return format!("cat_{out}");
     }
     out
+}
+
+/// Outcome of persisting the Sail Spark-catalog config for a
+/// newly-bootstrapped warehouse. Unlike Databend, Sail doesn't take
+/// CREATE CATALOG DDL -- catalog config is per-SparkSession at build
+/// time. We persist the config in vault and the Studio Python
+/// executor injects it into every SparkSession.builder it creates.
+#[derive(Debug)]
+enum SailCatalogOutcome {
+    /// Sail isn't installed -- nothing to record.
+    SailUnavailable,
+    /// Catalog config persisted to vault. Studio Python query path
+    /// will inject these conf entries into every SparkSession.
+    Configured { catalog_name: String },
+    /// Vault write failed -- the operator should investigate.
+    ConfigPersistFailed { reason: String },
+}
+
+/// Persist the per-warehouse Spark/Iceberg catalog config to vault
+/// so the Studio Python query path can inject it into
+/// `SparkSession.builder.config(...)` for every Sail query. Vault
+/// keys are namespaced `sail/catalog/<catalog-name>/...` so future
+/// multi-warehouse support drops in without a schema change.
+async fn persist_sail_catalog_config(
+    store: Option<&computeza_state::SqliteStore>,
+    secrets: Option<&computeza_secrets::SecretsStore>,
+    _lakekeeper_url: &str,
+    form: &StudioBootstrapForm,
+    warehouse_uuid: Option<String>,
+) -> SailCatalogOutcome {
+    // Sail-not-installed shortcut: no point persisting config if
+    // there's no engine to consume it.
+    if discover_sail_endpoint(store).await.is_none() {
+        return SailCatalogOutcome::SailUnavailable;
+    }
+    let Some(secrets) = secrets else {
+        return SailCatalogOutcome::ConfigPersistFailed {
+            reason: "Vault is not configured; cannot persist Sail catalog config.".into(),
+        };
+    };
+    let catalog_name = sanitize_sql_identifier(&form.warehouse_name);
+    let uuid = warehouse_uuid.unwrap_or_else(|| form.warehouse_name.clone());
+    // Persist as individual keys so a future "rotate one field" can
+    // touch a single vault entry. Lakekeeper-REST URL stays as a
+    // discoverable endpoint (not persisted) -- the executor reads
+    // it via discover_lakekeeper_endpoint at query time.
+    let kv = [
+        (
+            format!("sail/catalog/{catalog_name}/warehouse-uuid"),
+            uuid.as_str(),
+        ),
+        (
+            format!("sail/catalog/{catalog_name}/s3-endpoint"),
+            form.s3_endpoint.as_str(),
+        ),
+        (
+            format!("sail/catalog/{catalog_name}/s3-region"),
+            form.s3_region.as_str(),
+        ),
+        (
+            format!("sail/catalog/{catalog_name}/s3-access-key-id"),
+            form.s3_access_key.as_str(),
+        ),
+        (
+            format!("sail/catalog/{catalog_name}/s3-secret-access-key"),
+            form.s3_secret_access_key.as_str(),
+        ),
+    ];
+    for (k, v) in &kv {
+        if let Err(e) = secrets.put(k, v).await {
+            return SailCatalogOutcome::ConfigPersistFailed {
+                reason: format!("vault put {k}: {e}"),
+            };
+        }
+    }
+    // Also persist the canonical catalog-name list so the executor
+    // can enumerate which Sail catalogs to register on a session.
+    // Append-only set: read current, add if missing, write back.
+    let key = "sail/catalog-names";
+    let existing = secrets
+        .get(key)
+        .await
+        .ok()
+        .flatten()
+        .map(|v| {
+            use secrecy::ExposeSecret;
+            v.expose_secret().to_string()
+        })
+        .unwrap_or_default();
+    let mut names: Vec<&str> = existing.split(',').filter(|s| !s.is_empty()).collect();
+    if !names.iter().any(|n| *n == catalog_name) {
+        names.push(&catalog_name);
+        let joined = names.join(",");
+        if let Err(e) = secrets.put(key, &joined).await {
+            return SailCatalogOutcome::ConfigPersistFailed {
+                reason: format!("vault put {key}: {e}"),
+            };
+        }
+    }
+    SailCatalogOutcome::Configured { catalog_name }
 }
 
 /// Outcome of attempting to wire Databend up to the just-bootstrapped
