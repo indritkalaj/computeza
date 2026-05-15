@@ -5036,18 +5036,21 @@ fn render_studio_page(
     }}
     return "sql";
   }}
-  function effective() {{
-    return select.value === "auto" ? detect(ta.value) : select.value;
-  }}
   function paint() {{
-    var lang = effective();
-    label.dataset.lang = lang;
-    // Update the auto-detect option's label so the user can see
-    // what the heuristic resolves to without changing modes.
+    // The auto-detect option label always shows what the heuristic
+    // would pick for the CURRENT buffer -- never the user's override.
+    // Mixing the two would flip the auto-option label to "SQL"
+    // every time the user manually picked Python with an empty
+    // editor, which made the UI feel broken.
+    var heuristic = detect(ta.value);
     var autoOpt = select.querySelector('option[value="auto"]');
     if (autoOpt) {{
-      autoOpt.textContent = "Auto-detect → " + (lang === "sql" ? "SQL → Trino" : "Python → Sail");
+      autoOpt.textContent = "Auto-detect → " + (heuristic === "sql" ? "SQL → Trino" : "Python → Sail");
     }}
+    // The pill's color (data-lang) reflects what WILL actually run
+    // -- the user's override if any, otherwise the heuristic.
+    var effective = select.value === "auto" ? heuristic : select.value;
+    label.dataset.lang = effective;
   }}
   ta.addEventListener("input", paint);
   select.addEventListener("change", paint);
@@ -5285,6 +5288,21 @@ window.czDownloadCsv = function (e) {{
     var submitter = e.submitter;
     if (submitter && submitter.getAttribute("formaction")) return;
     e.preventDefault();
+    // Manually sync Monaco -> textarea before reading FormData.
+    // Monaco's own submit listener does this too, but it's
+    // registered LATER than ours (Monaco loads async after the
+    // inline script), so on the natural submit event we'd serialize
+    // a stale textarea value. The sibling sync listener still
+    // fires for non-AJAX fallback paths.
+    try {{
+      if (typeof monaco !== "undefined" && monaco.editor && monaco.editor.getEditors) {{
+        var editors = monaco.editor.getEditors();
+        if (editors && editors.length > 0) {{
+          var ta = document.getElementById("cz-sql-textarea");
+          if (ta) ta.value = editors[0].getValue();
+        }}
+      }}
+    }} catch (_) {{ /* Monaco may not have loaded; textarea is fine */ }}
     // Visual cue while the request is in flight: dim the panel +
     // disable the Run button so a double-click can't fire twice.
     results.classList.add("cz-studio-results-loading");

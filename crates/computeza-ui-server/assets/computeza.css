@@ -44,7 +44,14 @@
 
 *, *::before, *::after { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; }
-html { background: var(--navy); color: var(--ink); }
+html {
+  background: var(--navy);
+  color: var(--ink);
+  /* Tell the browser the entire page is dark mode so native form
+     controls (select popovers, date pickers, scrollbars) render
+     with dark chrome instead of the OS default light theme. */
+  color-scheme: dark;
+}
 
 body {
   font-family: 'Geist', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
