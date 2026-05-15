@@ -123,14 +123,27 @@ pub async fn install(
     // specific python3.X-venv package not pulled in by the bare
     // python3-venv meta-package. Auto-install python3<MAJ>-venv and
     // retry once before surfacing the manual-fix error.
+    //
+    // Note: Python's venv module writes its "apt install python3.X-venv"
+    // hint to STDOUT, not stderr (empty stderr was the symptom that
+    // bit us: the extractor only looked at stderr and missed the
+    // pkg name). We now scan stderr + stdout together, plus also
+    // derive the package name from `python3 --version` as a final
+    // fallback when Python's hint format changes.
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-        if let Some(versioned_pkg) = extract_versioned_venv_pkg_hint(&stderr) {
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let combined = format!("{stderr}\n{stdout}");
+        let versioned_pkg = extract_versioned_venv_pkg_hint(&combined)
+            .or_else(|| derive_versioned_venv_pkg_from_python(&py));
+        if let Some(versioned_pkg) = versioned_pkg {
             tracing::warn!(
                 pkg = %versioned_pkg,
                 "sail install: venv failed; installing version-specific package and retrying"
             );
-            let _ = apt_install(&versioned_pkg).await;
+            if let Err(e) = apt_install(&versioned_pkg).await {
+                tracing::warn!(error = %e, "sail install: apt-install {versioned_pkg} returned err; retrying venv anyway");
+            }
             out = Command::new(&py)
                 .args(["-m", "venv", venv_dir.to_str().unwrap_or("")])
                 .output()
@@ -337,6 +350,29 @@ async fn ensure_python_runtime() -> std::result::Result<(), String> {
         for pkg in ["python3", "python3-venv", "python3-pip"] {
             apt_install(pkg).await?;
         }
+        // The bare `python3-venv` meta-package on newer Debian/Ubuntu
+        // (e.g. Ubuntu noble/oracular shipping Python 3.14 as the
+        // default) only pulls in the dependency stub; the actual
+        // version-specific package `python3.X-venv` is required for
+        // ensurepip to work. Probe the resolved python3 version and
+        // install the matching package up front so the first
+        // `python3 -m venv` call succeeds.
+        if let Some(versioned) =
+            derive_versioned_venv_pkg_from_python(std::path::Path::new("python3"))
+        {
+            if versioned != "python3-venv" {
+                if let Err(e) = apt_install(&versioned).await {
+                    // Not fatal: if apt doesn't have this specific
+                    // package, the retry-on-failure path in the
+                    // install fn will catch it.
+                    tracing::warn!(
+                        pkg = %versioned,
+                        error = %e,
+                        "ensure_python_runtime: version-specific venv pkg install non-fatal failure"
+                    );
+                }
+            }
+        }
         return Ok(());
     }
     if Command::new("dnf").arg("--version").output().await.map(|o| o.status.success()).unwrap_or(false) {
@@ -411,6 +447,37 @@ fn extract_versioned_venv_pkg_hint(stderr: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Fallback: run `<py> --version` and derive the matching
+/// `python3.X-venv` package name. Used when Python's stderr/stdout
+/// don't include the helpful "apt install python3.X-venv" hint
+/// (e.g. on Ubuntu where the hint goes to stdout, not stderr, and
+/// the captured stdout was empty in the operator's report). Returns
+/// None if `python3 --version` doesn't print a parseable version.
+fn derive_versioned_venv_pkg_from_python(py: &std::path::Path) -> Option<String> {
+    let out = std::process::Command::new(py)
+        .arg("--version")
+        .output()
+        .ok()?;
+    // python3 --version writes "Python 3.14.0" to stdout (and on
+    // older versions, stderr -- check both).
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let version = combined.split_whitespace().find(|t| {
+        t.chars().next().is_some_and(|c| c.is_ascii_digit()) && t.contains('.')
+    })?;
+    let mut parts = version.split('.');
+    let major = parts.next()?;
+    let minor = parts.next()?;
+    if major == "3" {
+        Some(format!("python3.{minor}-venv"))
+    } else {
+        None
+    }
 }
 
 /// Discover the system's `python3` binary. PySail ships wheels for
