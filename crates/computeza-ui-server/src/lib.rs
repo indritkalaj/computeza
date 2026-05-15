@@ -2897,7 +2897,7 @@ fn render_studio_table_detail(
             );
             format!(
                 r#"<dl class="cz-dl">
-<dt>Location</dt><dd><code>{loc}</code></dd>
+<dt>Location</dt><dd><code>{loc}</code> <span class="cz-muted" style="font-size: 0.72rem; margin-left: 0.4rem;">(local Garage — on-disk under <code>/var/lib/computeza/garage</code>; the <code>s3://</code> URI is the protocol, not a cloud bucket)</span></dd>
 <dt>Current snapshot</dt><dd><code>{snap}</code></dd>
 <dt>Format version</dt><dd><code>{fmt}</code></dd>
 </dl>
@@ -4334,7 +4334,7 @@ fn render_studio_files_pane(files: &StudioFilesView) -> String {
 /// tree renders on the left (built async by the handler via
 /// `build_studio_full_sidebar`), the SQL editor + results pane
 /// renders on the right.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // explicit signature is the readable choice over a "render-context" bag
 
 /// Render the sidebar's "Recent queries" section. Each entry is a
 /// clickable row that bounces through /studio?sql=... to prefill
@@ -5806,26 +5806,28 @@ fn render_studio_bootstrap_form(
 </div>
 
 <div class="cz-setup-section">
-<p class="cz-setup-section-title">S3 storage</p>
-<p class="cz-setup-section-hint">Where Lakekeeper writes Iceberg metadata + data files. Point at the local Garage instance, or any S3-compatible endpoint.</p>
+<p class="cz-setup-section-title">Object storage</p>
+<p class="cz-setup-section-hint">Where Lakekeeper writes Iceberg metadata + data files. By default this is the <strong>local Garage instance</strong> Computeza installs on this same host — the S3 protocol is just how Lakekeeper + Garage talk. Point at a remote S3 endpoint only if you've turned off the bundled Garage.</p>
 <div class="cz-setup-field">
-<label for="bs-s3-endpoint">S3 endpoint</label>
+<label for="bs-s3-endpoint">Storage endpoint</label>
 <input id="bs-s3-endpoint" name="s3_endpoint" class="cz-input" type="text" value="{s3_endpoint}" required />
+<p class="cz-setup-field-hint">Default points at the local Garage on <code>127.0.0.1:3900</code>. No cloud egress, no AWS account needed.</p>
 </div>
 <div class="cz-setup-field">
 <label for="bs-s3-region">Region</label>
 <input id="bs-s3-region" name="s3_region" class="cz-input" type="text" value="garage" required />
-<p class="cz-setup-field-hint">Default <code>garage</code> matches Garage's SigV4 default region. <code>us-east-1</code> here makes Garage reject Lakekeeper with <em>unexpected scope</em>. Match your Garage <code>s3_region</code> if explicitly set.</p>
+<p class="cz-setup-field-hint">Default <code>garage</code> matches the local Garage's SigV4 default region. <code>us-east-1</code> here makes Garage reject Lakekeeper with <em>unexpected scope</em>. Match your Garage <code>s3_region</code> if explicitly set.</p>
 </div>
 <div class="cz-setup-field">
 <label for="bs-s3-bucket">Bucket</label>
 <input id="bs-s3-bucket" name="s3_bucket" class="cz-input" type="text" value="{prefill_bucket}" required />
+<p class="cz-setup-field-hint">A bucket inside the local Garage; data stays on this host's disk.</p>
 </div>
 </div>
 
 <div class="cz-setup-section">
-<p class="cz-setup-section-title">S3 credentials</p>
-<p class="cz-setup-section-hint">Lakekeeper signs every metadata write with these. v0.1 will auto-mint them — for now paste the values <code>garage key info</code> prints.</p>
+<p class="cz-setup-section-title">Storage credentials</p>
+<p class="cz-setup-section-hint">Local Garage signs every metadata write with these. Auto-minted from the Garage install — paste them only if pointing at a remote S3 endpoint.</p>
 <div class="cz-setup-field">
 <label for="bs-s3-ak">Access key ID</label>
 <input id="bs-s3-ak" name="s3_access_key" class="cz-input" type="text" required placeholder="GK..." value="{prefill_key_id}" />
@@ -8820,31 +8822,44 @@ async fn install_job_handler(
             } else {
                 Some(job_id.as_str())
             };
+            // On the rollback flow, render_uninstall_result swaps
+            // "Install completed" / "Install failed" labels for the
+            // "Uninstall completed / with errors" variants. No
+            // rollback-button on a rollback result page (would be a
+            // rollback of a rollback, which v0.0.x doesn't support).
             if let Some(err) = &p.error {
-                (
-                    StatusCode::OK,
-                    Html(render_install_result_with_credentials(
-                        &l,
-                        false,
-                        err,
-                        &credentials,
-                        rollback_id,
-                        download_id,
-                    )),
-                )
+                if p.is_rollback {
+                    (StatusCode::OK, Html(render_uninstall_result(&l, false, err)))
+                } else {
+                    (
+                        StatusCode::OK,
+                        Html(render_install_result_with_credentials(
+                            &l,
+                            false,
+                            err,
+                            &credentials,
+                            rollback_id,
+                            download_id,
+                        )),
+                    )
+                }
             } else {
                 let summary = p.success_summary.clone().unwrap_or_default();
-                (
-                    StatusCode::OK,
-                    Html(render_install_result_with_credentials(
-                        &l,
-                        true,
-                        &summary,
-                        &credentials,
-                        rollback_id,
-                        download_id,
-                    )),
-                )
+                if p.is_rollback {
+                    (StatusCode::OK, Html(render_uninstall_result(&l, true, &summary)))
+                } else {
+                    (
+                        StatusCode::OK,
+                        Html(render_install_result_with_credentials(
+                            &l,
+                            true,
+                            &summary,
+                            &credentials,
+                            rollback_id,
+                            download_id,
+                        )),
+                    )
+                }
             }
         }
         Some(p) => (
@@ -9117,6 +9132,9 @@ async fn install_rollback_handler(
     Path(job_id): Path<String>,
 ) -> Response {
     let l = Localizer::english();
+    // Snapshot the source job to figure out which components are
+    // installed -- the order we tear them down in mirrors that
+    // job's install order, reversed.
     let snapshot = state
         .jobs
         .lock()
@@ -9163,88 +9181,140 @@ async fn install_rollback_handler(
         .into_response();
     }
 
+    // Spawn a fresh background job for the rollback so the operator
+    // gets the same progress-bar wizard UX as install: per-component
+    // pending/running/done states, polling /api/install/job/{id}
+    // every 500ms, redirect to result page on completion. Returns
+    // the new job_id so the 303 lands the operator on the live
+    // progress page instead of waiting for the full sync teardown.
+    use computeza_driver_native::progress::{ComponentProgress, ComponentState, InstallPhase};
+    let new_job_id = uuid::Uuid::new_v4().to_string();
+    let teardown_order: Vec<String> = installed.iter().rev().cloned().collect();
+    let progress_arc = std::sync::Arc::new(std::sync::Mutex::new(
+        computeza_driver_native::progress::InstallProgress {
+            phase: InstallPhase::Queued,
+            message: format!("Rolling back {} components", teardown_order.len()),
+            log: Vec::new(),
+            components: teardown_order
+                .iter()
+                .map(|slug| ComponentProgress {
+                    slug: slug.clone(),
+                    state: ComponentState::Pending,
+                    error: None,
+                    summary: None,
+                })
+                .collect(),
+            is_rollback: true,
+            ..Default::default()
+        },
+    ));
+    state
+        .jobs
+        .lock()
+        .unwrap()
+        .insert(new_job_id.clone(), progress_arc.clone());
+
     let store = state.store.clone();
     let secrets = state.secrets.clone();
-    let mut summary = String::new();
-    let mut any_failed = false;
-    // Reverse dependency order so consumers come down before their
-    // dependencies (e.g. lakekeeper before postgres).
-    for slug in installed.iter().rev() {
-        summary.push_str(&format!("=== rollback: {slug} ===\n"));
+    let progress = progress_arc.clone();
+    tokio::spawn(async move {
+        let mut summary = String::new();
+        let mut any_failed = false;
+        for slug in &teardown_order {
+            // Mark this component as Running so the wizard's
+            // checklist shows the live cursor.
+            {
+                let mut p = progress.lock().unwrap();
+                p.phase = InstallPhase::StartingService;
+                p.message = format!("Uninstalling {slug}");
+                p.log.push(format!("=== uninstall: {slug} ==="));
+                if let Some(c) = p.components.iter_mut().find(|c| c.slug == *slug) {
+                    c.state = ComponentState::Running;
+                }
+            }
+            summary.push_str(&format!("=== uninstall: {slug} ===\n"));
 
-        // Load the install-config the operator chose at install time
-        // (custom service_name / root_dir / etc) so the rollback
-        // targets the SAME service the install created, not the
-        // driver default. Falls back to InstallConfig::default() if
-        // no config was persisted (legacy installs or per-component
-        // install path that doesn't persist).
-        let config = if let Some(store) = &store {
-            load_install_config(store.as_ref(), slug)
-                .await
-                .unwrap_or_default()
+            let config = if let Some(store) = &store {
+                load_install_config(store.as_ref(), slug)
+                    .await
+                    .unwrap_or_default()
+            } else {
+                InstallConfig::default()
+            };
+
+            let mut step_failed = false;
+            match dispatch_uninstall_with_config(slug, &config).await {
+                Ok(detail) => {
+                    summary.push_str(&format!("{detail}\n\n"));
+                    progress.lock().unwrap().log.push(detail);
+                }
+                Err(e) => {
+                    any_failed = true;
+                    step_failed = true;
+                    summary.push_str(&format!("FAIL  {e}\n\n"));
+                    progress.lock().unwrap().log.push(format!("FAIL: {e}"));
+                    tracing::warn!(component = %slug, error = %e, "rollback: dispatch_uninstall_with_config failed; continuing");
+                }
+            }
+            if let Some(store) = &store {
+                let kind = format!("{slug}-instance");
+                let key = ResourceKey::cluster_scoped(&kind, "local");
+                if let Err(e) = store.delete(&key, None).await {
+                    tracing::warn!(error = %e, component = %slug, "rollback: store.delete failed");
+                    summary.push_str(&format!(
+                        "Note: failed to drop {slug}-instance/local from metadata store ({e}).\n\n"
+                    ));
+                }
+                delete_install_config(store.as_ref(), slug).await;
+            }
+            if let Some(secrets) = &secrets {
+                let secret_ref = format!("{slug}/admin-password");
+                let _ = secrets.delete(&secret_ref).await;
+            }
+            // Mark Done (or Failed if dispatch errored).
+            {
+                let mut p = progress.lock().unwrap();
+                if let Some(c) = p.components.iter_mut().find(|c| c.slug == *slug) {
+                    c.state = if step_failed {
+                        ComponentState::Failed
+                    } else {
+                        ComponentState::Done
+                    };
+                }
+            }
+        }
+
+        let final_summary = if any_failed {
+            format!("Uninstall completed with errors. See per-component log below.\n\n{summary}")
         } else {
-            InstallConfig::default()
+            format!(
+                "Uninstall and removal of components completed.\n\n\
+                 {n} component(s) torn down in reverse dependency order. \
+                 Per-component details below.\n\n{summary}",
+                n = teardown_order.len()
+            )
         };
+        let mut p = progress.lock().unwrap();
+        p.phase = if any_failed {
+            InstallPhase::Failed
+        } else {
+            InstallPhase::Done
+        };
+        p.message = if any_failed {
+            "Uninstall completed with errors".into()
+        } else {
+            "Uninstall and removal of components completed".into()
+        };
+        p.completed = true;
+        p.finished_at = Some(chrono::Utc::now());
+        if any_failed {
+            p.error = Some(final_summary);
+        } else {
+            p.success_summary = Some(final_summary);
+        }
+    });
 
-        match dispatch_uninstall_with_config(slug, &config).await {
-            Ok(detail) => summary.push_str(&format!("{detail}\n\n")),
-            Err(e) => {
-                any_failed = true;
-                summary.push_str(&format!("FAIL  {e}\n\n"));
-                tracing::warn!(
-                    component = %slug,
-                    error = %e,
-                    "rollback: dispatch_uninstall_with_config failed; continuing with the rest of the chain"
-                );
-            }
-        }
-        if let Some(store) = &store {
-            // Drop the instance row.
-            let kind = format!("{slug}-instance");
-            let key = ResourceKey::cluster_scoped(&kind, "local");
-            if let Err(e) = store.delete(&key, None).await {
-                tracing::warn!(
-                    error = %e,
-                    component = %slug,
-                    "rollback: store.delete({slug}-instance/local) failed; \
-                     row may linger -- inspect via /resource and clean up manually"
-                );
-                summary.push_str(&format!(
-                    "Note: failed to drop {slug}-instance/local from metadata store ({e}).\n\n"
-                ));
-            }
-            // Drop the persisted install-config so the next install
-            // of this slug doesn't inherit stale overrides.
-            delete_install_config(store.as_ref(), slug).await;
-        }
-        // Drop the encrypted admin credential too -- the service is
-        // gone, the credential is meaningless.
-        if let Some(secrets) = &secrets {
-            let secret_ref = format!("{slug}/admin-password");
-            if let Err(e) = secrets.delete(&secret_ref).await {
-                tracing::debug!(
-                    error = %e,
-                    component = %slug,
-                    "rollback: secrets.delete({secret_ref}) failed; \
-                     ignoring -- the entry may not have existed"
-                );
-            }
-        }
-    }
-
-    let final_summary = if any_failed {
-        format!(
-            "Uninstall completed with errors. See per-component log below.\n\n{summary}"
-        )
-    } else {
-        format!(
-            "Uninstall and removal of components completed.\n\n\
-             {n} component(s) torn down in reverse dependency order. \
-             Per-component details below.\n\n{summary}",
-            n = installed.len()
-        )
-    };
-    Html(render_uninstall_result(&l, !any_failed, &final_summary)).into_response()
+    Redirect303(format!("/install/job/{new_job_id}")).into_response()
 }
 
 /// GET /api/install/job/{id} -- JSON snapshot of progress, polled by
@@ -10788,7 +10858,7 @@ pub fn render_shell(
     let nav_admin_operators = localizer.t("ui-nav-admin-operators");
     let nav_admin_groups = localizer.t("ui-nav-admin-groups");
     let nav_admin_tenants = localizer.t("ui-nav-admin-tenants");
-    let nav_admin_branding = localizer.t("ui-nav-admin-branding");
+    let _ = localizer.t("ui-nav-admin-branding"); // i18n key preserved; rail item removed
     let nav_admin_license = localizer.t("ui-nav-admin-license");
     let version_label = localizer.t("ui-footer-version");
     let version = env!("CARGO_PKG_VERSION");
@@ -10849,7 +10919,6 @@ pub fn render_shell(
     <a href="/admin/operators" class="cz-sidenav-item {nops}" data-label="{nav_admin_operators}"><i class="fa-solid fa-user-tie fa-fw"></i><span class="cz-sidenav-label">{nav_admin_operators}</span></a>
     <a href="/admin/groups" class="cz-sidenav-item {ngrp}" data-label="{nav_admin_groups}"><i class="fa-solid fa-users fa-fw"></i><span class="cz-sidenav-label">{nav_admin_groups}</span></a>
     <a href="/admin/tenants" class="cz-sidenav-item {nwsp}" data-label="{nav_admin_tenants}"><i class="fa-solid fa-building fa-fw"></i><span class="cz-sidenav-label">{nav_admin_tenants}</span></a>
-    <a href="/admin/branding" class="cz-sidenav-item {nbrd}" data-label="{nav_admin_branding}"><i class="fa-solid fa-palette fa-fw"></i><span class="cz-sidenav-label">{nav_admin_branding}</span></a>
     <a href="/admin/license" class="cz-sidenav-item {nlic}" data-label="{nav_admin_license}"><i class="fa-solid fa-certificate fa-fw"></i><span class="cz-sidenav-label">{nav_admin_license}</span></a>
   </div>
   <div class="cz-sidenav-spacer"></div>
@@ -11028,7 +11097,6 @@ window.czRewriteTimestamps();
         nops = nav_class(NavLink::Operators),
         ngrp = nav_class(NavLink::Groups),
         nwsp = nav_class(NavLink::Tenants),
-        nbrd = nav_class(NavLink::Branding),
         nlic = nav_class(NavLink::License),
         ncmp = nav_class(NavLink::Compliance),
         nacc = nav_class(NavLink::Account),
@@ -14360,7 +14428,13 @@ fn kanidm_version_options() -> Vec<VersionOption> {
 /// keeps each row's state badge in sync.
 #[must_use]
 pub fn render_install_progress(localizer: &Localizer, job_id: &str, p: &InstallProgress) -> String {
-    let title = localizer.t("ui-install-title");
+    // Title flips for the rollback flow so the operator's tab + page
+    // chrome don't say "Installing" while the system is tearing down.
+    let title = if p.is_rollback {
+        "Uninstalling".to_string()
+    } else {
+        localizer.t("ui-install-title")
+    };
     let phase_label = p.phase.label();
     let ratio_pct = format!("{:.1}", p.phase_ratio() * 100.0);
     let message = html_escape(&p.message);
@@ -14378,7 +14452,12 @@ pub fn render_install_progress(localizer: &Localizer, job_id: &str, p: &InstallP
         .collect();
 
     let multi = !p.components.is_empty();
-    let (hero_title, hero_intro) = if multi {
+    let (hero_title, hero_intro) = if p.is_rollback {
+        (
+            "Uninstalling".to_string(),
+            "Each component below is being torn down in reverse install order. You can leave this page open; it polls the server every half second and survives browser refresh.".to_string(),
+        )
+    } else if multi {
         (
             localizer.t("ui-install-progress-title-multi"),
             localizer.t("ui-install-progress-intro-multi"),
