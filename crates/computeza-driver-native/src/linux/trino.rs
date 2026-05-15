@@ -251,17 +251,25 @@ pub async fn install(
         "trino: wrote node/config/jvm/log properties"
     );
 
-    // Trino ships `bin/launcher` with a `#!/usr/bin/env python`
-    // shebang. Modern Linux distros (Ubuntu 20.04+, Debian 11+,
-    // RHEL 9+) only ship `python3` -- the unversioned `python`
-    // binary is gone unless the operator explicitly installs
-    // `python-is-python3`. Without this patch the service unit
-    // fails with `env: 'python': No such file or directory`
-    // (exit 127) and systemd restart-loops forever. We rewrite the
-    // shebang at install time; the launcher script itself is
-    // Python-3-compatible (Trino dropped Python 2 long before 442).
-    let launcher_script = bin_dir.join("launcher");
-    if let Ok(body) = fs::read_to_string(&launcher_script).await {
+    // Trino's bin/ has two files:
+    //   * bin/launcher    -- a shell wrapper that just execs launcher.py
+    //   * bin/launcher.py -- the real Python launcher with a
+    //                        `#!/usr/bin/env python` shebang
+    // Modern Linux distros (Ubuntu 20.04+, Debian 11+, RHEL 9+)
+    // only ship `python3` -- the unversioned `python` binary is
+    // gone unless the operator explicitly installs
+    // `python-is-python3`. Without intervention the service unit
+    // fails with `env: 'python': No such file or directory` (exit
+    // 127) when the shell wrapper kernel-execs launcher.py.
+    //
+    // Belt-and-braces fix:
+    //   1. Rewrite launcher.py's shebang from `python` to `python3`
+    //      so direct CLI invocation of the script works.
+    //   2. systemd ExecStart invokes `python3 bin/launcher.py run`
+    //      directly, bypassing the shell wrapper AND the script's
+    //      shebang entirely (see Step 3 below).
+    let launcher_py = bin_dir.join("launcher.py");
+    if let Ok(body) = fs::read_to_string(&launcher_py).await {
         if body.starts_with("#!/usr/bin/env python\n")
             || body.starts_with("#!/usr/bin/env python\r\n")
         {
@@ -270,8 +278,8 @@ pub async fn install(
                 "#!/usr/bin/env python3",
                 1,
             );
-            fs::write(&launcher_script, patched).await?;
-            info!("trino: patched bin/launcher shebang to python3");
+            fs::write(&launcher_py, patched).await?;
+            info!("trino: patched bin/launcher.py shebang to python3");
         }
     }
 
@@ -281,10 +289,14 @@ pub async fn install(
     // tracking. PATH/JAVA_HOME point at the bundled JRE.
     progress.set_phase(InstallPhase::RegisteringService);
     progress.set_message(format!("Writing systemd unit {}", opts.unit_name));
-    let launcher_path = bin_dir.join("launcher");
+    // launcher.py is the real Python entrypoint. bin/launcher is a
+    // shell wrapper that kernel-execs launcher.py; we skip the
+    // wrapper because invoking python3 on a shell script fails
+    // with `SyntaxError: Missing parentheses in call to 'exec'`.
+    let launcher_path = bin_dir.join("launcher.py");
     // Resolve the system's python3 once at install time. systemd
     // doesn't expand PATH for ExecStart, so we need an absolute
-    // path. We invoke python3 directly against the launcher script
+    // path. We invoke python3 directly against launcher.py
     // (bypassing the script's shebang entirely) so the install
     // works on distros where /usr/bin/python doesn't exist.
     let python3 = detect_python3().await.ok_or_else(|| {
