@@ -2116,11 +2116,33 @@ async fn studio_catalog_wire_trino_handler(
         other => other,
     };
 
+    // Also persist Sail catalog config so PySpark queries through
+    // Studio's Python executor see this warehouse as a Spark
+    // catalog (`spark.sql.catalog.<name>`). studio/bootstrap fires
+    // this implicitly; Connect-to-SQL didn't, leaving Sail's
+    // SparkSession unaware of the catalog and Python queries
+    // failing with `Catalog not found: default`.
+    let sail_outcome = persist_sail_catalog_config(
+        state.store.as_deref(),
+        state.secrets.as_deref(),
+        &lakekeeper_url,
+        &form,
+        None,
+    )
+    .await;
+    let sail_suffix = match sail_outcome {
+        SailCatalogOutcome::Configured { .. } => " Python (PySpark) is now wired too -- `spark.sql(\"USE CATALOG <name>\")` works from the editor.".to_string(),
+        SailCatalogOutcome::SailUnavailable => String::new(),
+        SailCatalogOutcome::ConfigPersistFailed { reason } => {
+            format!(" (Note: Sail catalog config FAILED to persist: {reason}. PySpark queries against this warehouse won't work until vault is fixed.)")
+        }
+    };
+
     match final_outcome {
         TrinoWiringOutcome::Wired { catalog_name } => axum::response::Redirect::to(&format!(
             "{base_redirect}?wired={}",
             url_encode(&format!(
-                "SQL catalog `{catalog_name}` is now registered with Trino. Run `SELECT * FROM {catalog_name}.<schema>.<table>` in the editor."
+                "SQL catalog `{catalog_name}` is now registered with Trino. Run `SELECT * FROM {catalog_name}.<schema>.<table>` in the editor.{sail_suffix}"
             ))
         )),
         TrinoWiringOutcome::TrinoUnavailable => err_redirect(
@@ -5084,7 +5106,6 @@ fn render_studio_page(
       hidden.value = opt.getAttribute("data-value");
       closeMenu();
       paint();
-      try {{ localStorage.setItem("cz-studio-lang", hidden.value); }} catch (_) {{}}
     }});
   }});
 
@@ -5099,13 +5120,13 @@ fn render_studio_page(
 
   ta.addEventListener("input", paint);
 
-  // Restore persisted choice.
-  try {{
-    var saved = localStorage.getItem("cz-studio-lang");
-    if (saved === "auto" || saved === "sql" || saved === "python") {{
-      hidden.value = saved;
-    }}
-  }} catch (_) {{}}
+  // Persistence intentionally NOT restored on page load. Sticky
+  // overrides made the editor mis-route after a single click ('I
+  // picked Python once -> every subsequent SQL gets a SyntaxError
+  // because it lands in Sail'). The override sticks within a
+  // session (the hidden input keeps its value across submits via
+  // form state) but a fresh page load defaults back to
+  // 'auto-detect' which routes correctly out of the box.
   paint();
 }})();
 </script>"##,
