@@ -10822,27 +10822,31 @@ pub fn render_shell(
   <a href="/account" class="cz-topbar-account {nacc}">{nav_account}</a>
 </div>
 <nav class="cz-sidenav" aria-label="Primary navigation">
+  <button type="button" class="cz-sidenav-toggle" id="cz-sidenav-toggle" aria-label="Toggle navigation rail"></button>
   <div class="cz-sidenav-section">
-    <a href="/studio" class="cz-sidenav-item {nwks}" data-label="{nav_studio}">⌬</a>
-    <a href="/install" class="cz-sidenav-item {ni}" data-label="{nav_install}">↓</a>
-    <a href="/components" class="cz-sidenav-item {nc}" data-label="{nav_components}">▦</a>
-    <a href="/install-guide" class="cz-sidenav-item {nig}" data-label="Install guide">?</a>
+    <div class="cz-sidenav-section-header">Build</div>
+    <a href="/studio" class="cz-sidenav-item {nwks}" data-label="{nav_studio}"><span>⌬</span><span class="cz-sidenav-label">{nav_studio}</span></a>
+    <a href="/install" class="cz-sidenav-item {ni}" data-label="{nav_install}"><span>↓</span><span class="cz-sidenav-label">{nav_install}</span></a>
+    <a href="/components" class="cz-sidenav-item {nc}" data-label="{nav_components}"><span>▦</span><span class="cz-sidenav-label">{nav_components}</span></a>
+    <a href="/install-guide" class="cz-sidenav-item {nig}" data-label="Install guide"><span>?</span><span class="cz-sidenav-label">Install guide</span></a>
   </div>
   <div class="cz-sidenav-sep"></div>
   <div class="cz-sidenav-section">
-    <a href="/status" class="cz-sidenav-item {ns}" data-label="{nav_status}">◉</a>
-    <a href="/state" class="cz-sidenav-item {nm}" data-label="{nav_state}">≣</a>
-    <a href="/audit" class="cz-sidenav-item {naud}" data-label="{nav_audit}">⌗</a>
-    <a href="/compliance/eu-ai-act" class="cz-sidenav-item {ncmp}" data-label="Compliance">⚖</a>
+    <div class="cz-sidenav-section-header">Operate</div>
+    <a href="/status" class="cz-sidenav-item {ns}" data-label="{nav_status}"><span>◉</span><span class="cz-sidenav-label">{nav_status}</span></a>
+    <a href="/state" class="cz-sidenav-item {nm}" data-label="{nav_state}"><span>≣</span><span class="cz-sidenav-label">{nav_state}</span></a>
+    <a href="/audit" class="cz-sidenav-item {naud}" data-label="{nav_audit}"><span>⌗</span><span class="cz-sidenav-label">{nav_audit}</span></a>
+    <a href="/compliance/eu-ai-act" class="cz-sidenav-item {ncmp}" data-label="Compliance"><span>⚖</span><span class="cz-sidenav-label">Compliance</span></a>
   </div>
   <div class="cz-sidenav-sep"></div>
   <div class="cz-sidenav-section">
-    <a href="/admin/secrets" class="cz-sidenav-item {na}" data-label="{nav_secrets}">⚿</a>
-    <a href="/admin/operators" class="cz-sidenav-item {nops}" data-label="{nav_admin_operators}">☥</a>
-    <a href="/admin/groups" class="cz-sidenav-item {ngrp}" data-label="{nav_admin_groups}">⌬</a>
-    <a href="/admin/tenants" class="cz-sidenav-item {nwsp}" data-label="{nav_admin_tenants}">⌘</a>
-    <a href="/admin/branding" class="cz-sidenav-item {nbrd}" data-label="{nav_admin_branding}">◈</a>
-    <a href="/admin/license" class="cz-sidenav-item {nlic}" data-label="{nav_admin_license}">✦</a>
+    <div class="cz-sidenav-section-header">Admin</div>
+    <a href="/admin/secrets" class="cz-sidenav-item {na}" data-label="{nav_secrets}"><span>⚿</span><span class="cz-sidenav-label">{nav_secrets}</span></a>
+    <a href="/admin/operators" class="cz-sidenav-item {nops}" data-label="{nav_admin_operators}"><span>☥</span><span class="cz-sidenav-label">{nav_admin_operators}</span></a>
+    <a href="/admin/groups" class="cz-sidenav-item {ngrp}" data-label="{nav_admin_groups}"><span>⌬</span><span class="cz-sidenav-label">{nav_admin_groups}</span></a>
+    <a href="/admin/tenants" class="cz-sidenav-item {nwsp}" data-label="{nav_admin_tenants}"><span>⌘</span><span class="cz-sidenav-label">{nav_admin_tenants}</span></a>
+    <a href="/admin/branding" class="cz-sidenav-item {nbrd}" data-label="{nav_admin_branding}"><span>◈</span><span class="cz-sidenav-label">{nav_admin_branding}</span></a>
+    <a href="/admin/license" class="cz-sidenav-item {nlic}" data-label="{nav_admin_license}"><span>✦</span><span class="cz-sidenav-label">{nav_admin_license}</span></a>
   </div>
   <div class="cz-sidenav-spacer"></div>
 </nav>
@@ -10875,6 +10879,25 @@ pub fn render_shell(
     const inputs = e.target.querySelectorAll('input[name="csrf_token"]');
     inputs.forEach(function (i) {{ if (!i.value) i.value = token; }});
   }}, true);
+}})();
+
+// Side-rail toggle. Persists open/collapsed state in localStorage
+// so a refresh / navigation doesn't reset the operator's choice.
+// Applies the class BEFORE the body paints to avoid a layout flash
+// (the inline <script> runs synchronously below the body element).
+(function () {{
+  var KEY = "cz-sidenav-open";
+  try {{
+    if (localStorage.getItem(KEY) === "1") {{
+      document.body.classList.add("cz-sidenav-open");
+    }}
+  }} catch (_) {{}}
+  var btn = document.getElementById("cz-sidenav-toggle");
+  if (!btn) return;
+  btn.addEventListener("click", function () {{
+    var on = document.body.classList.toggle("cz-sidenav-open");
+    try {{ localStorage.setItem(KEY, on ? "1" : "0"); }} catch (_) {{}}
+  }});
 }})();
 
 // Password-field show/hide toggle. For every <input type="password">
