@@ -14864,7 +14864,7 @@ pub fn render_install_progress(localizer: &Localizer, job_id: &str, p: &InstallP
             })
             .collect();
         format!(
-            r#"<section class="cz-section" style="max-width: 42rem;">
+            r#"<section class="cz-section">
 <div class="cz-card">
 <p class="cz-card-body" style="margin: 0 0 0.6rem; font-weight: 600;">{components_label}</p>
 <ul id="components" style="list-style: none; padding: 0; margin: 0;">
@@ -14885,7 +14885,7 @@ pub fn render_install_progress(localizer: &Localizer, job_id: &str, p: &InstallP
 <p>{hero_intro}</p>
 </section>
 {components_block}
-<section class="cz-section" style="max-width: 42rem;">
+<section class="cz-section">
 <div class="cz-progress">
   <div class="cz-progress-phase">
     <span id="phase">{phase_label}</span>
