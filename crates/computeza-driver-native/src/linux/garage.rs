@@ -339,10 +339,21 @@ pub async fn post_install_bootstrap(
     let key_id: String = if let Some(info) = key_info.as_deref() {
         // Key already exists; re-use the existing Key ID. The secret
         // cannot be recovered (Garage redacts on `key info`) so we
-        // don't emit a secret artifact -- the orchestrator preserves
-        // the vault entry from the original creation.
+        // emit only the Key ID. The orchestrator's vault.put on
+        // garage/lakekeeper-key-id is idempotent (same value -> no
+        // change); the secret stays in vault from the original
+        // creation. Surfacing the Key ID here keeps it visible in
+        // both the install-result page AND the credentials.json
+        // download even on idempotent re-runs, so operators don't
+        // think the credential vanished after a re-install.
         let id = parse_key_id(info)?;
-        info!(key_id = %id, "garage bootstrap: lakekeeper key already exists; skipping create");
+        info!(key_id = %id, "garage bootstrap: lakekeeper key already exists; re-emitting Key ID artifact");
+        artifacts.push(super::BootstrapArtifact {
+            vault_key: "garage/lakekeeper-key-id".into(),
+            value: SecretString::from(id.clone()),
+            label: "Garage Access Key ID (Lakekeeper-scoped)".into(),
+            display_inline: true,
+        });
         id
     } else {
         // Create the key; capture both ID + Secret from the create

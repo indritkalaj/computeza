@@ -5521,20 +5521,59 @@ async fn run_lakekeeper_bootstrap(
     // default project when the client doesn't send a project-id
     // header. Databend's Iceberg-REST client doesn't pass one, so
     // a warehouse stored under a custom project is invisible to it
-    // (NoSuchWarehouseException on every lookup -- exactly the
-    // bug operators reported after bootstrap "succeeded").
+    // (NoSuchWarehouseException on every lookup).
     //
-    // Putting warehouses in the nil project means the warehouse
-    // prefix returned by /v1/config is just `<warehouse-uuid>`,
-    // resolvable without authentication or headers. The
-    // project-name field on the bootstrap form becomes a label;
-    // for v0.1+ multi-tenant deployments we'll thread the
-    // project-id header through every Iceberg-REST round-trip and
-    // make this a real project.
+    // Two-step bootstrap to make this work:
+    //   a) POST /management/v1/bootstrap -- initializes the default
+    //      project (UUID = nil). One-time per Lakekeeper instance;
+    //      returns 200 first time, 4xx every subsequent call.
+    //   b) POST /management/v1/warehouse with project-id = nil.
+    //
+    // Without step (a), step (b) returns ProjectNotFound for the
+    // nil UUID -- which is exactly the bug we were hitting before.
     const NIL_PROJECT_ID: &str = "00000000-0000-0000-0000-000000000000";
+    let bootstrap_url = format!("{}/management/v1/bootstrap", base_url.trim_end_matches('/'));
+    // Body shape from Lakekeeper docs: accept_terms_of_use is
+    // required; is_operator marks this caller as the system
+    // operator (us). user-* fields are optional; we omit them and
+    // let Lakekeeper synthesise a service-principal entry.
+    let bootstrap_body = serde_json::json!({
+        "accept-terms-of-use": true,
+        "is-operator": true,
+    });
+    let bs_resp = client
+        .post(&bootstrap_url)
+        .json(&bootstrap_body)
+        .send()
+        .await
+        .map_err(|e| format!("POST {bootstrap_url}: {e}"))?;
+    let bs_status = bs_resp.status();
+    let bs_text = bs_resp
+        .text()
+        .await
+        .unwrap_or_else(|e| format!("(could not read body: {e})"));
+    // Lakekeeper returns 2xx on first bootstrap; 4xx (typically
+    // 409 conflict, or 400 "already bootstrapped") on subsequent
+    // calls. Either is fine -- we just need the default project
+    // to exist by the time we POST /warehouse.
+    let bootstrap_was_fresh = bs_status.is_success();
+    if !bootstrap_was_fresh
+        && !(400..500).contains(&bs_status.as_u16())
+        && bs_status.as_u16() != 409
+    {
+        return Err(format!(
+            "POST {bootstrap_url} returned unexpected {} (expected 2xx or 4xx already-bootstrapped):\n{bs_text}",
+            bs_status.as_u16()
+        ));
+    }
+    tracing::info!(
+        status = bs_status.as_u16(),
+        fresh = bootstrap_was_fresh,
+        "lakekeeper bootstrap-server endpoint called"
+    );
     let project_id = NIL_PROJECT_ID.to_string();
-    let project_existed = true; // logical placeholder for the success message
-    let project_status = reqwest::StatusCode::OK;
+    let project_existed = !bootstrap_was_fresh;
+    let project_status = bs_status;
     let _ = &form.project_name; // form field is preserved for display
 
     // --- Step 2: create warehouse with S3 storage profile +
