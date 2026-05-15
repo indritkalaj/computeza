@@ -5513,104 +5513,29 @@ async fn run_lakekeeper_bootstrap(
         .build()
         .map_err(|e| format!("building HTTP client: {e}"))?;
 
-    // --- Step 1: create project (idempotent-ish: if a project of
-    // the same name exists, Lakekeeper typically returns 409; we
-    // treat 409 as success and look up the existing project's ID
-    // for the warehouse step).
-    let project_url = format!("{}/management/v1/project", base_url.trim_end_matches('/'));
-    let project_body = serde_json::json!({
-        "project-name": form.project_name,
-    });
-    let project_resp = client
-        .post(&project_url)
-        .json(&project_body)
-        .send()
-        .await
-        .map_err(|e| format!("POST {project_url}: {e}"))?;
-    let project_status = project_resp.status();
-    let project_text = project_resp
-        .text()
-        .await
-        .unwrap_or_else(|e| format!("(could not read body: {e})"));
-    let project_existed = project_status.as_u16() == 409;
-    if !project_status.is_success() && !project_existed {
-        return Err(format!(
-            "POST {project_url} returned {}:\n{project_text}\n\n\
-             If Lakekeeper has a different field-name expectation \
-             (e.g. `name` instead of `project-name`), adjust \
-             run_lakekeeper_bootstrap() in ui-server/src/lib.rs.",
-            project_status.as_u16()
-        ));
-    }
-
-    // Resolve the project's UUID -- Lakekeeper's warehouse-create
-    // API takes `project-id` (a UUID), not `project-name`. The name
-    // is only a display label. Two paths:
-    //   - 201 fresh-create: project-id is in the create response.
-    //     Try a few likely field names since Lakekeeper drifts on
-    //     casing across releases (project-id, projectId, id).
-    //   - 409 already-existed: list projects and find the one whose
-    //     name matches. Same field-name fallback applies.
-    let parse_project_id = |body: &str| -> Option<String> {
-        let v: serde_json::Value = serde_json::from_str(body).ok()?;
-        v.get("project-id")
-            .or_else(|| v.get("projectId"))
-            .or_else(|| v.get("id"))
-            .and_then(|x| x.as_str())
-            .map(str::to_string)
-    };
-    let project_id: String = if !project_existed {
-        parse_project_id(&project_text).ok_or_else(|| {
-            format!(
-                "POST {project_url} returned 2xx but no `project-id` (tried `project-id`, `projectId`, `id`) was found in the response body:\n{project_text}"
-            )
-        })?
-    } else {
-        // List projects to find the one matching our name.
-        let list_resp = client
-            .get(&project_url)
-            .send()
-            .await
-            .map_err(|e| format!("GET {project_url} (project list): {e}"))?;
-        let list_text = list_resp
-            .text()
-            .await
-            .unwrap_or_else(|e| format!("(could not read body: {e})"));
-        let list_v: serde_json::Value = serde_json::from_str(&list_text).map_err(|e| {
-            format!(
-                "GET {project_url} body did not parse as JSON: {e}\nbody: {list_text}"
-            )
-        })?;
-        // Try a few container shapes: `{"projects": [...]}`, bare array, or `{"data": [...]}`
-        let arr = list_v
-            .get("projects")
-            .or_else(|| list_v.get("data"))
-            .and_then(|x| x.as_array())
-            .cloned()
-            .or_else(|| list_v.as_array().cloned())
-            .unwrap_or_default();
-        arr.iter()
-            .find(|p| {
-                p.get("project-name")
-                    .or_else(|| p.get("projectName"))
-                    .or_else(|| p.get("name"))
-                    .and_then(|n| n.as_str())
-                    == Some(form.project_name.as_str())
-            })
-            .and_then(|p| {
-                p.get("project-id")
-                    .or_else(|| p.get("projectId"))
-                    .or_else(|| p.get("id"))
-                    .and_then(|x| x.as_str())
-                    .map(str::to_string)
-            })
-            .ok_or_else(|| {
-                format!(
-                    "project `{}` returned 409 (already exists) but could not be found in the list at GET {project_url}.\nbody: {list_text}",
-                    form.project_name
-                )
-            })?
-    };
+    // --- Step 1: project resolution ----------------------------------
+    //
+    // CRITICAL DESIGN CHOICE: warehouses go into the nil/default
+    // project (UUID = all zeros). Lakekeeper's Iceberg-REST endpoint
+    // resolves `/catalog/v1/<warehouse-id>/...` only against the
+    // default project when the client doesn't send a project-id
+    // header. Databend's Iceberg-REST client doesn't pass one, so
+    // a warehouse stored under a custom project is invisible to it
+    // (NoSuchWarehouseException on every lookup -- exactly the
+    // bug operators reported after bootstrap "succeeded").
+    //
+    // Putting warehouses in the nil project means the warehouse
+    // prefix returned by /v1/config is just `<warehouse-uuid>`,
+    // resolvable without authentication or headers. The
+    // project-name field on the bootstrap form becomes a label;
+    // for v0.1+ multi-tenant deployments we'll thread the
+    // project-id header through every Iceberg-REST round-trip and
+    // make this a real project.
+    const NIL_PROJECT_ID: &str = "00000000-0000-0000-0000-000000000000";
+    let project_id = NIL_PROJECT_ID.to_string();
+    let project_existed = true; // logical placeholder for the success message
+    let project_status = reqwest::StatusCode::OK;
+    let _ = &form.project_name; // form field is preserved for display
 
     // --- Step 2: create warehouse with S3 storage profile +
     // credentials pointing at Garage.

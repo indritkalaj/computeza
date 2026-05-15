@@ -245,7 +245,75 @@ impl Default for UninstallOptions {
 }
 
 pub async fn uninstall(opts: UninstallOptions) -> Result<Uninstalled, ServiceError> {
-    service::uninstall_service("lakekeeper", &opts.root_dir, &opts.unit_name, None).await
+    // Lakekeeper stores all its operator-visible state -- projects,
+    // warehouses, catalog metadata -- in a Postgres database. A
+    // file-system-only uninstall leaves those rows behind, so the
+    // next install + bootstrap inherits stale projects + warehouses
+    // and the operator hits "warehouse not found" on every query.
+    // Drop the Lakekeeper-owned Postgres database here so re-install
+    // truly starts fresh.
+    //
+    // Best-effort: if Postgres is already stopped (e.g. uninstalled
+    // in the same rollback before Lakekeeper) the DROP fails
+    // silently. The service uninstall continues either way.
+    let mut out = service::uninstall_service("lakekeeper", &opts.root_dir, &opts.unit_name, None).await?;
+    if let Err(e) = drop_lakekeeper_postgres_database().await {
+        out.warn(format!("postgres cleanup: {e}"));
+    } else {
+        out.ok("dropped postgres lakekeeper database");
+    }
+    Ok(out)
+}
+
+/// Best-effort: drop the `lakekeeper` Postgres database via the
+/// local postgres superuser socket. Returns an Err only when psql
+/// is reachable but the command itself failed; "no postgres
+/// running" returns Ok so the rollback flow continues unimpeded.
+async fn drop_lakekeeper_postgres_database() -> std::result::Result<(), String> {
+    use tokio::process::Command;
+    // peer-auth via /var/run/postgresql -- works when postgres is
+    // running under its default unix socket. If postgres isn't
+    // installed / running, the spawn itself fails and we exit Ok.
+    let probe = Command::new("sudo")
+        .args(["-u", "postgres", "psql", "-c", "SELECT 1"])
+        .output()
+        .await;
+    match probe {
+        Ok(out) if !out.status.success() => {
+            // Postgres reachable but refused the query -- typically
+            // means it's stopped or the socket is at a non-default
+            // path. Not fatal.
+            return Ok(());
+        }
+        Err(_) => return Ok(()),
+        _ => {}
+    }
+    // Terminate any existing connections to the lakekeeper db
+    // before dropping (Postgres refuses DROP DATABASE with active
+    // sessions). Then drop. Both run as the postgres superuser.
+    let _ = Command::new("sudo")
+        .args([
+            "-u",
+            "postgres",
+            "psql",
+            "-c",
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'lakekeeper';",
+        ])
+        .output()
+        .await;
+    let drop = Command::new("sudo")
+        .args(["-u", "postgres", "psql", "-c", "DROP DATABASE IF EXISTS lakekeeper;"])
+        .output()
+        .await
+        .map_err(|e| format!("spawn psql DROP: {e}"))?;
+    if !drop.status.success() {
+        return Err(format!(
+            "DROP DATABASE lakekeeper exited {}: {}",
+            drop.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&drop.stderr)
+        ));
+    }
+    Ok(())
 }
 
 pub async fn detect_installed() -> Vec<crate::detect::DetectedInstall> {
