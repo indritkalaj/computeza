@@ -4517,7 +4517,6 @@ fn render_studio_page(
     let sql_placeholder = localizer.t("ui-studio-sql-placeholder");
     let sql_run = localizer.t("ui-studio-sql-run");
     let sql_help = localizer.t("ui-studio-sql-help");
-    let results_empty = localizer.t("ui-studio-results-empty");
     let err_no_lakekeeper = localizer.t("ui-studio-error-no-lakekeeper");
     let err_no_databend = localizer.t("ui-studio-error-no-databend");
     let lk_unreachable = localizer.t("ui-studio-lakekeeper-unreachable");
