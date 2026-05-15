@@ -237,6 +237,30 @@ pub async fn install(
         "trino: wrote node/config/jvm/log properties"
     );
 
+    // Trino ships `bin/launcher` with a `#!/usr/bin/env python`
+    // shebang. Modern Linux distros (Ubuntu 20.04+, Debian 11+,
+    // RHEL 9+) only ship `python3` -- the unversioned `python`
+    // binary is gone unless the operator explicitly installs
+    // `python-is-python3`. Without this patch the service unit
+    // fails with `env: 'python': No such file or directory`
+    // (exit 127) and systemd restart-loops forever. We rewrite the
+    // shebang at install time; the launcher script itself is
+    // Python-3-compatible (Trino dropped Python 2 long before 442).
+    let launcher_script = bin_dir.join("launcher");
+    if let Ok(body) = fs::read_to_string(&launcher_script).await {
+        if body.starts_with("#!/usr/bin/env python\n")
+            || body.starts_with("#!/usr/bin/env python\r\n")
+        {
+            let patched = body.replacen(
+                "#!/usr/bin/env python",
+                "#!/usr/bin/env python3",
+                1,
+            );
+            fs::write(&launcher_script, patched).await?;
+            info!("trino: patched bin/launcher shebang to python3");
+        }
+    }
+
     // Step 3: systemd unit. Trino's `launcher run` is the foreground
     // invocation systemd-managed services should use; `launcher
     // start` daemonises which conflicts with systemd's process
