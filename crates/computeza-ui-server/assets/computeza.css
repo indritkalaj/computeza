@@ -210,8 +210,7 @@ body.cz-sidenav-open { padding-left: 220px; }
   margin: 0 0.4rem 0.5rem;
   border-radius: var(--radius-sm);
   color: var(--muted);
-  font-family: 'Geist Mono', ui-monospace, monospace;
-  font-size: 1rem;
+  font-size: 0.95rem;
   background: transparent;
   border: 1px solid transparent;
   cursor: pointer;
@@ -219,8 +218,16 @@ body.cz-sidenav-open { padding-left: 220px; }
   padding: 0;
 }
 .cz-sidenav-toggle:hover { background: var(--navy-3); color: var(--ink); }
-.cz-sidenav-toggle::before { content: "≡"; }
-body.cz-sidenav-open .cz-sidenav-toggle::before { content: "←"; }
+/* FontAwesome glyph driven by ::before; swap class via JS toggle.
+   font-family is the FA web-font name; weight 900 = solid set. */
+.cz-sidenav-toggle::before {
+  font-family: "Font Awesome 6 Free";
+  font-weight: 900;
+  content: "\f0c9"; /* fa-bars */
+}
+body.cz-sidenav-open .cz-sidenav-toggle::before {
+  content: "\f100"; /* fa-angles-left */
+}
 body.cz-sidenav-open .cz-sidenav-toggle {
   justify-content: flex-start;
   padding: 0 0.85rem;
@@ -231,6 +238,17 @@ body.cz-sidenav-open .cz-sidenav-toggle::after {
   font-family: 'Geist', system-ui, sans-serif;
   font-size: 0.78rem;
   color: var(--muted);
+}
+
+/* Make the FA icon inside each rail item the same baseline width so
+   labels line up. fa-fw on the <i> already does this; the rule
+   below is the fallback if FA fails to load (the glyph slot stays
+   reserved). */
+.cz-sidenav-item > i.fa-solid,
+.cz-sidenav-item > i.fa-regular {
+  width: 1.1rem;
+  text-align: center;
+  font-size: 0.95rem;
 }
 
 /* Section header: hidden when collapsed, shown when expanded.

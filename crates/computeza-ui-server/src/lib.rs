@@ -10812,6 +10812,12 @@ pub fn render_shell(
 <title>{page_title} -- {app_title}</title>
 <link rel="icon" type="image/svg+xml" href="/static/brand/computeza-favicon.svg" />
 <link rel="stylesheet" href="/static/computeza.css" />
+<!-- Font Awesome 6 Free (solid + regular). Pinned to a specific
+     SRI-able CDN release so a silent upstream change can't break
+     the chrome. Operators on isolated networks can self-host the
+     same release under /static/ and swap this href; the icon
+     classes (fa-solid fa-...) stay identical. -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.5.2/css/all.min.css" />
 </head>
 <body>
 <div class="cz-topbar">
@@ -10825,28 +10831,28 @@ pub fn render_shell(
   <button type="button" class="cz-sidenav-toggle" id="cz-sidenav-toggle" aria-label="Toggle navigation rail"></button>
   <div class="cz-sidenav-section">
     <div class="cz-sidenav-section-header">Build</div>
-    <a href="/studio" class="cz-sidenav-item {nwks}" data-label="{nav_studio}"><span>⌬</span><span class="cz-sidenav-label">{nav_studio}</span></a>
-    <a href="/install" class="cz-sidenav-item {ni}" data-label="{nav_install}"><span>↓</span><span class="cz-sidenav-label">{nav_install}</span></a>
-    <a href="/components" class="cz-sidenav-item {nc}" data-label="{nav_components}"><span>▦</span><span class="cz-sidenav-label">{nav_components}</span></a>
-    <a href="/install-guide" class="cz-sidenav-item {nig}" data-label="Install guide"><span>?</span><span class="cz-sidenav-label">Install guide</span></a>
+    <a href="/studio" class="cz-sidenav-item {nwks}" data-label="{nav_studio}"><i class="fa-solid fa-flask fa-fw"></i><span class="cz-sidenav-label">{nav_studio}</span></a>
+    <a href="/install" class="cz-sidenav-item {ni}" data-label="{nav_install}"><i class="fa-solid fa-cloud-arrow-down fa-fw"></i><span class="cz-sidenav-label">{nav_install}</span></a>
+    <a href="/components" class="cz-sidenav-item {nc}" data-label="{nav_components}"><i class="fa-solid fa-cubes fa-fw"></i><span class="cz-sidenav-label">{nav_components}</span></a>
+    <a href="/install-guide" class="cz-sidenav-item {nig}" data-label="Install guide"><i class="fa-solid fa-book-open fa-fw"></i><span class="cz-sidenav-label">Install guide</span></a>
   </div>
   <div class="cz-sidenav-sep"></div>
   <div class="cz-sidenav-section">
     <div class="cz-sidenav-section-header">Operate</div>
-    <a href="/status" class="cz-sidenav-item {ns}" data-label="{nav_status}"><span>◉</span><span class="cz-sidenav-label">{nav_status}</span></a>
-    <a href="/state" class="cz-sidenav-item {nm}" data-label="{nav_state}"><span>≣</span><span class="cz-sidenav-label">{nav_state}</span></a>
-    <a href="/audit" class="cz-sidenav-item {naud}" data-label="{nav_audit}"><span>⌗</span><span class="cz-sidenav-label">{nav_audit}</span></a>
-    <a href="/compliance/eu-ai-act" class="cz-sidenav-item {ncmp}" data-label="Compliance"><span>⚖</span><span class="cz-sidenav-label">Compliance</span></a>
+    <a href="/status" class="cz-sidenav-item {ns}" data-label="{nav_status}"><i class="fa-solid fa-heart-pulse fa-fw"></i><span class="cz-sidenav-label">{nav_status}</span></a>
+    <a href="/state" class="cz-sidenav-item {nm}" data-label="{nav_state}"><i class="fa-solid fa-database fa-fw"></i><span class="cz-sidenav-label">{nav_state}</span></a>
+    <a href="/audit" class="cz-sidenav-item {naud}" data-label="{nav_audit}"><i class="fa-solid fa-clipboard-list fa-fw"></i><span class="cz-sidenav-label">{nav_audit}</span></a>
+    <a href="/compliance/eu-ai-act" class="cz-sidenav-item {ncmp}" data-label="Compliance"><i class="fa-solid fa-scale-balanced fa-fw"></i><span class="cz-sidenav-label">Compliance</span></a>
   </div>
   <div class="cz-sidenav-sep"></div>
   <div class="cz-sidenav-section">
     <div class="cz-sidenav-section-header">Admin</div>
-    <a href="/admin/secrets" class="cz-sidenav-item {na}" data-label="{nav_secrets}"><span>⚿</span><span class="cz-sidenav-label">{nav_secrets}</span></a>
-    <a href="/admin/operators" class="cz-sidenav-item {nops}" data-label="{nav_admin_operators}"><span>☥</span><span class="cz-sidenav-label">{nav_admin_operators}</span></a>
-    <a href="/admin/groups" class="cz-sidenav-item {ngrp}" data-label="{nav_admin_groups}"><span>⌬</span><span class="cz-sidenav-label">{nav_admin_groups}</span></a>
-    <a href="/admin/tenants" class="cz-sidenav-item {nwsp}" data-label="{nav_admin_tenants}"><span>⌘</span><span class="cz-sidenav-label">{nav_admin_tenants}</span></a>
-    <a href="/admin/branding" class="cz-sidenav-item {nbrd}" data-label="{nav_admin_branding}"><span>◈</span><span class="cz-sidenav-label">{nav_admin_branding}</span></a>
-    <a href="/admin/license" class="cz-sidenav-item {nlic}" data-label="{nav_admin_license}"><span>✦</span><span class="cz-sidenav-label">{nav_admin_license}</span></a>
+    <a href="/admin/secrets" class="cz-sidenav-item {na}" data-label="{nav_secrets}"><i class="fa-solid fa-key fa-fw"></i><span class="cz-sidenav-label">{nav_secrets}</span></a>
+    <a href="/admin/operators" class="cz-sidenav-item {nops}" data-label="{nav_admin_operators}"><i class="fa-solid fa-user-tie fa-fw"></i><span class="cz-sidenav-label">{nav_admin_operators}</span></a>
+    <a href="/admin/groups" class="cz-sidenav-item {ngrp}" data-label="{nav_admin_groups}"><i class="fa-solid fa-users fa-fw"></i><span class="cz-sidenav-label">{nav_admin_groups}</span></a>
+    <a href="/admin/tenants" class="cz-sidenav-item {nwsp}" data-label="{nav_admin_tenants}"><i class="fa-solid fa-building fa-fw"></i><span class="cz-sidenav-label">{nav_admin_tenants}</span></a>
+    <a href="/admin/branding" class="cz-sidenav-item {nbrd}" data-label="{nav_admin_branding}"><i class="fa-solid fa-palette fa-fw"></i><span class="cz-sidenav-label">{nav_admin_branding}</span></a>
+    <a href="/admin/license" class="cz-sidenav-item {nlic}" data-label="{nav_admin_license}"><i class="fa-solid fa-certificate fa-fw"></i><span class="cz-sidenav-label">{nav_admin_license}</span></a>
   </div>
   <div class="cz-sidenav-spacer"></div>
 </nav>
