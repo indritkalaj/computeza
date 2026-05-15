@@ -5320,85 +5320,14 @@ window.czDownloadCsv = function (e) {{
   setTimeout(function () {{ URL.revokeObjectURL(url); }}, 1000);
 }};
 
-// ---------- AJAX form submit: replace just the results panel ----------
-// The Run-query form used to do a full-page POST + re-render of the
-// entire studio shell -- sidebar, file tree, editor, results. That
-// caused a visible white-flash and lost client-side state (editor
-// scroll position, dropdown choice). Hijack the submit, fetch the
-// new page in the background, and swap ONLY the .cz-studio-results
-// div. Fallback: if JS or fetch fails, the form submits normally.
-(function () {{
-  console.log("[czRun] init: starting AJAX wire-up");
-  var form = document.getElementById("cz-sql-form");
-  var results = document.querySelector(".cz-studio-results");
-  if (!form) {{ console.warn("[czRun] init: form #cz-sql-form NOT FOUND"); return; }}
-  if (!results) {{ console.warn("[czRun] init: .cz-studio-results NOT FOUND"); return; }}
-  if (typeof fetch !== "function") {{ console.warn("[czRun] init: fetch API missing"); return; }}
-  if (typeof DOMParser !== "function") {{ console.warn("[czRun] init: DOMParser missing"); return; }}
-  console.log("[czRun] init: wiring submit listener on form, action=" + form.action);
-  form.addEventListener("submit", function (e) {{
-    // Save buttons share the form via formaction=/save -- we only
-    // want to intercept the actual Run-query submit, identified by
-    // the submitter's lack of a custom formaction.
-    var submitter = e.submitter;
-    if (submitter && submitter.getAttribute("formaction")) {{
-      console.log("[czRun] non-run submitter -> letting form submit normally");
-      return;
-    }}
-    console.log("[czRun] intercepting submit, posting via fetch");
-    e.preventDefault();
-    // Manually sync Monaco -> textarea before reading FormData.
-    // Monaco's own submit listener does this too, but it's
-    // registered LATER than ours (Monaco loads async after the
-    // inline script), so on the natural submit event we'd serialize
-    // a stale textarea value. The sibling sync listener still
-    // fires for non-AJAX fallback paths.
-    try {{
-      if (typeof monaco !== "undefined" && monaco.editor && monaco.editor.getEditors) {{
-        var editors = monaco.editor.getEditors();
-        if (editors && editors.length > 0) {{
-          var ta = document.getElementById("cz-sql-textarea");
-          if (ta) {{
-            ta.value = editors[0].getValue();
-            console.log("[czRun] synced Monaco -> textarea, length=" + ta.value.length);
-          }}
-        }}
-      }}
-    }} catch (_) {{ /* Monaco may not have loaded; textarea is fine */ }}
-    // Visual cue while the request is in flight: dim the panel +
-    // disable the Run button so a double-click can't fire twice.
-    results.classList.add("cz-studio-results-loading");
-    var runBtn = form.querySelector('button[type="submit"]:not([formaction])');
-    if (runBtn) runBtn.disabled = true;
-    var data = new FormData(form);
-    fetch(form.action, {{
-      method: "POST",
-      body: data,
-      credentials: "same-origin",
-      headers: {{ "Accept": "text/html" }}
-    }})
-      .then(function (r) {{ return r.text(); }})
-      .then(function (html) {{
-        var doc = new DOMParser().parseFromString(html, "text/html");
-        var fresh = doc.querySelector(".cz-studio-results");
-        if (fresh) {{
-          results.innerHTML = fresh.innerHTML;
-        }} else {{
-          // Fallback to full reload if the response didn't include
-          // a results panel (auth redirect, etc).
-          window.location.reload();
-        }}
-      }})
-      .catch(function () {{
-        // Network blip -- let the form fall through to a normal POST.
-        form.submit();
-      }})
-      .finally(function () {{
-        results.classList.remove("cz-studio-results-loading");
-        if (runBtn) runBtn.disabled = false;
-      }});
-  }});
-}})();
+// AJAX form submit was disabled -- the DOMParser swap was silently
+// failing in some browser contexts and the result was worse than
+// the original full-page refresh (operator clicked Run and saw
+// nothing change). Reverted to the simple form submit -- the
+// browser does a full POST + page render, which is fast and
+// always works. Editor state preservation across submit will
+// land in a follow-up that posts JSON to a dedicated /api/sql
+// endpoint instead of trying to scrape the full page.
 </script>
 <script>
 // Monaco editor progressive enhancement.

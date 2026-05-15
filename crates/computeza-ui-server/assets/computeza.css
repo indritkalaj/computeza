@@ -1957,13 +1957,6 @@ details > summary::-webkit-details-marker { display: none; }
   background: var(--navy-3);
 }
 
-/* AJAX-loading state: dim the panel while a Run-query fetch is
-   in flight so the operator gets feedback even on a fast query. */
-.cz-studio-results.cz-studio-results-loading {
-  opacity: 0.45;
-  transition: opacity 0.15s ease-out;
-  pointer-events: none;
-}
 .cz-studio-results-empty {
   padding: 2rem 1.25rem;
   text-align: center;
