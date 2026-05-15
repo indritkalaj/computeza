@@ -4934,7 +4934,7 @@ fn render_studio_page(
     };
     let file_actions_html = match files.active_file() {
         Some(f) => format!(
-            r##"<form method="post" action="/studio/files/{id}/duplicate" style="margin:0;display:inline;">{csrf}<input type="hidden" name="open" value="{open}" /><button type="submit" class="cz-btn-ghost" title="Duplicate {path}">Duplicate</button></form>
+            r##"<button type="submit" class="cz-btn-ghost" formaction="/studio/files/{id}/duplicate" formmethod="post" title="Duplicate {path}">Duplicate</button>
 <a href="#cz-delete-toolbar-{id}" class="cz-btn-danger" title="Delete {path}">Delete</a>
 <a href="/studio/files/{id}/export" class="cz-btn-ghost" title="Download {path}">Export</a>
 <div id="cz-delete-toolbar-{id}" class="cz-modal-overlay" role="dialog" aria-labelledby="cz-delete-toolbar-{id}-title" aria-modal="true">
@@ -4943,20 +4943,13 @@ fn render_studio_page(
 <a href="#" class="cz-modal-close" aria-label="Close">×</a>
 <h2 id="cz-delete-toolbar-{id}-title" class="cz-modal-title">Delete file?</h2>
 <p class="cz-modal-subtitle">This will permanently delete <code>{path}</code>. The file cannot be recovered.</p>
-<form method="post" action="/studio/files/{id}/delete">
-{csrf}
-<input type="hidden" name="open" value="{open_csv}" />
 <div class="cz-modal-actions">
 <a href="#" class="cz-btn-ghost">Cancel</a>
-<button type="submit" class="cz-btn-danger">Delete file</button>
+<button type="submit" class="cz-btn-danger" formaction="/studio/files/{id}/delete" formmethod="post">Delete file</button>
 </div>
-</form>
 </div>
 </div>"##,
-            csrf = csrf_str,
             id = url_encode(&f.id),
-            open = html_escape(&open_csv),
-            open_csv = html_escape(&open_csv),
             path = html_escape(&f.path),
         ),
         None => String::new(),
@@ -5382,9 +5375,40 @@ window.czDownloadCsv = function (e) {{
         .replace(/&quot;/g, '"')
         .replace(/&#39;/g, "'");
 
+      // Pick the initial syntax mode based on the current editor
+      // body + the operator's saved override. detect_pythonish
+      // mirrors the heuristic in detect_query_language (Rust side)
+      // and the Auto-detect popover JS. Switches at runtime via
+      // the listener installed below when the operator types or
+      // flips the language dropdown.
+      function detectPythonish(src) {{
+        var lines = (src || "").split(/\r?\n/);
+        var SQL_HEADS = [
+          "SELECT","WITH","INSERT","UPDATE","DELETE","MERGE","CREATE","DROP",
+          "ALTER","TRUNCATE","USE","SHOW","DESCRIBE","DESC","EXPLAIN","GRANT",
+          "REVOKE","CALL","REFRESH","OPTIMIZE","VACUUM","ANALYZE","COPY","SET"
+        ];
+        for (var i = 0; i < lines.length; i++) {{
+          var t = lines[i].trim();
+          if (!t) continue;
+          if (t.indexOf("--") === 0) continue;
+          if (t.indexOf("#") === 0) return true;
+          var first = (t.split(/\s+/)[0] || "").toUpperCase().replace(/[^A-Z]/g, "");
+          return SQL_HEADS.indexOf(first) < 0;
+        }}
+        return false;
+      }}
+      function pickMonacoLang() {{
+        var hidden = document.getElementById("cz-sql-lang-value");
+        var override = hidden ? hidden.value : "auto";
+        if (override === "sql") return "sql";
+        if (override === "python") return "python";
+        return detectPythonish(initial) ? "python" : "sql";
+      }}
+
       var editor = monaco.editor.create(mount, {{
         value: initial,
-        language: "sql",
+        language: pickMonacoLang(),
         theme: "vs-dark",
         automaticLayout: true,
         minimap: {{ enabled: false }},
@@ -5397,6 +5421,28 @@ window.czDownloadCsv = function (e) {{
         // don't fight Monaco's built-in keyword completion which
         // already triggers on letters.
         suggest: {{ showWords: true }},
+      }});
+
+      // Re-pick syntax mode whenever the editor content changes
+      // (auto-detect crossing the SQL/Python boundary) or when
+      // the operator clicks a language-pill option. Cheap: Monaco
+      // only re-tokenizes the visible viewport.
+      function applyLang() {{
+        var hidden = document.getElementById("cz-sql-lang-value");
+        var override = hidden ? hidden.value : "auto";
+        var lang;
+        if (override === "sql") lang = "sql";
+        else if (override === "python") lang = "python";
+        else lang = detectPythonish(editor.getValue()) ? "python" : "sql";
+        var model = editor.getModel();
+        if (model && model.getLanguageId() !== lang) {{
+          monaco.editor.setModelLanguage(model, lang);
+        }}
+      }}
+      editor.onDidChangeModelContent(applyLang);
+      // Tap into clicks on each lang-option button.
+      document.querySelectorAll(".cz-studio-lang-option").forEach(function (opt) {{
+        opt.addEventListener("click", function () {{ setTimeout(applyLang, 0); }});
       }});
 
       // Schema-aware completion provider. Fetches from
