@@ -30,7 +30,7 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 axum = { workspace = true }
 # HTTP client used by the /workspace handlers to talk to the local
-# Lakekeeper REST catalog + Databend HTTP query handler. The
+# Lakekeeper REST catalog + Trino /v1/statement coordinator. The
 # reconciler crates have their own HTTP clients but only expose
 # health-probe shapes; the workspace UI needs catalog browse and
 # SQL execute, which are direct passthroughs to each component's

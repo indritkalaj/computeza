@@ -545,6 +545,7 @@ a.cz-card:hover {
 .cz-badge-warn { color: var(--warn); background: var(--warn-faint); }
 .cz-badge-fail { color: var(--fail); background: var(--fail-faint); }
 .cz-badge-info { color: var(--info); background: var(--info-faint); }
+.cz-badge-dim  { color: var(--muted); background: rgba(255, 255, 255, 0.04); }
 
 /* ---------- Buttons ---------- */
 .cz-btn {
@@ -1971,6 +1972,35 @@ details > summary::-webkit-details-marker { display: none; }
   line-height: 1.55;
 }
 .cz-studio-banner strong { color: var(--ink); }
+
+/* Ephemeral toast for file-explorer notices. Pinned bottom-right;
+   auto-fades after a few seconds. Server-rendered on the page that
+   the flash query-param landed on; the operator sees it briefly
+   then it disappears without taking up layout space. */
+.cz-toast {
+  position: fixed;
+  bottom: 1.5rem;
+  right: 1.5rem;
+  z-index: 10000;
+  background: var(--navy-1);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--ok, #6cc28a);
+  border-radius: var(--radius);
+  padding: 0.6rem 0.95rem;
+  font-size: 0.78rem;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
+  pointer-events: none;
+  animation: cz-toast-fade 3.4s ease-out forwards;
+  max-width: 320px;
+  line-height: 1.4;
+}
+@keyframes cz-toast-fade {
+  0%   { opacity: 0; transform: translateY(8px); }
+  10%  { opacity: 1; transform: translateY(0); }
+  85%  { opacity: 1; transform: translateY(0); }
+  100% { opacity: 0; transform: translateY(-4px); visibility: hidden; }
+}
 
 /* Item row in catalog browse */
 .cz-studio-list {

@@ -313,13 +313,13 @@ ui-studio-catalog-fill-link  = Pre-fill SELECT *
 ui-studio-sql-heading        = SQL
 ui-studio-sql-placeholder    = SELECT 1
 ui-studio-sql-run            = Run query
-ui-studio-sql-help           = Hits Databend's HTTP query handler. Reads + writes from this editor are unrestricted in v0.0.x; per-user RLS lands in the Functions milestone (see AGENTS.md "Deferred work").
+ui-studio-sql-help           = Hits Trino's `/v1/statement` HTTP coordinator. Reads + writes from this editor are unrestricted in v0.0.x; per-user RLS lands in the Functions milestone (see AGENTS.md "Deferred work").
 ui-studio-results-heading    = Results
 ui-studio-results-empty      = Run a query above to see results.
 ui-studio-error-no-lakekeeper = No Lakekeeper instance is registered. Install Lakekeeper from /install before using the catalog browser.
-ui-studio-error-no-databend   = No Databend instance is registered. Install Databend from /install before running SQL.
+ui-studio-error-no-databend   = No Trino instance is registered. Install Trino from /install before running SQL.
 ui-nav-status         = Status
-ui-nav-state          = Metadata store
+ui-nav-state          = Metadata Store
 
 # --- Status page ---
 
@@ -333,6 +333,7 @@ ui-status-col-state     = State
 ui-status-state-ok      = Observing
 ui-status-state-failed  = Failed
 ui-status-state-unknown = Unknown
+ui-status-state-not-installed = Not installed
 ui-status-empty         = No resources have been observed yet. Bind a reconciler with `.with_state(store, instance_name)` and run it to populate this view.
 ui-status-store-missing = No metadata store is attached to this server. Start it with `computeza serve` (the binary wires a SqliteStore automatically) to see live reconciler state here.
 

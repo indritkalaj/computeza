@@ -686,8 +686,8 @@ pub fn router_with_state(state: AppState) -> Router {
             post(studio_catalog_namespace_create_handler),
         )
         .route(
-            "/studio/catalog/{warehouse}/wire-databend",
-            post(studio_catalog_wire_databend_handler),
+            "/studio/catalog/{warehouse}/wire-trino",
+            post(studio_catalog_wire_trino_handler),
         )
         .route(
             "/studio/catalog/{warehouse}/{namespace}",
@@ -1037,16 +1037,17 @@ async fn record_studio_history(
     }
 }
 
-/// Same shape as `discover_lakekeeper_endpoint`, for Databend.
-/// Phase 1 hits the HTTP query handler directly; multi-tenant
-/// dispatch (one databend per studio group) lands in phase B
-/// of the studio roadmap.
-async fn discover_databend_endpoint(
+/// Trino's HTTP coordinator URL discovered from the metadata store.
+/// Studio's SQL editor routes every SQL query here; the bootstrap
+/// step writes Iceberg-REST catalog properties files against this
+/// endpoint via the driver helper. Returns None if no trino-instance
+/// row is registered (Trino not installed yet).
+async fn discover_trino_endpoint(
     store: Option<&computeza_state::SqliteStore>,
 ) -> Option<String> {
     use computeza_state::Store;
     let store = store?;
-    let rows = store.list("databend-instance", None).await.ok()?;
+    let rows = store.list("trino-instance", None).await.ok()?;
     let sr = rows.into_iter().next()?;
     let spec: StudioEndpointSpec = serde_json::from_value(sr.spec).ok()?;
     Some(spec.endpoint.base_url)
@@ -1903,20 +1904,19 @@ struct CreateNamespaceForm {
     name: String,
 }
 
-/// POST /studio/catalog/{warehouse}/wire-databend
+/// POST /studio/catalog/{warehouse}/wire-trino
 ///
-/// Re-fires `CREATE CATALOG` against Databend for an already-
-/// bootstrapped warehouse, using credentials cached in vault. Lets
-/// the operator wire SQL access on demand without re-entering keys --
-/// useful when:
+/// Re-fires `CREATE CATALOG` against Trino for an already-bootstrapped
+/// warehouse, using credentials cached in vault. Lets the operator
+/// wire SQL access on demand without re-entering keys -- useful when:
 ///   - Lakekeeper was bootstrapped before the auto-wire shipped
-///   - Databend was installed AFTER the original bootstrap
+///   - Trino was installed AFTER the original bootstrap
 ///   - The CREATE CATALOG silently failed during bootstrap (network
 ///     glitch, missing meta, version mismatch) and needs a retry
 ///
 /// Redirects back to the warehouse page with `?err=...` on failure or
 /// `?wired=...` on success so the operator sees the outcome inline.
-async fn studio_catalog_wire_databend_handler(
+async fn studio_catalog_wire_trino_handler(
     State(state): State<AppState>,
     axum::extract::Path(warehouse): axum::extract::Path<String>,
 ) -> axum::response::Redirect {
@@ -1965,7 +1965,7 @@ async fn studio_catalog_wire_databend_handler(
     };
     // First attempt -- uses the vault-cached UUID (set by drill-down
     // auto-recovery, so usually fresh + reachable).
-    let attempt = wire_databend_iceberg_catalog(
+    let attempt = wire_trino_iceberg_catalog(
         state.store.as_deref(),
         state.secrets.as_deref(),
         &lakekeeper_url,
@@ -1979,14 +1979,14 @@ async fn studio_catalog_wire_databend_handler(
     // retry. Single retry only -- if recovery itself fails, surface
     // the original error so the operator has full context.
     let final_outcome = match attempt {
-        DatabendWiringOutcome::Failed { ref reason }
+        TrinoWiringOutcome::Failed { ref reason }
             if reason.to_lowercase().contains("nosuchwarehouse")
                 || reason.to_lowercase().contains("warehouseidisnotuuid") =>
         {
             tracing::warn!(
                 warehouse = %warehouse,
                 first_error = %reason,
-                "wire-databend: NoSuchWarehouse on first attempt; running auto-recovery"
+                "wire-trino: NoSuchWarehouse on first attempt; running auto-recovery"
             );
             match try_recover_missing_warehouse(
                 &warehouse,
@@ -2000,13 +2000,9 @@ async fn studio_catalog_wire_databend_handler(
                     tracing::info!(
                         warehouse = %warehouse,
                         prefix = %recovered_id,
-                        "wire-databend: auto-recovery succeeded; retrying CREATE CATALOG with fresh UUID"
+                        "wire-trino: auto-recovery succeeded; retrying CREATE CATALOG with fresh UUID"
                     );
-                    // try_recover_missing_warehouse persists the new
-                    // UUID under lakekeeper/default-warehouse-id, so
-                    // the next wire_databend call reads it via the
-                    // same vault tier.
-                    wire_databend_iceberg_catalog(
+                    wire_trino_iceberg_catalog(
                         state.store.as_deref(),
                         state.secrets.as_deref(),
                         &lakekeeper_url,
@@ -2021,17 +2017,17 @@ async fn studio_catalog_wire_databend_handler(
     };
 
     match final_outcome {
-        DatabendWiringOutcome::Wired { catalog_name } => axum::response::Redirect::to(&format!(
+        TrinoWiringOutcome::Wired { catalog_name } => axum::response::Redirect::to(&format!(
             "{base_redirect}?wired={}",
             url_encode(&format!(
-                "SQL catalog `{catalog_name}` is now registered with Databend. Run `SELECT * FROM {catalog_name}.<schema>.<table>` in the editor."
+                "SQL catalog `{catalog_name}` is now registered with Trino. Run `SELECT * FROM {catalog_name}.<schema>.<table>` in the editor."
             ))
         )),
-        DatabendWiringOutcome::DatabendUnavailable => err_redirect(
-            "Databend isn't installed or discoverable. Install it from /install and try again.",
+        TrinoWiringOutcome::TrinoUnavailable => err_redirect(
+            "Trino isn't installed or discoverable. Install it from /install and try again.",
         ),
-        DatabendWiringOutcome::Failed { reason } => err_redirect(&format!(
-            "Databend rejected CREATE CATALOG:\n{reason}\n\nMost likely cause: the Databend version doesn't accept Iceberg-REST as a catalog type, or the CREATE CATALOG syntax drifted. Adjust wire_databend_iceberg_catalog() and re-run."
+        TrinoWiringOutcome::Failed { reason } => err_redirect(&format!(
+            "Trino rejected CREATE CATALOG:\n{reason}\n\nMost likely cause: the Trino coordinator is up but Iceberg-REST returned an error (wrong warehouse name, missing project, S3 credentials drift). Inspect /etc/computeza/trino/etc/catalog/ on the host + the Trino log to drill in."
         )),
     }
 }
@@ -2697,7 +2693,7 @@ fn render_studio_namespace_list(
     };
 
     let wire_form = format!(
-        r#"<form method="post" action="/studio/catalog/{wh_enc}/wire-databend" style="margin: 0;" title="Re-fire CREATE CATALOG against Databend so the SQL editor can read tables in this warehouse. Uses credentials cached in vault from the original bootstrap.">{csrf}
+        r#"<form method="post" action="/studio/catalog/{wh_enc}/wire-trino" style="margin: 0;" title="Re-fire CREATE CATALOG against Trino so the SQL editor can read tables in this warehouse. Uses credentials cached in vault from the original bootstrap.">{csrf}
 <button type="submit" class="cz-btn-ghost">Connect to SQL</button>
 </form>"#,
         wh_enc = url_encode(warehouse),
@@ -2961,7 +2957,7 @@ fn render_studio_table_detail(
 <div class="cz-studio-actions" style="margin-top: 1.25rem;">
 <a href="/studio?sql={prefill_enc}" class="cz-btn-primary">Pre-fill SELECT * in editor</a>
 <span class="cz-studio-actions-spacer"></span>
-<span class="cz-studio-editor-hint" style="margin: 0;">Reads <code>{catalog_ident}.{ns_display}.{tbl_display}</code> via the Databend catalog the bootstrap step registered. If the editor can't find this catalog, re-run <a href="/studio/bootstrap">bootstrap</a> with Databend installed.</span>
+<span class="cz-studio-editor-hint" style="margin: 0;">Reads <code>{catalog_ident}.{ns_display}.{tbl_display}</code> via the Trino catalog the bootstrap step registered. If the editor can't find this catalog, re-run <a href="/studio/bootstrap">bootstrap</a> with Trino installed.</span>
 </div>
 <details style="margin-top: 1.75rem;">
 <summary class="cz-studio-raw-summary">Raw Iceberg metadata (JSON)</summary>
@@ -3100,7 +3096,7 @@ async fn studio_handler(
 ) -> Html<String> {
     let l = Localizer::english();
     let lakekeeper = discover_lakekeeper_endpoint(state.store.as_deref()).await;
-    let databend = discover_databend_endpoint(state.store.as_deref()).await;
+    let trino = discover_trino_endpoint(state.store.as_deref()).await;
     let lk_state = match &lakekeeper {
         Some(url) => probe_lakekeeper_with_vault_fallback(url, state.secrets.as_deref()).await,
         None => LakekeeperState::Unreachable,
@@ -3120,7 +3116,7 @@ async fn studio_handler(
     Html(render_studio_page(
         &l,
         lakekeeper.is_some(),
-        databend.is_some(),
+        trino.is_some(),
         &lk_state,
         &history,
         &sql_prefill,
@@ -3616,14 +3612,14 @@ struct CompletionItem {
 /// GET /studio/api/completions
 ///
 /// Aggregates symbol sources for Monaco's autocomplete:
-///   - Databend databases + tables (via `system.databases` /
-///     `system.tables` queries to the live HTTP handler).
+///   - Trino catalogs + schemas (via `SHOW CATALOGS` /
+///     `SHOW SCHEMAS FROM <catalog>` queries to /v1/statement).
 ///   - Lakekeeper warehouse names (via the same management API
 ///     `probe_lakekeeper` uses).
 ///   - Recent queries from studio history (deduplicated; the
 ///     full SQL inserts as a snippet).
 ///
-/// Each source is best-effort: a Databend outage skips its symbols
+/// Each source is best-effort: a Trino outage skips its symbols
 /// but still returns warehouses + history. The endpoint never
 /// fails the request -- Monaco just gets a shorter list.
 async fn studio_completions_handler(
@@ -3631,39 +3627,53 @@ async fn studio_completions_handler(
 ) -> axum::Json<CompletionSource> {
     let mut items: Vec<CompletionItem> = Vec::new();
 
-    // Databend symbols
-    if let Some(url) = discover_databend_endpoint(state.store.as_deref()).await {
-        // Databases -- system.databases ships built-in
-        if let SqlOutcome::Ok { rows, .. } =
-            execute_sql_against_databend(&url, "SELECT name FROM system.databases ORDER BY name").await
+    // Trino symbols. Trino's `SHOW CATALOGS` / `SHOW SCHEMAS FROM
+    // <catalog>` produces a single-column result, which we slice up
+    // into completion entries. We list catalogs (= Lakekeeper
+    // warehouses) and then the schemas of every catalog Trino has
+    // registered; tables-per-schema would be a third pass but most
+    // operators type the schema dot first.
+    if let Some(url) = discover_trino_endpoint(state.store.as_deref()).await {
+        let catalog_rows = if let SqlOutcome::Ok { rows, .. } =
+            execute_sql_against_trino(&url, "SHOW CATALOGS").await
         {
-            for r in rows {
-                if let Some(name) = r.first() {
-                    items.push(CompletionItem {
-                        label: name.clone(),
-                        insert: name.clone(),
-                        kind: "database",
-                        detail: Some("database".to_string()),
-                    });
+            rows
+        } else {
+            Vec::new()
+        };
+        let mut catalog_names: Vec<String> = Vec::new();
+        for r in &catalog_rows {
+            if let Some(name) = r.first() {
+                // Skip Trino's built-in system / jmx / tpch catalogs;
+                // the operator's iceberg catalogs are what matter.
+                if matches!(name.as_str(), "system" | "jmx" | "tpch" | "tpcds") {
+                    continue;
                 }
+                items.push(CompletionItem {
+                    label: name.clone(),
+                    insert: name.clone(),
+                    kind: "catalog",
+                    detail: Some("Trino catalog".to_string()),
+                });
+                catalog_names.push(name.clone());
             }
         }
-        // Tables -- system.tables joins back to its database column
-        if let SqlOutcome::Ok { rows, .. } = execute_sql_against_databend(
-            &url,
-            "SELECT database, name FROM system.tables WHERE database NOT IN ('system','information_schema') ORDER BY database, name",
-        )
-        .await
-        {
-            for r in rows {
-                if let (Some(db), Some(name)) = (r.first(), r.get(1)) {
-                    let qualified = format!("{db}.{name}");
-                    items.push(CompletionItem {
-                        label: qualified.clone(),
-                        insert: qualified,
-                        kind: "table",
-                        detail: Some(format!("table in {db}")),
-                    });
+        for cat in &catalog_names {
+            let q = format!("SHOW SCHEMAS FROM {cat}");
+            if let SqlOutcome::Ok { rows, .. } = execute_sql_against_trino(&url, &q).await {
+                for r in rows {
+                    if let Some(schema) = r.first() {
+                        if matches!(schema.as_str(), "information_schema") {
+                            continue;
+                        }
+                        let qualified = format!("{cat}.{schema}");
+                        items.push(CompletionItem {
+                            label: qualified.clone(),
+                            insert: qualified,
+                            kind: "schema",
+                            detail: Some(format!("schema in {cat}")),
+                        });
+                    }
                 }
             }
         }
@@ -3717,21 +3727,21 @@ async fn studio_sql_execute_handler(
 ) -> Html<String> {
     let l = Localizer::english();
     let lakekeeper = discover_lakekeeper_endpoint(state.store.as_deref()).await;
-    let databend = discover_databend_endpoint(state.store.as_deref()).await;
+    let trino = discover_trino_endpoint(state.store.as_deref()).await;
     let sail = discover_sail_endpoint(state.store.as_deref()).await;
 
     // Detect what kind of query this is and route accordingly.
-    // SQL goes to Databend; Python (or anything we can't confidently
+    // SQL goes to Trino; Python (or anything we can't confidently
     // call SQL) goes to Sail via the venv's Python interpreter.
     let language = detect_query_language(&form.sql);
     let routed = match language {
         QueryLanguage::Sql => {
-            let outcome = match &databend {
-                Some(url) => Some(execute_sql_against_databend(url, &form.sql).await),
+            let outcome = match &trino {
+                Some(url) => Some(execute_sql_against_trino(url, &form.sql).await),
                 None => None,
             };
             RoutedOutcome::Sql {
-                engine: ExecutedEngine::Databend,
+                engine: ExecutedEngine::Trino,
                 outcome,
             }
         }
@@ -3801,7 +3811,7 @@ async fn studio_sql_execute_handler(
     Html(render_studio_page(
         &l,
         lakekeeper.is_some(),
-        databend.is_some(),
+        trino.is_some(),
         &lk_state,
         &history,
         &form.sql,
@@ -3812,7 +3822,7 @@ async fn studio_sql_execute_handler(
 }
 
 /// Which language did the operator actually type? Routing key:
-/// SQL goes to Databend; Python goes to Sail. Anything we can't
+/// SQL goes to Trino; Python goes to Sail. Anything we can't
 /// confidently call SQL is treated as Python -- a wrong route shows
 /// a useful error from the wrong engine rather than silently
 /// pretending to succeed.
@@ -3823,18 +3833,18 @@ enum QueryLanguage {
 }
 
 /// Which engine produced an outcome. Surfaced on the result panel so
-/// the operator sees at a glance whether Databend or Sail ran the
+/// the operator sees at a glance whether Trino or Sail ran the
 /// query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExecutedEngine {
-    Databend,
+    Trino,
     Sail,
 }
 
 impl ExecutedEngine {
     fn label(&self) -> &'static str {
         match self {
-            ExecutedEngine::Databend => "Databend (SQL)",
+            ExecutedEngine::Trino => "Trino (SQL)",
             ExecutedEngine::Sail => "Sail (Spark Connect)",
         }
     }
@@ -4110,9 +4120,9 @@ except Exception:
     }
 }
 
-/// Outcome of forwarding a SQL query to Databend. Either a
-/// successful result set (columns + rows of stringified values) or
-/// an error message we can render verbatim.
+/// Outcome of forwarding a SQL query to Trino. Either a successful
+/// result set (columns + rows of stringified values) or an error
+/// message we can render verbatim.
 #[derive(Debug)]
 enum SqlOutcome {
     Ok {
@@ -4122,20 +4132,24 @@ enum SqlOutcome {
     Err(String),
 }
 
-/// POST to Databend's `/v1/query` HTTP handler with HTTP basic auth
-/// `root:root` (the credentials the install path provisions via
-/// `databend-query.toml`'s `[meta]` block). Returns either the
-/// parsed result or a stringified error for direct render.
+/// Execute a SQL statement against the local Trino coordinator via
+/// the documented HTTP client protocol. Trino's protocol:
 ///
-/// Databend's response shape (relevant subset):
-/// ```json
-/// {
-///   "schema": [{"name": "col", "type": "..."}, ...],
-///   "data":   [["v1", "v2"], ["v3", "v4"]],
-///   "error":  null | {"message": "..."}
-/// }
-/// ```
-async fn execute_sql_against_databend(base_url: &str, sql: &str) -> SqlOutcome {
+///   1. POST /v1/statement with the raw SQL as the request body
+///      (plain text, NOT JSON), `X-Trino-User` header required.
+///   2. The response is a JSON `QueryResults` document. If
+///      `nextUri` is present, GET it for the next page of results.
+///      Repeat until `nextUri` is absent (query is done).
+///   3. `columns` lands on the first page that has data; `data` is
+///      an array of arrays of cell values, may span multiple pages
+///      and we concatenate.
+///   4. On error, the `error` field carries `message` + `errorCode`.
+///
+/// `X-Trino-Catalog` is intentionally omitted -- Studio supports
+/// fully-qualified `<catalog>.<schema>.<table>` references so the
+/// operator can query any registered catalog from one editor
+/// without changing the session context.
+async fn execute_sql_against_trino(base_url: &str, sql: &str) -> SqlOutcome {
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
         .build()
@@ -4143,76 +4157,96 @@ async fn execute_sql_against_databend(base_url: &str, sql: &str) -> SqlOutcome {
         Ok(c) => c,
         Err(e) => return SqlOutcome::Err(format!("building HTTP client: {e}")),
     };
-    let url = format!("{}/v1/query", base_url.trim_end_matches('/'));
-    // Databend's `[[query.users]]` block (installed by databend.rs)
-    // defines `root` with `no_password` auth scoped to 127.0.0.1.
-    // HTTP basic auth still needs the username to identify the user;
-    // the password field is ignored by `no_password` so we pass `None`.
-    let resp = match client
-        .post(&url)
-        .basic_auth("root", None::<&str>)
-        .json(&serde_json::json!({ "sql": sql }))
+    let submit_url = format!("{}/v1/statement", base_url.trim_end_matches('/'));
+    // First request: POST the SQL as plain text. X-Trino-User is
+    // required by Trino's coordinator even when authn is disabled.
+    let initial = match client
+        .post(&submit_url)
+        .header("X-Trino-User", "computeza")
+        .header(reqwest::header::CONTENT_TYPE, "text/plain")
+        .body(sql.to_string())
         .send()
         .await
     {
         Ok(r) => r,
         Err(e) => {
             return SqlOutcome::Err(format!(
-                "could not reach Databend at {url}: {e}. Check /status -- the databend reconciler will show FAILED if the service is down."
+                "could not reach Trino at {submit_url}: {e}. Check /status -- the trino reconciler will show FAILED if the coordinator is down."
             ));
         }
     };
-    let status = resp.status();
-    let body: serde_json::Value = match resp.json().await {
-        Ok(b) => b,
+    let mut body: serde_json::Value = match initial.json().await {
+        Ok(v) => v,
         Err(e) => {
             return SqlOutcome::Err(format!(
-                "Databend returned HTTP {} but the body was not JSON: {e}",
-                status.as_u16()
+                "Trino /v1/statement returned non-JSON body: {e}"
             ));
         }
     };
-    if let Some(err) = body.get("error") {
-        // Databend's error shape varies across versions: sometimes
-        // `{"message": "..."}`, sometimes just a string, sometimes
-        // null. Stringify whatever's there so the operator sees it.
-        if !err.is_null() {
-            let msg = err
-                .get("message")
-                .and_then(|m| m.as_str())
-                .map(str::to_string)
-                .unwrap_or_else(|| err.to_string());
-            return SqlOutcome::Err(format!("Databend error: {msg}"));
+
+    let mut columns: Vec<String> = Vec::new();
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    // 60-iteration cap (~60s with the per-poll ~1s pacing Trino
+    // typically applies). A genuinely long query should produce
+    // partial results inside this window; longer-running analytics
+    // belong in a notebook session, not the Studio editor.
+    for _ in 0..60 {
+        if let Some(err) = body.get("error") {
+            if !err.is_null() {
+                let msg = err
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| err.to_string());
+                return SqlOutcome::Err(format!("Trino error: {msg}"));
+            }
+        }
+        if columns.is_empty() {
+            if let Some(cols) = body.get("columns").and_then(|v| v.as_array()) {
+                columns = cols
+                    .iter()
+                    .filter_map(|c| {
+                        c.get("name").and_then(|n| n.as_str()).map(str::to_string)
+                    })
+                    .collect();
+            }
+        }
+        if let Some(data) = body.get("data").and_then(|v| v.as_array()) {
+            for row in data {
+                if let Some(arr) = row.as_array() {
+                    rows.push(
+                        arr.iter()
+                            .map(|cell| {
+                                cell.as_str()
+                                    .map(str::to_string)
+                                    .unwrap_or_else(|| cell.to_string())
+                            })
+                            .collect(),
+                    );
+                }
+            }
+        }
+        let next_uri = body
+            .get("nextUri")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let Some(next) = next_uri else {
+            // No nextUri -> query is finished.
+            return SqlOutcome::Ok { columns, rows };
+        };
+        // Per Trino docs: headers are only needed on the initial
+        // POST; the GET to nextUri carries the session via the URI.
+        match client.get(&next).send().await {
+            Ok(r) => match r.json::<serde_json::Value>().await {
+                Ok(v) => body = v,
+                Err(e) => {
+                    return SqlOutcome::Err(format!("Trino nextUri body non-JSON: {e}"));
+                }
+            },
+            Err(e) => return SqlOutcome::Err(format!("Trino nextUri GET failed: {e}")),
         }
     }
-    let columns: Vec<String> = body
-        .get("schema")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|c| c.get("name").and_then(|n| n.as_str()).map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
-    let rows: Vec<Vec<String>> = body
-        .get("data")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|row| row.as_array())
-                .map(|row| {
-                    row.iter()
-                        .map(|cell| {
-                            cell.as_str()
-                                .map(str::to_string)
-                                .unwrap_or_else(|| cell.to_string())
-                        })
-                        .collect()
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    SqlOutcome::Ok { columns, rows }
+    SqlOutcome::Err("Trino query exceeded 60 polling iterations. The query is still running on the coordinator; cancel via the Trino UI or run a shorter slice from the editor.".into())
 }
 
 /// Render the middle "Workspace files" pane. Builds a flat tree
@@ -4239,7 +4273,7 @@ fn render_studio_files_pane(files: &StudioFilesView) -> String {
 <div class="cz-modal">
 <a href="#" class="cz-modal-close" aria-label="Close">×</a>
 <h2 id="cz-modal-new-file-title" class="cz-modal-title">New file</h2>
-<p class="cz-modal-subtitle">Saves the editor's current contents to a new file. The extension drives syntax highlighting + the auto-route (SQL → Databend, Python → Sail).</p>
+<p class="cz-modal-subtitle">Saves the editor's current contents to a new file. The extension drives syntax highlighting + the auto-route (SQL → Trino, Python → Sail).</p>
 <form method="post" action="/studio/files/new" id="cz-file-new-form">
 {csrf}
 <input type="hidden" name="open" value="{open_csv}" />
@@ -4323,7 +4357,7 @@ fn render_studio_files_pane(files: &StudioFilesView) -> String {
 <a href="#cz-rename-{id}" title="Rename" class="cz-file-row-rename"><i class="fa-solid fa-pen"></i></a>
 <form method="post" action="/studio/files/{id}/duplicate" style="margin:0;display:inline;">{csrf}<input type="hidden" name="open" value="{open}" /><button type="submit" title="Duplicate"><i class="fa-solid fa-copy"></i></button></form>
 <a href="/studio/files/{id}/export" title="Download"><i class="fa-solid fa-download"></i></a>
-<form method="post" action="/studio/files/{id}/delete" style="margin:0;display:inline;" onsubmit="return confirm('Delete {label}? This cannot be undone.');">{csrf}<input type="hidden" name="open" value="{open}" /><button type="submit" title="Delete" class="cz-file-row-delete"><i class="fa-solid fa-trash"></i></button></form>
+<a href="#cz-delete-{id}" title="Delete" class="cz-file-row-delete"><i class="fa-solid fa-trash"></i></a>
 </div>
 </div>
 <div id="cz-rename-{id}" class="cz-modal-overlay" role="dialog" aria-labelledby="cz-rename-{id}-title" aria-modal="true">
@@ -4342,6 +4376,22 @@ fn render_studio_files_pane(files: &StudioFilesView) -> String {
 <div class="cz-modal-actions">
 <a href="#" class="cz-btn-ghost">Cancel</a>
 <button type="submit" class="cz-btn-primary">Rename</button>
+</div>
+</form>
+</div>
+</div>
+<div id="cz-delete-{id}" class="cz-modal-overlay" role="dialog" aria-labelledby="cz-delete-{id}-title" aria-modal="true">
+<a href="#" class="cz-modal-overlay-backdrop" aria-label="Close"></a>
+<div class="cz-modal">
+<a href="#" class="cz-modal-close" aria-label="Close">×</a>
+<h2 id="cz-delete-{id}-title" class="cz-modal-title">Delete file?</h2>
+<p class="cz-modal-subtitle">This will permanently delete <code>{path}</code>. The file cannot be recovered.</p>
+<form method="post" action="/studio/files/{id}/delete">
+{csrf}
+<input type="hidden" name="open" value="{open}" />
+<div class="cz-modal-actions">
+<a href="#" class="cz-btn-ghost">Cancel</a>
+<button type="submit" class="cz-btn-danger">Delete file</button>
 </div>
 </form>
 </div>
@@ -4612,7 +4662,7 @@ fn render_studio_page(
     // Updates client-side as they type via a small inline script.
     let initial_language = detect_query_language(sql_prefill);
     let initial_lang_label = match initial_language {
-        QueryLanguage::Sql => "SQL → Databend",
+        QueryLanguage::Sql => "SQL → Trino",
         QueryLanguage::Python => "Python → Sail",
     };
     let csrf_str = auth::csrf_input();
@@ -4661,7 +4711,7 @@ fn render_studio_page(
         .as_deref()
         .map(|m| {
             format!(
-                r#"<div class="cz-studio-banner" style="margin: 0.5rem 0 0;"><strong>Notice:</strong> {}</div>"#,
+                r#"<div class="cz-toast" role="status" aria-live="polite">{}</div>"#,
                 html_escape(m)
             )
         })
@@ -4682,11 +4732,28 @@ fn render_studio_page(
     let file_actions_html = match files.active_file() {
         Some(f) => format!(
             r##"<form method="post" action="/studio/files/{id}/duplicate" style="margin:0;display:inline;">{csrf}<input type="hidden" name="open" value="{open}" /><button type="submit" class="cz-btn-ghost" title="Duplicate {path}">Duplicate</button></form>
-<form method="post" action="/studio/files/{id}/delete" style="margin:0;display:inline;" onsubmit="return confirm('Delete {path}? This cannot be undone.');">{csrf}<input type="hidden" name="open" value="{open}" /><button type="submit" class="cz-btn-danger" title="Delete {path}">Delete</button></form>
-<a href="/studio/files/{id}/export" class="cz-btn-ghost" title="Download {path}">Export</a>"##,
+<a href="#cz-delete-toolbar-{id}" class="cz-btn-danger" title="Delete {path}">Delete</a>
+<a href="/studio/files/{id}/export" class="cz-btn-ghost" title="Download {path}">Export</a>
+<div id="cz-delete-toolbar-{id}" class="cz-modal-overlay" role="dialog" aria-labelledby="cz-delete-toolbar-{id}-title" aria-modal="true">
+<a href="#" class="cz-modal-overlay-backdrop" aria-label="Close"></a>
+<div class="cz-modal">
+<a href="#" class="cz-modal-close" aria-label="Close">×</a>
+<h2 id="cz-delete-toolbar-{id}-title" class="cz-modal-title">Delete file?</h2>
+<p class="cz-modal-subtitle">This will permanently delete <code>{path}</code>. The file cannot be recovered.</p>
+<form method="post" action="/studio/files/{id}/delete">
+{csrf}
+<input type="hidden" name="open" value="{open_csv}" />
+<div class="cz-modal-actions">
+<a href="#" class="cz-btn-ghost">Cancel</a>
+<button type="submit" class="cz-btn-danger">Delete file</button>
+</div>
+</form>
+</div>
+</div>"##,
             csrf = csrf_str,
             id = url_encode(&f.id),
             open = html_escape(&open_csv),
+            open_csv = html_escape(&open_csv),
             path = html_escape(&f.path),
         ),
         None => String::new(),
@@ -4698,7 +4765,7 @@ fn render_studio_page(
 <div class="cz-studio-actions" style="margin-bottom: 0.5rem;">
 <div>
 <h1 class="cz-studio-pane-title" style="margin: 0;">Query editor</h1>
-<p class="cz-studio-pane-subtitle" style="margin: 0.25rem 0 0;">Type SQL for Databend or Python (PySpark) for Sail — the editor auto-routes. Ctrl/Cmd+Enter runs.</p>
+<p class="cz-studio-pane-subtitle" style="margin: 0.25rem 0 0;">Type SQL for Trino or Python (PySpark) for Sail — the editor auto-routes. Ctrl/Cmd+Enter runs.</p>
 </div>
 <span class="cz-studio-actions-spacer"></span>
 <label class="cz-studio-tenant-select" title="Multi-tenant + multi-region routing lands in v1.0. v0.0.x runs against a single tenant on the local cluster.">
@@ -4762,7 +4829,7 @@ fn render_studio_page(
   function paint() {{
     var lang = detect(ta.value);
     pill.dataset.lang = lang;
-    pill.textContent = lang === "sql" ? "SQL → Databend" : "Python → Sail";
+    pill.textContent = lang === "sql" ? "SQL → Trino" : "Python → Sail";
   }}
   ta.addEventListener("input", paint);
   paint();
@@ -5145,16 +5212,19 @@ async fn studio_bootstrap_submit_handler(
     }
     // After Lakekeeper succeeds, register this warehouse with both
     // engines:
-    //   1. Databend (SQL): fire CREATE CATALOG via Databend's HTTP
-    //      query handler.
+    //   1. Trino (SQL): drop an Iceberg-REST catalog .properties file
+    //      under etc/catalog/ AND fire CREATE CATALOG via Trino's HTTP
+    //      `/v1/statement` so the catalog is usable immediately
+    //      without restarting the coordinator (catalog-management =
+    //      DYNAMIC is set by the driver).
     //   2. Sail (Python / Spark Connect): there's no DDL equivalent
     //      for Spark catalog config -- it's set per-SparkSession at
     //      build time. We persist the catalog config to vault so the
     //      Studio Python execution path can inject it into the
     //      `SparkSession.builder.config(...)` chain on every query.
     // Both are best-effort: a missing engine doesn't fail bootstrap.
-    let (databend_wiring, sail_wiring) = if outcome.is_ok() {
-        let dbw = wire_databend_iceberg_catalog(
+    let (trino_wiring, sail_wiring) = if outcome.is_ok() {
+        let tw = wire_trino_iceberg_catalog(
             state.store.as_deref(),
             state.secrets.as_deref(),
             &lakekeeper_url,
@@ -5169,21 +5239,21 @@ async fn studio_bootstrap_submit_handler(
             outcome.as_ref().ok().and_then(|o| o.warehouse_id.clone()),
         )
         .await;
-        (Some(dbw), Some(saw))
+        (Some(tw), Some(saw))
     } else {
         (None, None)
     };
     let display_outcome: Result<String, String> = match outcome {
         Ok(ok) => {
-            let databend_line = match databend_wiring {
-                Some(DatabendWiringOutcome::Wired { catalog_name }) => format!(
-                    "\n - Databend SQL catalog `{catalog_name}` registered. Run \
+            let trino_line = match trino_wiring {
+                Some(TrinoWiringOutcome::Wired { catalog_name }) => format!(
+                    "\n - Trino SQL catalog `{catalog_name}` registered. Run \
                      `SELECT * FROM {catalog_name}.<schema>.<table>` in the \
-                     SQL editor (queries auto-route to Databend)."
+                     SQL editor (queries auto-route to Trino)."
                 ),
-                Some(DatabendWiringOutcome::DatabendUnavailable) => "\n - Databend SQL wiring skipped: Databend isn't installed. Install it from /install + re-run bootstrap to enable SQL queries.".to_string(),
-                Some(DatabendWiringOutcome::Failed { reason }) => format!(
-                    "\n - Databend SQL wiring FAILED: {reason}\n   Re-run bootstrap or use the \"Connect to SQL\" button on the warehouse page."
+                Some(TrinoWiringOutcome::TrinoUnavailable) => "\n - Trino SQL wiring skipped: Trino isn't installed. Install it from /install + re-run bootstrap to enable SQL queries.".to_string(),
+                Some(TrinoWiringOutcome::Failed { reason }) => format!(
+                    "\n - Trino SQL wiring FAILED: {reason}\n   Re-run bootstrap or use the \"Connect to SQL\" button on the warehouse page."
                 ),
                 None => String::new(),
             };
@@ -5198,7 +5268,7 @@ async fn studio_bootstrap_submit_handler(
                 ),
                 None => String::new(),
             };
-            Ok(format!("{}{}{}", ok.message, databend_line, sail_line))
+            Ok(format!("{}{}{}", ok.message, trino_line, sail_line))
         }
         Err(e) => Err(e),
     };
@@ -5413,60 +5483,56 @@ async fn persist_sail_catalog_config(
     SailCatalogOutcome::Configured { catalog_name }
 }
 
-/// Outcome of attempting to wire Databend up to the just-bootstrapped
+/// Outcome of attempting to wire Trino up to the just-bootstrapped
 /// Lakekeeper warehouse so `SELECT * FROM <catalog>.<namespace>.<tbl>`
 /// resolves in the SQL editor.
 #[derive(Debug)]
-enum DatabendWiringOutcome {
-    /// Databend isn't installed / discoverable -- nothing to wire.
+enum TrinoWiringOutcome {
+    /// Trino isn't installed / discoverable -- nothing to wire.
     /// Bootstrap still succeeds; the operator just has to install
-    /// Databend later and re-run bootstrap to enable SQL access.
-    DatabendUnavailable,
-    /// CREATE CATALOG succeeded; <warehouse_name>.<ns>.<tbl> now
-    /// resolves in Databend's parser.
+    /// Trino later and re-run bootstrap to enable SQL access.
+    TrinoUnavailable,
+    /// The `etc/catalog/<name>.properties` file landed and CREATE
+    /// CATALOG executed against the running coordinator. The catalog
+    /// is usable in the editor immediately and survives a coordinator
+    /// restart (the .properties file is read on startup).
     Wired { catalog_name: String },
-    /// Databend rejected the CREATE CATALOG. The most likely cause is
-    /// a Databend version that doesn't accept Iceberg-REST as a
-    /// catalog type, or a syntax drift across releases. Carries the
-    /// raw error so the operator can adjust.
+    /// Trino accepted neither the dynamic CREATE CATALOG nor was the
+    /// catalog already present. Carries the raw error so the operator
+    /// can drill into Trino's response.
     Failed { reason: String },
 }
 
-/// Auto-wire Databend → Lakekeeper-Iceberg by running
-/// `DROP CATALOG IF EXISTS` then `CREATE CATALOG <name> TYPE=ICEBERG
-/// CONNECTION=(...)`. Best-effort: a Databend outage or unsupported
-/// syntax doesn't fail the bootstrap.
+/// Auto-wire Trino → Lakekeeper-Iceberg in two steps:
+///   1. Write `etc/catalog/<name>.properties` via the Trino driver
+///      helper. This is the file Trino's static catalog loader picks
+///      up on startup -- so the catalog survives a coordinator
+///      restart.
+///   2. Submit `DROP CATALOG IF EXISTS` + `CREATE CATALOG <name>
+///      USING iceberg WITH (...)` against the running coordinator
+///      via `/v1/statement`. Trino's `catalog-management=DYNAMIC`
+///      flag (set in our generated config.properties) makes the
+///      catalog immediately usable from the editor without a restart.
 ///
-/// Per Lakekeeper 0.12.x's official query-engine examples, the
-/// `"warehouse"` value is the human NAME (e.g. "default"); the
-/// Iceberg-REST client hits /v1/config to resolve NAME -> UUID
-/// prefix internally. The CREATE CATALOG syntax uses Databend's
-/// lowercase-quoted CONNECTION-block convention -- same form as
-/// `"s3.endpoint"`. A previous version emitted both this and a
-/// bare `WAREHOUSE = '...'` line; Databend rejected the duplicate
-/// keys as a syntax error.
-async fn wire_databend_iceberg_catalog(
+/// Best-effort: a Trino outage or an Iceberg-REST mismatch surfaces
+/// `Failed { reason }`, but the bootstrap step itself still succeeds.
+async fn wire_trino_iceberg_catalog(
     store: Option<&computeza_state::SqliteStore>,
     secrets: Option<&computeza_secrets::SecretsStore>,
     lakekeeper_url: &str,
     form: &StudioBootstrapForm,
-) -> DatabendWiringOutcome {
-    let Some(databend_url) = discover_databend_endpoint(store).await else {
-        return DatabendWiringOutcome::DatabendUnavailable;
+) -> TrinoWiringOutcome {
+    let Some(trino_url) = discover_trino_endpoint(store).await else {
+        return TrinoWiringOutcome::TrinoUnavailable;
     };
     let catalog_name = sanitize_sql_identifier(&form.warehouse_name);
     let rest_address = format!("{}/catalog", lakekeeper_url.trim_end_matches('/'));
 
-    // Build a multi-strategy list of candidate WAREHOUSE values.
-    // Lakekeeper accepts different prefix formats depending on its
-    // configuration (single-project vs multi-project) and version,
-    // and operators have been reporting 404s where ONE candidate
-    // works but not another. Trying all of them gives the operator
-    // the best chance of a working CREATE CATALOG without manual
-    // intervention.
-    //
-    // Order: human name -> vault-cached UUID -> /v1/config-discovered
-    // prefix. Dedup so we don't waste a Databend round-trip.
+    // Per Lakekeeper's official Trino example, the `warehouse` config
+    // option holds the human warehouse NAME -- the Iceberg-REST
+    // client resolves NAME -> UUID-prefix on its own via /v1/config.
+    // For belt-and-braces, we also try the vault-cached UUID + the
+    // /v1/config-probed UUID if the name fails.
     let mut candidates: Vec<String> = Vec::with_capacity(3);
     candidates.push(form.warehouse_name.clone());
     let vault_uuid =
@@ -5474,7 +5540,9 @@ async fn wire_databend_iceberg_catalog(
     if !candidates.iter().any(|c| c == &vault_uuid) {
         candidates.push(vault_uuid);
     }
-    if let Some(probed) = try_discover_via_config(&form.warehouse_name, lakekeeper_url, secrets).await {
+    if let Some(probed) =
+        try_discover_via_config(&form.warehouse_name, lakekeeper_url, secrets).await
+    {
         if !candidates.iter().any(|c| c == &probed) {
             candidates.push(probed);
         }
@@ -5483,105 +5551,117 @@ async fn wire_databend_iceberg_catalog(
     // Drop the existing catalog once before trying candidates so
     // re-runs don't trip over a stale binding.
     let drop_sql = format!("DROP CATALOG IF EXISTS {catalog_name}");
-    if let SqlOutcome::Err(e) = execute_sql_against_databend(&databend_url, &drop_sql).await {
+    if let SqlOutcome::Err(e) = execute_sql_against_trino(&trino_url, &drop_sql).await {
         tracing::info!(
             catalog = %catalog_name,
             error = %e,
-            "wire_databend: DROP CATALOG IF EXISTS returned err (treating as ignorable)"
+            "wire_trino: DROP CATALOG IF EXISTS returned err (treating as ignorable)"
         );
     }
 
-    // Try each candidate. First success wins. Capture every failure
-    // so we can surface a useful diagnostic if all of them fail.
-    //
-    // Per Lakekeeper's official Spark / PyIceberg / Trino examples,
-    // the `warehouse` config option holds the human warehouse NAME,
-    // not the UUID -- the Iceberg-REST client hits /v1/config to
-    // resolve NAME -> UUID-prefix internally. We list NAME first;
-    // the UUID-shaped candidates are belt-and-braces for older
-    // Lakekeeper / Databend combinations that may accept either.
     let mut attempts: Vec<(String, String)> = Vec::with_capacity(candidates.len());
     for candidate in &candidates {
-        // CREATE CATALOG SQL for an Iceberg-REST connection.
+        // Step 1: write the .properties file so the catalog survives
+        // a coordinator restart. The driver helper resolves the
+        // install root via /var/lib/computeza/trino/binaries/*/.
+        // Trino itself only installs on Linux right now -- on other
+        // platforms the discover step would have already returned
+        // None, but we gate the call anyway so the binary compiles
+        // cross-platform.
+        #[cfg(target_os = "linux")]
+        {
+            let cfg = computeza_driver_native::linux::trino::TrinoIcebergRestConfig {
+                rest_catalog_uri: rest_address.clone(),
+                warehouse: candidate.clone(),
+                s3_endpoint: form.s3_endpoint.clone(),
+                s3_region: form.s3_region.clone(),
+                s3_access_key: form.s3_access_key.clone(),
+                s3_secret_key: form.s3_secret_access_key.clone(),
+            };
+            if let Err(e) =
+                computeza_driver_native::linux::trino::write_iceberg_rest_catalog_file(
+                    std::path::Path::new("/var/lib/computeza/trino"),
+                    &catalog_name,
+                    &cfg,
+                )
+                .await
+            {
+                tracing::warn!(
+                    catalog = %catalog_name,
+                    error = %e,
+                    "wire_trino: failed to write etc/catalog/{catalog_name}.properties (catalog won't survive coordinator restart, but CREATE CATALOG may still succeed)"
+                );
+            }
+        }
+
+        // Step 2: CREATE CATALOG so the catalog is immediately usable
+        // in the editor (catalog-management=DYNAMIC is on).
         //
-        // Databend's CONNECTION-block key naming has two flavors:
-        //   * Uppercase-unquoted keywords (TYPE, ADDRESS, WAREHOUSE)
-        //     are Databend's first-class connection options.
-        //   * Lowercase-quoted strings ("s3.endpoint", "s3.region")
-        //     are passed through to the underlying iceberg-rust
-        //     client as opaque connection properties.
-        //
-        // `WAREHOUSE` is a first-class keyword -- using the
-        // quoted-lowercase form makes Databend's parser miss it and
-        // raise "warehouse for iceberg catalog is not specified".
-        // Earlier this was masked by a privilege error (root user
-        // lacked SUPER, fixed in databend driver's default_role =
-        // account-admin); now that the privilege check passes,
-        // Databend's keyword-vs-passthrough distinction is the
-        // visible bug. Uppercase unquoted WAREHOUSE = '...' is the
-        // shape Databend wants.
+        // Trino's CREATE CATALOG WITH-clause keys are the Iceberg
+        // connector's full property names -- same shape as the
+        // .properties file. Lowercase, double-quoted because they
+        // contain dots; values are SQL single-quoted strings.
         let create_sql = format!(
-            "CREATE CATALOG {name} TYPE = ICEBERG CONNECTION = (\
-                TYPE = 'rest', \
-                ADDRESS = '{address}', \
-                WAREHOUSE = '{warehouse}', \
+            "CREATE CATALOG {name} USING iceberg WITH (\
+                \"iceberg.catalog.type\" = 'rest', \
+                \"iceberg.rest-catalog.uri\" = '{uri}', \
+                \"iceberg.rest-catalog.warehouse\" = '{warehouse}', \
+                \"fs.s3.enabled\" = 'true', \
                 \"s3.endpoint\" = '{s3_endpoint}', \
-                \"s3.access-key-id\" = '{ak}', \
-                \"s3.secret-access-key\" = '{sk}', \
-                \"s3.region\" = '{region}'\
+                \"s3.region\" = '{s3_region}', \
+                \"s3.path-style-access\" = 'true', \
+                \"s3.aws-access-key\" = '{ak}', \
+                \"s3.aws-secret-key\" = '{sk}'\
             )",
             name = catalog_name,
-            address = sql_quote(&rest_address),
+            uri = sql_quote(&rest_address),
             warehouse = sql_quote(candidate),
             s3_endpoint = sql_quote(&form.s3_endpoint),
+            s3_region = sql_quote(&form.s3_region),
             ak = sql_quote(&form.s3_access_key),
             sk = sql_quote(&form.s3_secret_access_key),
-            region = sql_quote(&form.s3_region),
         );
         tracing::info!(
             catalog = %catalog_name,
             warehouse = %candidate,
-            "wire_databend: trying CREATE CATALOG with this WAREHOUSE candidate"
+            "wire_trino: trying CREATE CATALOG with this warehouse candidate"
         );
-        match execute_sql_against_databend(&databend_url, &create_sql).await {
+        match execute_sql_against_trino(&trino_url, &create_sql).await {
             SqlOutcome::Ok { .. } => {
                 tracing::info!(
                     catalog = %catalog_name,
                     warehouse = %candidate,
-                    "wire_databend: CREATE CATALOG succeeded -- caching this prefix to vault"
+                    "wire_trino: CREATE CATALOG succeeded -- caching this prefix to vault"
                 );
-                // Cache the working prefix so the next wire skips
-                // the trial loop. Idempotent.
                 if let Some(s) = secrets {
                     let _ = s
                         .put("lakekeeper/default-warehouse-id", candidate)
                         .await;
                 }
-                return DatabendWiringOutcome::Wired { catalog_name };
+                return TrinoWiringOutcome::Wired { catalog_name };
             }
             SqlOutcome::Err(e) => {
                 tracing::warn!(
                     catalog = %catalog_name,
                     warehouse = %candidate,
                     error = %e,
-                    "wire_databend: CREATE CATALOG failed for this candidate; trying next"
+                    "wire_trino: CREATE CATALOG failed for this candidate; trying next"
                 );
                 attempts.push((candidate.clone(), e));
                 // Re-DROP between attempts so leftover state from a
                 // partial CREATE doesn't poison the next attempt.
-                let _ = execute_sql_against_databend(&databend_url, &drop_sql).await;
+                let _ = execute_sql_against_trino(&trino_url, &drop_sql).await;
             }
         }
     }
-    // All candidates failed. Build a verbose error so the operator
-    // can see what we tried + the raw Databend response each time.
+    // All candidates failed. Build a verbose error.
     let mut reason = String::from(
-        "Databend rejected CREATE CATALOG for every candidate WAREHOUSE value we tried. ",
+        "Trino rejected CREATE CATALOG for every candidate warehouse value we tried. ",
     );
     reason.push_str(&format!("Tried {} candidates:\n", attempts.len()));
     for (cand, err) in &attempts {
         reason.push_str(&format!(
-            "\n--- WAREHOUSE = '{cand}' ---\n{}\n",
+            "\n--- warehouse = '{cand}' ---\n{}\n",
             err.chars().take(800).collect::<String>()
         ));
     }
@@ -5590,10 +5670,10 @@ async fn wire_databend_iceberg_catalog(
          1. Reset Lakekeeper: stop computeza-lakekeeper, drop+recreate the \
          lakekeeper Postgres database, restart, re-run /studio/bootstrap.\n\
          2. If that fixes it, the original warehouse rows were corrupt.\n\
-         3. If it doesn't, check that the Databend version in /components \
-         accepts Iceberg-REST catalogs (TYPE='rest'); Databend 1.2.880+ should.",
+         3. If it doesn't, inspect /var/lib/computeza/trino/binaries/*/trino-server-*/var/log/server.log \
+         for the Iceberg connector's request to Lakekeeper.",
     );
-    DatabendWiringOutcome::Failed { reason }
+    TrinoWiringOutcome::Failed { reason }
 }
 
 /// Sanitize a warehouse name into an S3 key prefix.
@@ -7395,8 +7475,8 @@ async fn uninstall_postgres_handler(State(state): State<AppState>) -> Response {
         teardown_managed_uninstall("postgres", state.store.as_deref(), state.secrets.as_deref())
             .await;
     let body = match result {
-        Ok(summary) => render_install_result(&l, true, &summary),
-        Err(detail) => render_install_result(&l, false, &detail),
+        Ok(summary) => render_uninstall_result(&l, true, &summary),
+        Err(detail) => render_uninstall_result(&l, false, &detail),
     };
     Html(body).into_response()
 }
@@ -7482,8 +7562,8 @@ async fn uninstall_kanidm_handler(State(state): State<AppState>) -> Response {
         teardown_managed_uninstall("kanidm", state.store.as_deref(), state.secrets.as_deref())
             .await;
     let body = match result {
-        Ok(summary) => render_install_result(&l, true, &summary),
-        Err(detail) => render_install_result(&l, false, &detail),
+        Ok(summary) => render_uninstall_result(&l, true, &summary),
+        Err(detail) => render_uninstall_result(&l, false, &detail),
     };
     Html(body).into_response()
 }
@@ -7665,8 +7745,8 @@ async fn uninstall_garage_handler(State(state): State<AppState>) -> Response {
         teardown_managed_uninstall("garage", state.store.as_deref(), state.secrets.as_deref())
             .await;
     let body = match result {
-        Ok(summary) => render_install_result(&l, true, &summary),
-        Err(detail) => render_install_result(&l, false, &detail),
+        Ok(summary) => render_uninstall_result(&l, true, &summary),
+        Err(detail) => render_uninstall_result(&l, false, &detail),
     };
     Html(body).into_response()
 }
@@ -7797,8 +7877,8 @@ async fn uninstall_openfga_handler(State(state): State<AppState>) -> Response {
         teardown_managed_uninstall("openfga", state.store.as_deref(), state.secrets.as_deref())
             .await;
     let body = match result {
-        Ok(summary) => render_install_result(&l, true, &summary),
-        Err(detail) => render_install_result(&l, false, &detail),
+        Ok(summary) => render_uninstall_result(&l, true, &summary),
+        Err(detail) => render_uninstall_result(&l, false, &detail),
     };
     Html(body).into_response()
 }
@@ -7928,8 +8008,8 @@ async fn uninstall_qdrant_handler(State(state): State<AppState>) -> Response {
         teardown_managed_uninstall("qdrant", state.store.as_deref(), state.secrets.as_deref())
             .await;
     let body = match result {
-        Ok(summary) => render_install_result(&l, true, &summary),
-        Err(detail) => render_install_result(&l, false, &detail),
+        Ok(summary) => render_uninstall_result(&l, true, &summary),
+        Err(detail) => render_uninstall_result(&l, false, &detail),
     };
     Html(body).into_response()
 }
@@ -8059,8 +8139,8 @@ async fn uninstall_greptime_handler(State(state): State<AppState>) -> Response {
         teardown_managed_uninstall("greptime", state.store.as_deref(), state.secrets.as_deref())
             .await;
     let body = match result {
-        Ok(summary) => render_install_result(&l, true, &summary),
-        Err(detail) => render_install_result(&l, false, &detail),
+        Ok(summary) => render_uninstall_result(&l, true, &summary),
+        Err(detail) => render_uninstall_result(&l, false, &detail),
     };
     Html(body).into_response()
 }
@@ -8189,8 +8269,8 @@ async fn uninstall_lakekeeper_handler(State(state): State<AppState>) -> Response
     )
     .await;
     let body = match result {
-        Ok(summary) => render_install_result(&l, true, &summary),
-        Err(detail) => render_install_result(&l, false, &detail),
+        Ok(summary) => render_uninstall_result(&l, true, &summary),
+        Err(detail) => render_uninstall_result(&l, false, &detail),
     };
     Html(body).into_response()
 }
@@ -8316,8 +8396,8 @@ async fn uninstall_databend_handler(State(state): State<AppState>) -> Response {
         teardown_managed_uninstall("databend", state.store.as_deref(), state.secrets.as_deref())
             .await;
     let body = match result {
-        Ok(summary) => render_install_result(&l, true, &summary),
-        Err(detail) => render_install_result(&l, false, &detail),
+        Ok(summary) => render_uninstall_result(&l, true, &summary),
+        Err(detail) => render_uninstall_result(&l, false, &detail),
     };
     Html(body).into_response()
 }
@@ -8583,8 +8663,8 @@ async fn uninstall_grafana_handler(State(state): State<AppState>) -> Response {
         teardown_managed_uninstall("grafana", state.store.as_deref(), state.secrets.as_deref())
             .await;
     let body = match result {
-        Ok(summary) => render_install_result(&l, true, &summary),
-        Err(detail) => render_install_result(&l, false, &detail),
+        Ok(summary) => render_uninstall_result(&l, true, &summary),
+        Err(detail) => render_uninstall_result(&l, false, &detail),
     };
     Html(body).into_response()
 }
@@ -8710,8 +8790,8 @@ async fn uninstall_restate_handler(State(state): State<AppState>) -> Response {
         teardown_managed_uninstall("restate", state.store.as_deref(), state.secrets.as_deref())
             .await;
     let body = match result {
-        Ok(summary) => render_install_result(&l, true, &summary),
-        Err(detail) => render_install_result(&l, false, &detail),
+        Ok(summary) => render_uninstall_result(&l, true, &summary),
+        Err(detail) => render_uninstall_result(&l, false, &detail),
     };
     Html(body).into_response()
 }
@@ -9840,9 +9920,27 @@ async fn status_handler(State(state): State<AppState>) -> Html<String> {
     ];
     let mut rows: Vec<StatusRow> = Vec::new();
     for (kind, slug) in entries {
+        let component_label = l.t(&format!("component-{slug}-name"));
         let Ok(list) = store.list(kind, None).await else {
             continue;
         };
+        if list.is_empty() {
+            // No instance row for this component yet -- still surface
+            // a placeholder so /status shows the full catalogue of
+            // managed components at a glance. Empty `instance_name`
+            // is the sentinel render_status uses to render the
+            // "Not installed" badge instead of a dead resource link.
+            rows.push(StatusRow {
+                kind: (*kind).into(),
+                component_label,
+                instance_name: String::new(),
+                server_version: None,
+                last_observed_at: None,
+                last_observe_failed: false,
+                has_status: false,
+            });
+            continue;
+        }
         for sr in list {
             let status = sr.status.as_ref();
             let server_version = status
@@ -9859,7 +9957,7 @@ async fn status_handler(State(state): State<AppState>) -> Html<String> {
                 .unwrap_or(false);
             rows.push(StatusRow {
                 kind: (*kind).into(),
-                component_label: l.t(&format!("component-{slug}-name")),
+                component_label: component_label.clone(),
                 instance_name: sr.key.name.clone(),
                 server_version,
                 last_observed_at,
@@ -11114,7 +11212,7 @@ pub fn render_shell(
     <a href="/studio" class="cz-sidenav-item {nwks}" data-label="{nav_studio}"><i class="fa-solid fa-flask fa-fw"></i><span class="cz-sidenav-label">{nav_studio}</span></a>
     <a href="/install" class="cz-sidenav-item {ni}" data-label="{nav_install}"><i class="fa-solid fa-cloud-arrow-down fa-fw"></i><span class="cz-sidenav-label">{nav_install}</span></a>
     <a href="/components" class="cz-sidenav-item {nc}" data-label="{nav_components}"><i class="fa-solid fa-cubes fa-fw"></i><span class="cz-sidenav-label">{nav_components}</span></a>
-    <a href="/install-guide" class="cz-sidenav-item {nig}" data-label="Install guide"><i class="fa-solid fa-book-open fa-fw"></i><span class="cz-sidenav-label">Install guide</span></a>
+    <a href="/install-guide" class="cz-sidenav-item {nig}" data-label="Install Guide"><i class="fa-solid fa-book-open fa-fw"></i><span class="cz-sidenav-label">Install Guide</span></a>
   </div>
   <div class="cz-sidenav-sep"></div>
   <div class="cz-sidenav-section">
@@ -16655,10 +16753,14 @@ pub fn render_status(localizer: &Localizer, rows: Option<&[StatusRow]>) -> Strin
             let state_ok = localizer.t("ui-status-state-ok");
             let state_failed = localizer.t("ui-status-state-failed");
             let state_unknown = localizer.t("ui-status-state-unknown");
+            let state_not_installed = localizer.t("ui-status-state-not-installed");
             let body_rows: String = rs
                 .iter()
                 .map(|r| {
-                    let (state_label, badge_cls) = if !r.has_status {
+                    let not_installed = r.instance_name.is_empty();
+                    let (state_label, badge_cls) = if not_installed {
+                        (state_not_installed.clone(), "cz-badge cz-badge-dim")
+                    } else if !r.has_status {
                         (state_unknown.clone(), "cz-badge cz-badge-info")
                     } else if r.last_observe_failed {
                         (state_failed.clone(), "cz-badge cz-badge-fail")
@@ -16670,23 +16772,39 @@ pub fn render_status(localizer: &Localizer, rows: Option<&[StatusRow]>) -> Strin
                         .last_observed_at
                         .clone()
                         .unwrap_or_else(|| "-".to_string());
-                    let href = format!(
-                        "/resource/{}/{}",
-                        urlencoding_min(&r.kind),
-                        urlencoding_min(&r.instance_name)
-                    );
+                    // Placeholder rows (no instance yet) skip the
+                    // resource link -- it would 404 -- and surface
+                    // just the component name with a dim "Not
+                    // installed" badge so the catalogue is
+                    // discoverable at a glance.
+                    let name_cell = if not_installed {
+                        format!(
+                            "<span class=\"cz-strong\">{label}</span>",
+                            label = html_escape(&r.component_label),
+                        )
+                    } else {
+                        let href = format!(
+                            "/resource/{}/{}",
+                            urlencoding_min(&r.kind),
+                            urlencoding_min(&r.instance_name)
+                        );
+                        format!(
+                            "<a href=\"{href}\" class=\"cz-strong\">{label} / {name}</a>",
+                            href = href,
+                            label = html_escape(&r.component_label),
+                            name = html_escape(&r.instance_name),
+                        )
+                    };
                     format!(
                         "<tr>\
                          <td class=\"cz-cell-mono cz-cell-dim\">{kind}</td>\
-                         <td><a href=\"{href}\" class=\"cz-strong\">{label} / {name}</a></td>\
+                         <td>{name_cell}</td>\
                          <td class=\"cz-cell-dim\">{version}</td>\
                          <td class=\"cz-cell-mono cz-cell-dim\">{observed}</td>\
                          <td><span class=\"{badge_cls}\">{state_label}</span></td>\
                          </tr>",
                         kind = html_escape(&r.kind),
-                        href = href,
-                        label = html_escape(&r.component_label),
-                        name = html_escape(&r.instance_name),
+                        name_cell = name_cell,
                         version = html_escape(&version),
                         observed = html_escape(&observed),
                         badge_cls = badge_cls,

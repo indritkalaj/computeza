@@ -49,9 +49,7 @@ use crate::{
     progress::{InstallPhase, ProgressHandle},
 };
 
-use super::service::{
-    self, ConfigFile, InstalledService, ServiceError, ServiceInstall, Uninstalled,
-};
+use super::service::{self, InstalledService, ServiceError, Uninstalled};
 
 pub const UNIT_NAME: &str = "computeza-trino.service";
 
@@ -66,17 +64,24 @@ pub const DEFAULT_PORT: u16 = 8088;
 /// disk footprint tight. To bump past 442, the bundled JRE in
 /// `ensure_bundled_temurin_jre` must move to Java 25 first (Trino
 /// 481+ refuses to start under older JVMs).
+///
+/// The Trino project publishes release artifacts to Maven Central
+/// (not GitHub releases -- the github.com/trinodb/trino/releases
+/// page only links source tarballs, which would force a full
+/// Maven build at install time). The canonical download URL is
+/// `https://repo1.maven.org/maven2/io/trino/trino-server/<v>/trino-server-<v>.tar.gz`
+/// per Trino's own install docs.
 const TRINO_BUNDLES: &[Bundle] = &[
     Bundle {
         version: "442",
-        url: "https://github.com/trinodb/trino/releases/download/442/trino-server-442.tar.gz",
+        url: "https://repo1.maven.org/maven2/io/trino/trino-server/442/trino-server-442.tar.gz",
         kind: ArchiveKind::TarGz,
         sha256: None,
         bin_subpath: "bin",
     },
     Bundle {
         version: "441",
-        url: "https://github.com/trinodb/trino/releases/download/441/trino-server-441.tar.gz",
+        url: "https://repo1.maven.org/maven2/io/trino/trino-server/441/trino-server-441.tar.gz",
         kind: ArchiveKind::TarGz,
         sha256: None,
         bin_subpath: "bin",
