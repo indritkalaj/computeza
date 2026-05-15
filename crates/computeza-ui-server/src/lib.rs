@@ -5478,20 +5478,27 @@ async fn wire_databend_iceberg_catalog(
     for candidate in &candidates {
         // CREATE CATALOG SQL for an Iceberg-REST connection.
         //
-        // Databend's CONNECTION block uses lowercase-quoted keys
-        // ("s3.endpoint", "s3.region", ...); the `warehouse` value
-        // follows the same convention. We previously emitted BOTH
-        // the quoted form AND a bare uppercase `WAREHOUSE = '..'`
-        // line for belt-and-braces, but Databend treats duplicate
-        // keys as a syntax error and rejects the whole statement
-        // ("default catalog cannot be created" with no nested
-        // Lakekeeper detail). Single quoted-lowercase key, per
-        // Databend's CONNECTION-block convention.
+        // Databend's CONNECTION-block key naming has two flavors:
+        //   * Uppercase-unquoted keywords (TYPE, ADDRESS, WAREHOUSE)
+        //     are Databend's first-class connection options.
+        //   * Lowercase-quoted strings ("s3.endpoint", "s3.region")
+        //     are passed through to the underlying iceberg-rust
+        //     client as opaque connection properties.
+        //
+        // `WAREHOUSE` is a first-class keyword -- using the
+        // quoted-lowercase form makes Databend's parser miss it and
+        // raise "warehouse for iceberg catalog is not specified".
+        // Earlier this was masked by a privilege error (root user
+        // lacked SUPER, fixed in databend driver's default_role =
+        // account-admin); now that the privilege check passes,
+        // Databend's keyword-vs-passthrough distinction is the
+        // visible bug. Uppercase unquoted WAREHOUSE = '...' is the
+        // shape Databend wants.
         let create_sql = format!(
             "CREATE CATALOG {name} TYPE = ICEBERG CONNECTION = (\
                 TYPE = 'rest', \
                 ADDRESS = '{address}', \
-                \"warehouse\" = '{warehouse}', \
+                WAREHOUSE = '{warehouse}', \
                 \"s3.endpoint\" = '{s3_endpoint}', \
                 \"s3.access-key-id\" = '{ak}', \
                 \"s3.secret-access-key\" = '{sk}', \
