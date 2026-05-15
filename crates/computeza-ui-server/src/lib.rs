@@ -4868,7 +4868,6 @@ fn render_studio_page(
         QueryLanguage::Sql => "SQL → Trino",
         QueryLanguage::Python => "Python → Sail",
     };
-    let csrf_str = auth::csrf_input();
     let open_csv = files.open_csv();
     let active_id = files.active_id.clone().unwrap_or_default();
     // Tab strip above the editor. The "scratch" tab is always
