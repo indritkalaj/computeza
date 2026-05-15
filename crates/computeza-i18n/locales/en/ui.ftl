@@ -58,7 +58,7 @@ ui-landing-features-title    = Built for operators who deliver, not who tinker.
 ui-landing-features-subtitle = Every surface below is GUI-first and CLI-equivalent. Anything you can click in the console, you can drive from `computeza`, your shell pipelines, or your CI.
 
 ui-landing-feature-1-title = Unified one-click install
-ui-landing-feature-1-body  = One Install button lays down every component in dependency order: postgres, openfga, kanidm, garage, qdrant, lakekeeper, greptime, grafana, restate, databend. Sequenced, idempotent, and resumable across browser refreshes.
+ui-landing-feature-1-body  = One Install button lays down every managed component in dependency order. Sequenced, idempotent, resumable across browser refreshes, and roll-back-able with a single click.
 ui-landing-feature-2-title = Encrypted secrets store
 ui-landing-feature-2-body  = AES-256-GCM at rest, Argon2id-derived KEK, zero-on-drop in memory. Initial admin credentials generated post-install and surfaced one time; everything else lives under the rotate-secrets UI.
 ui-landing-feature-3-title = Audit-grade event log
@@ -73,6 +73,10 @@ ui-landing-feature-7-title = Idempotent rollback
 ui-landing-feature-7-body  = Every install path remembers what it changed -- service names, root directories, generated credentials -- and the rollback button can tear it down in exact reverse dependency order, leaving no orphan rows, no orphan units, no orphan secrets.
 ui-landing-feature-8-title = Reseller-ready by design
 ui-landing-feature-8-body  = Multi-tier license chains, white-label theming, channel-partner API contracts. Whether you sell direct, via a reseller, or via a sub-reseller, the platform encodes the relationship in the license and routes telemetry up the chain without leaking customer-private content.
+ui-landing-stack-eyebrow  = Stack
+ui-landing-stack-title    = COUNT_PLACEHOLDER managed services. One install.
+ui-landing-stack-subtitle = Every box in the lakehouse you need to run a tenant: storage, catalog, compute, search, identity, observability, orchestration. Each component is open-source upstream; Computeza glues them together with a single install, rollback, and license envelope.
+
 ui-landing-feature-9-title = GUI-first, CLI-equivalent
 ui-landing-feature-9-body  = Spec section 2.1 mandate: every administrative action reachable from the web console must also work from `computeza`. No "use the CLI" escape hatches, no operator-only flags, no production drift between your scripts and your operators' fingertips.
 
@@ -117,10 +121,10 @@ ui-landing-pricing-title    = Per-seat, paid-only. No free tier. No usage meteri
 ui-landing-pricing-subtitle = Computeza is commercial software you install on your own hardware. We charge per operator seat; we never charge for compute, storage, query volume, or hosting -- because we never run any of those for you. Pricing scales linearly from small teams to multi-tier resale chains.
 
 ui-landing-pricing-1-name     = Standard
-ui-landing-pricing-1-price    = 49.99 EUR
+ui-landing-pricing-1-price    = 99.99 EUR
 ui-landing-pricing-1-unit     = / seat / month, up to 100 seats
 ui-landing-pricing-1-tagline  = For SMB platform teams putting Computeza into production -- seat-capped, self-service, signed license.
-ui-landing-pricing-1-feature-1 = Every one of the 11 managed components
+ui-landing-pricing-1-feature-1 = Every one of the managed components
 ui-landing-pricing-1-feature-2 = Unified install + rollback + repair
 ui-landing-pricing-1-feature-3 = Encrypted secrets store + rotate UI
 ui-landing-pricing-1-feature-4 = Signed license envelope with seat cap + expiry kill-switch

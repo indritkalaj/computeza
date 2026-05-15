@@ -11083,6 +11083,42 @@ pub fn render_landing_page(localizer: &Localizer) -> String {
         })
         .collect();
 
+    // Stack at a glance -- auto-rendered from the COMPONENTS array
+    // so adding a managed component (e.g. Sail) makes the homepage
+    // catch up without copy edits. Each card lights up the icon
+    // glyph + name + role line + a link to /components for the
+    // full upstream metadata (license, version, source).
+    let stack_eyebrow = localizer.t("ui-landing-stack-eyebrow");
+    let stack_title = localizer
+        .t("ui-landing-stack-title")
+        .replace("COUNT_PLACEHOLDER", &format!("{}", COMPONENTS.len()));
+    let stack_subtitle = localizer.t("ui-landing-stack-subtitle");
+    let stack_cards: String = COMPONENTS
+        .iter()
+        .map(|c| {
+            let name = localizer.t(c.name_key);
+            let role = localizer.t(c.role_key);
+            // First letter as the icon glyph, mono-styled so the
+            // grid stays uniform regardless of component name length.
+            let glyph: String = name
+                .chars()
+                .next()
+                .map(|c| c.to_ascii_uppercase().to_string())
+                .unwrap_or_else(|| "·".into());
+            format!(
+                r#"<a class="cz-feature cz-stack-card" href="/components#{slug}">
+<span class="cz-feature-icon">{glyph}</span>
+<h3 class="cz-feature-title">{name}</h3>
+<p class="cz-feature-body">{role}</p>
+</a>"#,
+                slug = html_escape(c.slug),
+                glyph = html_escape(&glyph),
+                name = html_escape(&name),
+                role = html_escape(&role),
+            )
+        })
+        .collect();
+
     // Trust + compliance pillars
     let trust_eyebrow = localizer.t("ui-landing-trust-eyebrow");
     let trust_title = localizer.t("ui-landing-trust-title");
@@ -11256,6 +11292,15 @@ pub fn render_landing_page(localizer: &Localizer) -> String {
 
 <section class="cz-landing-section">
 <div class="cz-landing-section-head">
+<p class="cz-landing-section-eyebrow">{stack_eyebrow}</p>
+<h2 class="cz-landing-section-title">{stack_title}</h2>
+<p class="cz-landing-section-subtitle">{stack_subtitle}</p>
+</div>
+<div class="cz-stack-grid">{stack_cards}</div>
+</section>
+
+<section class="cz-landing-section">
+<div class="cz-landing-section-head">
 <p class="cz-landing-section-eyebrow">{trust_eyebrow}</p>
 <h2 class="cz-landing-section-title">{trust_title}</h2>
 <p class="cz-landing-section-subtitle">{trust_subtitle}</p>
@@ -11316,6 +11361,10 @@ pub fn render_landing_page(localizer: &Localizer) -> String {
         features_title = html_escape(&features_title),
         features_subtitle = html_escape(&features_subtitle),
         feature_cards = feature_cards,
+        stack_eyebrow = html_escape(&stack_eyebrow),
+        stack_title = html_escape(&stack_title),
+        stack_subtitle = html_escape(&stack_subtitle),
+        stack_cards = stack_cards,
         trust_eyebrow = html_escape(&trust_eyebrow),
         trust_title = html_escape(&trust_title),
         trust_subtitle = html_escape(&trust_subtitle),
