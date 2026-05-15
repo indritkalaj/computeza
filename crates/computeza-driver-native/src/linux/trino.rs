@@ -385,7 +385,7 @@ pub async fn install(
     // separate JAR download; v0.0.x just exposes the launcher.
     let _ = super::path::register(
         "trino",
-        &launcher_path,
+        &entry,
     )
     .await;
 
