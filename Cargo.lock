@@ -553,6 +553,7 @@ dependencies = [
  "computeza-reconciler-postgres",
  "computeza-reconciler-qdrant",
  "computeza-reconciler-restate",
+ "computeza-reconciler-sail",
  "computeza-secrets",
  "computeza-state",
  "computeza-ui-server",

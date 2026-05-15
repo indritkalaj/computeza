@@ -745,6 +745,25 @@ async fn reconcile_tick(
                 let _ = reconciler.observe(&ctx).await;
             }
         }
+
+        // ---- sail-instance ----
+        {
+            use computeza_reconciler_sail::{SailReconciler, SailSpec};
+            let rows = store.list("sail-instance", None).await.unwrap_or_default();
+            for sr in rows {
+                let spec: SailSpec = match serde_json::from_value(sr.spec.clone()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(error = %e, name = %sr.key.name, "sail spec deserialize failed");
+                        continue;
+                    }
+                };
+                let reconciler: SailReconciler<NoOpDriver> =
+                    SailReconciler::new(spec.endpoint.clone())
+                        .with_state(store.clone(), &sr.key.name);
+                let _ = reconciler.observe(&ctx).await;
+            }
+        }
     }
 }
 
