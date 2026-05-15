@@ -1810,13 +1810,154 @@ details > summary::-webkit-details-marker { display: none; }
   background: var(--navy-3);
 }
 .cz-studio-results-empty {
-  padding: 2rem 1rem;
+  padding: 2rem 1.25rem;
   text-align: center;
   color: var(--muted);
   font-size: 0.85rem;
   border: 1px dashed var(--line);
   border-radius: var(--radius);
   background: var(--navy-2);
+}
+.cz-studio-empty-eyebrow {
+  font-family: 'Geist Mono', monospace;
+  font-size: 0.7rem;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--lavender);
+  opacity: 0.65;
+  margin-bottom: 0.6rem;
+}
+.cz-studio-empty-headline {
+  color: var(--ink);
+  font-size: 0.95rem;
+  margin-bottom: 1.2rem;
+}
+.cz-studio-empty-examples {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  align-items: stretch;
+  max-width: 36rem;
+  margin: 0 auto;
+}
+.cz-studio-empty-example-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.55rem 0.85rem;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  font-size: 0.8rem;
+  text-align: left;
+}
+.cz-studio-empty-example-row a {
+  flex: 1;
+  color: var(--ink);
+  text-decoration: none;
+}
+.cz-studio-empty-example-row a:hover code {
+  color: var(--lavender);
+}
+.cz-studio-empty-example-row code {
+  font-family: 'Geist Mono', monospace;
+  font-size: 0.78rem;
+  color: var(--ink);
+}
+
+/* Inline action button in the results header (e.g. copy-as-tsv). */
+.cz-studio-results-action {
+  color: var(--muted);
+  padding: 0.2rem 0.5rem;
+  border-radius: var(--radius-sm);
+  text-decoration: none;
+  font-size: 0.85rem;
+}
+.cz-studio-results-action:hover {
+  color: var(--lavender);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+/* ---------- Studio status bar (bottom, Databricks-style) ---------- */
+.cz-studio-statusbar {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.45rem 1rem;
+  background: var(--navy-1);
+  border-top: 1px solid var(--line);
+  font-family: 'Geist Mono', monospace;
+  font-size: 0.7rem;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  position: sticky;
+  bottom: 0;
+  z-index: 50;
+}
+.cz-studio-statusbar-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.cz-studio-statusbar-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--muted);
+  display: inline-block;
+}
+.cz-studio-statusbar-dot[data-state="ok"]      { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+.cz-studio-statusbar-dot[data-state="down"]    { background: var(--fail); }
+.cz-studio-statusbar-dot[data-state="unknown"] { background: var(--muted); }
+.cz-studio-statusbar-label {
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--ink);
+  font-size: 0.7rem;
+  opacity: 0.85;
+}
+.cz-studio-statusbar-hint {
+  opacity: 0.75;
+}
+.cz-studio-statusbar-hint kbd {
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 0.65rem;
+  font-family: inherit;
+  color: var(--ink);
+}
+
+/* ---------- Keyboard-shortcut overlay ---------- */
+#cz-studio-shortcuts {
+  display: none;
+}
+#cz-studio-shortcuts.cz-studio-shortcuts-open {
+  display: flex;
+}
+.cz-shortcut-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 0.5rem;
+}
+.cz-shortcut-table td {
+  padding: 0.5rem 0.6rem;
+  border-bottom: 1px solid var(--line);
+  font-size: 0.85rem;
+}
+.cz-shortcut-table td:first-child {
+  width: 12rem;
+  white-space: nowrap;
+}
+.cz-shortcut-table kbd {
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-family: 'Geist Mono', monospace;
+  font-size: 0.75rem;
+  color: var(--ink);
 }
 
 /* Pre-formatted error panels */

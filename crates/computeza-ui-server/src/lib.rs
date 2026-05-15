@@ -4128,6 +4128,10 @@ enum SqlOutcome {
     Ok {
         columns: Vec<String>,
         rows: Vec<Vec<String>>,
+        /// Wall-clock execution time on the server side, in
+        /// milliseconds. Surfaced in the results header so the
+        /// operator can see "1,247 rows · 142 ms" Databricks-style.
+        duration_ms: u128,
     },
     Err(String),
 }
@@ -4150,6 +4154,7 @@ enum SqlOutcome {
 /// operator can query any registered catalog from one editor
 /// without changing the session context.
 async fn execute_sql_against_trino(base_url: &str, sql: &str) -> SqlOutcome {
+    let start = std::time::Instant::now();
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
         .build()
@@ -4232,7 +4237,11 @@ async fn execute_sql_against_trino(base_url: &str, sql: &str) -> SqlOutcome {
             .map(str::to_string);
         let Some(next) = next_uri else {
             // No nextUri -> query is finished.
-            return SqlOutcome::Ok { columns, rows };
+            return SqlOutcome::Ok {
+                columns,
+                rows,
+                duration_ms: start.elapsed().as_millis(),
+            };
         };
         // Per Trino docs: headers are only needed on the initial
         // POST; the GET to nextUri carries the session via the URI.
@@ -4550,11 +4559,76 @@ fn render_studio_page(
             html_escape(engine.label())
         )
     };
+    // Empty-state suggestions: pull the three most-recent successful
+    // queries from history (deduped on first line) so the operator
+    // can re-fire them as a one-click prefill instead of staring at
+    // an empty pane. Falls back to a generic prompt when history is
+    // empty (e.g. first install).
+    let empty_state_html = {
+        let mut seen = std::collections::HashSet::new();
+        let recent: Vec<&StudioHistoryEntry> = history
+            .entries
+            .iter()
+            .filter(|e| e.ok)
+            .filter(|e| {
+                let first_line = e.sql.lines().next().unwrap_or("").trim().to_string();
+                if first_line.is_empty() {
+                    return false;
+                }
+                seen.insert(first_line)
+            })
+            .take(3)
+            .collect();
+        let suggestions = if recent.is_empty() {
+            r##"<div class="cz-studio-empty-examples">
+<div class="cz-studio-empty-example-row">
+<span class="cz-tag">try</span>
+<a href="/studio?sql=SHOW%20CATALOGS"><code>SHOW CATALOGS</code></a>
+</div>
+<div class="cz-studio-empty-example-row">
+<span class="cz-tag">try</span>
+<a href="/studio?sql=SHOW%20SCHEMAS%20FROM%20%3Ccatalog%3E"><code>SHOW SCHEMAS FROM &lt;catalog&gt;</code></a>
+</div>
+<div class="cz-studio-empty-example-row">
+<span class="cz-tag">try</span>
+<a href="/studio?sql=SELECT%201"><code>SELECT 1</code></a>
+</div>
+</div>"##.to_string()
+        } else {
+            let rows: String = recent
+                .iter()
+                .map(|e| {
+                    let preview: String = e
+                        .sql
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(80)
+                        .collect();
+                    format!(
+                        r#"<div class="cz-studio-empty-example-row">
+<span class="cz-tag">recent</span>
+<a href="/studio?sql={enc}"><code>{txt}</code></a>
+</div>"#,
+                        enc = url_encode(&e.sql),
+                        txt = html_escape(&preview),
+                    )
+                })
+                .collect();
+            format!(r#"<div class="cz-studio-empty-examples">{rows}</div>"#)
+        };
+        format!(
+            r#"<div class="cz-studio-results-empty">
+<div class="cz-studio-empty-eyebrow">No results yet</div>
+<div class="cz-studio-empty-headline">Run a SQL or Python query above. Ctrl/Cmd+Enter to fire.</div>
+{suggestions}
+</div>"#
+        )
+    };
+
     let results_html = match result {
-        None => format!(
-            r#"<div class="cz-studio-results-empty">{}</div>"#,
-            html_escape(&results_empty)
-        ),
+        None => empty_state_html.clone(),
         Some(RoutedOutcome::Sql {
             outcome: None,
             ..
@@ -4573,7 +4647,7 @@ fn render_studio_page(
         ),
         Some(RoutedOutcome::Sql {
             engine,
-            outcome: Some(SqlOutcome::Ok { columns, rows }),
+            outcome: Some(SqlOutcome::Ok { columns, rows, duration_ms }),
         }) => {
             let header: String = columns
                 .iter()
@@ -4590,18 +4664,34 @@ fn render_studio_page(
                 })
                 .collect();
             let row_count = rows.len();
+            // Format the wall-clock duration. ms under 1s, s under
+            // 60s, otherwise mm:ss. Keeps the metadata line compact.
+            let duration_label = if duration_ms < 1000 {
+                format!("{duration_ms} ms")
+            } else if duration_ms < 60_000 {
+                format!("{:.1} s", (duration_ms as f64) / 1000.0)
+            } else {
+                let total_s = duration_ms / 1000;
+                format!("{}:{:02}", total_s / 60, total_s % 60)
+            };
+            // Thousands-separator the row count for readability on
+            // large result sets (the Databricks SQL editor does
+            // this too).
+            let row_count_fmt = thousands(row_count);
             format!(
-                r#"<div class="cz-studio-results-header">
+                r##"<div class="cz-studio-results-header">
 {pill}
 <span class="cz-studio-results-eyebrow">Results</span>
-<span class="cz-studio-results-count">{row_count} row{plural}</span>
+<span class="cz-studio-results-count">{row_count_fmt} row{plural} · {duration_label}</span>
+<span class="cz-studio-actions-spacer"></span>
+<a href="#" class="cz-studio-results-action" onclick="czCopyResults(event);" title="Copy results as TSV"><i class="fa-solid fa-copy"></i></a>
 </div>
 <div style="overflow-x: auto;">
-<table class="cz-studio-results-table">
+<table class="cz-studio-results-table" id="cz-results-table">
 <thead><tr>{header}</tr></thead>
 <tbody>{body_rows}</tbody>
 </table>
-</div>"#,
+</div>"##,
                 plural = if row_count == 1 { "" } else { "s" },
                 pill = engine_pill(engine),
             )
@@ -4856,11 +4946,159 @@ fn render_studio_page(
     let files_pane_html = render_studio_files_pane(files);
 
     let body = format!(
-        r#"<div class="cz-studio-shell">
+        r##"<div class="cz-studio-shell">
 <aside class="cz-studio-sidebar">{sidebar_html}</aside>
 <aside class="cz-studio-files">{files_pane_html}</aside>
 <main class="cz-studio-main">{main_html}</main>
 </div>
+
+<!-- Studio status bar, Databricks-style. Pinned to bottom of the
+     studio shell. Each dot is updated client-side from /status JSON
+     so the operator can see at a glance whether Trino, Sail, and
+     Lakekeeper are live without leaving the editor. -->
+<div class="cz-studio-statusbar" role="status" aria-label="Engine status">
+  <span class="cz-studio-statusbar-item" data-engine="trino">
+    <span class="cz-studio-statusbar-dot" data-state="unknown"></span>
+    <span class="cz-studio-statusbar-label">Trino</span>
+  </span>
+  <span class="cz-studio-statusbar-item" data-engine="sail">
+    <span class="cz-studio-statusbar-dot" data-state="unknown"></span>
+    <span class="cz-studio-statusbar-label">Sail</span>
+  </span>
+  <span class="cz-studio-statusbar-item" data-engine="lakekeeper">
+    <span class="cz-studio-statusbar-dot" data-state="unknown"></span>
+    <span class="cz-studio-statusbar-label">Lakekeeper</span>
+  </span>
+  <span class="cz-studio-actions-spacer"></span>
+  <span class="cz-studio-statusbar-hint">Press <kbd>Cmd</kbd>+<kbd>/</kbd> for shortcuts</span>
+</div>
+
+<!-- Keyboard-shortcut overlay, Cmd+/ toggles. -->
+<div id="cz-studio-shortcuts" class="cz-modal-overlay" role="dialog" aria-modal="true" aria-hidden="true">
+  <div class="cz-modal-overlay-backdrop" onclick="czCloseShortcuts(event)"></div>
+  <div class="cz-modal">
+    <a href="#" class="cz-modal-close" onclick="czCloseShortcuts(event)" aria-label="Close">×</a>
+    <h2 class="cz-modal-title">Keyboard shortcuts</h2>
+    <table class="cz-shortcut-table">
+      <tr><td><kbd>Ctrl/Cmd</kbd> + <kbd>Enter</kbd></td><td>Run current query</td></tr>
+      <tr><td><kbd>Ctrl/Cmd</kbd> + <kbd>S</kbd></td><td>Save active file</td></tr>
+      <tr><td><kbd>Ctrl/Cmd</kbd> + <kbd>/</kbd></td><td>This shortcut overlay</td></tr>
+      <tr><td><kbd>Ctrl/Cmd</kbd> + <kbd>K</kbd></td><td>Focus editor</td></tr>
+      <tr><td><kbd>Esc</kbd></td><td>Close any open overlay</td></tr>
+    </table>
+    <p class="cz-modal-subtitle" style="margin-top:1rem">Editor body autosaves every keystroke to your browser's localStorage. Files saved via the <strong>Save</strong> button persist server-side.</p>
+  </div>
+</div>
+
+<script>
+// ---------- Studio status bar ----------
+// Poll /api/state/info every 8s and paint the dot per engine.
+(function () {{
+  function setDot(slug, state) {{
+    var el = document.querySelector('.cz-studio-statusbar-item[data-engine="' + slug + '"] .cz-studio-statusbar-dot');
+    if (el) el.setAttribute("data-state", state);
+  }}
+  function refresh() {{
+    fetch("/api/state/info", {{ credentials: "same-origin" }})
+      .then(function(r) {{ return r.ok ? r.json() : null; }})
+      .then(function(j) {{
+        if (!j || !j.resource_counts) return;
+        ["trino", "sail", "lakekeeper"].forEach(function(slug) {{
+          var n = j.resource_counts[slug + "-instance"] || 0;
+          setDot(slug, n > 0 ? "ok" : "down");
+        }});
+      }})
+      .catch(function() {{ /* network blip, leave dots as they were */ }});
+  }}
+  refresh();
+  setInterval(refresh, 8000);
+}})();
+
+// ---------- Editor autosave to localStorage ----------
+// Every keystroke writes the textarea body to localStorage under
+// cz-studio-scratch. On page load, if the textarea is empty AND no
+// file is active AND no ?sql= query param was passed, restore it.
+(function () {{
+  var SCRATCH_KEY = "cz-studio-scratch";
+  var ta = document.getElementById("cz-sql-textarea");
+  if (!ta) return;
+  // Restore only when the editor would otherwise be empty -- never
+  // clobber an explicit prefill from ?sql= or a loaded file.
+  try {{
+    if (!ta.value || ta.value.trim() === "") {{
+      var saved = localStorage.getItem(SCRATCH_KEY);
+      if (saved) ta.value = saved;
+    }}
+  }} catch (_) {{}}
+  // Throttled write -- one localStorage call every 250ms while
+  // typing, plus one on blur.
+  var pending = null;
+  function save() {{
+    try {{ localStorage.setItem(SCRATCH_KEY, ta.value); }} catch (_) {{}}
+    pending = null;
+  }}
+  ta.addEventListener("input", function () {{
+    if (pending !== null) clearTimeout(pending);
+    pending = setTimeout(save, 250);
+  }});
+  ta.addEventListener("blur", save);
+}})();
+
+// ---------- Keyboard shortcuts ----------
+window.czCloseShortcuts = function (e) {{
+  if (e) e.preventDefault();
+  var modal = document.getElementById("cz-studio-shortcuts");
+  if (modal) modal.classList.remove("cz-studio-shortcuts-open");
+}};
+(function () {{
+  var modal = document.getElementById("cz-studio-shortcuts");
+  document.addEventListener("keydown", function (e) {{
+    // Cmd+/ or Ctrl+/
+    if ((e.metaKey || e.ctrlKey) && e.key === "/") {{
+      e.preventDefault();
+      if (modal) modal.classList.toggle("cz-studio-shortcuts-open");
+    }}
+    // Cmd+K or Ctrl+K -> focus editor
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {{
+      var ta = document.getElementById("cz-sql-textarea");
+      if (ta) {{ e.preventDefault(); ta.focus(); }}
+    }}
+    // Cmd+S or Ctrl+S -> click Save button if present
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s") {{
+      var save = document.querySelector('button[formaction*="/save"]');
+      if (save) {{ e.preventDefault(); save.click(); }}
+    }}
+    // Esc -> close any open overlay
+    if (e.key === "Escape" && modal) {{
+      modal.classList.remove("cz-studio-shortcuts-open");
+    }}
+  }});
+}})();
+
+// ---------- Copy results as TSV ----------
+window.czCopyResults = function (e) {{
+  if (e) e.preventDefault();
+  var table = document.getElementById("cz-results-table");
+  if (!table) return;
+  var rows = [];
+  table.querySelectorAll("tr").forEach(function (tr) {{
+    var cells = [];
+    tr.querySelectorAll("th,td").forEach(function (c) {{ cells.push(c.textContent); }});
+    rows.push(cells.join("\t"));
+  }});
+  var tsv = rows.join("\n");
+  if (navigator.clipboard && navigator.clipboard.writeText) {{
+    navigator.clipboard.writeText(tsv).then(function () {{
+      var link = e && e.currentTarget;
+      if (link) {{
+        var prev = link.innerHTML;
+        link.innerHTML = '<i class="fa-solid fa-check"></i>';
+        setTimeout(function () {{ link.innerHTML = prev; }}, 1200);
+      }}
+    }});
+  }}
+}};
+</script>
 <script>
 // Monaco editor progressive enhancement.
 //
@@ -5015,7 +5253,7 @@ fn render_studio_page(
   }};
   document.head.appendChild(script);
 }})();
-</script>"#,
+</script>"##,
         sidebar_html = sidebar_html,
         main_html = main_html,
     );
@@ -12249,6 +12487,22 @@ fn html_escape(s: &str) -> String {
     out
 }
 
+/// Format an integer with thousands separators ("1,247", "10,000").
+/// Used in the studio results header so big row counts read at a
+/// glance instead of as a wall of digits.
+fn thousands(n: usize) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
+}
+
 /// Render the `/install` page: a wizard form that POSTs to
 /// `/install/postgres` and lays down a native PostgreSQL service on the
 /// host. Per spec section 2.1 / 4.2 the install path is GUI-equivalent
@@ -16782,10 +17036,19 @@ pub fn render_status(localizer: &Localizer, rows: Option<&[StatusRow]>) -> Strin
                         (state_ok.clone(), "cz-badge cz-badge-ok")
                     };
                     let version = r.server_version.clone().unwrap_or_else(|| "-".to_string());
-                    let observed = r
-                        .last_observed_at
-                        .clone()
-                        .unwrap_or_else(|| "-".to_string());
+                    // Wrap the ISO timestamp in a span carrying
+                    // data-ts-utc so the global czRewriteTimestamps
+                    // JS converts it to local time when the operator
+                    // opted into "local" via /account. Render the
+                    // raw ISO inside so server-rendered HTML still
+                    // works without JS.
+                    let observed = match r.last_observed_at.as_deref() {
+                        Some(iso) => format!(
+                            "<span data-ts-utc=\"{iso}\">{iso}</span>",
+                            iso = html_escape(iso),
+                        ),
+                        None => "-".to_string(),
+                    };
                     // Placeholder rows (no instance yet) skip the
                     // resource link -- it would 404 -- and surface
                     // just the component name with a dim "Not
@@ -16820,7 +17083,7 @@ pub fn render_status(localizer: &Localizer, rows: Option<&[StatusRow]>) -> Strin
                         kind = html_escape(&r.kind),
                         name_cell = name_cell,
                         version = html_escape(&version),
-                        observed = html_escape(&observed),
+                        observed = observed,
                         badge_cls = badge_cls,
                         state_label = html_escape(&state_label),
                     )
