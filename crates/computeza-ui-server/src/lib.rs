@@ -5411,12 +5411,14 @@ enum DatabendWiringOutcome {
 /// CONNECTION=(...)`. Best-effort: a Databend outage or unsupported
 /// syntax doesn't fail the bootstrap.
 ///
-/// The WAREHOUSE param is the warehouse UUID, NOT the human name --
-/// Lakekeeper's `/catalog/v1/config?warehouse=<x>` lookup only resolves
-/// UUIDs (returning <name> here makes Lakekeeper 404 with
-/// NoSuchWarehouseException, which Databend surfaces as "Catalog
-/// creation failed"). We resolve the UUID via the same three-tier
-/// resolver the drill-down handlers use.
+/// Per Lakekeeper 0.12.x's official query-engine examples, the
+/// `"warehouse"` value is the human NAME (e.g. "default"); the
+/// Iceberg-REST client hits /v1/config to resolve NAME -> UUID
+/// prefix internally. The CREATE CATALOG syntax uses Databend's
+/// lowercase-quoted CONNECTION-block convention -- same form as
+/// `"s3.endpoint"`. A previous version emitted both this and a
+/// bare `WAREHOUSE = '...'` line; Databend rejected the duplicate
+/// keys as a syntax error.
 async fn wire_databend_iceberg_catalog(
     store: Option<&computeza_state::SqliteStore>,
     secrets: Option<&computeza_secrets::SecretsStore>,
@@ -5464,25 +5466,32 @@ async fn wire_databend_iceberg_catalog(
     }
 
     // Try each candidate. First success wins. Capture every failure
-    // so we can surface a useful diagnostic if all of them 404.
+    // so we can surface a useful diagnostic if all of them fail.
     //
-    // CRITICAL: Databend's Iceberg-REST CREATE CATALOG ignores the
-    // bare `WAREHOUSE = '<value>'` form and silently falls back to
-    // the catalog NAME as the warehouse identifier. (Operator
-    // report: WAREHOUSE='<uuid>' but Lakekeeper got asked for
-    // 'default' anyway.) Databend's CONNECTION-block convention is
-    // lowercase-quoted keys -- same as "s3.endpoint" -- so the
-    // parameter must be written as "warehouse" = '<value>'. We
-    // include BOTH forms below so the active syntax wins regardless
-    // of which Databend version is installed.
+    // Per Lakekeeper's official Spark / PyIceberg / Trino examples,
+    // the `warehouse` config option holds the human warehouse NAME,
+    // not the UUID -- the Iceberg-REST client hits /v1/config to
+    // resolve NAME -> UUID-prefix internally. We list NAME first;
+    // the UUID-shaped candidates are belt-and-braces for older
+    // Lakekeeper / Databend combinations that may accept either.
     let mut attempts: Vec<(String, String)> = Vec::with_capacity(candidates.len());
     for candidate in &candidates {
+        // CREATE CATALOG SQL for an Iceberg-REST connection.
+        //
+        // Databend's CONNECTION block uses lowercase-quoted keys
+        // ("s3.endpoint", "s3.region", ...); the `warehouse` value
+        // follows the same convention. We previously emitted BOTH
+        // the quoted form AND a bare uppercase `WAREHOUSE = '..'`
+        // line for belt-and-braces, but Databend treats duplicate
+        // keys as a syntax error and rejects the whole statement
+        // ("default catalog cannot be created" with no nested
+        // Lakekeeper detail). Single quoted-lowercase key, per
+        // Databend's CONNECTION-block convention.
         let create_sql = format!(
             "CREATE CATALOG {name} TYPE = ICEBERG CONNECTION = (\
                 TYPE = 'rest', \
                 ADDRESS = '{address}', \
                 \"warehouse\" = '{warehouse}', \
-                WAREHOUSE = '{warehouse}', \
                 \"s3.endpoint\" = '{s3_endpoint}', \
                 \"s3.access-key-id\" = '{ak}', \
                 \"s3.secret-access-key\" = '{sk}', \
