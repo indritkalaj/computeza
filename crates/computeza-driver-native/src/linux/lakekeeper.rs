@@ -265,6 +265,95 @@ pub async fn uninstall(opts: UninstallOptions) -> Result<Uninstalled, ServiceErr
     Ok(out)
 }
 
+/// State reset: keep Lakekeeper installed but blow away every byte
+/// of operator-visible state. Used by the Studio "Reset Lakekeeper
+/// state" button when the warehouse / project rows in postgres get
+/// into a state Studio can't reason about (orphaned warehouses in
+/// non-default projects, duplicate names across projects, etc).
+///
+/// Steps:
+///   1. systemctl stop computeza-lakekeeper (so DROP DATABASE isn't
+///      blocked by open connections).
+///   2. DROP + CREATE the lakekeeper postgres database. Recreated
+///      empty so Lakekeeper's ExecStartPre `migrate` step rebuilds
+///      the schema on next start.
+///   3. systemctl start computeza-lakekeeper.
+///   4. Poll port 8181 for readiness.
+///
+/// Returns the list of step-by-step ok/warn messages so the caller
+/// can render them on the result page. Best-effort throughout; a
+/// stuck step is reported as a warning but doesn't abort later
+/// steps.
+pub async fn reset_state() -> Uninstalled {
+    let mut out = Uninstalled::default();
+    let unit = UNIT_NAME;
+
+    // Step 1: stop service.
+    match super::systemctl::stop(unit).await {
+        Ok(()) => out.ok(format!("stopped {unit}")),
+        Err(e) => out.warn(format!("stop {unit} (continuing): {e}")),
+    }
+
+    // Step 2: drop + recreate postgres database. Same helper the
+    // uninstall path uses for the DROP; this variant follows with
+    // a CREATE so the next service start has an empty target.
+    match drop_lakekeeper_postgres_database().await {
+        Ok(()) => out.ok("dropped postgres lakekeeper database"),
+        Err(e) => out.warn(format!("drop postgres lakekeeper db: {e}")),
+    }
+    match create_lakekeeper_postgres_database().await {
+        Ok(()) => out.ok("recreated empty postgres lakekeeper database"),
+        Err(e) => out.warn(format!("create postgres lakekeeper db: {e}")),
+    }
+
+    // Step 3: restart service. systemd's ExecStartPre runs
+    // `lakekeeper migrate` which rebuilds the schema on the empty
+    // database.
+    match super::systemctl::run(&["start", unit]).await {
+        Ok(()) => out.ok(format!("started {unit}")),
+        Err(e) => {
+            out.warn(format!("start {unit} failed: {e}"));
+            return out;
+        }
+    }
+
+    // Step 4: wait for port ready. 30s ceiling -- migrate is
+    // ~100ms on an empty schema; anything longer is a real
+    // problem the operator should investigate.
+    use std::time::Duration;
+    match super::service::wait_for_port("127.0.0.1", DEFAULT_PORT, Duration::from_secs(30)).await {
+        Ok(()) => out.ok(format!(
+            "lakekeeper accepting connections on 127.0.0.1:{DEFAULT_PORT}"
+        )),
+        Err(e) => out.warn(format!("readiness probe: {e}")),
+    }
+
+    out
+}
+
+async fn create_lakekeeper_postgres_database() -> std::result::Result<(), String> {
+    use tokio::process::Command;
+    let out = Command::new("sudo")
+        .args([
+            "-u",
+            "postgres",
+            "psql",
+            "-c",
+            "CREATE DATABASE lakekeeper OWNER lakekeeper;",
+        ])
+        .output()
+        .await
+        .map_err(|e| format!("spawn psql CREATE: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "CREATE DATABASE lakekeeper exited {}: {}",
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(())
+}
+
 /// Best-effort: drop the `lakekeeper` Postgres database via the
 /// local postgres superuser socket. Returns an Err only when psql
 /// is reachable but the command itself failed; "no postgres

@@ -668,6 +668,7 @@ pub fn router_with_state(state: AppState) -> Router {
             "/studio/bootstrap",
             get(studio_bootstrap_form_handler).post(studio_bootstrap_submit_handler),
         )
+        .route("/studio/bootstrap/reset", post(studio_bootstrap_reset_handler))
         // Iceberg-REST catalog drill-down (phase 1.5):
         //   /studio/catalog/{warehouse}                       -> namespace list
         //   /studio/catalog/{warehouse}/{namespace}           -> table list
@@ -1791,6 +1792,8 @@ async fn studio_catalog_namespace_handler(
 struct FlashQuery {
     err: Option<String>,
     wired: Option<String>,
+    #[serde(default)]
+    flash: Option<String>,
 }
 
 async fn studio_catalog_table_handler(
@@ -4987,31 +4990,84 @@ struct StudioBootstrapForm {
 
 async fn studio_bootstrap_form_handler(
     State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<FlashQuery>,
 ) -> Html<String> {
     let l = Localizer::english();
     let lakekeeper = discover_lakekeeper_endpoint(state.store.as_deref()).await;
     let garage = discover_garage_endpoint(state.store.as_deref()).await;
-    // Garage's S3 API typically lives on a different port from the
-    // admin endpoint; substitute :3900 for the admin :3903 if we
-    // can't tell. Operator can edit before submitting.
     let suggested_s3 = garage
         .as_ref()
         .map(|u| u.replace(":3903", ":3900"))
         .unwrap_or_else(|| "http://127.0.0.1:3900".to_string());
-    // Pre-fill the access-key and secret fields from the vault if
-    // Garage's post-install hook (or a previous manual bootstrap
-    // run) has populated them. Auto-bootstrap is the primary path
-    // since v0.1; this form is the power-user escape hatch when
-    // auto-bootstrap fails or when migrating from v0.0.x where the
-    // operator already minted credentials by hand.
     let prefill = read_garage_credentials_for_prefill(state.secrets.as_deref()).await;
+    // The `flash` query param carries the post-reset summary so the
+    // operator sees what happened after the redirect.
+    let flash_result = q
+        .flash
+        .as_deref()
+        .map(|s| Ok::<String, String>(s.to_string()));
     Html(render_studio_bootstrap_form(
         &l,
         lakekeeper.is_some(),
         &suggested_s3,
         &prefill,
-        None,
+        flash_result,
     ))
+}
+
+/// POST /studio/bootstrap/reset
+///
+/// Destructive recovery action: drops + recreates the lakekeeper
+/// postgres database, restarts the service, and clears the vault's
+/// cached warehouse identifiers so the next /studio/bootstrap mints
+/// fresh ones. Use when the postgres state has drifted from what
+/// Studio expects (orphaned warehouses in non-default projects,
+/// duplicate names across projects, ...) and a clean re-bootstrap
+/// is the only way to recover without touching the shell.
+///
+/// The handler runs synchronously rather than spawning a job because
+/// the reset is fast (~5s including a 30s readiness ceiling) and the
+/// operator is sitting on the form waiting for the next step.
+async fn studio_bootstrap_reset_handler(
+    State(state): State<AppState>,
+) -> axum::response::Redirect {
+    #[cfg(target_os = "linux")]
+    {
+        let result = computeza_driver_native::linux::lakekeeper::reset_state().await;
+        // Clear the vault's cached warehouse identifiers so the
+        // next bootstrap is a true fresh start. Per-name entries
+        // can't be enumerated without a list operation; the
+        // singleton key + the well-known sail catalog index cover
+        // the common cases.
+        if let Some(s) = state.secrets.as_deref() {
+            let _ = s.delete("lakekeeper/default-warehouse-id").await;
+            let _ = s.delete("lakekeeper/default-warehouse-name").await;
+            let _ = s.delete("sail/catalog-names").await;
+            // Best-effort: also nuke any per-name keys that the
+            // resolver may have written. We can't enumerate, but
+            // re-bootstrap will overwrite them.
+        }
+        let mut detail = String::from("Lakekeeper reset complete:\n");
+        for step in &result.steps {
+            detail.push_str(&format!("  ✓ {step}\n"));
+        }
+        for warn in &result.warnings {
+            detail.push_str(&format!("  ! {warn}\n"));
+        }
+        detail.push_str("\nVault warehouse cache cleared.\n\nNext: re-run /studio/bootstrap below to provision a fresh warehouse.");
+        axum::response::Redirect::to(&format!(
+            "/studio/bootstrap?flash={}",
+            url_encode(&detail)
+        ))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = state; // suppress unused on non-linux
+        axum::response::Redirect::to(&format!(
+            "/studio/bootstrap?flash={}",
+            url_encode("Reset is Linux-only in v0.0.x.")
+        ))
+    }
 }
 
 async fn studio_bootstrap_submit_handler(
@@ -5883,6 +5939,15 @@ gg key info lakekeeper                         # &lt;-- copy Key ID + Secret key
 <button type="submit" class="cz-btn-primary">Run bootstrap</button>
 </div>
 </form>
+
+<div class="cz-setup-card" style="margin-top: 1.5rem; border-color: rgba(255, 157, 166, 0.3);">
+<h2 style="margin-top: 0; font-size: 0.95rem; color: var(--fail);"><i class="fa-solid fa-triangle-exclamation"></i> Recovery: reset Lakekeeper state</h2>
+<p class="cz-muted" style="margin: 0 0 0.85rem; font-size: 0.82rem; line-height: 1.55;">If bootstrap keeps failing with <code>NoSuchWarehouseException</code> or <code>WarehouseIdIsNotUUID</code>, the Lakekeeper postgres database has drifted from what Studio expects (orphaned warehouses from earlier attempts, duplicate names across projects, etc.). This button stops Lakekeeper, drops + recreates the <code>lakekeeper</code> postgres database, restarts the service, and clears the vault's cached warehouse identifiers. <strong>Destroys every warehouse and namespace</strong> in this Lakekeeper instance &mdash; the underlying Iceberg data files on Garage are NOT touched.</p>
+<form method="post" action="/studio/bootstrap/reset" style="margin: 0;" onsubmit="return confirm('This destroys every warehouse + namespace + table metadata row in Lakekeeper. The on-disk Iceberg files in Garage stay put -- you can re-register the warehouse + namespaces and the table data remains queryable. Proceed?');">
+{csrf}
+<button type="submit" class="cz-btn-danger"><i class="fa-solid fa-rotate-left"></i> Reset Lakekeeper state</button>
+</form>
+</div>
 </div>"#,
         title = html_escape(&title),
         intro = html_escape(&intro),
