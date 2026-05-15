@@ -1206,20 +1206,50 @@ a.cz-card:hover {
   padding-left: 1.2rem;
 }
 .cz-studio-file-row-actions button,
-.cz-studio-file-row-actions a,
-.cz-studio-file-row-actions summary {
+.cz-studio-file-row-actions a {
+  position: relative;
   background: transparent;
   border: none;
   color: var(--muted);
   cursor: pointer;
   padding: 1px 4px;
-  font-size: 0.78rem;
+  font-size: 0.75rem;
   line-height: 1;
   border-radius: 3px;
   text-decoration: none;
   display: inline-flex;
   align-items: center;
 }
+/* Hover-revealed tooltip via the standard title-style attribute we
+   already set on each action. Browsers' default tooltip has a ~1s
+   delay; this CSS one fires instantly + matches the rail's tooltip
+   style. The data-tooltip attribute drives the label text. */
+.cz-studio-file-row-actions [title]::after,
+.cz-studio-files-actions [data-tooltip]::after,
+.cz-studio-file-row-actions [data-tooltip]::after {
+  content: attr(title) attr(data-tooltip);
+  position: absolute;
+  bottom: calc(100% + 0.3rem);
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--navy-2);
+  border: 1px solid var(--line);
+  color: var(--ink);
+  font-family: 'Geist', system-ui, sans-serif;
+  font-size: 0.72rem;
+  font-weight: 500;
+  padding: 0.25rem 0.5rem;
+  border-radius: var(--radius-sm);
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 100ms ease;
+  z-index: 200;
+  box-shadow: var(--shadow-card);
+}
+.cz-studio-file-row-actions [title]:hover::after,
+.cz-studio-files-actions [data-tooltip]:hover::after,
+.cz-studio-file-row-actions [data-tooltip]:hover::after { opacity: 1; }
 .cz-studio-file-row-actions button:hover,
 .cz-studio-file-row-actions a:hover,
 .cz-studio-file-row-actions summary:hover {

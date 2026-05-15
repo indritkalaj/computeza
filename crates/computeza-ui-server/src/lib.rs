@@ -4176,25 +4176,36 @@ fn render_studio_files_pane(files: &StudioFilesView) -> String {
     // empty file.
     let actions = format!(
         r##"<div class="cz-studio-files-actions">
-<details style="position: relative; margin: 0; display: inline-block;">
-<summary title="New file" style="list-style: none; cursor: pointer; padding: 2px 6px; border-radius: 4px;">+</summary>
-<form method="post" action="/studio/files/new" id="cz-file-new-form" style="position: absolute; right: 0; top: 1.6rem; background: var(--navy-2); border: 1px solid var(--line); border-radius: var(--radius); padding: 0.6rem; z-index: 50; min-width: 16rem; box-shadow: var(--shadow-card);">
+<a href="#cz-modal-new-file" data-tooltip="New file"><i class="fa-solid fa-plus"></i></a>
+<a href="/studio/files/export-archive" data-tooltip="Export workspace as .cptz"><i class="fa-solid fa-file-zipper"></i></a>
+</div>
+<div id="cz-modal-new-file" class="cz-modal-overlay" role="dialog" aria-labelledby="cz-modal-new-file-title" aria-modal="true">
+<a href="#" class="cz-modal-overlay-backdrop" aria-label="Close"></a>
+<div class="cz-modal">
+<a href="#" class="cz-modal-close" aria-label="Close">×</a>
+<h2 id="cz-modal-new-file-title" class="cz-modal-title">New file</h2>
+<p class="cz-modal-subtitle">Saves the editor's current contents to a new file. The extension drives syntax highlighting + the auto-route (SQL → Databend, Python → Sail).</p>
+<form method="post" action="/studio/files/new" id="cz-file-new-form">
 {csrf}
 <input type="hidden" name="open" value="{open_csv}" />
 <input type="hidden" name="content" id="cz-file-new-content" value="" />
-<label style="display:block; font-size:0.7rem; color:var(--muted); margin-bottom:0.3rem;">Path</label>
-<input type="text" name="path" class="cz-input" placeholder="/sql/my-query.sql" style="width:100%; font-family:'Geist Mono', ui-monospace, monospace; font-size:0.78rem; margin-bottom:0.5rem;" />
-<div style="display:flex; gap:0.3rem; flex-wrap:wrap; margin-bottom:0.5rem;">
-<button type="button" class="cz-btn-ghost" style="font-size:0.7rem; padding:0.2rem 0.45rem;" onclick="document.querySelector('#cz-file-new-form input[name=path]').value='/sql/untitled.sql'">.sql</button>
-<button type="button" class="cz-btn-ghost" style="font-size:0.7rem; padding:0.2rem 0.45rem;" onclick="document.querySelector('#cz-file-new-form input[name=path]').value='/python/untitled.py'">.py</button>
-<button type="button" class="cz-btn-ghost" style="font-size:0.7rem; padding:0.2rem 0.45rem;" onclick="document.querySelector('#cz-file-new-form input[name=path]').value='/notes/untitled.txt'">.txt</button>
-<button type="button" class="cz-btn-ghost" style="font-size:0.7rem; padding:0.2rem 0.45rem;" onclick="document.querySelector('#cz-file-new-form input[name=path]').value='/scratch/untitled.md'">.md</button>
+<div class="cz-modal-field">
+<label for="cz-file-new-path">Path</label>
+<input id="cz-file-new-path" type="text" name="path" class="cz-input" placeholder="/sql/my-query.sql" autofocus />
+<div style="display:flex; gap:0.3rem; flex-wrap:wrap; margin-top:0.5rem;">
+<button type="button" class="cz-btn-ghost" style="font-size:0.74rem; padding:0.25rem 0.6rem;" onclick="document.getElementById('cz-file-new-path').value='/sql/untitled.sql'">.sql</button>
+<button type="button" class="cz-btn-ghost" style="font-size:0.74rem; padding:0.25rem 0.6rem;" onclick="document.getElementById('cz-file-new-path').value='/python/untitled.py'">.py</button>
+<button type="button" class="cz-btn-ghost" style="font-size:0.74rem; padding:0.25rem 0.6rem;" onclick="document.getElementById('cz-file-new-path').value='/notes/untitled.txt'">.txt</button>
+<button type="button" class="cz-btn-ghost" style="font-size:0.74rem; padding:0.25rem 0.6rem;" onclick="document.getElementById('cz-file-new-path').value='/scratch/untitled.md'">.md</button>
 </div>
-<p style="font-size:0.66rem; color:var(--muted); margin:0 0 0.5rem; line-height:1.4;">Empty path → /untitled.sql. Use a path like <code>/python/x.py</code> to put it under a folder; the extension drives syntax + run-routing.</p>
-<button type="submit" class="cz-btn-primary" style="font-size:0.74rem; padding:0.3rem 0.7rem; width:100%;">Create file</button>
+<p class="cz-modal-field-hint">Empty path → /untitled.sql. Folder prefix like <code>/python/</code> groups the file in the tree.</p>
+</div>
+<div class="cz-modal-actions">
+<a href="#" class="cz-btn-ghost">Cancel</a>
+<button type="submit" class="cz-btn-primary">Create file</button>
+</div>
 </form>
-</details>
-<a href="/studio/files/export-archive" title="Export workspace as .cptz">⇩</a>
+</div>
 </div>"##,
         csrf = csrf,
         open_csv = html_escape(&open_csv),
@@ -4244,28 +4255,40 @@ fn render_studio_files_pane(files: &StudioFilesView) -> String {
                             next_open.push(&f.id);
                         }
                         let next_open_csv = next_open.join(",");
-                        // Hover-revealed actions on the row: rename
-                        // (opens a one-line form), duplicate, export
-                        // download, delete. Forms are inline + tiny;
-                        // each posts to its handler with the current
-                        // tab state forwarded so the file panel
-                        // re-renders consistently.
+                        // Hover-revealed actions on the row. Rename
+                        // is a :target-anchored modal centered on
+                        // the page (the previous inline popover
+                        // spilled out of the 220px-wide files pane).
+                        // Duplicate/delete are tiny inline forms;
+                        // export is a GET download.
                         format!(
                             r##"<div class="cz-studio-file-row-wrap">
 <a class="cz-studio-file-row{active}" href="/studio?open={open}&active={id}"><span class="cz-tree-label" title="{path}">{label}</span></a>
 <div class="cz-studio-file-row-actions">
-<details style="display:inline-block; position:relative; margin:0;">
-<summary title="Rename" style="list-style:none; cursor:pointer; padding:1px 4px; border-radius:3px;">✎</summary>
-<form method="post" action="/studio/files/{id}/rename" style="position:absolute; right:0; top:1.4rem; background:var(--navy-2); border:1px solid var(--line); border-radius:var(--radius); padding:0.4rem; z-index:50; min-width:14rem; box-shadow:var(--shadow-card);">
+<a href="#cz-rename-{id}" title="Rename" class="cz-file-row-rename"><i class="fa-solid fa-pen"></i></a>
+<form method="post" action="/studio/files/{id}/duplicate" style="margin:0;display:inline;">{csrf}<input type="hidden" name="open" value="{open}" /><button type="submit" title="Duplicate"><i class="fa-solid fa-copy"></i></button></form>
+<a href="/studio/files/{id}/export" title="Download"><i class="fa-solid fa-download"></i></a>
+<form method="post" action="/studio/files/{id}/delete" style="margin:0;display:inline;" onsubmit="return confirm('Delete {label}? This cannot be undone.');">{csrf}<input type="hidden" name="open" value="{open}" /><button type="submit" title="Delete" class="cz-file-row-delete"><i class="fa-solid fa-trash"></i></button></form>
+</div>
+</div>
+<div id="cz-rename-{id}" class="cz-modal-overlay" role="dialog" aria-labelledby="cz-rename-{id}-title" aria-modal="true">
+<a href="#" class="cz-modal-overlay-backdrop" aria-label="Close"></a>
+<div class="cz-modal">
+<a href="#" class="cz-modal-close" aria-label="Close">×</a>
+<h2 id="cz-rename-{id}-title" class="cz-modal-title">Rename file</h2>
+<p class="cz-modal-subtitle">Change the path of <code>{path}</code>. Use a leading slash; the first folder segment becomes the tree group.</p>
+<form method="post" action="/studio/files/{id}/rename">
 {csrf}
 <input type="hidden" name="open" value="{open}" />
-<input type="text" name="path" value="{path}" class="cz-input" style="width:100%; font-family:'Geist Mono',ui-monospace,monospace; font-size:0.74rem; margin-bottom:0.35rem;" />
-<button type="submit" class="cz-btn-primary" style="font-size:0.7rem; padding:0.2rem 0.5rem; width:100%;">Rename</button>
+<div class="cz-modal-field">
+<label for="cz-rename-input-{id}">New path</label>
+<input id="cz-rename-input-{id}" type="text" name="path" value="{path}" class="cz-input" required autofocus />
+</div>
+<div class="cz-modal-actions">
+<a href="#" class="cz-btn-ghost">Cancel</a>
+<button type="submit" class="cz-btn-primary">Rename</button>
+</div>
 </form>
-</details>
-<form method="post" action="/studio/files/{id}/duplicate" style="margin:0;display:inline;">{csrf}<input type="hidden" name="open" value="{open}" /><button type="submit" title="Duplicate">⎘</button></form>
-<a href="/studio/files/{id}/export" title="Download">⬇</a>
-<form method="post" action="/studio/files/{id}/delete" style="margin:0;display:inline;" onsubmit="return confirm('Delete {label}? This cannot be undone.');">{csrf}<input type="hidden" name="open" value="{open}" /><button type="submit" title="Delete" class="cz-file-row-delete">✕</button></form>
 </div>
 </div>"##,
                             csrf = csrf,
