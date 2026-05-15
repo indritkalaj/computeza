@@ -5360,12 +5360,23 @@ async fn wire_databend_iceberg_catalog(
 
     // Try each candidate. First success wins. Capture every failure
     // so we can surface a useful diagnostic if all of them 404.
+    //
+    // CRITICAL: Databend's Iceberg-REST CREATE CATALOG ignores the
+    // bare `WAREHOUSE = '<value>'` form and silently falls back to
+    // the catalog NAME as the warehouse identifier. (Operator
+    // report: WAREHOUSE='<uuid>' but Lakekeeper got asked for
+    // 'default' anyway.) Databend's CONNECTION-block convention is
+    // lowercase-quoted keys -- same as "s3.endpoint" -- so the
+    // parameter must be written as "warehouse" = '<value>'. We
+    // include BOTH forms below so the active syntax wins regardless
+    // of which Databend version is installed.
     let mut attempts: Vec<(String, String)> = Vec::with_capacity(candidates.len());
     for candidate in &candidates {
         let create_sql = format!(
             "CREATE CATALOG {name} TYPE = ICEBERG CONNECTION = (\
                 TYPE = 'rest', \
                 ADDRESS = '{address}', \
+                \"warehouse\" = '{warehouse}', \
                 WAREHOUSE = '{warehouse}', \
                 \"s3.endpoint\" = '{s3_endpoint}', \
                 \"s3.access-key-id\" = '{ak}', \
