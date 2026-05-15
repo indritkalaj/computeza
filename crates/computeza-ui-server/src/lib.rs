@@ -3858,15 +3858,18 @@ async fn studio_sql_execute_handler(
     let sail = discover_sail_endpoint(state.store.as_deref()).await;
 
     // Detect what kind of query this is and route accordingly.
-    // SQL goes to Trino; Python (or anything we can't confidently
-    // call SQL) goes to Sail via the venv's Python interpreter.
-    // The editor's language dropdown (auto / SQL / Python) lets the
-    // operator override the heuristic when its guess is wrong --
-    // e.g. a Python snippet that starts with `WITH ...` would
-    // otherwise misroute as SQL.
+    // SQL goes to Trino; Python defaults to PyIceberg (mature,
+    // catalog client talks straight to Lakekeeper REST), with Sail
+    // available as an explicit override for Spark-DataFrame work.
+    // The editor's language dropdown (auto / SQL / PyIceberg /
+    // Sail) lets the operator override the heuristic.
     let language = match form.language.as_str() {
         "sql" => QueryLanguage::Sql,
-        "python" => QueryLanguage::Python,
+        "pyiceberg" => QueryLanguage::PyIceberg,
+        "sail" => QueryLanguage::Sail,
+        // Back-compat: legacy persisted value "python" maps to Sail
+        // (the only Python engine before PyIceberg landed).
+        "python" => QueryLanguage::Sail,
         _ => detect_query_language(&form.sql),
     };
     let routed = match language {
@@ -3880,7 +3883,22 @@ async fn studio_sql_execute_handler(
                 outcome,
             }
         }
-        QueryLanguage::Python => {
+        QueryLanguage::PyIceberg => {
+            // PyIceberg runs in the same Python venv Sail installed,
+            // so it's available iff Sail is installed. (Future: split
+            // into its own venv so PyIceberg works without Sail.)
+            let outcome = match &sail {
+                Some(_) => Some(
+                    execute_python_via_pyiceberg(&form.sql, state.secrets.as_deref()).await,
+                ),
+                None => None,
+            };
+            RoutedOutcome::Python {
+                engine: ExecutedEngine::PyIceberg,
+                outcome,
+            }
+        }
+        QueryLanguage::Sail => {
             let outcome = match &sail {
                 Some(url) => Some(
                     execute_python_via_sail(url, &form.sql, state.secrets.as_deref()).await,
@@ -3957,14 +3975,16 @@ async fn studio_sql_execute_handler(
 }
 
 /// Which language did the operator actually type? Routing key:
-/// SQL goes to Trino; Python goes to Sail. Anything we can't
-/// confidently call SQL is treated as Python -- a wrong route shows
-/// a useful error from the wrong engine rather than silently
-/// pretending to succeed.
+/// SQL goes to Trino; PyIceberg (the default Python path) talks
+/// to Lakekeeper REST directly; Sail is the experimental Spark
+/// Connect engine for DataFrame compute. Anything we can't
+/// confidently call SQL is treated as Python; auto-detect prefers
+/// PyIceberg since its Iceberg integration works end-to-end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QueryLanguage {
     Sql,
-    Python,
+    PyIceberg,
+    Sail,
 }
 
 /// Which engine produced an outcome. Surfaced on the result panel so
@@ -3973,6 +3993,7 @@ enum QueryLanguage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExecutedEngine {
     Trino,
+    PyIceberg,
     Sail,
 }
 
@@ -3980,7 +4001,8 @@ impl ExecutedEngine {
     fn label(&self) -> &'static str {
         match self {
             ExecutedEngine::Trino => "Trino (SQL)",
-            ExecutedEngine::Sail => "Sail (Spark Connect)",
+            ExecutedEngine::PyIceberg => "PyIceberg (Python)",
+            ExecutedEngine::Sail => "Sail (Spark Connect, experimental)",
         }
     }
 }
@@ -4043,6 +4065,20 @@ fn detect_query_language(src: &str) -> QueryLanguage {
         "ALTER", "TRUNCATE", "USE", "SHOW", "DESCRIBE", "DESC", "EXPLAIN", "GRANT",
         "REVOKE", "CALL", "REFRESH", "OPTIMIZE", "VACUUM", "ANALYZE", "COPY", "SET",
     ];
+    // Python default = PyIceberg (mature catalog client). Operators
+    // who specifically want PySpark / DataFrame compute can pick
+    // "Sail (experimental)" from the dropdown. Detecting a 'spark.'
+    // or 'pyspark' reference promotes the body to Sail since
+    // that's the only thing Sail does that PyIceberg can't.
+    let lower = src.to_ascii_lowercase();
+    let prefers_sail = lower.contains("spark.")
+        || lower.contains("from pyspark")
+        || lower.contains("import pyspark");
+    let python_default = if prefers_sail {
+        QueryLanguage::Sail
+    } else {
+        QueryLanguage::PyIceberg
+    };
     for line in src.lines() {
         let t = line.trim();
         if t.is_empty() {
@@ -4054,7 +4090,7 @@ fn detect_query_language(src: &str) -> QueryLanguage {
         }
         // Python line comments
         if t.starts_with('#') {
-            return QueryLanguage::Python;
+            return python_default;
         }
         // First non-empty token, uppercased
         let first = t.split_whitespace().next().unwrap_or("").to_uppercase();
@@ -4063,7 +4099,7 @@ fn detect_query_language(src: &str) -> QueryLanguage {
         return if SQL_HEADS.contains(&first) {
             QueryLanguage::Sql
         } else {
-            QueryLanguage::Python
+            python_default
         };
     }
     // All-blank input: default to SQL so the empty-state messaging
@@ -4254,6 +4290,220 @@ except Exception:
             return PythonOutcome::Err {
                 stdout: String::new(),
                 stderr: "Sail Python query exceeded 120s timeout. If the query is expected to be long-running, run it via `<root>/venv/bin/sail spark client` from a shell instead.".into(),
+            };
+        }
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    if out.status.success() {
+        PythonOutcome::Ok { stdout, stderr }
+    } else {
+        PythonOutcome::Err { stdout, stderr }
+    }
+}
+
+/// Execute Python code with PyIceberg already-bound. The PyIceberg
+/// catalog client talks straight to Lakekeeper REST -- no Spark
+/// involved, no JVM, no Sail catalog-router gotchas. The wrapper
+/// pre-builds a `cat` variable (the first registered catalog, same
+/// vault config Sail reads) so the operator can run:
+///
+///   schemas = cat.list_namespaces()
+///   tbl     = cat.load_table(("analytics", "events"))
+///   df      = tbl.scan().to_pandas()
+///
+/// without boilerplate. Multiple catalogs are exposed as `cat_<name>`
+/// variables, with the first also bound as the unprefixed `cat`.
+async fn execute_python_via_pyiceberg(
+    user_code: &str,
+    secrets: Option<&computeza_secrets::SecretsStore>,
+) -> PythonOutcome {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (user_code, secrets);
+        return PythonOutcome::Err {
+            stdout: String::new(),
+            stderr: "PyIceberg execution is Linux-only (uses the Sail venv at /var/lib/computeza/sail/).".into(),
+        };
+    }
+    #[cfg(target_os = "linux")]
+    execute_python_via_pyiceberg_linux(user_code, secrets).await
+}
+
+#[cfg(target_os = "linux")]
+async fn execute_python_via_pyiceberg_linux(
+    user_code: &str,
+    secrets: Option<&computeza_secrets::SecretsStore>,
+) -> PythonOutcome {
+    use secrecy::ExposeSecret;
+    use tokio::io::AsyncWriteExt;
+
+    // Re-use Sail's venv -- pyiceberg installs there during Sail
+    // install (sail.rs's pip line includes pyiceberg[pyarrow,s3fs]).
+    let root = std::path::PathBuf::from("/var/lib/computeza/sail");
+    let venv_python = computeza_driver_native::linux::sail::installed_venv_python(&root);
+    if !tokio::fs::try_exists(&venv_python).await.unwrap_or(false) {
+        return PythonOutcome::Err {
+            stdout: String::new(),
+            stderr: format!(
+                "PyIceberg runs in the Sail venv at {}, which doesn't exist. Install Sail \
+                 from /install first -- the same install brings PyIceberg + PyArrow.",
+                venv_python.display()
+            ),
+        };
+    }
+
+    // Collect catalog configs from vault, same shape Sail uses.
+    let catalog_names = match secrets {
+        Some(s) => s
+            .get("sail/catalog-names")
+            .await
+            .ok()
+            .flatten()
+            .map(|v| {
+                v.expose_secret()
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let mut catalog_cfg: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    if let Some(s) = secrets {
+        for name in &catalog_names {
+            let prefix = format!("sail/catalog/{name}");
+            let mut entry = serde_json::Map::new();
+            for field in &[
+                "warehouse-uuid",
+                "s3-endpoint",
+                "s3-region",
+                "s3-access-key-id",
+                "s3-secret-access-key",
+            ] {
+                if let Ok(Some(v)) = s.get(&format!("{prefix}/{field}")).await {
+                    entry.insert(
+                        (*field).into(),
+                        serde_json::Value::String(v.expose_secret().to_string()),
+                    );
+                }
+            }
+            if let Some(lk) = discover_lakekeeper_endpoint(None).await {
+                entry.insert(
+                    "lakekeeper-rest-uri".into(),
+                    serde_json::Value::String(format!("{lk}/catalog")),
+                );
+            }
+            catalog_cfg.insert(name.clone(), serde_json::Value::Object(entry));
+        }
+    }
+    let catalog_cfg_json = serde_json::Value::Object(catalog_cfg).to_string();
+
+    // Wrapper script:
+    //   1. Reads catalog config JSON from stdin.
+    //   2. Builds a pyiceberg Catalog for each registered name and
+    //      stashes it in globals as `cat_<sanitized_name>`. The first
+    //      one also binds as the unqualified `cat`.
+    //   3. Self-heals: if pyiceberg isn't installed (older Sail
+    //      install that pre-dated the pip line change), pip-install
+    //      it in-process so the operator doesn't have to re-run
+    //      install. This is a one-shot first-use cost.
+    //   4. Executes user code with `cat` and `catalogs` (dict) in
+    //      scope alongside the stdlib.
+    let wrapper = r#"
+import sys, json, subprocess, traceback
+
+catalog_cfg = json.loads(sys.stdin.readline())
+user_code = sys.stdin.read()
+
+# Self-heal: install pyiceberg into the venv on the fly if it isn't
+# already there. Older Sail installs pre-dated the pip line change
+# that bundles PyIceberg, so the first PyIceberg query on those
+# would otherwise crash with ModuleNotFoundError.
+try:
+    import pyiceberg.catalog  # noqa: F401
+except ModuleNotFoundError:
+    print("[pyiceberg] first-use install (~30s) ...", file=sys.stderr)
+    subprocess.check_call([
+        sys.executable, "-m", "pip", "install", "--quiet",
+        "pyiceberg[pyarrow,s3fs]>=0.10",
+    ])
+    import pyiceberg.catalog  # noqa: F401
+
+from pyiceberg.catalog import load_catalog
+
+catalogs = {}
+for name, cfg in catalog_cfg.items():
+    try:
+        c = load_catalog(
+            name,
+            **{
+                "type":                 "rest",
+                "uri":                  cfg.get("lakekeeper-rest-uri", ""),
+                "warehouse":            cfg.get("warehouse-uuid", ""),
+                "s3.endpoint":          cfg.get("s3-endpoint", ""),
+                "s3.access-key-id":     cfg.get("s3-access-key-id", ""),
+                "s3.secret-access-key": cfg.get("s3-secret-access-key", ""),
+                "s3.region":            cfg.get("s3-region", "garage"),
+                "s3.path-style-access": "true",
+            },
+        )
+        catalogs[name] = c
+    except Exception as e:
+        print(f"[pyiceberg] skipping catalog {name}: {e}", file=sys.stderr)
+
+# First catalog is conventionally `cat` so quick examples work
+# without picking a name. catalogs[<name>] always works.
+cat = next(iter(catalogs.values()), None)
+
+scope = {"catalogs": catalogs, "cat": cat, "__name__": "__main__"}
+try:
+    exec(compile(user_code, "<studio>", "exec"), scope)
+except Exception:
+    traceback.print_exc()
+    sys.exit(1)
+"#;
+
+    let mut child = match tokio::process::Command::new(&venv_python)
+        .arg("-c")
+        .arg(wrapper)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return PythonOutcome::Err {
+                stdout: String::new(),
+                stderr: format!("spawn {}: {e}", venv_python.display()),
+            };
+        }
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(catalog_cfg_json.as_bytes()).await;
+        let _ = stdin.write_all(b"\n").await;
+        let _ = stdin.write_all(user_code.as_bytes()).await;
+        drop(stdin);
+    }
+    let out = match tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        child.wait_with_output(),
+    )
+    .await
+    {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            return PythonOutcome::Err {
+                stdout: String::new(),
+                stderr: format!("wait child: {e}"),
+            };
+        }
+        Err(_) => {
+            return PythonOutcome::Err {
+                stdout: String::new(),
+                stderr: "PyIceberg query exceeded 120s timeout.".into(),
             };
         }
     };
@@ -4899,7 +5149,8 @@ fn render_studio_page(
     let initial_language = detect_query_language(sql_prefill);
     let initial_lang_label = match initial_language {
         QueryLanguage::Sql => "SQL → Trino",
-        QueryLanguage::Python => "Python → Sail",
+        QueryLanguage::PyIceberg => "Python → PyIceberg",
+        QueryLanguage::Sail => "Python → Sail",
     };
     let open_csv = files.open_csv();
     let active_id = files.active_id.clone().unwrap_or_default();
@@ -5022,8 +5273,12 @@ fn render_studio_page(
     <button type="button" class="cz-studio-lang-option" data-value="sql" role="menuitem">
       <span class="cz-studio-lang-option-label">SQL → Trino</span>
     </button>
-    <button type="button" class="cz-studio-lang-option" data-value="python" role="menuitem">
+    <button type="button" class="cz-studio-lang-option" data-value="pyiceberg" role="menuitem">
+      <span class="cz-studio-lang-option-label">Python → PyIceberg</span>
+    </button>
+    <button type="button" class="cz-studio-lang-option" data-value="sail" role="menuitem">
       <span class="cz-studio-lang-option-label">Python → Sail</span>
+      <span class="cz-studio-lang-option-hint">experimental</span>
     </button>
   </div>
 </div>
@@ -5068,31 +5323,44 @@ fn render_studio_page(
   ];
   function detect(src) {{
     var lines = (src || "").split(/\r?\n/);
+    var lower = (src || "").toLowerCase();
+    var prefersSail = lower.indexOf("spark.") >= 0
+      || lower.indexOf("from pyspark") >= 0
+      || lower.indexOf("import pyspark") >= 0;
+    var pythonDefault = prefersSail ? "sail" : "pyiceberg";
     for (var i = 0; i < lines.length; i++) {{
       var t = lines[i].trim();
       if (!t) continue;
       if (t.indexOf("--") === 0) continue;
-      if (t.indexOf("#") === 0) return "python";
+      if (t.indexOf("#") === 0) return pythonDefault;
       var first = (t.split(/\s+/)[0] || "").toUpperCase().replace(/[^A-Z]/g, "");
-      return SQL_HEADS.indexOf(first) >= 0 ? "sql" : "python";
+      return SQL_HEADS.indexOf(first) >= 0 ? "sql" : pythonDefault;
     }}
     return "sql";
   }}
 
+  function heuristicLabel(h) {{
+    if (h === "sql") return "SQL → Trino";
+    if (h === "sail") return "Python → Sail";
+    return "Python → PyIceberg";
+  }}
   function labelFor(val, heuristic) {{
     if (val === "sql") return "SQL → Trino";
-    if (val === "python") return "Python → Sail";
-    return "Auto-detect → " + (heuristic === "sql" ? "SQL → Trino" : "Python → Sail");
+    if (val === "pyiceberg") return "Python → PyIceberg";
+    if (val === "sail") return "Python → Sail";
+    return "Auto-detect → " + heuristicLabel(heuristic);
   }}
 
   function paint() {{
     var heuristic = detect(ta.value);
     if (autoTarget) {{
-      autoTarget.textContent = heuristic === "sql" ? "SQL → Trino" : "Python → Sail";
+      autoTarget.textContent = heuristicLabel(heuristic);
     }}
     currentLabel.textContent = labelFor(hidden.value, heuristic);
-    // Pill color: user override beats heuristic.
-    pill.dataset.lang = hidden.value === "auto" ? heuristic : hidden.value;
+    // Pill color: user override beats heuristic. Map both Python
+    // engines to the same color class for consistency.
+    var resolved = hidden.value === "auto" ? heuristic : hidden.value;
+    pill.dataset.lang = (resolved === "pyiceberg" || resolved === "sail") ? "python" : resolved;
   }}
 
   function closeMenu() {{
@@ -5148,7 +5416,7 @@ fn render_studio_page(
         sql_run = html_escape(&sql_run),
         sql_help = html_escape(&sql_help),
         results_html = results_html,
-        lang_attr = match initial_language { QueryLanguage::Sql => "sql", QueryLanguage::Python => "python" },
+        lang_attr = match initial_language { QueryLanguage::Sql => "sql", QueryLanguage::PyIceberg | QueryLanguage::Sail => "python" },
         lang_label = initial_lang_label,
         tabs_html = tabs_html,
         flash_html = flash_html,
@@ -5433,7 +5701,7 @@ window.czDownloadCsv = function (e) {{
         var hidden = document.getElementById("cz-sql-lang-value");
         var override = hidden ? hidden.value : "auto";
         if (override === "sql") return "sql";
-        if (override === "python") return "python";
+        if (override === "pyiceberg" || override === "sail" || override === "python") return "python";
         return detectPythonish(initial) ? "python" : "sql";
       }}
 
@@ -5463,7 +5731,7 @@ window.czDownloadCsv = function (e) {{
         var override = hidden ? hidden.value : "auto";
         var lang;
         if (override === "sql") lang = "sql";
-        else if (override === "python") lang = "python";
+        else if (override === "pyiceberg" || override === "sail" || override === "python") lang = "python";
         else lang = detectPythonish(editor.getValue()) ? "python" : "sql";
         var model = editor.getModel();
         if (model && model.getLanguageId() !== lang) {{
