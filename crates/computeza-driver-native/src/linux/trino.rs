@@ -7,16 +7,18 @@
 //! community-grade. Sail continues to handle Python/Spark Connect
 //! queries; both engines point at the same Lakekeeper catalog.
 //!
-//! # Version pin: Trino 442
+//! # Version pin: Trino 470
 //!
-//! Trino 481 (current at time of writing) requires Java 25; bundling
-//! a fresh Temurin 25 distribution would mean a second JRE on disk
-//! beside the Temurin 21 xtable already bundles via
-//! `prerequisites::ensure_bundled_temurin_jre`. Pinning Trino 442 --
-//! the last release on Java 21 LTS -- lets us reuse the same JRE
-//! bundle and keeps the install footprint tighter. A follow-up pin
-//! bump to a Java 25-aware Trino can happen in a focused commit when
-//! Temurin 25 has stabilised.
+//! Trino 470 (verified available on Maven Central) ships the
+//! `catalog-management=DYNAMIC` flag (introduced in Trino 459)
+//! which lets the Studio bootstrap path use `CREATE CATALOG ...`
+//! SQL DDL to register Iceberg-REST catalogs at runtime -- no
+//! coordinator restart needed. Trino 470 requires Java 23+; we
+//! bundle a dedicated Temurin 25 LTS JRE for it
+//! (`prerequisites::ensure_bundled_temurin_jre_25`) so xtable can
+//! keep its Java 21 bundle unchanged. The disk overhead of carrying
+//! both JREs (~100MB) is the price of keeping Spark-based xtable on
+//! a runtime it's tested against.
 //!
 //! # Layout on disk
 //!
@@ -59,11 +61,11 @@ pub const UNIT_NAME: &str = "computeza-trino.service";
 /// operators searching docs for "trino 8080" find their way.
 pub const DEFAULT_PORT: u16 = 8088;
 
-/// Trino bundle pins. 442 is the final release on Java 21 LTS;
-/// reusing the same JRE bundle xtable already installs keeps the
-/// disk footprint tight. To bump past 442, the bundled JRE in
-/// `ensure_bundled_temurin_jre` must move to Java 25 first (Trino
-/// 481+ refuses to start under older JVMs).
+/// Trino bundle pins. 470 is the first version available on Maven
+/// Central with both DYNAMIC catalog management (459+) and a stable
+/// release cadence; 459+ also requires Java 22+, so the install
+/// path pulls Temurin 25 LTS instead of the Java 21 bundle xtable
+/// uses.
 ///
 /// The Trino project publishes release artifacts to Maven Central
 /// (not GitHub releases -- the github.com/trinodb/trino/releases
@@ -73,15 +75,8 @@ pub const DEFAULT_PORT: u16 = 8088;
 /// per Trino's own install docs.
 const TRINO_BUNDLES: &[Bundle] = &[
     Bundle {
-        version: "442",
-        url: "https://repo1.maven.org/maven2/io/trino/trino-server/442/trino-server-442.tar.gz",
-        kind: ArchiveKind::TarGz,
-        sha256: None,
-        bin_subpath: "bin",
-    },
-    Bundle {
-        version: "441",
-        url: "https://repo1.maven.org/maven2/io/trino/trino-server/441/trino-server-441.tar.gz",
+        version: "470",
+        url: "https://repo1.maven.org/maven2/io/trino/trino-server/470/trino-server-470.tar.gz",
         kind: ArchiveKind::TarGz,
         sha256: None,
         bin_subpath: "bin",
@@ -123,11 +118,14 @@ pub async fn install(
     progress.set_phase(InstallPhase::DetectingBinaries);
     progress.set_message("Ensuring bundled Temurin JRE 21".to_string());
     fs::create_dir_all(&opts.root_dir).await?;
-    // ensure_bundled_temurin_jre returns the path to the `java`
-    // binary (<jre-root>/bin/java), not the JRE root itself. Walk
-    // two parents up to get JAVA_HOME (= <jre-root>) for systemd's
+    // Trino 470 needs Java 22+. We bundle Java 25 LTS (separate
+    // from xtable's Java 21 bundle so Spark's runtime support
+    // matrix isn't disturbed). ensure_bundled_temurin_jre_25
+    // returns the path to the `java` binary
+    // (<jre-root>/bin/java), not the JRE root itself. Walk two
+    // parents up to get JAVA_HOME (= <jre-root>) for systemd's
     // JAVA_HOME/PATH environment.
-    let java_bin = prerequisites::ensure_bundled_temurin_jre(&opts.root_dir, progress)
+    let java_bin = prerequisites::ensure_bundled_temurin_jre_25(&opts.root_dir, progress)
         .await
         .map_err(|e| ServiceError::Io(std::io::Error::other(format!("bundle JRE: {e}"))))?;
     let jre_home = java_bin
@@ -168,12 +166,15 @@ pub async fn install(
          # 2GB is enough for v0.0.x dev installs; production should bump this.\n\
          query.max-memory=2GB\n\
          query.max-memory-per-node=1GB\n\
-         # catalog-management=DYNAMIC enables runtime CREATE CATALOG SQL.\n\
-         # Computeza writes etc/catalog/<warehouse>.properties files at\n\
-         # bootstrap time; this flag lets operators also use SQL DDL if\n\
-         # they prefer. Both surfaces stay in sync because the SQL form\n\
-         # writes the same file under the hood.\n\
-         catalog-management=DYNAMIC\n",
+         # catalog-management=DYNAMIC enables runtime CREATE CATALOG SQL\n\
+         # (introduced in Trino 459). Computeza writes etc/catalog/<warehouse>.properties\n\
+         # files at bootstrap time AND submits CREATE CATALOG via /v1/statement\n\
+         # so the new catalog is usable immediately, no coordinator restart.\n\
+         catalog.management=dynamic\n\
+         # catalog.store=file makes the in-memory catalog state persist on\n\
+         # disk so DYNAMIC-created catalogs survive a coordinator restart\n\
+         # in addition to the etc/catalog/ files.\n\
+         catalog.store=file\n",
         port = opts.port,
         discovery_uri = discovery_uri,
     );
@@ -570,6 +571,42 @@ pub struct TrinoIcebergRestConfig {
     pub s3_region: String,
     pub s3_access_key: String,
     pub s3_secret_key: String,
+}
+
+/// Restart the Trino coordinator and wait for its HTTP endpoint to
+/// answer again. Used by the bootstrap path after dropping a new
+/// catalog .properties file -- Trino 442 reads catalogs only at
+/// startup, so a restart is required for new catalogs to register.
+///
+/// `unit_name` is typically [`UNIT_NAME`] (`computeza-trino.service`).
+/// Waits up to 90 seconds for the port to come back; returns an
+/// error containing the journal tail if the coordinator doesn't
+/// re-bind in that window.
+pub async fn restart_and_wait(unit_name: &str, port: u16) -> Result<(), ServiceError> {
+    super::systemctl::run(&["restart", unit_name])
+        .await
+        .map_err(|e| ServiceError::Io(std::io::Error::other(format!(
+            "systemctl restart {unit_name}: {e}"
+        ))))?;
+    // Coordinator restart usually re-binds inside 30s; give it
+    // 90s of headroom for cold JIT.
+    if let Err(e) = service::wait_for_port(
+        "127.0.0.1",
+        port,
+        std::time::Duration::from_secs(90),
+    )
+    .await
+    {
+        if matches!(e, ServiceError::NotReady { .. }) {
+            let tail = super::systemctl::journal_tail(unit_name, 40).await;
+            return Err(ServiceError::Io(std::io::Error::other(format!(
+                "trino did not re-bind 127.0.0.1:{port} within 90s after restart. \
+                 Journal tail:\n\n{tail}"
+            ))));
+        }
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Post-install bootstrap for Trino. v0.0.x runs unauthenticated --

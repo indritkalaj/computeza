@@ -113,6 +113,22 @@ pub const TEMURIN_JRE_21_X86_64_LINUX: Bundle = Bundle {
     bin_subpath: "jdk-21.0.11+10-jre/bin",
 };
 
+/// Adoptium Temurin JRE 25 (LTS, GA October 2025). Used by Trino,
+/// which requires Java 22+ for DYNAMIC catalog management (Trino
+/// 459+) and Java 23+ for the latest releases. Sitting on Java 25
+/// LTS keeps Trino on a long-supported runtime without forcing
+/// xtable off its established Java 21 bundle.
+///
+/// JRE-only (~55MB compressed). Extracted layout:
+/// `<root>/jre/jdk-25+36-jre/bin/java`.
+pub const TEMURIN_JRE_25_X86_64_LINUX: Bundle = Bundle {
+    version: "25+36",
+    url: "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25%2B36/OpenJDK25U-jre_x64_linux_hotspot_25_36.tar.gz",
+    kind: ArchiveKind::TarGz,
+    sha256: None,
+    bin_subpath: "jdk-25+36-jre/bin",
+};
+
 /// Result of probing a single [`SystemCommand`] on the host.
 #[derive(Clone, Debug)]
 pub struct CommandStatus {
@@ -375,10 +391,29 @@ pub async fn ensure_bundled_temurin_jre(
     component_root: &std::path::Path,
     progress: &crate::progress::ProgressHandle,
 ) -> Result<PathBuf, std::io::Error> {
+    ensure_bundled_temurin_jre_inner(component_root, &TEMURIN_JRE_21_X86_64_LINUX, "21", progress).await
+}
+
+/// Java 25 LTS variant of [`ensure_bundled_temurin_jre`]. Trino 459+
+/// needs Java 22+ for DYNAMIC catalog management; we go straight to
+/// the next LTS so the runtime is supported until 2030+.
+#[cfg(target_os = "linux")]
+pub async fn ensure_bundled_temurin_jre_25(
+    component_root: &std::path::Path,
+    progress: &crate::progress::ProgressHandle,
+) -> Result<PathBuf, std::io::Error> {
+    ensure_bundled_temurin_jre_inner(component_root, &TEMURIN_JRE_25_X86_64_LINUX, "25", progress).await
+}
+
+#[cfg(target_os = "linux")]
+async fn ensure_bundled_temurin_jre_inner(
+    component_root: &std::path::Path,
+    bundle: &Bundle,
+    version_label: &str,
+    progress: &crate::progress::ProgressHandle,
+) -> Result<PathBuf, std::io::Error> {
     let jre_root = component_root.join("jre");
-    let expected_bin = jre_root
-        .join(TEMURIN_JRE_21_X86_64_LINUX.bin_subpath)
-        .join("java");
+    let expected_bin = jre_root.join(bundle.bin_subpath).join("java");
     if expected_bin.is_file() {
         tracing::info!(
             java = %expected_bin.display(),
@@ -388,29 +423,38 @@ pub async fn ensure_bundled_temurin_jre(
     }
 
     tokio::fs::create_dir_all(&jre_root).await?;
-    progress.set_message(
-        "Bundling Adoptium Temurin JRE 21 into <component-root>/jre \
-         (one-time download, ~50MB, sandboxed -- not registered on system PATH)",
-    );
+    progress.set_message(format!(
+        "Bundling Adoptium Temurin JRE {version_label} into <component-root>/jre \
+         (one-time download, ~50MB, sandboxed -- not registered on system PATH)"
+    ));
 
     // Stream-download the tarball.
     let tarball_path = jre_root.join("temurin-jre.tar.gz");
-    download_to(TEMURIN_JRE_21_X86_64_LINUX.url, &tarball_path).await?;
+    download_to(bundle.url, &tarball_path).await?;
 
-    // Extract using the existing fetch infrastructure. We can't reuse
-    // `fetch_and_extract` directly because that does a verify pass
-    // against `sha256` (None here) + writes a `.computeza-extracted`
-    // sentinel that's keyed against a Bundle. Inline the extraction.
-    let bytes = tokio::fs::read(&tarball_path).await?;
-    let cursor = std::io::Cursor::new(&bytes[..]);
-    let gz = flate2::read::GzDecoder::new(cursor);
-    let mut archive = tar::Archive::new(gz);
-    archive.unpack(&jre_root).map_err(|e| {
-        std::io::Error::other(format!(
-            "unpacking Temurin JRE tarball into {}: {e}",
-            jre_root.display()
-        ))
-    })?;
+    // Use system tar on Linux for the same reason fetch.rs does:
+    // the Rust tar crate trips on some Temurin tarball entries
+    // (long paths, hardlinks) and surfaces opaque errors.
+    let status = tokio::process::Command::new("tar")
+        .arg("-xzf")
+        .arg(&tarball_path)
+        .arg("-C")
+        .arg(&jre_root)
+        .status()
+        .await?;
+    if !status.success() {
+        // Fall back to the Rust crate if system tar isn't available.
+        let bytes = tokio::fs::read(&tarball_path).await?;
+        let cursor = std::io::Cursor::new(&bytes[..]);
+        let gz = flate2::read::GzDecoder::new(cursor);
+        let mut archive = tar::Archive::new(gz);
+        archive.unpack(&jre_root).map_err(|e| {
+            std::io::Error::other(format!(
+                "unpacking Temurin JRE tarball into {}: {e}",
+                jre_root.display()
+            ))
+        })?;
+    }
     // Drop the tarball -- the unpacked tree is what we keep.
     let _ = tokio::fs::remove_file(&tarball_path).await;
 
@@ -423,7 +467,8 @@ pub async fn ensure_bundled_temurin_jre(
     }
     tracing::info!(
         java = %expected_bin.display(),
-        "temurin bootstrap: JRE 21 ready"
+        version = version_label,
+        "temurin bootstrap: JRE ready"
     );
     Ok(expected_bin)
 }
@@ -436,6 +481,17 @@ pub async fn ensure_bundled_temurin_jre(
 ) -> Result<PathBuf, std::io::Error> {
     Err(std::io::Error::other(
         "ensure_bundled_temurin_jre: bundled Temurin JRE is x86_64-linux-only in v0.0.x",
+    ))
+}
+
+/// Non-Linux stub for the Java 25 LTS variant.
+#[cfg(not(target_os = "linux"))]
+pub async fn ensure_bundled_temurin_jre_25(
+    _component_root: &std::path::Path,
+    _progress: &crate::progress::ProgressHandle,
+) -> Result<PathBuf, std::io::Error> {
+    Err(std::io::Error::other(
+        "ensure_bundled_temurin_jre_25: bundled Temurin JRE is x86_64-linux-only in v0.0.x",
     ))
 }
 
