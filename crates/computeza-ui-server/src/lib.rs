@@ -6200,6 +6200,86 @@ for name, cfg in catalog_cfg.items():
 # without picking a name. catalogs[<name>] always works.
 cat = next(iter(catalogs.values()), None)
 
+# Lakekeeper's /v1/config response injects `s3.remote-signing-enabled
+# = true` plus `s3.signer.uri = http://.../v1/signer/...`, which tells
+# pyiceberg's FsspecFileIO to ask Lakekeeper to sign every S3 request
+# remotely. That handshake is fragile (auth-token aware) and silently
+# 403s against our setup; meanwhile the static AWS_* credentials we
+# already injected work fine for direct S3. Strip the remote-signing
+# props after load_catalog so fsspec falls back to signing locally
+# with the static keys. We also re-affirm those static keys on the
+# catalog's FileIO so a stale prefix-merged blank doesn't leak in.
+def _cz_disable_remote_signing(catalog_obj):
+    if catalog_obj is None or not hasattr(catalog_obj, "_file_io"):
+        return
+    try:
+        props = catalog_obj._file_io.properties
+        for k in (
+            "s3.remote-signing-enabled",
+            "s3.signer",
+            "s3.signer.uri",
+            "s3.signer.endpoint",
+        ):
+            props.pop(k, None)
+        # Force static creds from env (we already set these above).
+        for k, env in (
+            ("s3.access-key-id",     "AWS_ACCESS_KEY_ID"),
+            ("s3.secret-access-key", "AWS_SECRET_ACCESS_KEY"),
+            ("s3.endpoint",          "AWS_ENDPOINT_URL"),
+            ("s3.region",            "AWS_REGION"),
+        ):
+            v = os.environ.get(env, "")
+            if v:
+                props[k] = v
+        props["s3.path-style-access"] = "true"
+    except Exception as _e:
+        pass
+for _c in catalogs.values():
+    _cz_disable_remote_signing(_c)
+
+# Patch load_table so every freshly-loaded table also has its FileIO
+# sanitized -- some pyiceberg builds rebuild FileIO per load_table
+# call from the REST loadTable response (which carries the
+# remote-signing flags again).
+def _cz_wrap_load_table(catalog_obj):
+    if catalog_obj is None:
+        return
+    orig = catalog_obj.load_table
+    def patched(*args, **kwargs):
+        tbl = orig(*args, **kwargs)
+        try:
+            props = tbl.io.properties
+            for k in (
+                "s3.remote-signing-enabled",
+                "s3.signer",
+                "s3.signer.uri",
+                "s3.signer.endpoint",
+            ):
+                props.pop(k, None)
+            for k, env in (
+                ("s3.access-key-id",     "AWS_ACCESS_KEY_ID"),
+                ("s3.secret-access-key", "AWS_SECRET_ACCESS_KEY"),
+                ("s3.endpoint",          "AWS_ENDPOINT_URL"),
+                ("s3.region",            "AWS_REGION"),
+            ):
+                v = os.environ.get(env, "")
+                if v:
+                    props[k] = v
+            props["s3.path-style-access"] = "true"
+            # Drop s3fs's cached FileSystem so the patched props
+            # actually take effect on the next read/write.
+            try:
+                from s3fs import S3FileSystem
+                S3FileSystem.clear_instance_cache()
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return tbl
+    catalog_obj.load_table = patched
+for _c in catalogs.values():
+    _cz_wrap_load_table(_c)
+
 # Surface what the wrapper bound so a NameError on `cat` from
 # user code immediately tells the operator whether the vault
 # wiring is wrong (no catalogs found) vs a real bug.
