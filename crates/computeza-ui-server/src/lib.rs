@@ -3977,22 +3977,38 @@ async fn studio_file_revision_restore_handler(
     axum::extract::Path((file_id, revision_id)): axum::extract::Path<(String, String)>,
 ) -> axum::response::Redirect {
     let Some(store) = state.store.as_deref() else {
-        return redirect_studio_flash(None, Some(file_id), "metadata store unavailable");
+        return redirect_studio_flash(Some(file_id.clone()), Some(file_id), "metadata store unavailable");
     };
     let Ok(Some(rev)) = store.studio_files_get_revision(&revision_id).await else {
-        return redirect_studio_flash(None, Some(file_id), "revision not found");
+        return redirect_studio_flash(Some(file_id.clone()), Some(file_id), "revision not found");
     };
+    // Defense in depth: the revision_id must belong to the file_id
+    // claimed in the URL. The handler used to skip this check, so a
+    // mis-typed path could silently restore a *different* file's
+    // revision into this file. Now we refuse.
+    if rev.file_id != file_id {
+        return redirect_studio_flash(
+            Some(file_id.clone()),
+            Some(file_id),
+            "restore: revision does not belong to this file",
+        );
+    }
     match store
         .studio_files_update(&file_id, None, Some(&rev.content))
         .await
     {
+        // Redirect carries the file id as BOTH `open` and `active` so
+        // the post-restore studio page reopens the file as a tab.
+        // Previously we only passed `active`, which left `open` empty
+        // and the editor fell back to a blank scratch buffer -- making
+        // every restore look like it had zapped the file.
         Ok(Some(_)) => redirect_studio_flash(
-            None,
+            Some(file_id.clone()),
             Some(file_id),
             &format!("restored revision from {}", rev.created_at),
         ),
-        Ok(None) => redirect_studio_flash(None, Some(file_id), "file not found"),
-        Err(e) => redirect_studio_flash(None, Some(file_id), &format!("restore: {e}")),
+        Ok(None) => redirect_studio_flash(Some(file_id.clone()), Some(file_id), "file not found"),
+        Err(e) => redirect_studio_flash(Some(file_id.clone()), Some(file_id), &format!("restore: {e}")),
     }
 }
 
@@ -6051,12 +6067,27 @@ def _cz_run(code, scope):
     tree = _cz_ast.parse(code, "<studio>", mode="exec")
     if tree.body and isinstance(tree.body[-1], _cz_ast.Expr):
         last = tree.body[-1]
-        tree.body[-1] = _cz_ast.Assign(
-            targets=[_cz_ast.Name(id="__cz_last", ctx=_cz_ast.Store())],
+        # CPython >=3.8 validates end_lineno >= lineno and end_col_offset
+        # >= col_offset. fix_missing_locations only fills in zeros, so
+        # we copy the originals from the Expr node we replaced -- if we
+        # leave end_lineno unset, the parent Module's end_lineno=1 wins
+        # and compile() raises "AST node line range (20, 1) is not valid".
+        new_node = _cz_ast.Assign(
+            targets=[_cz_ast.Name(
+                id="__cz_last",
+                ctx=_cz_ast.Store(),
+                lineno=last.lineno,
+                col_offset=last.col_offset,
+                end_lineno=getattr(last, "end_lineno", last.lineno),
+                end_col_offset=getattr(last, "end_col_offset", last.col_offset),
+            )],
             value=last.value,
             lineno=last.lineno,
             col_offset=last.col_offset,
+            end_lineno=getattr(last, "end_lineno", last.lineno),
+            end_col_offset=getattr(last, "end_col_offset", last.col_offset),
         )
+        tree.body[-1] = new_node
         _cz_ast.fix_missing_locations(tree)
     exec(compile(tree, "<studio>", "exec"), scope)
     _cz_emit_df(scope.get("__cz_last"))
