@@ -1427,14 +1427,48 @@ a.cz-card:hover {
 /* "scratch" tab when no file is active -- runs queries without
    saving them. Always present so the editor never goes blank. */
 .cz-studio-tab-scratch { font-style: italic; }
-/* Drag-to-reorder visual: dim the source tab during drag so the
-   operator sees where it'll land after drop. */
-.cz-studio-tab[draggable="true"] {
+/* Wrapper that owns BOTH the open-link <a> and the close-link <a>
+   as siblings. Drag-to-reorder targets this wrapper so the close
+   button always moves together with its parent tab. The wrapper
+   inherits the visual styling that used to live on .cz-studio-tab;
+   .cz-studio-tab itself is now just the inner click target for
+   the open path. */
+.cz-studio-tab-wrap {
+  display: inline-flex;
+  align-items: center;
+  border-right: 1px solid var(--line);
+  background: var(--navy-2);
+  color: var(--muted);
+  font-family: 'Geist Mono', ui-monospace, monospace;
+  font-size: 0.74rem;
+  white-space: nowrap;
+  max-width: 18rem;
+}
+.cz-studio-tab-wrap:hover {
+  background: var(--navy-3);
+  color: var(--ink);
+}
+.cz-studio-tab-wrap.cz-studio-tab-active {
+  background: var(--navy);
+  color: var(--ink);
+  border-bottom: 2px solid var(--lavender);
+}
+.cz-studio-tab-wrap[draggable="true"] {
   cursor: grab;
 }
-.cz-studio-tab.cz-studio-tab-dragging {
+.cz-studio-tab-wrap.cz-studio-tab-dragging {
   opacity: 0.4;
   cursor: grabbing;
+}
+/* Inner <a> -- the click target for opening the tab. */
+.cz-studio-tab-wrap > .cz-studio-tab {
+  padding: 0.4rem 0.5rem 0.4rem 0.75rem;
+  background: transparent;
+  border: 0;
+  color: inherit;
+}
+.cz-studio-tab-wrap > .cz-studio-tab-close {
+  margin-right: 0.5rem;
 }
 
 .cz-studio-sidebar {
@@ -2148,7 +2182,8 @@ details > summary::-webkit-details-marker { display: none; }
 .cz-studio-statusbar-hint {
   opacity: 0.75;
 }
-.cz-studio-statusbar-hint kbd {
+.cz-studio-statusbar-hint kbd,
+.cz-studio-statusbar-shortcuts-btn kbd {
   background: rgba(255, 255, 255, 0.06);
   border: 1px solid var(--line);
   border-radius: 4px;
@@ -2156,6 +2191,55 @@ details > summary::-webkit-details-marker { display: none; }
   font-size: 0.65rem;
   font-family: inherit;
   color: var(--ink);
+}
+/* Version + license blurb merged into the statusbar so the page
+   doesn't waste a second row on the footer. */
+.cz-studio-statusbar-meta {
+  opacity: 0.7;
+  font-size: 0.65rem;
+  letter-spacing: 0.04em;
+}
+.cz-studio-statusbar-meta a {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-style: dotted;
+}
+.cz-studio-statusbar-meta a:hover {
+  color: var(--lavender);
+}
+.cz-studio-statusbar-sep {
+  opacity: 0.3;
+}
+/* Clickable shortcut hint -- replaces the static "Press Cmd+/"
+   text so operators can open the cheat sheet without discovering
+   the chord by chance. */
+.cz-studio-statusbar-shortcuts-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 0.65rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 0.2rem 0.55rem;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: color 0.12s ease, border-color 0.12s ease, background 0.12s ease;
+}
+.cz-studio-statusbar-shortcuts-btn:hover {
+  color: var(--ink);
+  border-color: var(--lavender);
+  background: rgba(196, 184, 232, 0.06);
+}
+
+/* On Studio pages, the version + license info already lives in the
+   .cz-studio-statusbar -- hide the legacy <footer class="cz-footer">
+   so we don't render the same info on two rows. */
+.cz-page:has(.cz-studio-statusbar) .cz-footer {
+  display: none;
 }
 
 /* ---------- Keyboard-shortcut overlay ---------- */

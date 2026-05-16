@@ -5233,20 +5233,24 @@ fn render_studio_page(
     let tabs_html = {
         let scratch_active = files.active_id.is_none();
         let scratch_class = if scratch_active { " cz-studio-tab-active" } else { "" };
-        // data-tab-id="" marks the scratch tab as non-draggable (it
-        // has no id to reorder against). Other tabs carry their id
-        // in data-tab-id and become draggable.
+        // Each tab is a <div data-tab-id="..."> wrapper containing
+        // the open-link anchor and (for non-scratch tabs) a close
+        // anchor as a sibling. Nesting anchors is invalid HTML and
+        // browsers auto-close the outer one, which made drag-to-
+        // reorder leave the close button stranded as a sibling --
+        // tabs ended up with a doubled close after a single drag.
+        // data-tab-id="" marks the scratch tab as non-draggable.
         let mut html = format!(
-            r#"<div class="cz-studio-tabs" id="cz-studio-tabs"><a class="cz-studio-tab cz-studio-tab-scratch{scratch_class}" href="/studio?open={open}" data-tab-id=""><span class="cz-studio-tab-label">scratch</span></a>"#,
+            r#"<div class="cz-studio-tabs" id="cz-studio-tabs"><div class="cz-studio-tab-wrap{scratch_class}" data-tab-id=""><a class="cz-studio-tab cz-studio-tab-scratch" href="/studio?open={open}"><span class="cz-studio-tab-label">scratch</span></a></div>"#,
             open = url_encode(&open_csv),
         );
         for f in &files.open {
             let is_active = files.active_id.as_deref() == Some(f.id.as_str());
             let active = if is_active { " cz-studio-tab-active" } else { "" };
             let basename = f.path.rsplit('/').next().unwrap_or(&f.path);
-            // Close button: posts to delete handler? No -- close just
-            // removes the tab from the open csv, doesn't delete the
-            // file. So it's a link, not a form.
+            // Close action just drops this id from the open csv;
+            // doesn't delete the file. Sibling of the open-link so
+            // the wrapper's drag carries both as a unit.
             let next_open: String = files
                 .open
                 .iter()
@@ -5255,7 +5259,7 @@ fn render_studio_page(
                 .collect::<Vec<_>>()
                 .join(",");
             html.push_str(&format!(
-                r##"<a class="cz-studio-tab{active}" href="/studio?open={open}&active={id}" draggable="true" data-tab-id="{id_raw}"><span class="cz-studio-tab-label" title="{path}">{label}</span><a class="cz-studio-tab-close" href="/studio?open={next_open}" title="Close tab (doesn't delete file)">×</a></a>"##,
+                r##"<div class="cz-studio-tab-wrap{active}" draggable="true" data-tab-id="{id_raw}"><a class="cz-studio-tab" href="/studio?open={open}&active={id}"><span class="cz-studio-tab-label" title="{path}">{label}</span></a><a class="cz-studio-tab-close" href="/studio?open={next_open}" title="Close tab (doesn't delete file)">×</a></div>"##,
                 open = url_encode(&open_csv),
                 next_open = url_encode(&next_open),
                 id = url_encode(&f.id),
@@ -5531,8 +5535,16 @@ fn render_studio_page(
     <span class="cz-studio-statusbar-dot" data-state="unknown"></span>
     <span class="cz-studio-statusbar-label">Lakekeeper</span>
   </span>
+  <span class="cz-studio-statusbar-sep">|</span>
+  <span class="cz-studio-statusbar-meta">v{cz_version}</span>
+  <span class="cz-studio-statusbar-sep">|</span>
+  <span class="cz-studio-statusbar-meta">Computeza proprietary -- managed components retain upstream licenses (<a href="/components">/components</a>)</span>
   <span class="cz-studio-actions-spacer"></span>
-  <span class="cz-studio-statusbar-hint">Press <kbd>Cmd</kbd>+<kbd>/</kbd> for shortcuts</span>
+  <button type="button" class="cz-studio-statusbar-shortcuts-btn" onclick="document.getElementById('cz-studio-shortcuts').classList.add('cz-studio-shortcuts-open')" title="Open keyboard shortcuts (Cmd/Ctrl+/)">
+    <i class="fa-solid fa-keyboard" aria-hidden="true"></i>
+    <span>Keyboard shortcuts</span>
+    <kbd>Cmd</kbd><span style="opacity:0.5;">+</span><kbd>/</kbd>
+  </button>
 </div>
 
 <!-- Keyboard-shortcut overlay, Cmd+/ toggles. -->
@@ -5672,14 +5684,18 @@ document.addEventListener("click", function (e) {{
   var strip = document.getElementById("cz-studio-tabs");
   if (!strip) return;
   var dragging = null;
-  function tabs() {{
+  // The draggable element is now the <div class="cz-studio-tab-wrap">
+  // that owns BOTH the open-link and the close-link as siblings.
+  // Selecting on the wrap means a drag carries both children as a
+  // unit -- no orphaned close button after reorder.
+  function wraps() {{
     return Array.prototype.filter.call(
-      strip.querySelectorAll(".cz-studio-tab"),
+      strip.querySelectorAll(".cz-studio-tab-wrap"),
       function (el) {{ return el.getAttribute("data-tab-id"); }}
     );
   }}
   function persistOrder() {{
-    var ids = tabs().map(function (t) {{ return t.getAttribute("data-tab-id"); }});
+    var ids = wraps().map(function (w) {{ return w.getAttribute("data-tab-id"); }});
     var csv = ids.join(",");
     // Mirror to the hidden open field so the next Run/Save submit
     // forwards the new order.
@@ -5691,20 +5707,23 @@ document.addEventListener("click", function (e) {{
       url.searchParams.set("open", csv);
       window.history.replaceState({{}}, "", url);
     }} catch (_) {{}}
-    // Patch the href of each tab to carry the fresh open csv.
-    tabs().forEach(function (t) {{
+    // Patch the href of every open-link AND close-link inside the
+    // strip to carry the fresh open csv. The next click on either
+    // navigates against the new order.
+    strip.querySelectorAll(".cz-studio-tab, .cz-studio-tab-close").forEach(function (a) {{
+      if (!a.href) return;
       try {{
-        var u = new URL(t.href, window.location.origin);
+        var u = new URL(a.href, window.location.origin);
         u.searchParams.set("open", csv);
-        t.href = u.toString();
+        a.href = u.toString();
       }} catch (_) {{}}
     }});
   }}
   strip.addEventListener("dragstart", function (e) {{
-    var t = e.target.closest(".cz-studio-tab[data-tab-id]");
-    if (!t || !t.getAttribute("data-tab-id")) return;
-    dragging = t;
-    t.classList.add("cz-studio-tab-dragging");
+    var w = e.target.closest(".cz-studio-tab-wrap[data-tab-id]");
+    if (!w || !w.getAttribute("data-tab-id")) return;
+    dragging = w;
+    w.classList.add("cz-studio-tab-dragging");
     try {{ e.dataTransfer.effectAllowed = "move"; }} catch (_) {{}}
   }});
   strip.addEventListener("dragend", function () {{
@@ -5712,7 +5731,7 @@ document.addEventListener("click", function (e) {{
     dragging = null;
   }});
   strip.addEventListener("dragover", function (e) {{
-    var over = e.target.closest(".cz-studio-tab[data-tab-id]");
+    var over = e.target.closest(".cz-studio-tab-wrap[data-tab-id]");
     if (!dragging || !over || over === dragging) return;
     e.preventDefault();
     var rect = over.getBoundingClientRect();
@@ -6063,6 +6082,7 @@ window.czDownloadCsv = function (e) {{
 </script>"##,
         sidebar_html = sidebar_html,
         main_html = main_html,
+        cz_version = env!("CARGO_PKG_VERSION"),
     );
 
     render_shell(localizer, &title, NavLink::Studio, &body)
