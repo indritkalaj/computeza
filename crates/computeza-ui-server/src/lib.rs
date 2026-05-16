@@ -3789,8 +3789,21 @@ async fn studio_file_autosave_api_handler(
     let Some(store) = state.store.as_deref() else {
         return axum::http::StatusCode::SERVICE_UNAVAILABLE;
     };
+    // Translate the incoming body if the file is a .ipynb notebook
+    // -- the client always sends the computeza-native shape (one
+    // shared JS path for both .notebook and .ipynb), but on-disk
+    // .ipynb files must be in Jupyter format so Jupyter / VSCode /
+    // Databricks can open them. .notebook files round-trip native
+    // and skip the translation.
+    let content_to_store = match store.studio_files_get(&id).await {
+        Ok(Some(file)) if is_ipynb_path(&file.path) => {
+            let nb = Notebook::parse_or_fresh(&form.content);
+            notebook_to_file_content(&file.path, &nb)
+        }
+        _ => form.content.clone(),
+    };
     match store
-        .studio_files_update(&id, None, Some(&form.content))
+        .studio_files_update(&id, None, Some(&content_to_store))
         .await
     {
         Ok(Some(_)) => axum::http::StatusCode::NO_CONTENT,
