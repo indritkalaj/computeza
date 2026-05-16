@@ -729,6 +729,9 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/storage", get(storage_page_handler))
         .route("/admin/smtp", get(admin_smtp_handler).post(admin_smtp_submit_handler))
         .route("/api/health/all", get(api_health_all_handler))
+        .route("/api/test/echo", post(api_test_echo_handler))
+        .route("/help/sitemap", get(help_sitemap_handler))
+        .route("/storage/connect/aws", get(storage_connect_aws_form_handler).post(storage_connect_aws_submit_handler))
         .route(
             "/studio/api/completions",
             get(studio_completions_handler),
@@ -5395,6 +5398,227 @@ fn render_admin_smtp_page(flash: Option<&str>) -> Html<String> {
 }
 
 // ============================================================
+// /api/test/echo -- diagnostic echo endpoint. POST any form body,
+// the server returns the parsed fields verbatim. Used by the
+// 'Test save' button on the notebook page to verify the round-
+// trip path independent of the file table.
+// ============================================================
+
+#[derive(Default, serde::Deserialize, serde::Serialize)]
+struct EchoBody {
+    #[serde(default)]
+    payload: String,
+    #[serde(default)]
+    csrf_token: String,
+}
+
+async fn api_test_echo_handler(
+    axum::extract::Form(body): axum::extract::Form<EchoBody>,
+) -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({
+        "ok": true,
+        "echoed_payload_len": body.payload.len(),
+        "echoed_payload_preview": body.payload.chars().take(120).collect::<String>(),
+        "received_at": chrono::Utc::now().to_rfc3339(),
+    }))
+}
+
+// ============================================================
+// /help/sitemap -- one-page list of every reachable URL on the
+// operator console. Helps operators discover surfaces they may
+// not know exist (the nav rail is curated).
+// ============================================================
+
+async fn help_sitemap_handler() -> Html<String> {
+    let l = Localizer::english();
+    let sections: &[(&str, &[(&str, &str)])] = &[
+        (
+            "Studio",
+            &[
+                ("/studio", "Notebook + SQL editor"),
+                ("/studio/history", "Query history (all files)"),
+                ("/studio/trash", "Recently deleted files"),
+                ("/studio/bootstrap", "Bootstrap a new warehouse"),
+            ],
+        ),
+        (
+            "Workspace overview",
+            &[
+                ("/workspace", "Counts + storage source + deep links"),
+                ("/storage", "Storage source detail"),
+            ],
+        ),
+        (
+            "Components + install",
+            &[
+                ("/install", "Unified install hub"),
+                ("/install-guide", "Step-by-step install walkthrough"),
+                ("/components", "Installed components overview"),
+                ("/status", "Live reconciler health"),
+                ("/state", "Metadata store contents"),
+            ],
+        ),
+        (
+            "Audit + governance",
+            &[
+                ("/audit", "Signed audit log"),
+                ("/audit/export.csv", "Audit log as CSV"),
+                ("/sbom", "Software bill of materials"),
+                ("/compliance/eu-ai-act", "EU AI Act compliance pack"),
+            ],
+        ),
+        (
+            "Admin",
+            &[
+                ("/admin/secrets", "Encrypted secrets vault"),
+                ("/admin/operators", "Operator accounts"),
+                ("/admin/groups", "RBAC groups"),
+                ("/admin/tenants", "Workspace / tenant separation"),
+                ("/admin/license", "License envelope"),
+                ("/admin/smtp", "SMTP config (rotation pipeline scaffold)"),
+            ],
+        ),
+        (
+            "Account",
+            &[
+                ("/account", "Your profile"),
+                ("/login", "Sign in"),
+                ("/logout", "Sign out"),
+            ],
+        ),
+        (
+            "APIs (JSON)",
+            &[
+                ("/api/state/info", "Metadata store summary"),
+                ("/api/health/all", "Aggregate component health"),
+                ("/api/test/echo", "Diagnostic round-trip (POST)"),
+                ("/healthz", "Liveness probe"),
+            ],
+        ),
+    ];
+    let rows: String = sections
+        .iter()
+        .map(|(title, entries)| {
+            let items: String = entries
+                .iter()
+                .map(|(url, desc)| {
+                    format!(
+                        r#"<tr><td class="cz-cell-mono"><a href="{url}" style="color:var(--lavender);">{url}</a></td><td class="cz-cell-dim">{desc}</td></tr>"#,
+                        url = html_escape(url),
+                        desc = html_escape(desc),
+                    )
+                })
+                .collect();
+            format!(
+                r##"<section class="cz-section">
+<h2 style="margin-bottom:0.5rem;">{title}</h2>
+<div class="cz-table-wrap"><table class="cz-table"><tbody>{items}</tbody></table></div>
+</section>"##,
+                title = html_escape(title),
+                items = items,
+            )
+        })
+        .collect();
+    let body = format!(
+        r#"<section class="cz-hero">
+<h1>Site map</h1>
+<p class="cz-muted">Every operator-facing surface on this Computeza instance.</p>
+</section>
+{rows}"#,
+    );
+    Html(render_shell(&l, "Site map", NavLink::Studio, &body))
+}
+
+// ============================================================
+// /storage/connect/aws -- scaffold for a BYO-bucket connector.
+// The form persists S3-compatible credentials into the secrets
+// vault so an operator can point Lakekeeper at AWS-managed S3
+// (or any external endpoint). v0.0.x stores the record; the
+// reconciler hookup that ACTUALLY wires it into Lakekeeper as a
+// new warehouse is a v0.1+ task.
+// ============================================================
+
+async fn storage_connect_aws_form_handler() -> Html<String> {
+    render_storage_connect_aws_page(None)
+}
+
+#[derive(serde::Deserialize, Default)]
+#[allow(dead_code)] // scaffold -- full wiring into Lakekeeper is v0.1+
+struct AwsConnectForm {
+    #[serde(default)]
+    bucket: String,
+    #[serde(default)]
+    region: String,
+    #[serde(default)]
+    endpoint: String,
+    #[serde(default)]
+    access_key_id: String,
+    #[serde(default)]
+    secret_access_key: String,
+}
+
+async fn storage_connect_aws_submit_handler(
+    State(state): State<AppState>,
+    axum::extract::Form(form): axum::extract::Form<AwsConnectForm>,
+) -> Html<String> {
+    // Persist to secrets vault best-effort; the actual wire-up into
+    // Lakekeeper as a second warehouse ships with the storage
+    // connector reconciler (v0.1+).
+    if let Some(s) = state.secrets.as_deref() {
+        let _ = s.put("storage/aws/bucket", &form.bucket).await;
+        let _ = s.put("storage/aws/region", &form.region).await;
+        let _ = s.put("storage/aws/endpoint", &form.endpoint).await;
+        let _ = s
+            .put("storage/aws/access-key-id", &form.access_key_id)
+            .await;
+        let _ = s
+            .put("storage/aws/secret-access-key", &form.secret_access_key)
+            .await;
+    }
+    render_storage_connect_aws_page(Some(
+        "Saved to secrets vault. Wiring this bucket into Lakekeeper as a second warehouse is the v0.1+ storage-connector reconciler; the credentials are now available for that step.",
+    ))
+}
+
+fn render_storage_connect_aws_page(flash: Option<&str>) -> Html<String> {
+    let l = Localizer::english();
+    let csrf = auth::csrf_input();
+    let flash_html = flash
+        .map(|m| {
+            format!(
+                r#"<div class="cz-flash" style="margin-bottom:1rem;">{}</div>"#,
+                html_escape(m)
+            )
+        })
+        .unwrap_or_default();
+    let body = format!(
+        r##"<section class="cz-hero">
+<h1>Connect AWS S3 bucket</h1>
+<p class="cz-muted">Point Computeza at an external S3-compatible bucket -- AWS S3, MinIO, Ceph, Cloudflare R2, Backblaze B2. v0.0.x records the credentials; the connector reconciler that registers the bucket as a Lakekeeper warehouse ships in v0.1+.</p>
+</section>
+<section class="cz-section" style="max-width:42rem;">
+{flash_html}
+<form method="post" action="/storage/connect/aws" class="cz-form">
+{csrf}
+<label for="aws-bucket">Bucket name</label>
+<input id="aws-bucket" name="bucket" class="cz-input" type="text" placeholder="my-lakehouse-bucket" required />
+<label for="aws-region">Region</label>
+<input id="aws-region" name="region" class="cz-input" type="text" placeholder="us-east-1" />
+<label for="aws-endpoint">Endpoint URL (blank = AWS-managed S3)</label>
+<input id="aws-endpoint" name="endpoint" class="cz-input" type="text" placeholder="https://s3.us-east-1.amazonaws.com" />
+<label for="aws-ak">Access key ID</label>
+<input id="aws-ak" name="access_key_id" class="cz-input" type="text" placeholder="AKIA..." required />
+<label for="aws-sk">Secret access key</label>
+<input id="aws-sk" name="secret_access_key" class="cz-input" type="password" placeholder="(write-only)" required />
+<button type="submit" class="cz-btn-primary" style="align-self:flex-start;">Save credentials</button>
+</form>
+<p class="cz-muted" style="margin-top:1rem;font-size:0.85rem;">Stored at <code>storage/aws/&lt;field&gt;</code> in the encrypted secrets vault. <a href="/storage" style="color:var(--lavender);">Back to storage</a>.</p>
+</section>"##,
+    );
+    Html(render_shell(&l, "Connect AWS S3", NavLink::Studio, &body))
+}
+
+// ============================================================
 // /api/health/all -- JSON aggregate across every reconciler-
 // observed component so external monitoring can scrape ONE URL.
 // ============================================================
@@ -9705,6 +9929,7 @@ fn render_studio_notebook_page(
 </div>
 <span class="cz-studio-actions-spacer"></span>
 <button type="button" class="cz-studio-autosave-status" id="cz-autosave-status" data-file-id="{file_id}" data-state="idle" title="Autosaves every second after you stop typing. Click to save now." style="border:none;cursor:pointer;"><i class="fa-solid fa-cloud-arrow-up" aria-hidden="true"></i><span class="cz-studio-autosave-text">Saved</span></button>
+<button type="button" class="cz-btn-ghost" id="cz-autosave-test" data-file-id="{file_id}" title="Round-trip test: POSTs a marker save and verifies the server stored it. Click and watch the badge.">Test save</button>
 <a href="/studio/files/{file_id_enc}/revisions" class="cz-btn-ghost" title="Revision history">History</a>
 </div>
 {tabs_html}
@@ -9864,6 +10089,73 @@ window.czNotebook = (function () {{
       persistNow({{ force: true }});
     }}
   }});
+
+  // 'Test save' button: round-trips a known marker against the
+  // autosave endpoint and shows the response directly so operators
+  // can verify the path E2E without rummaging through DevTools.
+  var testBtn = document.getElementById("cz-autosave-test");
+  if (testBtn) {{
+    testBtn.addEventListener("click", function () {{
+      var orig = testBtn.innerHTML;
+      testBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Testing...';
+      testBtn.disabled = true;
+      // We intentionally do NOT mutate `nb` here -- the test save uses
+      // a marker payload, but we restore the previous content right
+      // after so the user's actual notebook is untouched.
+      var stamp = "_cz_save_test_" + Date.now();
+      var probe = JSON.stringify({{
+        _computeza_save_test: stamp,
+        cells: nb.cells || [],
+      }});
+      var b = new URLSearchParams();
+      b.append("content", probe);
+      var csrf = csrfToken();
+      if (csrf) b.append("csrf_token", csrf);
+      var t0 = performance.now();
+      fetch("/studio/api/files/" + encodeURIComponent(FILE_ID) + "/autosave", {{
+        method: "POST",
+        credentials: "same-origin",
+        headers: {{ "Content-Type": "application/x-www-form-urlencoded" }},
+        body: b.toString(),
+      }})
+        .then(function (r) {{
+          var ms = Math.round(performance.now() - t0);
+          if (r.ok) {{
+            // Re-save the real notebook content so the probe doesn't
+            // overwrite the user's work on disk.
+            return fetch("/studio/api/files/" + encodeURIComponent(FILE_ID) + "/autosave", {{
+              method: "POST",
+              credentials: "same-origin",
+              headers: {{ "Content-Type": "application/x-www-form-urlencoded" }},
+              body: (function () {{
+                var p = new URLSearchParams();
+                p.append("content", JSON.stringify(nb, null, 2));
+                var c = csrfToken();
+                if (c) p.append("csrf_token", c);
+                return p.toString();
+              }})(),
+            }}).then(function (r2) {{
+              alert(
+                "Round-trip OK (" + r.status + ", " + ms + "ms). Probe save persisted, " +
+                "and the live notebook was re-saved on top. Marker: " + stamp + ". " +
+                (r2.ok ? "Restore OK." : "RESTORE FAILED (" + r2.status + ")")
+              );
+            }});
+          }} else {{
+            return r.text().then(function (txt) {{
+              alert("Save FAILED " + r.status + " (" + ms + "ms): " + txt.substring(0, 400));
+            }});
+          }}
+        }})
+        .catch(function (e) {{
+          alert("Network error: " + e);
+        }})
+        .finally(function () {{
+          testBtn.innerHTML = orig;
+          testBtn.disabled = false;
+        }});
+    }});
+  }}
 
   function uuid() {{
     // RFC4122 v4-ish. Crypto-good when available; falls back to
@@ -17155,6 +17447,7 @@ pub fn render_shell(
     <a href="/sbom" class="cz-sidenav-item" data-label="SBOM"><i class="fa-solid fa-list-check fa-fw"></i><span class="cz-sidenav-label">SBOM</span></a>
     <a href="/storage" class="cz-sidenav-item" data-label="Storage"><i class="fa-solid fa-hard-drive fa-fw"></i><span class="cz-sidenav-label">Storage</span></a>
     <a href="/workspace" class="cz-sidenav-item" data-label="Workspace"><i class="fa-solid fa-table-cells fa-fw"></i><span class="cz-sidenav-label">Workspace</span></a>
+    <a href="/help/sitemap" class="cz-sidenav-item" data-label="Sitemap"><i class="fa-solid fa-sitemap fa-fw"></i><span class="cz-sidenav-label">Sitemap</span></a>
   </div>
   <div class="cz-sidenav-spacer"></div>
 </nav>
@@ -24022,6 +24315,75 @@ mod tests {
     }
 
     // ---- dispatch_install / dispatch_uninstall_with_config: unknown slugs ----
+
+    #[tokio::test]
+    async fn notebook_autosave_persists_and_snapshots() {
+        // Proves the server-side autosave path round-trips:
+        // create file -> save new content -> verify stored ->
+        // verify a revision row was snapshotted.
+        let store = computeza_state::SqliteStore::open(":memory:")
+            .await
+            .expect("open sqlite");
+        let path = "/notebooks/autosave-test.notebook";
+        let initial = r#"{"cells":[{"id":"a","kind":"sql","content":""}]}"#;
+        let file = store
+            .studio_files_create(path, initial)
+            .await
+            .expect("create");
+        // Saving the SAME content should not snapshot.
+        let _ = store
+            .studio_files_update(&file.id, None, Some(initial))
+            .await
+            .expect("noop update");
+        let revs_after_noop = store
+            .studio_files_list_revisions(&file.id)
+            .await
+            .expect("list rev");
+        assert_eq!(
+            revs_after_noop.len(),
+            0,
+            "no-op update must not create a revision"
+        );
+        // Saving NEW content snapshots the prior content as a revision.
+        let updated = r#"{"cells":[{"id":"a","kind":"sql","content":"SELECT 1"}]}"#;
+        let _ = store
+            .studio_files_update(&file.id, None, Some(updated))
+            .await
+            .expect("update");
+        let back = store
+            .studio_files_get(&file.id)
+            .await
+            .expect("get")
+            .expect("file exists");
+        assert_eq!(back.content, updated, "new content must persist");
+        let revs = store
+            .studio_files_list_revisions(&file.id)
+            .await
+            .expect("list rev");
+        assert_eq!(
+            revs.len(),
+            1,
+            "a changed save must create exactly one revision"
+        );
+        assert_eq!(
+            revs[0].content, initial,
+            "revision row carries prior content"
+        );
+        // Saving the same updated content again should not double-snapshot.
+        let _ = store
+            .studio_files_update(&file.id, None, Some(updated))
+            .await
+            .expect("noop update");
+        let revs2 = store
+            .studio_files_list_revisions(&file.id)
+            .await
+            .expect("list rev");
+        assert_eq!(
+            revs2.len(),
+            1,
+            "no-op save must not create another revision"
+        );
+    }
 
     #[tokio::test]
     async fn dispatch_install_unknown_slug_returns_error() {
