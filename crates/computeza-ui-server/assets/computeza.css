@@ -1709,6 +1709,38 @@ a.cz-card:hover {
   background: var(--navy-3);
   border-color: var(--line);
 }
+.cz-studio-sidebar-eyebrow-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.15rem;
+}
+.cz-studio-sidebar-eyebrow-actions .cz-studio-sidebar-action {
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.4rem;
+}
+
+/* Hover-revealed copy-name button on every catalog/namespace/table
+   tree row. Sits flush against the right edge of the row so it
+   doesn't push the row label around. */
+.cz-tree-copy {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 0.7rem;
+  line-height: 1;
+  opacity: 0;
+  transition: opacity 0.12s ease, color 0.12s ease, background 0.12s ease;
+  margin-left: auto;
+}
+.cz-tree-row:hover .cz-tree-copy,
+.cz-tree-copy:focus { opacity: 1; }
+.cz-tree-copy:hover { color: var(--ink); background: var(--navy); }
 
 /* Tree component */
 .cz-tree {

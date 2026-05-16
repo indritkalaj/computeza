@@ -3000,12 +3000,21 @@ async fn load_namespaces_for_sidebar(
 /// names only (clicking navigates, which on the next page-load shows
 /// them expanded).
 fn render_studio_tree_sidebar(tree: &StudioSidebarTree, focus: SidebarFocus<'_>) -> String {
+    // Eyebrow carries: Bootstrap (+), Refresh. Refresh reloads the
+    // current page so the server re-fetches warehouses / namespaces /
+    // tables from Lakekeeper. (The tree is server-rendered; a live
+    // JSON re-fetch is a future enhancement.)
+    let eyebrow_actions = r##"<a href="/studio/bootstrap" class="cz-studio-sidebar-action" title="Bootstrap a warehouse" data-tooltip="Bootstrap a warehouse"><i class="fa-solid fa-plus"></i></a>
+<a href="#" class="cz-studio-sidebar-action cz-catalog-refresh" title="Refresh catalog" data-tooltip="Refresh catalog" aria-label="Refresh catalog"><i class="fa-solid fa-rotate"></i></a>"##;
     if tree.warehouses.is_empty() {
         return format!(
             r#"<section class="cz-studio-sidebar-section">
-<div class="cz-studio-sidebar-eyebrow"><span>Catalog</span><a href="/studio/bootstrap" class="cz-studio-sidebar-action" title="Bootstrap a warehouse">+</a></div>
+<div class="cz-studio-sidebar-eyebrow"><span>Catalog</span><span class="cz-studio-sidebar-eyebrow-actions">{actions}</span></div>
 <p class="cz-studio-sidebar-note">No warehouses yet. <a href="/studio/bootstrap" style="color: var(--lavender);">Bootstrap one</a> to start.</p>
-</section>"#,
+</section>
+{js}"#,
+            actions = eyebrow_actions,
+            js = render_sidebar_tree_js(),
         );
     }
     let items: String = tree
@@ -3015,10 +3024,55 @@ fn render_studio_tree_sidebar(tree: &StudioSidebarTree, focus: SidebarFocus<'_>)
         .collect();
     format!(
         r#"<section class="cz-studio-sidebar-section">
-<div class="cz-studio-sidebar-eyebrow"><span>Catalog</span><a href="/studio/bootstrap" class="cz-studio-sidebar-action" title="Bootstrap a warehouse">+</a></div>
+<div class="cz-studio-sidebar-eyebrow"><span>Catalog</span><span class="cz-studio-sidebar-eyebrow-actions">{actions}</span></div>
 <ul class="cz-tree">{items}</ul>
-</section>"#,
+</section>
+{js}"#,
+        actions = eyebrow_actions,
+        js = render_sidebar_tree_js(),
     )
+}
+
+/// Inline script for catalog-sidebar interactions: Refresh (reload
+/// current location to re-render server-side tree) + Copy-name on
+/// each row (writes the fully-qualified identifier to the clipboard).
+fn render_sidebar_tree_js() -> &'static str {
+    r#"<script>
+(function () {
+  // Refresh button -- full reload so the server re-queries Lakekeeper.
+  document.querySelectorAll(".cz-catalog-refresh").forEach(function (a) {
+    a.addEventListener("click", function (e) {
+      e.preventDefault();
+      window.location.reload();
+    });
+  });
+  // Copy-name buttons: each .cz-tree-copy[data-copy] writes its
+  // data-copy attribute to the clipboard and shows a transient
+  // checkmark.
+  document.querySelectorAll(".cz-tree-copy[data-copy]").forEach(function (b) {
+    b.addEventListener("click", function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      var text = b.getAttribute("data-copy") || "";
+      var done = function () {
+        var orig = b.innerHTML;
+        b.innerHTML = '<i class="fa-solid fa-check"></i>';
+        setTimeout(function () { b.innerHTML = orig; }, 900);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done, done);
+      } else {
+        // Fallback: textarea trick.
+        var ta = document.createElement("textarea");
+        ta.value = text; document.body.appendChild(ta);
+        ta.select(); document.execCommand("copy");
+        document.body.removeChild(ta);
+        done();
+      }
+    });
+  });
+})();
+</script>"#
 }
 
 fn render_sidebar_warehouse(node: &SidebarWarehouseNode, focus: SidebarFocus<'_>) -> String {
@@ -3051,11 +3105,12 @@ fn render_sidebar_warehouse(node: &SidebarWarehouseNode, focus: SidebarFocus<'_>
     };
     format!(
         r#"<li class="cz-tree-item"><details class="cz-tree-details"{open_attr}>
-<summary class="cz-tree-row{active}"><span class="cz-tree-toggle"></span><span class="cz-tree-icon">⬢</span><a class="cz-tree-link" href="{href}">{label}</a></summary>
+<summary class="cz-tree-row{active}"><span class="cz-tree-toggle"></span><span class="cz-tree-icon">⬢</span><a class="cz-tree-link" href="{href}">{label}</a><button type="button" class="cz-tree-copy" data-copy="{copy}" title="Copy name" aria-label="Copy {copy}"><i class="fa-solid fa-copy"></i></button></summary>
 {children_block}
 </details></li>"#,
         href = html_escape(&href),
         label = html_escape(&node.name),
+        copy = html_escape(&node.name),
     )
 }
 
@@ -3095,13 +3150,15 @@ fn render_sidebar_namespace(
     } else {
         String::new()
     };
+    let copy_full = format!("{warehouse}.{}", &node.qualified);
     format!(
         r#"<li class="cz-tree-item"><details class="cz-tree-details"{open_attr}>
-<summary class="cz-tree-row{active}"><span class="cz-tree-toggle"></span><span class="cz-tree-icon">◇</span><a class="cz-tree-link" href="{href}">{label}</a></summary>
+<summary class="cz-tree-row{active}"><span class="cz-tree-toggle"></span><span class="cz-tree-icon">◇</span><a class="cz-tree-link" href="{href}">{label}</a><button type="button" class="cz-tree-copy" data-copy="{copy}" title="Copy {copy}" aria-label="Copy {copy}"><i class="fa-solid fa-copy"></i></button></summary>
 {children_block}
 </details></li>"#,
         href = html_escape(&href),
         label = html_escape(&node.qualified),
+        copy = html_escape(&copy_full),
     )
 }
 
@@ -3119,10 +3176,12 @@ fn render_sidebar_table(
         url_encode(table)
     );
     let active = if is_current { " cz-tree-active" } else { "" };
+    let copy_full = format!("{warehouse}.{namespace}.{table}");
     format!(
-        r#"<li class="cz-tree-item"><a class="cz-tree-row cz-tree-leaf{active}" href="{href}"><span class="cz-tree-toggle"></span><span class="cz-tree-icon">▤</span><span class="cz-tree-label">{label}</span></a></li>"#,
+        r#"<li class="cz-tree-item"><div class="cz-tree-row cz-tree-leaf{active}"><a href="{href}" style="display:flex;align-items:center;gap:0.35rem;flex:1;min-width:0;text-decoration:none;color:inherit;"><span class="cz-tree-toggle"></span><span class="cz-tree-icon">▤</span><span class="cz-tree-label">{label}</span></a><button type="button" class="cz-tree-copy" data-copy="{copy}" title="Copy {copy}" aria-label="Copy {copy}"><i class="fa-solid fa-copy"></i></button></div></li>"#,
         href = html_escape(&href),
         label = html_escape(table),
+        copy = html_escape(&copy_full),
     )
 }
 
@@ -5989,6 +6048,35 @@ except ModuleNotFoundError:
 
 from pyiceberg.catalog import load_catalog
 
+# Propagate S3 credentials to the boto3 / s3fs credential chain via
+# environment variables. PyIceberg's `s3.*` properties feed the FileIO
+# at catalog-load time, but the write path goes through s3fs ->
+# aiobotocore, which on read of LOAD-TABLE response sometimes drops
+# the catalog props and falls back to boto3's default chain. Without
+# AWS_* env vars, that chain ends in "anonymous" and Garage rejects
+# the PutObject with "Garage does not support anonymous access yet".
+# Setting them BEFORE the first FileIO call routes the write through
+# the same key/secret pair Lakekeeper saw at catalog-load time.
+def _cz_export_aws_env(catalog_cfg):
+    for cfg in catalog_cfg.values():
+        ak = cfg.get("s3-access-key-id") or ""
+        sk = cfg.get("s3-secret-access-key") or ""
+        ep = cfg.get("s3-endpoint") or ""
+        rg = cfg.get("s3-region") or "garage"
+        if ak and sk:
+            os.environ.setdefault("AWS_ACCESS_KEY_ID", ak)
+            os.environ.setdefault("AWS_SECRET_ACCESS_KEY", sk)
+            os.environ.setdefault("AWS_DEFAULT_REGION", rg)
+            os.environ.setdefault("AWS_REGION", rg)
+            if ep:
+                # Both spellings -- boto3>=1.34 honors AWS_ENDPOINT_URL,
+                # older s3fs still looks at AWS_S3_ENDPOINT_URL.
+                os.environ.setdefault("AWS_ENDPOINT_URL", ep)
+                os.environ.setdefault("AWS_ENDPOINT_URL_S3", ep)
+                os.environ.setdefault("AWS_S3_ENDPOINT_URL", ep)
+            return
+_cz_export_aws_env(catalog_cfg)
+
 catalogs = {}
 for name, cfg in catalog_cfg.items():
     try:
@@ -5998,11 +6086,23 @@ for name, cfg in catalog_cfg.items():
                 "type":                 "rest",
                 "uri":                  cfg.get("lakekeeper-rest-uri", ""),
                 "warehouse":            cfg.get("warehouse-uuid", ""),
+                # FileIO is constructed from these at load time. Note:
+                # pyiceberg's REST catalog may merge in `overrides` /
+                # `defaults` from Lakekeeper's /v1/config response,
+                # which can blank out the keys -- the env vars above
+                # are the backstop for that case.
                 "s3.endpoint":          cfg.get("s3-endpoint", ""),
                 "s3.access-key-id":     cfg.get("s3-access-key-id", ""),
                 "s3.secret-access-key": cfg.get("s3-secret-access-key", ""),
                 "s3.region":            cfg.get("s3-region", "garage"),
                 "s3.path-style-access": "true",
+                # Force the PyArrow FileIO over the fsspec one. PyArrow's
+                # S3 client honors s3.access-key-id directly without
+                # falling back to anonymous when the catalog's load-table
+                # response omits creds; fsspec / aiobotocore was the
+                # path that produced 'anonymous access yet' against
+                # Garage.
+                "py-io-impl":           "pyiceberg.io.pyarrow.PyArrowFileIO",
             },
         )
         catalogs[name] = c
@@ -6648,8 +6748,26 @@ fn render_studio_files_pane(files: &StudioFilesView, current_dir: Option<&str>) 
     // a single "/" label; inside a folder it's a back arrow + the
     // folder name.
     let crumb_html = if in_root {
+        // Root crumb gets its own 3-dot menu carrying the same set of
+        // actions as a folder row (plus the create-new shortcuts that
+        // also live in the eyebrow). Operators expecting consistency
+        // ("every row has a ⋮") get it.
         format!(
-            r#"<div class="cz-studio-files-crumb"><span class="cz-studio-files-crumb-root"><i class="fa-solid fa-house fa-fw"></i> /</span></div>"#
+            r##"<div class="cz-studio-files-crumb">
+<span class="cz-studio-files-crumb-root"><i class="fa-solid fa-house fa-fw"></i> /</span>
+<span class="cz-studio-actions-spacer"></span>
+<details class="cz-row-menu cz-folder-menu">
+<summary title="Workspace actions" aria-label="Workspace actions"><i class="fa-solid fa-ellipsis-vertical"></i></summary>
+<div class="cz-row-menu-popup">
+<a href="#cz-modal-new-file" class="cz-row-menu-item"><i class="fa-solid fa-plus fa-fw"></i> New file</a>
+<a href="#cz-modal-new-folder" class="cz-row-menu-item"><i class="fa-solid fa-folder-plus fa-fw"></i> New folder</a>
+<form method="post" action="/studio/notebooks/new" class="cz-row-menu-form">{csrf}<button type="submit" class="cz-row-menu-item"><i class="fa-solid fa-book fa-fw"></i> New notebook</button></form>
+<a href="#cz-modal-import-archive" class="cz-row-menu-item"><i class="fa-solid fa-file-arrow-up fa-fw"></i> Import .cptz</a>
+<a href="/studio/files/export-archive" class="cz-row-menu-item"><i class="fa-solid fa-file-zipper fa-fw"></i> Export workspace as .cptz</a>
+</div>
+</details>
+</div>"##,
+            csrf = csrf,
         )
     } else {
         format!(
@@ -6761,6 +6879,7 @@ fn render_studio_files_pane(files: &StudioFilesView, current_dir: Option<&str>) 
 <div class="cz-row-menu-popup">
 <a href="/studio?open={open}&dir={folder_enc}" class="cz-row-menu-item"><i class="fa-solid fa-folder-open fa-fw"></i> Open</a>
 <a href="#cz-folder-rename-{folder_safe}" class="cz-row-menu-item"><i class="fa-solid fa-pen fa-fw"></i> Rename folder</a>
+<a href="#cz-modal-import-archive" data-import-dest="{folder_label_html}" class="cz-row-menu-item cz-import-archive-trigger"><i class="fa-solid fa-file-arrow-up fa-fw"></i> Import .cptz here</a>
 <a href="/studio/folders/export?name={folder_enc}" class="cz-row-menu-item"><i class="fa-solid fa-file-zipper fa-fw"></i> Export as .cptz</a>
 <a href="#cz-folder-delete-{folder_safe}" class="cz-row-menu-item cz-row-menu-item-danger"><i class="fa-solid fa-trash fa-fw"></i> Delete folder</a>
 </div>
@@ -6868,6 +6987,25 @@ fn render_studio_files_pane(files: &StudioFilesView, current_dir: Option<&str>) 
       hidden.value = ta.value;
     }});
   }}
+  // Per-folder Import-into-this-folder trigger. When a folder's
+  // 3-dot menu links here with data-import-dest=<name>, write that
+  // name into the shared import modal's hidden `dest` field before
+  // the modal opens. The eyebrow / root-menu Import link has no
+  // data-import-dest so the modal keeps the server-rendered default
+  // (current dir if folder view, empty if root).
+  document.querySelectorAll("a.cz-import-archive-trigger[data-import-dest]").forEach(function (a) {{
+    a.addEventListener("click", function () {{
+      var destInput = document.getElementById("cz-archive-dest");
+      var hint = document.getElementById("cz-archive-dest-hint");
+      if (destInput) destInput.value = a.getAttribute("data-import-dest") || "";
+      if (hint) {{
+        var d = a.getAttribute("data-import-dest") || "";
+        hint.innerHTML = d
+          ? ('Every entry will be placed under <code>/' + d.replace(/[<>&]/g, "") + '/</code>.')
+          : 'Paths in the archive are preserved as-is (root-level import).';
+      }}
+    }});
+  }});
   // Single-popup behavior for the per-row 3-dot menus: opening one
   // closes any others, and clicking outside any menu closes the
   // currently-open one. Native <details> wouldn't do this by
