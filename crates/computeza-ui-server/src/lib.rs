@@ -5531,6 +5531,55 @@ async fn studio_cell_run_handler(
 /// cell's last expression captured to a DataFrame. We extract
 /// that line out of stdout, parse the JSON, and return the
 /// remaining stdout for the operator to read.
+/// Server-side mirror of the notebook-cell JS renderTableOutput.
+/// Used by the single-buffer Python editor (which renders results
+/// server-side) so its DataFrame display matches what cells emit.
+fn render_python_df_html(df: &DataFrameOutput) -> String {
+    let header: String = df
+        .columns
+        .iter()
+        .map(|c| format!("<th>{}</th>", html_escape(&c.name)))
+        .collect();
+    let body: String = df
+        .rows
+        .iter()
+        .map(|row| {
+            let cells: String = row
+                .iter()
+                .map(|v| {
+                    format!(
+                        "<td class=\"cz-cell-clickable\" data-full=\"{full}\" title=\"Click to expand\">{shown}</td>",
+                        full = html_escape(v),
+                        shown = html_escape(v),
+                    )
+                })
+                .collect();
+            format!("<tr>{cells}</tr>")
+        })
+        .collect();
+    let trunc = if df.total_rows as usize > df.rows.len() {
+        format!(
+            r#"<div class="cz-muted" style="font-size:0.72rem;margin:0.4rem 0;">Showing {} of {} rows from {}. Filter / aggregate in code to see more.</div>"#,
+            thousands(df.rows.len()),
+            thousands(df.total_rows as usize),
+            html_escape(&df.origin),
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        r#"<div class="cz-studio-results-header" style="margin-top:0.4rem;">
+<span class="cz-studio-results-eyebrow">DataFrame</span>
+<span class="cz-studio-results-count">{rows} of {total} rows · {origin}</span>
+</div>
+{trunc}
+<div class="cz-studio-results-table-wrap"><table class="cz-studio-results-table cz-cell-table"><thead><tr>{header}</tr></thead><tbody>{body}</tbody></table></div>"#,
+        rows = thousands(df.rows.len()),
+        total = thousands(df.total_rows as usize),
+        origin = html_escape(&df.origin),
+    )
+}
+
 fn split_dataframe_marker(
     outcome: PythonOutcome,
 ) -> (String, String, Option<Result<DataFrameOutput, String>>) {
@@ -6520,6 +6569,39 @@ for name, cfg in catalog_cfg.items():
 # First catalog is conventionally `cat` so quick examples work
 # without picking a name. catalogs[<name>] always works.
 cat = next(iter(catalogs.values()), None)
+
+def print_storage(c=None):
+    """Friendlier alternative to dumping `tbl.io.properties`. Prints
+    the storage backend behind the catalog without leaking the raw
+    `s3.*` pyiceberg keys -- those are protocol names, not vendor
+    names, and they're often misread as 'we're on AWS'."""
+    c = c if c is not None else cat
+    if c is None:
+        print("No catalog bound.")
+        return
+    props = getattr(c, "properties", {}) or {}
+    endpoint = props.get("s3.endpoint") or os.environ.get("AWS_ENDPOINT_URL") or "(unknown)"
+    region   = props.get("s3.region")   or os.environ.get("AWS_REGION")       or "(unknown)"
+    wh       = props.get("warehouse")   or "(unknown)"
+    uri      = props.get("uri")         or "(unknown)"
+    # Classify the endpoint: 127.0.0.1 / localhost / WSL-local =>
+    # Computeza Local Storage. AWS / Azure / GCS would surface here
+    # with their own labels when we add those backends.
+    is_local = any(s in str(endpoint) for s in ("127.0.0.1", "localhost", "::1"))
+    backend = "Computeza Local Storage (Garage, S3-compatible)" if is_local else f"S3-compatible endpoint: {endpoint}"
+    print(f"Catalog       : {getattr(c, 'name', '?')}")
+    print(f"REST URI      : {uri}")
+    print(f"Warehouse     : {wh}")
+    print(f"Storage       : {backend}")
+    print(f"Region        : {region}")
+    print(f"FileIO class  : {type(c._file_io).__name__ if hasattr(c, '_file_io') else '?'}")
+    print()
+    print("(`s3.*` in pyiceberg's property keys is the *protocol*")
+    print(" name -- Iceberg, Trino, and Spark all call the wire")
+    print(" format 'S3' regardless of whether the bytes live in AWS,")
+    print(" Garage, MinIO, Ceph, R2, etc. The data here is on this")
+    print(" host, not on AWS.)")
+scope["print_storage"] = print_storage
 
 # Lakekeeper's /v1/config response injects `s3.remote-signing-enabled
 # = true` plus `s3.signer.uri = http://.../v1/signer/...`, which tells
@@ -7835,24 +7917,42 @@ fn render_studio_page(
             engine,
             outcome: Some(PythonOutcome::Ok { stdout, stderr }),
         }) => {
-            let stderr_block = if stderr.trim().is_empty() {
+            // Same DataFrame-marker stripping the notebook-cell path
+            // does. Without this the single-buffer editor's "Run"
+            // dumped the raw `__COMPUTEZA_DATAFRAME__...__END__` line
+            // into stdout instead of rendering a table.
+            let (clean_stdout, clean_stderr, df_opt) = split_dataframe_marker(
+                PythonOutcome::Ok {
+                    stdout: stdout.clone(),
+                    stderr: stderr.clone(),
+                },
+            );
+            let df_block = match df_opt {
+                Some(Ok(df)) => render_python_df_html(&df),
+                _ => String::new(),
+            };
+            let stderr_block = if clean_stderr.trim().is_empty() {
                 String::new()
             } else {
                 format!(
                     r#"<details style="margin-top: 0.75rem;"><summary class="cz-studio-raw-summary">stderr (warnings / Spark logs)</summary><pre class="cz-studio-raw">{}</pre></details>"#,
-                    html_escape(&stderr)
+                    html_escape(&clean_stderr)
+                )
+            };
+            let stdout_block = if clean_stdout.trim().is_empty() {
+                String::new()
+            } else {
+                format!(
+                    r#"<details style="margin-top: 0.75rem;"><summary class="cz-studio-raw-summary">stdout</summary><pre class="cz-studio-raw">{}</pre></details>"#,
+                    html_escape(&clean_stdout)
                 )
             };
             format!(
-                r#"<div class="cz-studio-results-header">{pill}<span class="cz-studio-results-eyebrow">stdout</span></div>
-<pre class="cz-studio-raw">{stdout}</pre>
+                r#"<div class="cz-studio-results-header">{pill}<span class="cz-studio-actions-spacer"></span></div>
+{df_block}
+{stdout_block}
 {stderr_block}"#,
                 pill = engine_pill(engine),
-                stdout = if stdout.trim().is_empty() {
-                    "(no output)".into()
-                } else {
-                    html_escape(&stdout)
-                }
             )
         }
         Some(RoutedOutcome::Python {
