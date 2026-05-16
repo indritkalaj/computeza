@@ -3063,12 +3063,54 @@ fn render_studio_tree_sidebar(tree: &StudioSidebarTree, focus: SidebarFocus<'_>)
     )
 }
 
-/// Inline script for catalog-sidebar interactions: Refresh (reload
-/// current location to re-render server-side tree) + Copy-name on
-/// each row (writes the fully-qualified identifier to the clipboard).
+/// Inline script for catalog-sidebar interactions:
+///   - Refresh (reload current location to re-render server-side tree)
+///   - Copy-name buttons on each row
+///   - Persistent expand-state via localStorage so navigating between
+///     studio files doesn't collapse the catalog tree the operator
+///     just expanded.
 fn render_sidebar_tree_js() -> &'static str {
     r#"<script>
 (function () {
+  var STORAGE_KEY = "cz-catalog-tree-open";
+  function readOpenSet() {
+    try {
+      var raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return {};
+      var arr = JSON.parse(raw);
+      if (!Array.isArray(arr)) return {};
+      var s = {};
+      arr.forEach(function (k) { s[k] = true; });
+      return s;
+    } catch (_) { return {}; }
+  }
+  function writeOpenSet(s) {
+    try {
+      var keys = Object.keys(s);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(keys));
+    } catch (_) {}
+  }
+  // On first paint: restore every <details data-tree-key="..."> that
+  // was open last time. We do this BEFORE the user's first click so
+  // there's no visible flicker.
+  var openSet = readOpenSet();
+  document.querySelectorAll("details.cz-tree-details[data-tree-key]").forEach(function (d) {
+    var k = d.getAttribute("data-tree-key");
+    if (openSet[k]) d.setAttribute("open", "");
+  });
+  // Persist toggles. Listening on the document with capture so we
+  // pick up programmatic <details> mutations too.
+  document.addEventListener("toggle", function (e) {
+    var d = e.target;
+    if (!(d instanceof HTMLDetailsElement)) return;
+    if (!d.classList.contains("cz-tree-details")) return;
+    var k = d.getAttribute("data-tree-key");
+    if (!k) return;
+    var s = readOpenSet();
+    if (d.open) s[k] = true; else delete s[k];
+    writeOpenSet(s);
+  }, true);
+
   // Refresh button -- full reload so the server re-queries Lakekeeper.
   document.querySelectorAll(".cz-catalog-refresh").forEach(function (a) {
     a.addEventListener("click", function (e) {
@@ -3127,14 +3169,16 @@ fn render_sidebar_warehouse(node: &SidebarWarehouseNode, focus: SidebarFocus<'_>
     // Hits the existing namespace-creation flow which lives on the
     // warehouse page; the deep link pre-fills the warehouse param.
     let create_url = format!("/studio/catalog/{}", url_encode(&node.name));
+    let tree_key = format!("wh:{}", &node.name);
     format!(
-        r#"<li class="cz-tree-item"><details class="cz-tree-details"{open_attr}>
+        r#"<li class="cz-tree-item"><details class="cz-tree-details" data-tree-key="{key}"{open_attr}>
 <summary class="cz-tree-row"><span class="cz-tree-toggle"></span><span class="cz-tree-icon">⬢</span><span class="cz-tree-label">{label}</span><a href="{create_url}" class="cz-tree-action" title="Add namespace inside {label}" aria-label="Add namespace"><i class="fa-solid fa-plus"></i></a><button type="button" class="cz-tree-copy" data-copy="{copy}" title="Copy {copy}" aria-label="Copy {copy}"><i class="fa-solid fa-copy"></i></button></summary>
 {children_block}
 </details></li>"#,
         label = html_escape(&node.name),
         copy = html_escape(&node.name),
         create_url = html_escape(&create_url),
+        key = html_escape(&tree_key),
     )
 }
 
@@ -3170,14 +3214,16 @@ fn render_sidebar_namespace(
         url_encode(warehouse),
         url_encode(&node.qualified)
     );
+    let tree_key = format!("ns:{warehouse}.{}", &node.qualified);
     format!(
-        r#"<li class="cz-tree-item"><details class="cz-tree-details"{open_attr}>
+        r#"<li class="cz-tree-item"><details class="cz-tree-details" data-tree-key="{key}"{open_attr}>
 <summary class="cz-tree-row"><span class="cz-tree-toggle"></span><span class="cz-tree-icon">◇</span><span class="cz-tree-label">{label}</span><a href="{create_url}" class="cz-tree-action" title="Add table inside {copy}" aria-label="Add table"><i class="fa-solid fa-plus"></i></a><button type="button" class="cz-tree-copy" data-copy="{copy}" title="Copy {copy}" aria-label="Copy {copy}"><i class="fa-solid fa-copy"></i></button></summary>
 {children_block}
 </details></li>"#,
         label = html_escape(&node.qualified),
         copy = html_escape(&copy_full),
         create_url = html_escape(&create_url),
+        key = html_escape(&tree_key),
     )
 }
 
