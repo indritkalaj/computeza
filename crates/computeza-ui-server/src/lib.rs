@@ -8909,13 +8909,121 @@ window.czNotebook = (function () {{
       return '<th>' + escapeHtml(c.name) + '</th>';
     }}).join("");
     var body = rows.map(function (row) {{
-      return '<tr>' + row.map(function (cell) {{ return '<td>' + escapeHtml(String(cell)) + '</td>'; }}).join("") + '</tr>';
+      return '<tr>' + row.map(function (cell) {{
+        // Every cell is a click-to-expand target. data-full carries
+        // the raw value for the expand modal; the visible text is
+        // CSS-truncated at the cell's max-width.
+        var raw = String(cell);
+        return '<td class="cz-cell-clickable" data-full="' + escapeAttr(raw) + '" title="Click to expand">'
+          + escapeHtml(raw) + '</td>';
+      }}).join("") + '</tr>';
     }}).join("");
     var truncNote = (totalRows != null && totalRows > rows.length)
       ? ('<div class="cz-muted" style="font-size:0.72rem;margin:0.4rem 0;">Showing ' + thousands(rows.length) + ' of ' + thousands(totalRows) + ' rows from ' + escapeHtml(originLabel || "result") + '. Filter / aggregate in code to see more.</div>')
       : "";
     var dlAttr = downloadName ? ' data-download="' + escapeAttr(downloadName) + '"' : "";
     return truncNote + '<div class="cz-studio-results-table-wrap"><table class="cz-studio-results-table cz-cell-table"' + dlAttr + '><thead><tr>' + header + '</tr></thead><tbody>' + body + '</tbody></table></div>';
+  }}
+
+  // Pretty-print a cell value when possible. Tries JSON first
+  // (handles {{'k': 'v'}} / Python repr by best-effort quote-fixing),
+  // falls back to the raw text. Returns {{text, pretty}} where pretty
+  // is true iff we successfully reformatted as JSON.
+  function prettifyCellValue(raw) {{
+    if (raw == null) return {{ text: "", pretty: false }};
+    var s = String(raw).trim();
+    // Stock JSON.
+    if ((s.startsWith("{{") && s.endsWith("}}")) || (s.startsWith("[") && s.endsWith("]"))) {{
+      try {{
+        return {{ text: JSON.stringify(JSON.parse(s), null, 2), pretty: true }};
+      }} catch (_) {{}}
+      // Python repr: single quotes + True/False/None. Best-effort
+      // swap to JSON-ish before retrying.
+      try {{
+        var swapped = s
+          .replace(/(['"])(?:(?=(\\?))\2.)*?\1/g, function (m) {{
+            // strings that are already double-quoted stay; turn
+            // single-quoted strings into JSON strings.
+            if (m[0] === '"') return m;
+            return JSON.stringify(m.slice(1, -1));
+          }})
+          .replace(/\bTrue\b/g, "true")
+          .replace(/\bFalse\b/g, "false")
+          .replace(/\bNone\b/g, "null");
+        return {{ text: JSON.stringify(JSON.parse(swapped), null, 2), pretty: true }};
+      }} catch (_) {{}}
+    }}
+    return {{ text: String(raw), pretty: false }};
+  }}
+
+  // Modal showing the full value of a clicked cell. Created lazily on
+  // first click and reused thereafter.
+  var expandModal = null;
+  function ensureExpandModal() {{
+    if (expandModal) return expandModal;
+    var m = document.createElement("div");
+    m.className = "cz-cell-expand-modal";
+    m.innerHTML = ''
+      + '<div class="cz-cell-expand-backdrop"></div>'
+      + '<div class="cz-cell-expand-dialog" role="dialog" aria-modal="true">'
+      +   '<div class="cz-cell-expand-header">'
+      +     '<span class="cz-cell-expand-title">Cell value</span>'
+      +     '<span class="cz-cell-expand-meta" data-role="meta"></span>'
+      +     '<span style="flex:1"></span>'
+      +     '<button type="button" class="cz-btn-ghost" data-role="copy" title="Copy to clipboard"><i class="fa-solid fa-copy"></i> Copy</button>'
+      +     '<button type="button" class="cz-btn-ghost" data-role="close" title="Close (Esc)">×</button>'
+      +   '</div>'
+      +   '<pre class="cz-cell-expand-body" data-role="body"></pre>'
+      + '</div>';
+    document.body.appendChild(m);
+    var hide = function () {{ m.style.display = "none"; }};
+    m.querySelector(".cz-cell-expand-backdrop").addEventListener("click", hide);
+    m.querySelector('[data-role="close"]').addEventListener("click", hide);
+    document.addEventListener("keydown", function (e) {{
+      if (e.key === "Escape" && m.style.display !== "none") hide();
+    }});
+    m.querySelector('[data-role="copy"]').addEventListener("click", function () {{
+      var text = m.querySelector('[data-role="body"]').textContent;
+      var btn = m.querySelector('[data-role="copy"]');
+      var done = function () {{
+        var orig = btn.innerHTML;
+        btn.innerHTML = '<i class="fa-solid fa-check"></i> Copied';
+        setTimeout(function () {{ btn.innerHTML = orig; }}, 1200);
+      }};
+      if (navigator.clipboard && navigator.clipboard.writeText) {{
+        navigator.clipboard.writeText(text).then(done, done);
+      }} else {{
+        var ta = document.createElement("textarea");
+        ta.value = text; document.body.appendChild(ta);
+        ta.select(); document.execCommand("copy");
+        document.body.removeChild(ta);
+        done();
+      }}
+    }});
+    expandModal = m;
+    return m;
+  }}
+  function showCellExpand(raw) {{
+    var m = ensureExpandModal();
+    var p = prettifyCellValue(raw);
+    m.querySelector('[data-role="body"]').textContent = p.text;
+    m.querySelector('[data-role="meta"]').textContent =
+      (p.pretty ? "JSON · " : "") + p.text.length + " chars";
+    m.style.display = "flex";
+  }}
+  // Document-wide delegated click handler for any expandable cell.
+  // Set once at script load -- works for cells rendered now AND any
+  // cells that get re-rendered after later runs.
+  if (!window._czCellExpandWired) {{
+    window._czCellExpandWired = true;
+    document.addEventListener("click", function (e) {{
+      var td = e.target.closest && e.target.closest("td.cz-cell-clickable");
+      if (!td) return;
+      // Ignore clicks that land on a child action (download / copy
+      // icons live in the header, not on cells, but be safe).
+      if (e.target.closest("[data-cell-action]")) return;
+      showCellExpand(td.getAttribute("data-full") || td.textContent || "");
+    }});
   }}
   function renderOutput(out, cellSqlForPlan) {{
     if (!out) return "";

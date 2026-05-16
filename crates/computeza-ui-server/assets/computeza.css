@@ -2362,6 +2362,74 @@ details > summary::-webkit-details-marker { display: none; }
 .cz-studio-results-table tr:hover td {
   background: var(--navy-3);
 }
+/* Click-to-expand cells. Each <td.cz-cell-clickable> is a click
+   target; the row hover tints the whole row, this just makes the
+   individual cell read as "I'm interactive". */
+.cz-studio-results-table td.cz-cell-clickable {
+  cursor: pointer;
+}
+.cz-studio-results-table td.cz-cell-clickable:hover {
+  background: var(--navy-2);
+  box-shadow: inset 0 0 0 1px var(--lavender);
+}
+
+/* Modal for the expanded cell value. Sits over everything; pre is
+   monospace + scrollable so multi-line JSON renders properly. */
+.cz-cell-expand-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+  display: none;
+  align-items: center;
+  justify-content: center;
+}
+.cz-cell-expand-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(8, 12, 28, 0.65);
+  backdrop-filter: blur(2px);
+}
+.cz-cell-expand-dialog {
+  position: relative;
+  max-width: min(60rem, 92vw);
+  max-height: 82vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--navy-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-card);
+  overflow: hidden;
+  z-index: 1;
+}
+.cz-cell-expand-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.6rem 0.9rem;
+  border-bottom: 1px solid var(--line);
+  background: var(--navy);
+}
+.cz-cell-expand-title {
+  font-weight: 600;
+  font-size: 0.85rem;
+}
+.cz-cell-expand-meta {
+  font-size: 0.7rem;
+  color: var(--muted);
+  font-family: 'Geist Mono', ui-monospace, monospace;
+}
+.cz-cell-expand-body {
+  margin: 0;
+  padding: 0.9rem 1.1rem;
+  font-family: 'Geist Mono', ui-monospace, monospace;
+  font-size: 0.78rem;
+  line-height: 1.55;
+  color: var(--ink);
+  overflow: auto;
+  white-space: pre;
+  background: var(--navy-2);
+}
 
 .cz-studio-results-empty {
   padding: 2rem 1.25rem;
