@@ -576,6 +576,9 @@ component-databend-role   = Columnar SQL, vector, full-text search, geospatial
 component-sail-name       = Sail
 component-sail-role       = Spark-API distributed compute (Python / DataFrame / Spark Connect)
 
+component-pyiceberg-name  = PyIceberg
+component-pyiceberg-role  = Python Iceberg client (Studio's Python -> PyIceberg execution path; installs into Sail's venv)
+
 component-trino-name      = Trino
 component-trino-role      = Distributed SQL engine with first-class Iceberg-REST support (Studio's default SQL surface)
 

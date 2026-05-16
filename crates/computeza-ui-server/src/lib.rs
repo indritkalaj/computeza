@@ -5602,12 +5602,15 @@ catalog_cfg = json.loads(sys.stdin.readline())
 user_code = sys.stdin.read()
 
 # Self-heal: install pyiceberg into the venv on the fly if it isn't
-# already there. Two-attempt strategy:
+# already there. Three-step strategy with zero operator action:
 #   1. Try with --only-binary so pip refuses source builds. Fast
 #      path on Python versions where wheels exist (3.10-3.13).
-#   2. If no compatible wheel exists, retry WITHOUT --only-binary
-#      so pip compiles the C extension from source. Requires
-#      python3-dev on the host (PyIceberg's decoder_fast).
+#   2. If no wheel exists, auto-install python3-dev + build-essential
+#      via apt (sudo -n is best-effort: works when the computeza
+#      service runs as root; harmlessly skipped otherwise).
+#   3. Retry WITHOUT --only-binary so pip compiles the C extension
+#      from source against the freshly-installed headers.
+import os
 try:
     import pyiceberg.catalog  # noqa: F401
 except ModuleNotFoundError:
@@ -5622,8 +5625,30 @@ except ModuleNotFoundError:
         capture_output=True, text=True,
     )
     if res.returncode != 0:
-        # Pass 2: allow source build. Needs python3-dev.
-        print("[pyiceberg] no wheel for this Python; trying source build (needs python3-dev) ...", file=sys.stderr)
+        # Step 2: auto-install build deps. As root this just works;
+        # under sudo it works iff a NOPASSWD rule exists; otherwise
+        # the source build below either falls back to a pure-Python
+        # path or fails with a clearer message.
+        print("[pyiceberg] no wheel for Python "
+              f"{sys.version_info.major}.{sys.version_info.minor}; "
+              "installing build deps (python3-dev) and retrying from source ...",
+              file=sys.stderr)
+        apt_cmd = (
+            ["apt-get", "install", "-y", "--no-install-recommends",
+             "python3-dev", "build-essential"]
+            if os.geteuid() == 0
+            else ["sudo", "-n", "apt-get", "install", "-y", "--no-install-recommends",
+                  "python3-dev", "build-essential"]
+        )
+        apt_res = subprocess.run(apt_cmd, capture_output=True, text=True)
+        if apt_res.returncode != 0:
+            # Non-fatal: pip may still succeed (e.g. wheels of
+            # transitive deps). Note it and continue.
+            print(f"[pyiceberg] apt-get install python3-dev did not run cleanly "
+                  f"(rc={apt_res.returncode}); proceeding with pip source build "
+                  "anyway. If pip fails below, install python3-dev manually.",
+                  file=sys.stderr)
+        # Step 3: allow source build now that headers should be present.
         res2 = subprocess.run(
             [
                 sys.executable, "-m", "pip", "install", "--quiet",
@@ -5634,17 +5659,20 @@ except ModuleNotFoundError:
         if res2.returncode != 0:
             print(
                 f"\n[pyiceberg] Install failed on Python "
-                f"{sys.version_info.major}.{sys.version_info.minor}. Two options:\n\n"
-                "  A. Install Python dev headers (lets pip compile the C extension):\n"
-                "       sudo apt install python3-dev\n"
-                "     Then re-run this cell.\n\n"
-                "  B. Recreate the Sail venv against Python 3.13 (which has\n"
-                "     pre-built wheels published upstream):\n"
-                "       python3.13 -m venv /var/lib/computeza/sail/venv && \\\n"
-                "       /var/lib/computeza/sail/venv/bin/pip install pysail \\\n"
-                "         pyspark-client 'pyiceberg[pyarrow,s3fs]>=0.10'\n\n"
-                "Use Trino (SQL -> Trino in the editor) until either lands.\n\n"
+                f"{sys.version_info.major}.{sys.version_info.minor}.\n\n"
+                "  - Tried pre-built wheels: none available for this Python.\n"
+                "  - Tried apt-get install python3-dev build-essential:\n"
+                f"      rc={apt_res.returncode}\n"
+                "  - Tried pip source build: failed.\n\n"
+                "Workaround: recreate the Sail venv against Python 3.13 (which\n"
+                "has pre-built wheels published upstream):\n"
+                "  python3.13 -m venv /var/lib/computeza/sail/venv && \\\n"
+                "  /var/lib/computeza/sail/venv/bin/pip install pysail \\\n"
+                "    pyspark-client 'pyiceberg[pyarrow,s3fs]>=0.10'\n\n"
+                "Or use Trino (SQL -> Trino in the editor) until pyiceberg\n"
+                "ships wheels for your interpreter.\n\n"
                 f"pip (wheel attempt) stderr:\n{res.stderr}\n"
+                f"apt-get stderr:\n{apt_res.stderr}\n"
                 f"pip (source attempt) stderr:\n{res2.stderr}",
                 file=sys.stderr,
             )
@@ -10336,6 +10364,12 @@ async fn dispatch_uninstall_with_config(
                     .map(|r| format_uninstall_summary(&r.steps, &r.warnings))
                     .map_err(|e| format!("{e}"))
             }
+            "pyiceberg" => {
+                // PyIceberg is a Python library in Sail's venv; the
+                // uninstall path drops it via `pip uninstall -y` so
+                // the venv itself (and Sail) keeps working.
+                run_pyiceberg_uninstall().await
+            }
             other => Err(format!(
                 "dispatch_uninstall_with_config: unknown component slug {other:?}"
             )),
@@ -10375,6 +10409,7 @@ async fn dispatch_install(
         "databend" => run_databend_install_with_progress(progress, config).await?,
         "trino" => run_trino_install_with_progress(progress, config).await?,
         "sail" => run_sail_install_with_progress(progress, config).await?,
+        "pyiceberg" => run_pyiceberg_install_with_progress(progress, config).await?,
         "xtable" => run_xtable_install_with_progress(progress, config).await?,
         other => {
             return Err(format!(
@@ -10408,6 +10443,16 @@ async fn dispatch_install(
                 },
             })
         }
+        // PyIceberg is a Python library, not a service. The metadata
+        // store still records it so the install hub can render its
+        // "Installed" badge, but it has no port / base_url. Reading
+        // the venv path lets the studio executor sanity-check the
+        // install state without re-running pip.
+        "pyiceberg" => serde_json::json!({
+            "kind": "library",
+            "venv_path": "/var/lib/computeza/sail/venv",
+            "package": "pyiceberg[pyarrow,s3fs]",
+        }),
         _ => serde_json::json!({
             "endpoint": {
                 "base_url": format!("http://127.0.0.1:{port}"),
@@ -11650,6 +11695,127 @@ async fn run_sail_install_with_progress(
     _config: &InstallConfig,
 ) -> Result<(String, u16), String> {
     Err("Sail install requires a supported Linux host.".into())
+}
+
+// ============================================================
+// PyIceberg install path -- apt python3-dev + pip into Sail venv
+// ============================================================
+//
+// PyIceberg is a Python library, not a service. The Studio
+// "Python -> PyIceberg" execution path runs user code in Sail's
+// venv, so this install: (1) ensures build deps are present via
+// apt-get (python3-dev + build-essential, needed when no wheel
+// exists for the venv's interpreter), (2) pip-installs
+// pyiceberg[pyarrow,s3fs] into Sail's venv at
+// /var/lib/computeza/sail/venv. No systemd unit, no port.
+
+#[cfg(target_os = "linux")]
+async fn run_pyiceberg_install_with_progress(
+    progress: &ProgressHandle,
+    _config: &InstallConfig,
+) -> Result<(String, u16), String> {
+    use crate::progress::InstallPhase;
+    use tokio::process::Command;
+
+    let venv_dir = std::path::PathBuf::from("/var/lib/computeza/sail/venv");
+    let venv_pip = venv_dir.join("bin").join("pip");
+
+    if !tokio::fs::try_exists(&venv_pip).await.unwrap_or(false) {
+        return Err(format!(
+            "Sail venv not found at {}. Install Sail first (Studio's \
+             PyIceberg execution path runs in Sail's venv).",
+            venv_dir.display()
+        ));
+    }
+
+    // Step 1: apt-get install build deps. Best-effort: a wheel-only
+    // pip install below may still succeed if the venv's interpreter
+    // has published wheels, in which case the apt step is moot.
+    progress.set_phase(InstallPhase::DetectingBinaries);
+    progress.set_message("apt-get install python3-dev build-essential".into());
+    let apt = Command::new("apt-get")
+        .args([
+            "install",
+            "-y",
+            "--no-install-recommends",
+            "python3-dev",
+            "build-essential",
+        ])
+        .output()
+        .await;
+    let apt_note = match apt {
+        Ok(o) if o.status.success() => "apt-get install python3-dev: ok".to_string(),
+        Ok(o) => format!(
+            "apt-get install python3-dev: rc={} (continuing -- pip may still succeed via wheels)\nstderr: {}",
+            o.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => format!("apt-get install python3-dev: spawn failed ({e}) -- continuing"),
+    };
+
+    // Step 2: pip install into Sail's venv. No --only-binary so pip
+    // can fall back to a source build when the interpreter has no
+    // wheel published upstream.
+    progress.set_message("pip install pyiceberg[pyarrow,s3fs]".into());
+    let pip = Command::new(&venv_pip)
+        .args([
+            "install",
+            "--no-cache-dir",
+            "--upgrade",
+            "pyiceberg[pyarrow,s3fs]>=0.10",
+        ])
+        .output()
+        .await
+        .map_err(|e| format!("pip install spawn: {e}"))?;
+    if !pip.status.success() {
+        return Err(format!(
+            "pip install pyiceberg failed (rc={}).\n\n{apt_note}\n\npip stderr:\n{}\n\npip stdout:\n{}",
+            pip.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&pip.stderr),
+            String::from_utf8_lossy(&pip.stdout),
+        ));
+    }
+
+    let summary = format!(
+        "venv: {}\npackage: pyiceberg[pyarrow,s3fs]>=0.10\n{apt_note}",
+        venv_dir.display(),
+    );
+    Ok((summary, 0))
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn run_pyiceberg_install_with_progress(
+    _progress: &ProgressHandle,
+    _config: &InstallConfig,
+) -> Result<(String, u16), String> {
+    Err("PyIceberg install requires a supported Linux host.".into())
+}
+
+#[cfg(target_os = "linux")]
+async fn run_pyiceberg_uninstall() -> Result<String, String> {
+    use tokio::process::Command;
+    let venv_pip = std::path::PathBuf::from("/var/lib/computeza/sail/venv/bin/pip");
+    if !tokio::fs::try_exists(&venv_pip).await.unwrap_or(false) {
+        return Ok("Sail venv already gone -- nothing to uninstall.".into());
+    }
+    let out = Command::new(&venv_pip)
+        .args(["uninstall", "-y", "pyiceberg"])
+        .output()
+        .await
+        .map_err(|e| format!("pip uninstall spawn: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "pip uninstall pyiceberg failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok("pip uninstall pyiceberg -y: ok".into())
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)] // only called from the Linux-gated dispatch_uninstall arm
+async fn run_pyiceberg_uninstall() -> Result<String, String> {
+    Err("PyIceberg uninstall requires a supported Linux host.".into())
 }
 
 // ============================================================
@@ -15596,6 +15762,18 @@ const COMPONENTS: &[ComponentEntry] = &[
         available: true,
     },
     ComponentEntry {
+        slug: "pyiceberg",
+        name_key: "component-pyiceberg-name",
+        role_key: "component-pyiceberg-role",
+        // Not a service: PyIceberg is a Python library used by
+        // Studio's "Python -> PyIceberg" execution path. "Installing"
+        // it means: ensure python3-dev + build-essential are present
+        // (so wheel-less interpreters can source-build), then `pip
+        // install pyiceberg[pyarrow,s3fs]` into Sail's venv. No
+        // systemd unit, no port.
+        available: true,
+    },
+    ComponentEntry {
         slug: "qdrant",
         name_key: "component-qdrant-name",
         role_key: "component-qdrant-role",
@@ -15689,6 +15867,13 @@ const INSTALL_ORDER: &[&str] = &[
     // roughly in parallel from the operator's perspective on the
     // install results page.
     "sail",
+    // PyIceberg goes right after Sail: it lives in Sail's venv so
+    // Sail must be installed first. Library-only (no port, no
+    // systemd unit) -- the install step apt-installs python3-dev +
+    // build-essential and pip-installs pyiceberg[pyarrow,s3fs] into
+    // <sail-venv>. Studio's Python->PyIceberg execution path uses
+    // it transparently once present.
+    "pyiceberg",
     // xtable goes last because the dataset config it eventually
     // reads (datasets.yaml under <root>) typically references
     // upstream sources living in other components (garage / lakekeeper).
@@ -15717,6 +15902,9 @@ fn canonical_defaults_for(slug: &str) -> (u16, String) {
         "grafana" => 3000,
         "restate" => 8081,
         "xtable" => 8090,
+        // PyIceberg is a library, not a service. 0 means "no port"
+        // -- the install hub renders no port placeholder for these.
+        "pyiceberg" => 0,
         _ => 0,
     };
     (port, format!("computeza-{slug}"))
