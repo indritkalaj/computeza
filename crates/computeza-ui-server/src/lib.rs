@@ -1380,21 +1380,61 @@ struct StudioHistory {
     entries: Vec<StudioHistoryEntry>,
 }
 
-/// Read the studio SQL history from the metadata store. Returns
-/// an empty history when no row exists yet (first query of a fresh
-/// install) or when the store isn't attached.
+/// Resource-key name for storing per-file history. We bucket entries
+/// under the file id (so each file gets its own list) and use a
+/// dedicated "scratch" bucket for the editor when no file is open.
+/// The /studio/history page lists every `studio-history` row and
+/// merges them for the global view.
+fn studio_history_key_name(file_id: Option<&str>) -> String {
+    match file_id {
+        Some(id) if !id.is_empty() => id.to_string(),
+        _ => "scratch".to_string(),
+    }
+}
+
+/// Read the studio SQL history for one file (or the scratch buffer
+/// when `file_id` is None / empty). Returns an empty history when
+/// no row exists yet.
 async fn load_studio_history(
+    store: Option<&computeza_state::SqliteStore>,
+    file_id: Option<&str>,
+) -> StudioHistory {
+    use computeza_state::Store;
+    let Some(store) = store else {
+        return StudioHistory::default();
+    };
+    let key = computeza_state::ResourceKey::cluster_scoped(
+        "studio-history",
+        studio_history_key_name(file_id),
+    );
+    match store.load(&key).await {
+        Ok(Some(stored)) => serde_json::from_value(stored.spec).unwrap_or_default(),
+        _ => StudioHistory::default(),
+    }
+}
+
+/// Aggregate every per-file history bucket into one merged list,
+/// newest-first. Used by /studio/history to render a global view.
+async fn load_studio_history_all(
     store: Option<&computeza_state::SqliteStore>,
 ) -> StudioHistory {
     use computeza_state::Store;
     let Some(store) = store else {
         return StudioHistory::default();
     };
-    let key = computeza_state::ResourceKey::cluster_scoped("studio-history", "default");
-    match store.load(&key).await {
-        Ok(Some(stored)) => serde_json::from_value(stored.spec).unwrap_or_default(),
-        _ => StudioHistory::default(),
+    let rows = match store.list("studio-history", None).await {
+        Ok(r) => r,
+        Err(_) => return StudioHistory::default(),
+    };
+    let mut merged: Vec<StudioHistoryEntry> = Vec::new();
+    for sr in rows {
+        if let Ok(h) = serde_json::from_value::<StudioHistory>(sr.spec) {
+            merged.extend(h.entries);
+        }
     }
+    merged.sort_by(|a, b| b.executed_at.cmp(&a.executed_at));
+    merged.truncate(STUDIO_HISTORY_CAP * 4);
+    StudioHistory { entries: merged }
 }
 
 /// Prepend a new history entry and persist. Best-effort: a save
@@ -1403,13 +1443,17 @@ async fn load_studio_history(
 /// `STUDIO_HISTORY_CAP` entries (drops oldest).
 async fn record_studio_history(
     store: Option<&computeza_state::SqliteStore>,
+    file_id: Option<&str>,
     entry: StudioHistoryEntry,
 ) {
     use computeza_state::Store;
     let Some(store) = store else {
         return;
     };
-    let key = computeza_state::ResourceKey::cluster_scoped("studio-history", "default");
+    let key = computeza_state::ResourceKey::cluster_scoped(
+        "studio-history",
+        studio_history_key_name(file_id),
+    );
     let existing = match store.load(&key).await {
         Ok(Some(s)) => Some(s),
         _ => None,
@@ -2811,24 +2855,12 @@ fn render_drilldown_breadcrumbs(crumbs: &[(&str, &str)]) -> String {
 /// page passes the operator's current focus so the right branch
 /// renders expanded and the right row gets `cz-tree-active`.
 async fn build_studio_full_sidebar(state: &AppState, focus: SidebarFocus<'_>) -> String {
+    // Recent-queries section used to live here; removed at operator
+    // request. Per-file query history is reachable via the file 3-dot
+    // menu's "History" entry (revisions list) and the global view at
+    // /studio/history aggregates across all files.
     let tree = build_studio_sidebar_tree(state, focus).await;
-    let tree_html = render_studio_tree_sidebar(&tree, focus);
-    let history = load_studio_history(state.store.as_deref()).await;
-    let recent_html = render_sidebar_recent_queries(&history, "Reload query");
-    // Recent is collapsed by default. <details> remembers per-page
-    // state in the URL via :target if we want; for now it's a fresh
-    // collapsed view on every render so operators always start with
-    // a clean rail. Click the eyebrow to expand.
-    format!(
-        r#"{tree_html}
-<section class="cz-studio-sidebar-section">
-<details class="cz-studio-recent-details">
-<summary class="cz-studio-sidebar-eyebrow cz-studio-recent-summary"><span><span class="cz-studio-recent-chevron"></span>Recent ({n})</span><a href="/studio/history" class="cz-studio-sidebar-action" title="Open full query history">All →</a></summary>
-<div class="cz-studio-recent-body">{recent_html}</div>
-</details>
-</section>"#,
-        n = history.entries.len(),
-    )
+    render_studio_tree_sidebar(&tree, focus)
 }
 
 /// In-memory shape of the full sidebar tree at render time. Built by
@@ -3622,8 +3654,9 @@ async fn studio_handler(
         Some(url) => probe_lakekeeper_with_vault_fallback(url, state.secrets.as_deref()).await,
         None => LakekeeperState::Unreachable,
     };
-    let history = load_studio_history(state.store.as_deref()).await;
     let files = build_studio_files_view(&state, &q).await;
+    let active_file_id = files.active_id.clone();
+    let history = load_studio_history(state.store.as_deref(), active_file_id.as_deref()).await;
     let sidebar = build_studio_full_sidebar(&state, SidebarFocus::default()).await;
 
     // Notebook detection: if the active file's path ends in
@@ -4715,8 +4748,10 @@ async fn studio_completions_handler(
     }
 
     // History (dedup by the first line so repeated SELECT 1's
-    // don't bury fresh queries).
-    let history = load_studio_history(state.store.as_deref()).await;
+    // don't bury fresh queries). Completions are file-agnostic --
+    // pull from every per-file bucket so an operator copying a
+    // query across files still sees it offered.
+    let history = load_studio_history_all(state.store.as_deref()).await;
     let mut seen_first_lines = std::collections::HashSet::new();
     for entry in history.entries.into_iter().take(20) {
         let first_line: String = entry.sql.lines().next().unwrap_or("").chars().take(60).collect();
@@ -4839,8 +4874,14 @@ async fn studio_sql_execute_handler(
             } => (false, None),
             _ => (false, None),
         };
+        let active_file_id = if form.active.is_empty() {
+            None
+        } else {
+            Some(form.active.as_str())
+        };
         record_studio_history(
             state.store.as_deref(),
+            active_file_id,
             StudioHistoryEntry {
                 sql: form.sql.clone(),
                 executed_at: chrono::Utc::now(),
@@ -4854,7 +4895,12 @@ async fn studio_sql_execute_handler(
         Some(url) => probe_lakekeeper_with_vault_fallback(url, state.secrets.as_deref()).await,
         None => LakekeeperState::Unreachable,
     };
-    let history = load_studio_history(state.store.as_deref()).await;
+    let active_file_id = if form.active.is_empty() {
+        None
+    } else {
+        Some(form.active.as_str())
+    };
+    let history = load_studio_history(state.store.as_deref(), active_file_id).await;
     let sidebar = build_studio_full_sidebar(&state, SidebarFocus::default()).await;
     // Rebuild the files view from the form's forwarded tab state so
     // the renderer re-emits the same tabs / active highlight after
@@ -5091,7 +5137,10 @@ async fn studio_history_page_handler(
     State(state): State<AppState>,
 ) -> Html<String> {
     let l = Localizer::english();
-    let history = load_studio_history(state.store.as_deref()).await;
+    // Aggregate across every per-file bucket so the global history
+    // page shows everything; per-file scoping happens via
+    // load_studio_history(.., Some(file_id)) on the editor pages.
+    let history = load_studio_history_all(state.store.as_deref()).await;
     let sidebar = build_studio_full_sidebar(&state, SidebarFocus::default()).await;
     let csrf = auth::csrf_input();
 
@@ -5738,12 +5787,12 @@ async fn execute_python_via_pyiceberg_linux(
         None => Vec::new(),
     };
     let mut catalog_cfg: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    let lk_base = discover_lakekeeper_endpoint(store).await;
     if let Some(s) = secrets {
         for name in &catalog_names {
             let prefix = format!("sail/catalog/{name}");
             let mut entry = serde_json::Map::new();
             for field in &[
-                "warehouse-uuid",
                 "s3-endpoint",
                 "s3-region",
                 "s3-access-key-id",
@@ -5756,7 +5805,34 @@ async fn execute_python_via_pyiceberg_linux(
                     );
                 }
             }
-            if let Some(lk) = discover_lakekeeper_endpoint(store).await {
+            // Resolve warehouse UUID FRESH against live Lakekeeper.
+            // The vault entry under `sail/catalog/<name>/warehouse-uuid`
+            // gets stale when Lakekeeper is reset (new run -> new UUIDs
+            // for the same warehouse names); reading it verbatim then
+            // hands PyIceberg an ID that no longer exists and pyiceberg
+            // surfaces `NoSuchWarehouseException`. resolve_warehouse_id_fresh
+            // hits /catalog/v1/config?warehouse=<name>, returns the
+            // current UUID, and on miss falls back to the input name --
+            // the same logic the Studio SQL path uses.
+            let warehouse_id = match lk_base.as_ref() {
+                Some(lk) => resolve_warehouse_id_fresh(name, lk, Some(s)).await,
+                None => {
+                    // No live Lakekeeper -- fall back to vault cache,
+                    // even if stale; the wrapper will surface the
+                    // error to the operator.
+                    s.get(&format!("{prefix}/warehouse-uuid"))
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|v| v.expose_secret().to_string())
+                        .unwrap_or_else(|| name.clone())
+                }
+            };
+            entry.insert(
+                "warehouse-uuid".into(),
+                serde_json::Value::String(warehouse_id),
+            );
+            if let Some(lk) = lk_base.as_ref() {
                 entry.insert(
                     "lakekeeper-rest-uri".into(),
                     serde_json::Value::String(format!("{lk}/catalog")),
@@ -6538,58 +6614,6 @@ fn render_studio_files_pane(files: &StudioFilesView) -> String {
 /// `build_studio_full_sidebar`), the SQL editor + results pane
 /// renders on the right.
 #[allow(clippy::too_many_arguments)] // explicit signature is the readable choice over a "render-context" bag
-
-/// Render the sidebar's "Recent queries" section. Each entry is a
-/// clickable row that bounces through /studio?sql=... to prefill
-/// the editor.
-fn render_sidebar_recent_queries(history: &StudioHistory, reload_label: &str) -> String {
-    if history.entries.is_empty() {
-        return r#"<p class="cz-studio-sidebar-note">No queries yet. Run one above; it'll show here.</p>"#.to_string();
-    }
-    let items: String = history
-        .entries
-        .iter()
-        .take(8) // sidebar is tight; show the top 8 most recent
-        .map(|e| {
-            let badge_class = if e.ok { "cz-badge-ok" } else { "cz-badge-warn" };
-            let badge_text = if e.ok {
-                e.row_count
-                    .map(|n| format!("{n}"))
-                    .unwrap_or_else(|| "ok".to_string())
-            } else {
-                "err".to_string()
-            };
-            let preview: String = e
-                .sql
-                .lines()
-                .next()
-                .unwrap_or("")
-                .chars()
-                .take(40)
-                .collect();
-            let preview = if preview.len() < e.sql.len() {
-                format!("{preview}…")
-            } else {
-                preview
-            };
-            let ts = e.executed_at.format("%H:%M").to_string();
-            format!(
-                r#"<li class="cz-tree-item"><a class="cz-tree-row" href="/studio?sql={enc}" title="{tooltip}">
-<span class="cz-tree-icon" style="font-size: 0.65rem;"><span class="cz-badge {badge_class}" style="font-size: 0.6rem; padding: 1px 4px;">{badge}</span></span>
-<span class="cz-tree-label" style="font-size: 0.72rem;">{preview}</span>
-<span class="cz-muted" style="font-size: 0.62rem; font-variant-numeric: tabular-nums;">{ts}</span>
-</a></li>"#,
-                enc = url_encode(&e.sql),
-                tooltip = html_escape(&format!("{} ({})", reload_label, &e.sql)),
-                badge_class = badge_class,
-                badge = html_escape(&badge_text),
-                preview = html_escape(&preview),
-                ts = html_escape(&ts),
-            )
-        })
-        .collect();
-    format!(r#"<ul class="cz-tree">{items}</ul>"#)
-}
 
 fn render_studio_page(
     localizer: &Localizer,
@@ -8018,36 +8042,65 @@ window.czNotebook = (function () {{
 
   var savePending = null;
   var lastSaved = null;
-  function persistNow() {{
+  function persistNow(opts) {{
     savePending = null;
     var body = JSON.stringify(nb, null, 2);
-    if (body === lastSaved) return;
+    if (body === lastSaved && !(opts && opts.force)) return;
     setStatus("saving", "Saving…");
     var b = new URLSearchParams();
     b.append("content", body);
     var csrf = csrfToken();
     if (csrf) b.append("csrf_token", csrf);
-    fetch("/studio/api/files/" + encodeURIComponent(FILE_ID) + "/autosave", {{
+    if (!FILE_ID) {{
+      setStatus("error", "No file id");
+      console.error("notebook autosave skipped: FILE_ID is empty");
+      return;
+    }}
+    var fetchOpts = {{
       method: "POST",
       credentials: "same-origin",
       headers: {{ "Content-Type": "application/x-www-form-urlencoded" }},
       body: b.toString(),
-    }})
+    }};
+    // keepalive lets the browser finish the POST during page unload.
+    if (opts && opts.keepalive) fetchOpts.keepalive = true;
+    fetch("/studio/api/files/" + encodeURIComponent(FILE_ID) + "/autosave", fetchOpts)
       .then(function (r) {{
         if (r.ok) {{
           lastSaved = body;
-          setStatus("idle", "Saved");
+          var when = new Date();
+          var hh = pad(when.getHours()), mm = pad(when.getMinutes()), ss = pad(when.getSeconds());
+          setStatus("idle", "Saved " + hh + ":" + mm + ":" + ss);
         }} else {{
           setStatus("error", "Save failed (" + r.status + ")");
+          console.error("notebook autosave failed:", r.status, r.statusText);
         }}
       }})
-      .catch(function () {{ setStatus("error", "Save failed"); }});
+      .catch(function (e) {{
+        setStatus("error", "Save failed (network)");
+        console.error("notebook autosave network error:", e);
+      }});
   }}
   function scheduleSave() {{
     if (savePending !== null) clearTimeout(savePending);
     setStatus("dirty", "Saving in 1s…");
     savePending = setTimeout(persistNow, 1000);
   }}
+  // Flush pending save on page hide / tab close so typed content
+  // doesn't get stranded. keepalive:true tells the browser to finish
+  // the POST even after the page is gone.
+  window.addEventListener("beforeunload", function () {{
+    if (savePending !== null) {{
+      clearTimeout(savePending);
+      persistNow({{ keepalive: true, force: true }});
+    }}
+  }});
+  document.addEventListener("visibilitychange", function () {{
+    if (document.visibilityState === "hidden" && savePending !== null) {{
+      clearTimeout(savePending);
+      persistNow({{ keepalive: true, force: true }});
+    }}
+  }});
 
   function uuid() {{
     // RFC4122 v4-ish. Crypto-good when available; falls back to
