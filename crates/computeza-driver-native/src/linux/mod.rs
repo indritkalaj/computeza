@@ -18,7 +18,7 @@ pub mod service;
 pub mod systemctl;
 
 // ============================================================
-// Post-install bootstrap convention (per v0.1 design doc §3.2)
+// Post-install bootstrap convention (per v0.1 design doc section3.2)
 // ============================================================
 //
 // Some managed components need post-daemon-start setup to reach

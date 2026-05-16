@@ -797,34 +797,34 @@ dep, per-operator key UI, SMTP config). Treat it as a separate
 milestone with its own design pass; don't ram it through together
 with pieces 1+2.
 
-### v0.1 milestone — auto-bootstrap + SSO/Entra
+### v0.1 milestone -- auto-bootstrap + SSO/Entra
 
 **Status:** in progress. Tracked in
 [`docs/v0.1-bootstrap-and-sso-design.md`](docs/v0.1-bootstrap-and-sso-design.md)
 (commit `4b9adce`). That doc supersedes three deferred entries
 this section used to carry inline:
 
-  - "Garage cluster-layout bootstrap (single-node)" — auto-run
+  - "Garage cluster-layout bootstrap (single-node)" -- auto-run
     `layout assign + apply` at install time so operators never see
     "Layout not ready" errors. **Shipped** via the
     `post_install_bootstrap` convention in commits `4a2db89`
     (driver-native side) + `14b4a34` (ui-server wiring).
 
   - "Lakekeeper bootstrap (project + warehouse + storage
-    credentials)" — auto-create the default project + warehouse
+    credentials)" -- auto-create the default project + warehouse
     using Garage credentials minted by the prior step. **Shipped**
     in `14b4a34`; field-name iteration landed in `f59121e`
     (project-id resolution) and earlier commits.
 
-  - "Apply-admin-password for kanidm + grafana" — finish the
+  - "Apply-admin-password for kanidm + grafana" -- finish the
     apply-side of the existing `apply_admin_password()` for kanidm
     via `kanidmd recover_account` and grafana via its admin HTTP
-    API. **Still deferred** — covered by §8.2 of the design doc as
+    API. **Still deferred** -- covered by section8.2 of the design doc as
     part of the Kanidm bootstrap track (since kanidm-side auth
     landing first unblocks the reconciler-token mint that follows).
 
-See the design doc §8 work-breakdown for ordered commit-sized
-items. §7 open questions need sign-off before the SSO half (§8.2)
+See the design doc section8 work-breakdown for ordered commit-sized
+items. section7 open questions need sign-off before the SSO half (section8.2)
 starts.
 
 ### XTable runtime invocation

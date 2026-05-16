@@ -721,6 +721,9 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/studio/trash/restore", post(studio_trash_restore_handler))
         .route("/studio/trash/purge", post(studio_trash_purge_handler))
         .route("/studio/trash/empty", post(studio_trash_empty_handler))
+        .route("/studio/api/format", post(studio_format_handler))
+        .route("/audit", get(audit_log_page_handler))
+        .route("/workspace", get(workspace_overview_handler))
         .route(
             "/studio/api/completions",
             get(studio_completions_handler),
@@ -1066,9 +1069,9 @@ impl CellKind {
     }
     fn label(&self) -> &'static str {
         match self {
-            CellKind::Sql => "SQL → Trino",
-            CellKind::PyIceberg => "Python → PyIceberg",
-            CellKind::Sail => "Python → Sail",
+            CellKind::Sql => "SQL -> Trino",
+            CellKind::PyIceberg => "Python -> PyIceberg",
+            CellKind::Sail => "Python -> Sail",
         }
     }
 }
@@ -1286,9 +1289,7 @@ fn ipynb_to_notebook(raw: &str) -> Notebook {
                     // Inspect any computeza-specific cell metadata
                     // we wrote on a previous export -- carry kind +
                     // last output across the round-trip when present.
-                    let cz_meta = c
-                        .get("metadata")
-                        .and_then(|m| m.get("computeza"));
+                    let cz_meta = c.get("metadata").and_then(|m| m.get("computeza"));
                     let kind = cz_meta
                         .and_then(|m| m.get("kind"))
                         .and_then(|k| k.as_str())
@@ -1439,9 +1440,7 @@ async fn load_studio_history(
 
 /// Aggregate every per-file history bucket into one merged list,
 /// newest-first. Used by /studio/history to render a global view.
-async fn load_studio_history_all(
-    store: Option<&computeza_state::SqliteStore>,
-) -> StudioHistory {
+async fn load_studio_history_all(store: Option<&computeza_state::SqliteStore>) -> StudioHistory {
     use computeza_state::Store;
     let Some(store) = store else {
         return StudioHistory::default();
@@ -1456,7 +1455,7 @@ async fn load_studio_history_all(
             merged.extend(h.entries);
         }
     }
-    merged.sort_by(|a, b| b.executed_at.cmp(&a.executed_at));
+    merged.sort_by_key(|e| std::cmp::Reverse(e.executed_at));
     merged.truncate(STUDIO_HISTORY_CAP * 4);
     StudioHistory { entries: merged }
 }
@@ -1509,9 +1508,7 @@ async fn record_studio_history(
 /// step writes Iceberg-REST catalog properties files against this
 /// endpoint via the driver helper. Returns None if no trino-instance
 /// row is registered (Trino not installed yet).
-async fn discover_trino_endpoint(
-    store: Option<&computeza_state::SqliteStore>,
-) -> Option<String> {
+async fn discover_trino_endpoint(store: Option<&computeza_state::SqliteStore>) -> Option<String> {
     use computeza_state::Store;
     let store = store?;
     let rows = store.list("trino-instance", None).await.ok()?;
@@ -1525,9 +1522,7 @@ async fn discover_trino_endpoint(
 /// return the http://host:port form that the existing reconciler /
 /// status pages already render. The Studio Python executor reads
 /// the raw host + port from this URL to build the `sc://` URI.
-async fn discover_sail_endpoint(
-    store: Option<&computeza_state::SqliteStore>,
-) -> Option<String> {
+async fn discover_sail_endpoint(store: Option<&computeza_state::SqliteStore>) -> Option<String> {
     use computeza_state::Store;
     let store = store?;
     let rows = store.list("sail-instance", None).await.ok()?;
@@ -1548,8 +1543,8 @@ enum LakekeeperState {
     /// `/management/v1/warehouse` or the project-list call failed
     /// (Lakekeeper unreachable, 5xx, malformed JSON).
     Unreachable,
-    /// Lakekeeper is up but has no warehouses configured. v0.0.x
-    /// + v0.1 auto-bootstrap covers this; manual recovery is the
+    /// Lakekeeper is up but has no warehouses configured. The v0.0.x
+    /// plus v0.1 auto-bootstrap covers this; manual recovery is the
     /// /studio/bootstrap form.
     NoWarehouses,
     /// At least one warehouse exists. The strings are the warehouse
@@ -1880,8 +1875,16 @@ async fn try_recover_missing_warehouse(
     // Pre-flight: bootstrap state must exist in vault. If it
     // doesn't, this is a fresh install that hasn't been bootstrapped
     // yet -- not our job to autostart.
-    let key_id = secrets.get("garage/lakekeeper-key-id").await.ok().flatten()?;
-    let secret = secrets.get("garage/lakekeeper-secret").await.ok().flatten()?;
+    let key_id = secrets
+        .get("garage/lakekeeper-key-id")
+        .await
+        .ok()
+        .flatten()?;
+    let secret = secrets
+        .get("garage/lakekeeper-secret")
+        .await
+        .ok()
+        .flatten()?;
     let bucket = secrets
         .get("garage/lakekeeper-bucket")
         .await
@@ -1976,10 +1979,7 @@ async fn probe_lakekeeper_with_vault_fallback(
     // persist the name). Probe the Iceberg catalog REST directly for
     // common defaults; that endpoint is what engines actually use, so
     // it's authoritative regardless of management-API quirks.
-    let garage_provisioned = matches!(
-        secrets.get("garage/lakekeeper-key-id").await,
-        Ok(Some(_))
-    );
+    let garage_provisioned = matches!(secrets.get("garage/lakekeeper-key-id").await, Ok(Some(_)));
     if !garage_provisioned {
         // No prior bootstrap detected; the "no warehouses" verdict is
         // honest.
@@ -2079,9 +2079,7 @@ async fn probe_lakekeeper(base_url: &str) -> LakekeeperState {
                         })
                         .collect();
                     for pid in &project_ids {
-                        endpoints.push(format!(
-                            "{base}/management/v1/warehouse?project-id={pid}"
-                        ));
+                        endpoints.push(format!("{base}/management/v1/warehouse?project-id={pid}"));
                     }
                 }
             }
@@ -2261,9 +2259,11 @@ async fn studio_catalog_warehouse_handler(
     // REST refuses non-UUID prefixes with `WarehouseIdIsNotUUID`).
     let mut wh_id =
         resolve_warehouse_id_or_pass(&warehouse, Some(&base_url), state.secrets.as_deref()).await;
-    let mut result =
-        get_lakekeeper_catalog_json(&base_url, &format!("/catalog/v1/{}/namespaces", url_encode(&wh_id)))
-            .await;
+    let mut result = get_lakekeeper_catalog_json(
+        &base_url,
+        &format!("/catalog/v1/{}/namespaces", url_encode(&wh_id)),
+    )
+    .await;
     // Auto-recovery: if Lakekeeper says the warehouse doesn't exist
     // but we have bootstrap state in vault, re-fire the bootstrap
     // and retry. Triggered by NoSuchWarehouse or WarehouseIdIsNotUUID
@@ -2342,13 +2342,17 @@ async fn studio_catalog_namespace_handler(
             &l,
             &[
                 (&warehouse, &format!("/studio/catalog/{warehouse}")),
-                (&namespace, &format!("/studio/catalog/{warehouse}/{namespace}")),
+                (
+                    &namespace,
+                    &format!("/studio/catalog/{warehouse}/{namespace}"),
+                ),
             ],
             "Lakekeeper is not registered.",
             &sidebar,
         ));
     };
-    let wh_id = resolve_warehouse_id_or_pass(&warehouse, Some(&base_url), state.secrets.as_deref()).await;
+    let wh_id =
+        resolve_warehouse_id_or_pass(&warehouse, Some(&base_url), state.secrets.as_deref()).await;
     // Multi-level namespaces ("finance.raw") become %1F-separated
     // (unit-separator) in the Iceberg REST URL spec. Single-level
     // is the common case in v0.0.x; we still encode for safety.
@@ -2402,14 +2406,21 @@ async fn studio_catalog_table_handler(
             &l,
             &[
                 (&warehouse, &format!("/studio/catalog/{warehouse}")),
-                (&namespace, &format!("/studio/catalog/{warehouse}/{namespace}")),
-                (&table, &format!("/studio/catalog/{warehouse}/{namespace}/{table}")),
+                (
+                    &namespace,
+                    &format!("/studio/catalog/{warehouse}/{namespace}"),
+                ),
+                (
+                    &table,
+                    &format!("/studio/catalog/{warehouse}/{namespace}/{table}"),
+                ),
             ],
             "Lakekeeper is not registered.",
             &sidebar,
         ));
     };
-    let wh_id = resolve_warehouse_id_or_pass(&warehouse, Some(&base_url), state.secrets.as_deref()).await;
+    let wh_id =
+        resolve_warehouse_id_or_pass(&warehouse, Some(&base_url), state.secrets.as_deref()).await;
     let ns_encoded = namespace.split('.').collect::<Vec<_>>().join("%1F");
     let path = format!(
         "/catalog/v1/{}/namespaces/{}/tables/{}",
@@ -2645,7 +2656,8 @@ async fn studio_catalog_namespace_create_handler(
     if segments.is_empty() {
         return redirect_err("Schema name is required.");
     }
-    let wh_id = resolve_warehouse_id_or_pass(&warehouse, Some(&base_url), state.secrets.as_deref()).await;
+    let wh_id =
+        resolve_warehouse_id_or_pass(&warehouse, Some(&base_url), state.secrets.as_deref()).await;
     let path = format!("/catalog/v1/{}/namespaces", url_encode(&wh_id));
     let body = serde_json::json!({
         "namespace": segments,
@@ -2672,15 +2684,15 @@ async fn studio_catalog_namespace_delete_handler(
     let Some(base_url) = discover_lakekeeper_endpoint(state.store.as_deref()).await else {
         return axum::response::Redirect::to(&format!("/studio/catalog/{warehouse}"));
     };
-    let wh_id = resolve_warehouse_id_or_pass(&warehouse, Some(&base_url), state.secrets.as_deref()).await;
+    let wh_id =
+        resolve_warehouse_id_or_pass(&warehouse, Some(&base_url), state.secrets.as_deref()).await;
     let ns_encoded = namespace.split('.').collect::<Vec<_>>().join("%1F");
     let path = format!(
         "/catalog/v1/{}/namespaces/{}",
         url_encode(&wh_id),
         ns_encoded
     );
-    if let Err(e) =
-        lakekeeper_catalog_mutate(&base_url, reqwest::Method::DELETE, &path, None).await
+    if let Err(e) = lakekeeper_catalog_mutate(&base_url, reqwest::Method::DELETE, &path, None).await
     {
         tracing::warn!(
             warehouse = %warehouse,
@@ -2750,7 +2762,8 @@ async fn studio_catalog_table_create_handler(
             "No valid columns parsed. Each non-blank, non-comment line must look like `name:type`.",
         );
     }
-    let wh_id = resolve_warehouse_id_or_pass(&warehouse, Some(&base_url), state.secrets.as_deref()).await;
+    let wh_id =
+        resolve_warehouse_id_or_pass(&warehouse, Some(&base_url), state.secrets.as_deref()).await;
     let ns_encoded = namespace.split('.').collect::<Vec<_>>().join("%1F");
     let path = format!(
         "/catalog/v1/{}/namespaces/{}/tables",
@@ -2799,7 +2812,8 @@ async fn studio_catalog_table_delete_handler(
     let Some(base_url) = discover_lakekeeper_endpoint(state.store.as_deref()).await else {
         return axum::response::Redirect::to(&redirect_to);
     };
-    let wh_id = resolve_warehouse_id_or_pass(&warehouse, Some(&base_url), state.secrets.as_deref()).await;
+    let wh_id =
+        resolve_warehouse_id_or_pass(&warehouse, Some(&base_url), state.secrets.as_deref()).await;
     let ns_encoded = namespace.split('.').collect::<Vec<_>>().join("%1F");
     let path = format!(
         "/catalog/v1/{}/namespaces/{}/tables/{}",
@@ -2807,8 +2821,7 @@ async fn studio_catalog_table_delete_handler(
         ns_encoded,
         url_encode(&table)
     );
-    if let Err(e) =
-        lakekeeper_catalog_mutate(&base_url, reqwest::Method::DELETE, &path, None).await
+    if let Err(e) = lakekeeper_catalog_mutate(&base_url, reqwest::Method::DELETE, &path, None).await
     {
         tracing::warn!(
             warehouse = %warehouse,
@@ -2874,7 +2887,7 @@ fn render_drilldown_breadcrumbs(crumbs: &[(&str, &str)]) -> String {
 }
 
 /// Build the full sidebar HTML used on every Studio page: the
-/// expandable catalog tree (warehouses → namespaces → tables, with
+/// expandable catalog tree (warehouses -> namespaces -> tables, with
 /// the focused branch open) plus the Recent Queries section. Each
 /// page passes the operator's current focus so the right branch
 /// renders expanded and the right row gets `cz-tree-active`.
@@ -2956,15 +2969,11 @@ struct SidebarFocus<'a> {
 /// currently focused warehouse + namespace. Each tier is best-effort:
 /// if a network call fails we attach the error to the subtree so the
 /// sidebar still renders.
-async fn build_studio_sidebar_tree(
-    state: &AppState,
-    focus: SidebarFocus<'_>,
-) -> StudioSidebarTree {
+async fn build_studio_sidebar_tree(state: &AppState, focus: SidebarFocus<'_>) -> StudioSidebarTree {
     let Some(base_url) = discover_lakekeeper_endpoint(state.store.as_deref()).await else {
         return StudioSidebarTree::default();
     };
-    let lk_state =
-        probe_lakekeeper_with_vault_fallback(&base_url, state.secrets.as_deref()).await;
+    let lk_state = probe_lakekeeper_with_vault_fallback(&base_url, state.secrets.as_deref()).await;
     let names: Vec<String> = match lk_state {
         LakekeeperState::HasWarehouses(n) => n,
         _ => Vec::new(),
@@ -3034,9 +3043,7 @@ async fn load_namespaces_for_sidebar(
                         .map(|arr| {
                             arr.iter()
                                 .filter_map(|t| {
-                                    t.get("name")
-                                        .and_then(|n| n.as_str())
-                                        .map(str::to_string)
+                                    t.get("name").and_then(|n| n.as_str()).map(str::to_string)
                                 })
                                 .collect::<Vec<String>>()
                         })
@@ -3225,15 +3232,15 @@ fn render_sidebar_warehouse(node: &SidebarWarehouseNode, focus: SidebarFocus<'_>
     let is_current = focus.warehouse == Some(node.name.as_str());
     let open_attr = if is_current { " open" } else { "" };
     let children_html = match &node.namespaces {
-        Some(Ok(nss)) if nss.is_empty() => format!(
-            r#"<li class="cz-tree-empty">No namespaces yet.</li>"#
-        ),
+        Some(Ok(nss)) if nss.is_empty() => {
+            r#"<li class="cz-tree-empty">No namespaces yet.</li>"#.to_string()
+        }
         Some(Ok(nss)) => nss
             .iter()
             .map(|ns| render_sidebar_namespace(&node.name, ns, focus))
             .collect::<String>(),
         Some(Err(e)) => format!(
-            r#"<li class="cz-tree-error" title="{}">⚠ load failed</li>"#,
+            r#"<li class="cz-tree-error" title="{}">! load failed</li>"#,
             html_escape(e)
         ),
         None => String::new(),
@@ -3272,7 +3279,7 @@ fn render_sidebar_namespace(
             .map(|t| render_sidebar_table(warehouse, &node.qualified, t, focus))
             .collect(),
         Some(Err(e)) => format!(
-            r#"<li class="cz-tree-error" title="{}">⚠ load failed</li>"#,
+            r#"<li class="cz-tree-error" title="{}">! load failed</li>"#,
             html_escape(e)
         ),
         None => String::new(),
@@ -3409,22 +3416,22 @@ fn render_studio_namespace_list(
                     })
                     .collect();
                 let count = namespaces.len();
-                (
-                    format!(r#"<ul class="cz-studio-list">{items}</ul>"#),
-                    count,
-                )
+                (format!(r#"<ul class="cz-studio-list">{items}</ul>"#), count)
             }
         }
-        Err(e) => (format!(r#"<pre class="cz-studio-error">{}</pre>"#, html_escape(&e)), 0),
+        Err(e) => (
+            format!(r#"<pre class="cz-studio-error">{}</pre>"#, html_escape(&e)),
+            0,
+        ),
     };
 
     let create_modal = format!(
         r##"<div id="cz-modal-new-schema" class="cz-modal-overlay" role="dialog" aria-labelledby="cz-modal-new-schema-title" aria-modal="true">
 <a href="#" class="cz-modal-overlay-backdrop" aria-label="Close"></a>
 <div class="cz-modal">
-<a href="#" class="cz-modal-close" aria-label="Close">×</a>
+<a href="#" class="cz-modal-close" aria-label="Close">&times;</a>
 <h2 id="cz-modal-new-schema-title" class="cz-modal-title">New schema</h2>
-<p class="cz-modal-subtitle">Schemas group related tables — like databases. Dotted names like <code>finance.raw</code> become nested schemas.</p>
+<p class="cz-modal-subtitle">Schemas group related tables -- like databases. Dotted names like <code>finance.raw</code> become nested schemas.</p>
 <form method="post" action="/studio/catalog/{wh}/namespaces/create">{csrf}
 <div class="cz-modal-field">
 <label for="ns-create-name">Schema name</label>
@@ -3546,22 +3553,22 @@ fn render_studio_table_list(
                     })
                     .collect();
                 let count = tables.len();
-                (
-                    format!(r#"<ul class="cz-studio-list">{items}</ul>"#),
-                    count,
-                )
+                (format!(r#"<ul class="cz-studio-list">{items}</ul>"#), count)
             }
         }
-        Err(e) => (format!(r#"<pre class="cz-studio-error">{}</pre>"#, html_escape(&e)), 0),
+        Err(e) => (
+            format!(r#"<pre class="cz-studio-error">{}</pre>"#, html_escape(&e)),
+            0,
+        ),
     };
 
     let create_modal = format!(
         r##"<div id="cz-modal-new-table" class="cz-modal-overlay" role="dialog" aria-labelledby="cz-modal-new-table-title" aria-modal="true">
 <a href="#" class="cz-modal-overlay-backdrop" aria-label="Close"></a>
 <div class="cz-modal" style="max-width: 36rem;">
-<a href="#" class="cz-modal-close" aria-label="Close">×</a>
+<a href="#" class="cz-modal-close" aria-label="Close">&times;</a>
 <h2 id="cz-modal-new-table-title" class="cz-modal-title">New table in <code>{ns_display}</code></h2>
-<p class="cz-modal-subtitle">Define an Iceberg table — a name and a list of typed columns, one per line.</p>
+<p class="cz-modal-subtitle">Define an Iceberg table -- a name and a list of typed columns, one per line.</p>
 <form method="post" action="/studio/catalog/{wh}/{ns}/tables/create">{csrf}
 <div class="cz-modal-field">
 <label for="tbl-create-name">Table name</label>
@@ -3698,12 +3705,11 @@ fn render_studio_table_detail(
             let raw_json = serde_json::to_string_pretty(&v)
                 .unwrap_or_else(|_| "(could not pretty-print)".to_string());
             let catalog_ident = sanitize_sql_identifier(warehouse);
-            let prefill_sql = format!(
-                "SELECT * FROM {catalog_ident}.{namespace}.{table} LIMIT 100"
-            );
+            let prefill_sql =
+                format!("SELECT * FROM {catalog_ident}.{namespace}.{table} LIMIT 100");
             format!(
                 r#"<dl class="cz-dl">
-<dt>Location</dt><dd><code>{loc}</code> <span class="cz-muted" style="font-size: 0.72rem; margin-left: 0.4rem;">(local Garage — on-disk under <code>/var/lib/computeza/garage</code>; the <code>s3://</code> URI is the protocol, not a cloud bucket)</span></dd>
+<dt>Location</dt><dd><code>{loc}</code> <span class="cz-muted" style="font-size: 0.72rem; margin-left: 0.4rem;">(local Garage -- on-disk under <code>/var/lib/computeza/garage</code>; the <code>s3://</code> URI is the protocol, not a cloud bucket)</span></dd>
 <dt>Current snapshot</dt><dd><code>{snap}</code></dd>
 <dt>Format version</dt><dd><code>{fmt}</code></dd>
 </dl>
@@ -3734,7 +3740,7 @@ fn render_studio_table_detail(
     let main_html = format!(
         r#"{breadcrumbs}
 <h1 class="cz-studio-pane-title"><code>{wh}</code>.<code>{ns}</code>.<code>{tbl}</code></h1>
-<p class="cz-studio-pane-subtitle">Iceberg table metadata — schema, location, current snapshot. Use the editor to query rows.</p>
+<p class="cz-studio-pane-subtitle">Iceberg table metadata -- schema, location, current snapshot. Use the editor to query rows.</p>
 {body_inner}"#,
         wh = html_escape(warehouse),
         ns = html_escape(namespace),
@@ -3807,10 +3813,7 @@ impl StudioFilesView {
 /// Build the StudioFilesView from the current request query. Handles
 /// missing store gracefully (returns an empty view, so the editor
 /// works without persisted files).
-async fn build_studio_files_view(
-    state: &AppState,
-    q: &StudioQuery,
-) -> StudioFilesView {
+async fn build_studio_files_view(state: &AppState, q: &StudioQuery) -> StudioFilesView {
     let Some(store) = state.store.as_deref() else {
         return StudioFilesView {
             all: Vec::new(),
@@ -3986,7 +3989,13 @@ async fn studio_file_create_handler(
     if !path.starts_with('/') {
         path = format!("/{path}");
     }
-    if store.studio_files_get_by_path(&path).await.ok().flatten().is_some() {
+    if store
+        .studio_files_get_by_path(&path)
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+    {
         let stem = path.trim_end_matches(".sql").trim_end_matches(".py");
         for n in 2..100 {
             let candidate = if path.ends_with(".sql") {
@@ -3996,7 +4005,13 @@ async fn studio_file_create_handler(
             } else {
                 format!("{path}-{n}")
             };
-            if store.studio_files_get_by_path(&candidate).await.ok().flatten().is_none() {
+            if store
+                .studio_files_get_by_path(&candidate)
+                .await
+                .ok()
+                .flatten()
+                .is_none()
+            {
                 path = candidate;
                 break;
             }
@@ -4015,11 +4030,7 @@ async fn studio_file_create_handler(
     if !open.contains(&created.id) {
         open.push(created.id.clone());
     }
-    redirect_studio_flash(
-        Some(open.join(",")),
-        Some(created.id),
-        "file created",
-    )
+    redirect_studio_flash(Some(open.join(",")), Some(created.id), "file created")
 }
 
 #[derive(serde::Deserialize)]
@@ -4038,14 +4049,19 @@ async fn studio_file_save_handler(
     axum::extract::Form(form): axum::extract::Form<FileSaveForm>,
 ) -> axum::response::Redirect {
     let Some(store) = state.store.as_deref() else {
-        return redirect_studio_flash(Some(form.open.clone()), Some(id), "metadata store unavailable");
+        return redirect_studio_flash(
+            Some(form.open.clone()),
+            Some(id),
+            "metadata store unavailable",
+        );
     };
-    match store
-        .studio_files_update(&id, None, Some(&form.sql))
-        .await
-    {
+    match store.studio_files_update(&id, None, Some(&form.sql)).await {
         Ok(Some(_)) => redirect_studio_flash(Some(form.open), Some(id), "saved"),
-        Ok(None) => redirect_studio_flash(Some(form.open), Some(id), "file not found (deleted elsewhere?)"),
+        Ok(None) => redirect_studio_flash(
+            Some(form.open),
+            Some(id),
+            "file not found (deleted elsewhere?)",
+        ),
         Err(e) => redirect_studio_flash(Some(form.open), Some(id), &format!("save: {e}")),
     }
 }
@@ -4158,7 +4174,10 @@ async fn studio_file_revisions_handler(
             "<section class=\"cz-section\"><p>File not found.</p></section>",
         ));
     };
-    let revisions = store.studio_files_list_revisions(&id).await.unwrap_or_default();
+    let revisions = store
+        .studio_files_list_revisions(&id)
+        .await
+        .unwrap_or_default();
     let csrf = auth::csrf_input();
     let rows: String = if revisions.is_empty() {
         r#"<tr><td colspan="3" class="cz-cell-dim" style="text-align:center; padding:1.5rem;">No revisions yet. Edits will start showing up here as you type.</td></tr>"#.to_string()
@@ -4202,7 +4221,7 @@ async fn studio_file_revisions_handler(
 <tbody>{rows}</tbody>
 </table>
 </div>
-<p style="margin-top:1rem;"><a href="/studio?open={id_q}&amp;active={id_q}" class="cz-btn-ghost">← Back to editor</a></p>
+<p style="margin-top:1rem;"><a href="/studio?open={id_q}&amp;active={id_q}" class="cz-btn-ghost"><- Back to editor</a></p>
 </section>"##,
         path = html_escape(&file.path),
         rows = rows,
@@ -4220,7 +4239,11 @@ async fn studio_file_revision_restore_handler(
     axum::extract::Path((file_id, revision_id)): axum::extract::Path<(String, String)>,
 ) -> axum::response::Redirect {
     let Some(store) = state.store.as_deref() else {
-        return redirect_studio_flash(Some(file_id.clone()), Some(file_id), "metadata store unavailable");
+        return redirect_studio_flash(
+            Some(file_id.clone()),
+            Some(file_id),
+            "metadata store unavailable",
+        );
     };
     let Ok(Some(rev)) = store.studio_files_get_revision(&revision_id).await else {
         return redirect_studio_flash(Some(file_id.clone()), Some(file_id), "revision not found");
@@ -4251,7 +4274,11 @@ async fn studio_file_revision_restore_handler(
             &format!("restored revision from {}", rev.created_at),
         ),
         Ok(None) => redirect_studio_flash(Some(file_id.clone()), Some(file_id), "file not found"),
-        Err(e) => redirect_studio_flash(Some(file_id.clone()), Some(file_id), &format!("restore: {e}")),
+        Err(e) => redirect_studio_flash(
+            Some(file_id.clone()),
+            Some(file_id),
+            &format!("restore: {e}"),
+        ),
     }
 }
 
@@ -4282,7 +4309,11 @@ async fn studio_file_delete_handler(
         .map(str::to_string)
         .collect();
     let next_active = open.last().cloned();
-    let msg = if removed { "file deleted" } else { "file already gone" };
+    let msg = if removed {
+        "file deleted"
+    } else {
+        "file already gone"
+    };
     redirect_studio_flash(Some(open.join(",")), next_active, msg)
 }
 
@@ -4292,7 +4323,11 @@ async fn studio_file_duplicate_handler(
     axum::extract::Form(form): axum::extract::Form<FileTabContextForm>,
 ) -> axum::response::Redirect {
     let Some(store) = state.store.as_deref() else {
-        return redirect_studio_flash(Some(form.open.clone()), Some(id), "metadata store unavailable");
+        return redirect_studio_flash(
+            Some(form.open.clone()),
+            Some(id),
+            "metadata store unavailable",
+        );
     };
     let Ok(Some(original)) = store.studio_files_get(&id).await else {
         return redirect_studio_flash(Some(form.open), Some(id), "source file not found");
@@ -4304,14 +4339,25 @@ async fn studio_file_duplicate_handler(
     };
     let mut candidate = format!("{stem}-copy{ext}");
     for n in 2..100 {
-        if store.studio_files_get_by_path(&candidate).await.ok().flatten().is_none() {
+        if store
+            .studio_files_get_by_path(&candidate)
+            .await
+            .ok()
+            .flatten()
+            .is_none()
+        {
             break;
         }
         candidate = format!("{stem}-copy-{n}{ext}");
     }
-    let copy = match store.studio_files_create(&candidate, &original.content).await {
+    let copy = match store
+        .studio_files_create(&candidate, &original.content)
+        .await
+    {
         Ok(f) => f,
-        Err(e) => return redirect_studio_flash(Some(form.open), Some(id), &format!("duplicate: {e}")),
+        Err(e) => {
+            return redirect_studio_flash(Some(form.open), Some(id), &format!("duplicate: {e}"))
+        }
     };
     let mut open: Vec<String> = form
         .open
@@ -4336,7 +4382,11 @@ async fn studio_file_rename_handler(
     axum::extract::Form(form): axum::extract::Form<FileRenameForm>,
 ) -> axum::response::Redirect {
     let Some(store) = state.store.as_deref() else {
-        return redirect_studio_flash(Some(form.open.clone()), Some(id), "metadata store unavailable");
+        return redirect_studio_flash(
+            Some(form.open.clone()),
+            Some(id),
+            "metadata store unavailable",
+        );
     };
     let mut path = form.path.trim().to_string();
     if path.is_empty() {
@@ -4370,20 +4420,38 @@ async fn studio_file_export_handler(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
     let Some(store) = state.store.as_deref() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "metadata store unavailable").into_response();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "metadata store unavailable",
+        )
+            .into_response();
     };
     let Ok(Some(file)) = store.studio_files_get(&id).await else {
         return (StatusCode::NOT_FOUND, "file not found").into_response();
     };
-    let basename = file.path.rsplit('/').next().unwrap_or(&file.path).to_string();
+    let basename = file
+        .path
+        .rsplit('/')
+        .next()
+        .unwrap_or(&file.path)
+        .to_string();
     let safe_basename: String = basename
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     (
         StatusCode::OK,
         [
-            (axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8".to_string()),
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8".to_string(),
+            ),
             (
                 axum::http::header::CONTENT_DISPOSITION,
                 format!("attachment; filename=\"{safe_basename}\""),
@@ -4457,11 +4525,13 @@ async fn studio_file_import_handler(
 /// into a `.cptz` archive (just a ZIP with a manifest.json + the
 /// files in their original tree). Downloads as
 /// `computeza-workspace-<timestamp>.cptz`.
-async fn studio_files_export_archive_handler(
-    State(state): State<AppState>,
-) -> Response {
+async fn studio_files_export_archive_handler(State(state): State<AppState>) -> Response {
     let Some(store) = state.store.as_deref() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "metadata store unavailable").into_response();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "metadata store unavailable",
+        )
+            .into_response();
     };
     let files = match store.studio_files_list().await {
         Ok(f) => f,
@@ -4475,7 +4545,10 @@ async fn studio_files_export_archive_handler(
     (
         StatusCode::OK,
         [
-            (axum::http::header::CONTENT_TYPE, "application/zip".to_string()),
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/zip".to_string(),
+            ),
             (
                 axum::http::header::CONTENT_DISPOSITION,
                 format!("attachment; filename=\"computeza-workspace-{ts}.cptz\""),
@@ -4495,7 +4568,9 @@ async fn studio_files_export_archive_handler(
 /// the per-folder export (/studio/folders/export?name=<folder>) use
 /// this builder. The matching import path is
 /// /studio/files/import-archive (POST archive_b64=<base64>).
-fn build_cptz_archive(files: &[computeza_state::StudioFile]) -> std::result::Result<Vec<u8>, String> {
+fn build_cptz_archive(
+    files: &[computeza_state::StudioFile],
+) -> std::result::Result<Vec<u8>, String> {
     use std::io::Write;
     let mut buf: Vec<u8> = Vec::new();
     {
@@ -4508,14 +4583,20 @@ fn build_cptz_archive(files: &[computeza_state::StudioFile]) -> std::result::Res
             "exported_at": chrono::Utc::now().to_rfc3339(),
             "files": files.iter().map(|f| serde_json::json!({"path": f.path})).collect::<Vec<_>>(),
         });
-        zip.start_file("manifest.json", opts).map_err(|e| e.to_string())?;
-        zip.write_all(serde_json::to_string_pretty(&manifest).unwrap_or_default().as_bytes())
+        zip.start_file("manifest.json", opts)
             .map_err(|e| e.to_string())?;
+        zip.write_all(
+            serde_json::to_string_pretty(&manifest)
+                .unwrap_or_default()
+                .as_bytes(),
+        )
+        .map_err(|e| e.to_string())?;
         // files/...
         for f in files {
             let entry = format!("files{}", f.path);
             zip.start_file(&entry, opts).map_err(|e| e.to_string())?;
-            zip.write_all(f.content.as_bytes()).map_err(|e| e.to_string())?;
+            zip.write_all(f.content.as_bytes())
+                .map_err(|e| e.to_string())?;
         }
         zip.finish().map_err(|e| e.to_string())?;
     }
@@ -4539,7 +4620,9 @@ async fn import_cptz_archive(
     // When dest_folder is set, re-root every entry under
     // /<dest_folder>/<basename-or-relative-path>. When None, the
     // archive's paths are preserved verbatim (root-level import).
-    let dest = dest_folder.map(|d| d.trim().trim_matches('/').to_string()).filter(|s| !s.is_empty());
+    let dest = dest_folder
+        .map(|d| d.trim().trim_matches('/').to_string())
+        .filter(|s| !s.is_empty());
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i).map_err(|e| e.to_string())?;
         let name = entry.name().to_string();
@@ -4555,7 +4638,9 @@ async fn import_cptz_archive(
             None => format!("/{raw_rel}"),
         };
         let mut content = String::new();
-        entry.read_to_string(&mut content).map_err(|e| e.to_string())?;
+        entry
+            .read_to_string(&mut content)
+            .map_err(|e| e.to_string())?;
         staged.push((path, content));
         // entry drops at the end of this iteration (before any
         // store .await happens below).
@@ -4628,7 +4713,11 @@ async fn studio_files_import_archive_handler(
             let where_ = dest
                 .map(|d| format!(" into /{}/", d.trim_matches('/')))
                 .unwrap_or_default();
-            redirect_studio_flash(None, None, &format!("imported {n} file(s) from .cptz{where_}"))
+            redirect_studio_flash(
+                None,
+                None,
+                &format!("imported {n} file(s) from .cptz{where_}"),
+            )
         }
         Err(e) => redirect_studio_flash(None, None, &format!("import: {e}")),
     }
@@ -4681,9 +4770,7 @@ fn extract_multipart_file_field(body: &[u8], field_name: &str) -> Option<Vec<u8>
     // From header_pos, scan forward to the \r\n\r\n that
     // separates this part's headers from its body.
     let after_header = &body[header_pos..];
-    let body_off = after_header
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")?;
+    let body_off = after_header.windows(4).position(|w| w == b"\r\n\r\n")?;
     let body_start = header_pos + body_off + 4;
     // Find the next `\r\n--<boundary>` to mark the end of this
     // part's body.
@@ -4786,7 +4873,10 @@ async fn studio_folder_rename_handler(
     let mut errors: Vec<String> = Vec::new();
     for f in all.iter().filter(|f| f.path.starts_with(&old_prefix)) {
         let new_path = format!("{new_prefix}{}", &f.path[old_prefix.len()..]);
-        match store.studio_files_update(&f.id, Some(&new_path), None).await {
+        match store
+            .studio_files_update(&f.id, Some(&new_path), None)
+            .await
+        {
             Ok(Some(_)) => renamed += 1,
             Ok(None) => errors.push(format!("{} not found", f.path)),
             Err(e) => errors.push(format!("{}: {e}", f.path)),
@@ -4846,7 +4936,10 @@ async fn studio_folder_delete_handler(
         .open
         .split(',')
         .filter(|s| !s.is_empty())
-        .filter(|id| !all.iter().any(|f| &f.id == id && f.path.starts_with(&prefix)))
+        .filter(|id| {
+            !all.iter()
+                .any(|f| &f.id == id && f.path.starts_with(&prefix))
+        })
         .map(str::to_string)
         .collect();
     redirect_studio_flash(
@@ -4870,7 +4963,11 @@ async fn studio_folder_export_handler(
     axum::extract::Query(q): axum::extract::Query<FolderExportQuery>,
 ) -> Response {
     let Some(store) = state.store.as_deref() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "metadata store unavailable").into_response();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "metadata store unavailable",
+        )
+            .into_response();
     };
     let name = q.name.trim().trim_matches('/').to_string();
     if name.is_empty() {
@@ -4878,7 +4975,10 @@ async fn studio_folder_export_handler(
     }
     let prefix = format!("/{name}/");
     let files = match store.studio_files_list().await {
-        Ok(f) => f.into_iter().filter(|f| f.path.starts_with(&prefix)).collect::<Vec<_>>(),
+        Ok(f) => f
+            .into_iter()
+            .filter(|f| f.path.starts_with(&prefix))
+            .collect::<Vec<_>>(),
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("list: {e}")).into_response(),
     };
     if files.is_empty() {
@@ -4890,13 +4990,22 @@ async fn studio_folder_export_handler(
     };
     let safe: String = name
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
     (
         StatusCode::OK,
         [
-            (axum::http::header::CONTENT_TYPE, "application/zip".to_string()),
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/zip".to_string(),
+            ),
             (
                 axum::http::header::CONTENT_DISPOSITION,
                 format!("attachment; filename=\"{safe}-{ts}.cptz\""),
@@ -4944,16 +5053,18 @@ async fn studio_trash_purge_handler(
     };
     // Empty force_ids slice -- pass the one we want to purge.
     let n = store
-        .studio_files_purge_trash(TRASH_RETENTION_DAYS, &[form.id.clone()])
+        .studio_files_purge_trash(TRASH_RETENTION_DAYS, std::slice::from_ref(&form.id))
         .await
         .unwrap_or(0);
-    let flash = if n > 0 { "permanently deleted" } else { "not in trash" };
+    let flash = if n > 0 {
+        "permanently deleted"
+    } else {
+        "not in trash"
+    };
     axum::response::Redirect::to(&format!("/studio/trash?flash={}", url_encode(flash)))
 }
 
-async fn studio_trash_empty_handler(
-    State(state): State<AppState>,
-) -> axum::response::Redirect {
+async fn studio_trash_empty_handler(State(state): State<AppState>) -> axum::response::Redirect {
     let Some(store) = state.store.as_deref() else {
         return axum::response::Redirect::to("/studio/trash?flash=metadata+store+unavailable");
     };
@@ -4961,10 +5072,7 @@ async fn studio_trash_empty_handler(
     let ids: Vec<String> = trashed.iter().map(|f| f.id.clone()).collect();
     // retention=0 plus explicit force_ids ensures everything currently
     // in trash gets hard-deleted regardless of how old it is.
-    let n = store
-        .studio_files_purge_trash(0, &ids)
-        .await
-        .unwrap_or(0);
+    let n = store.studio_files_purge_trash(0, &ids).await.unwrap_or(0);
     axum::response::Redirect::to(&format!(
         "/studio/trash?flash={}",
         url_encode(&format!("emptied trash ({n} files)"))
@@ -5062,7 +5170,7 @@ async fn studio_trash_page_handler(
 </table>
 </div>
 {empty_button}
-<p style="margin-top:1rem;"><a href="/studio" class="cz-btn-ghost">← Back to editor</a></p>
+<p style="margin-top:1rem;"><a href="/studio" class="cz-btn-ghost"><- Back to editor</a></p>
 </section>"##,
         retention = TRASH_RETENTION_DAYS,
         flash_html = flash_html,
@@ -5070,6 +5178,302 @@ async fn studio_trash_page_handler(
         empty_button = empty_button,
     );
     Html(render_shell(&l, "Trash", NavLink::Studio, &body))
+}
+
+// ============================================================
+// Audit log viewer (read-only) -- surfaces the tamper-evident
+// jsonl log under /audit. AppState carries an Arc<AuditLog>; we
+// fetch the most-recent 500 events via list_recent.
+// ============================================================
+
+async fn audit_log_page_handler(State(state): State<AppState>) -> Html<String> {
+    let l = Localizer::english();
+    let events = match state.audit.as_ref() {
+        Some(a) => a.list_recent(500).await.unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let rows: String = if events.is_empty() {
+        r#"<tr><td colspan="5" class="cz-cell-dim" style="text-align:center; padding:1.5rem;">No audit events recorded yet.</td></tr>"#.to_string()
+    } else {
+        events
+            .iter()
+            .map(|e| {
+                let action = format!("{:?}", e.body.action);
+                let resource = e.body.resource.clone().unwrap_or_default();
+                let detail = serde_json::to_string(&e.body.detail).unwrap_or_default();
+                let detail_short: String = detail.chars().take(140).collect();
+                format!(
+                    r#"<tr>
+<td class="cz-cell-mono cz-cell-dim">{seq}</td>
+<td class="cz-cell-mono cz-cell-dim"><span data-ts-utc="{ts}">{ts}</span></td>
+<td class="cz-cell-mono"><span class="cz-badge cz-badge-info">{action}</span></td>
+<td class="cz-cell-mono">{actor}</td>
+<td class="cz-cell-mono" style="max-width:30rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="{detail_full}">{resource} {detail}</td>
+</tr>"#,
+                    seq = e.body.seq,
+                    ts = html_escape(&e.body.timestamp.to_rfc3339()),
+                    action = html_escape(&action),
+                    actor = html_escape(&e.body.actor),
+                    resource = html_escape(&resource),
+                    detail = html_escape(&detail_short),
+                    detail_full = html_escape(&detail),
+                )
+            })
+            .collect()
+    };
+    let body = format!(
+        r#"<section class="cz-hero">
+<h1>Audit log</h1>
+<p class="cz-muted">Tamper-evident JSONL: every administrative action signed and chained to its predecessor. Newest first; capped at 500 events for this view. Raw file: <code>audit.jsonl</code>.</p>
+</section>
+<section class="cz-section">
+<div class="cz-table-wrap">
+<table class="cz-table">
+<thead><tr><th>#</th><th>When (UTC)</th><th>Action</th><th>Actor</th><th>Resource &middot; detail</th></tr></thead>
+<tbody>{rows}</tbody>
+</table>
+</div>
+</section>"#,
+    );
+    Html(render_shell(&l, "Audit log", NavLink::Studio, &body))
+}
+
+// ============================================================
+// Workspace overview -- one-screen summary of files, history,
+// trash, and the current storage source. Lands at /workspace.
+// ============================================================
+
+async fn workspace_overview_handler(
+    State(state): State<AppState>,
+    session: Option<axum::Extension<auth::Session>>,
+) -> Html<String> {
+    let l = Localizer::english();
+    let username = session.as_ref().map(|s| s.username.clone());
+    let store = state.store.as_deref();
+    let files = match store {
+        Some(s) => s.studio_files_list().await.unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let trash = match store {
+        Some(s) => s.studio_files_list_trash().await.unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let history = load_studio_history_all(store).await;
+    let folders: std::collections::BTreeSet<String> = files
+        .iter()
+        .filter_map(|f| {
+            let trimmed = f.path.trim_start_matches('/');
+            trimmed.split_once('/').map(|(d, _)| d.to_string())
+        })
+        .collect();
+    let storage = discover_garage_endpoint(store).await;
+    let storage_label = storage
+        .as_deref()
+        .map(|_| "Computeza Local Storage (live)")
+        .unwrap_or("Not configured");
+    let user_label = username.unwrap_or_else(|| "operator".to_string());
+    let body = format!(
+        r#"<section class="cz-hero">
+<h1>Workspace</h1>
+<p class="cz-muted">One-screen overview for <strong>{user}</strong>. The studio editor is at <a href="/studio" style="color:var(--lavender);">/studio</a>; deeper details are on each subpage.</p>
+</section>
+<section class="cz-section">
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(14rem,1fr));gap:1rem;">
+
+<div class="cz-card">
+<div class="cz-card-eyebrow">Files</div>
+<div style="font-size:2rem;font-weight:600;">{files_count}</div>
+<p class="cz-muted" style="margin:0.25rem 0 0;font-size:0.85rem;">{folders_count} folders</p>
+</div>
+
+<div class="cz-card">
+<div class="cz-card-eyebrow">In trash</div>
+<div style="font-size:2rem;font-weight:600;color:var(--fail);">{trash_count}</div>
+<p class="cz-muted" style="margin:0.25rem 0 0;font-size:0.85rem;"><a href="/studio/trash" style="color:var(--lavender);">View &middot; restore &middot; empty</a></p>
+</div>
+
+<div class="cz-card">
+<div class="cz-card-eyebrow">Query history</div>
+<div style="font-size:2rem;font-weight:600;">{history_count}</div>
+<p class="cz-muted" style="margin:0.25rem 0 0;font-size:0.85rem;"><a href="/studio/history" style="color:var(--lavender);">Browse all</a></p>
+</div>
+
+<div class="cz-card">
+<div class="cz-card-eyebrow">Storage source</div>
+<div style="font-size:1rem;font-weight:600;">{storage_label}</div>
+<p class="cz-muted" style="margin:0.25rem 0 0;font-size:0.85rem;">{storage_endpoint}</p>
+</div>
+
+<div class="cz-card">
+<div class="cz-card-eyebrow">Audit log</div>
+<div style="font-size:1rem;font-weight:600;">Tamper-evident</div>
+<p class="cz-muted" style="margin:0.25rem 0 0;font-size:0.85rem;"><a href="/audit" style="color:var(--lavender);">View recent events</a></p>
+</div>
+
+</div>
+</section>"#,
+        user = html_escape(&user_label),
+        files_count = files.len(),
+        folders_count = folders.len(),
+        trash_count = trash.len(),
+        history_count = history.entries.len(),
+        storage_label = html_escape(storage_label),
+        storage_endpoint = html_escape(storage.as_deref().unwrap_or("")),
+    );
+    Html(render_shell(&l, "Workspace", NavLink::Studio, &body))
+}
+
+// ============================================================
+// Studio formatter -- shells out to black (Python) or runs a
+// regex-based SQL pretty-printer. Same endpoint, kind=python|sql.
+// ============================================================
+
+#[derive(serde::Deserialize)]
+struct FormatRequest {
+    kind: String,
+    content: String,
+}
+
+#[derive(serde::Serialize)]
+struct FormatResponse {
+    ok: bool,
+    formatted: String,
+    error: Option<String>,
+}
+
+async fn studio_format_handler(
+    axum::extract::Form(req): axum::extract::Form<FormatRequest>,
+) -> axum::Json<FormatResponse> {
+    let result = match req.kind.as_str() {
+        "python" => format_python(&req.content).await,
+        "sql" => Ok(format_sql(&req.content)),
+        _ => Err(format!("unknown format kind: {}", req.kind)),
+    };
+    match result {
+        Ok(formatted) => axum::Json(FormatResponse {
+            ok: true,
+            formatted,
+            error: None,
+        }),
+        Err(e) => axum::Json(FormatResponse {
+            ok: false,
+            formatted: req.content,
+            error: Some(e),
+        }),
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn format_python(src: &str) -> Result<String, String> {
+    use tokio::io::AsyncWriteExt;
+    let venv_black = std::path::PathBuf::from("/var/lib/computeza/sail/venv/bin/black");
+    if !tokio::fs::try_exists(&venv_black).await.unwrap_or(false) {
+        return Err(format!(
+            "black not found at {}. Install Sail (Studio's Python venv) to enable formatting.",
+            venv_black.display()
+        ));
+    }
+    let mut child = tokio::process::Command::new(&venv_black)
+        .args(["--quiet", "-"]) // stdin -> stdout
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn black: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(src.as_bytes())
+            .await
+            .map_err(|e| format!("write to black: {e}"))?;
+    }
+    let out = child
+        .wait_with_output()
+        .await
+        .map_err(|e| format!("wait black: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "black failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn format_python(_src: &str) -> Result<String, String> {
+    Err("Python formatting requires the Sail venv (Linux-only in v0.0.x).".into())
+}
+
+/// Lightweight SQL pretty-printer. Not a parser; this is a regex-
+/// based reformatter that uppercases keywords and inserts line
+/// breaks before the major clauses. Good enough for the "Format"
+/// button; deeper formatting would pull in a real parser.
+fn format_sql(src: &str) -> String {
+    let major = [
+        "SELECT",
+        "FROM",
+        "WHERE",
+        "GROUP BY",
+        "ORDER BY",
+        "HAVING",
+        "LIMIT",
+        "OFFSET",
+        "INNER JOIN",
+        "LEFT JOIN",
+        "RIGHT JOIN",
+        "FULL JOIN",
+        "JOIN",
+        "UNION ALL",
+        "UNION",
+        "ON",
+        "WITH",
+        "INSERT INTO",
+        "VALUES",
+        "UPDATE",
+        "SET",
+        "DELETE FROM",
+        "CREATE TABLE",
+        "CREATE SCHEMA",
+        "CREATE CATALOG",
+        "DROP TABLE",
+        "DROP SCHEMA",
+        "DROP CATALOG",
+        "ALTER TABLE",
+    ];
+    // Collapse whitespace.
+    let collapsed = src.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out = collapsed;
+    // Insert newline before each major keyword (case-insensitive).
+    for kw in major.iter() {
+        // Match the keyword as a whole token; we just do a
+        // case-insensitive search and break before each hit.
+        let mut buf = String::with_capacity(out.len() + 8);
+        let lower = out.to_ascii_lowercase();
+        let kw_lower = kw.to_ascii_lowercase();
+        let mut i = 0;
+        while let Some(pos) = lower[i..].find(&kw_lower) {
+            let abs = i + pos;
+            // Skip if the matched run is part of a longer identifier.
+            let prev_ok = abs == 0 || !lower.as_bytes()[abs - 1].is_ascii_alphanumeric();
+            let next = abs + kw_lower.len();
+            let next_ok = next == lower.len() || !lower.as_bytes()[next].is_ascii_alphanumeric();
+            if prev_ok && next_ok {
+                buf.push_str(&out[i..abs]);
+                if !buf.is_empty() && !buf.ends_with('\n') {
+                    buf.push('\n');
+                }
+                buf.push_str(kw);
+                i = next;
+            } else {
+                buf.push_str(&out[i..abs + 1]);
+                i = abs + 1;
+            }
+        }
+        buf.push_str(&out[i..]);
+        out = buf;
+    }
+    // Trim leading newline from the head of the buffer.
+    out.trim_start().to_string()
 }
 
 /// Build the /studio redirect URL with the standard tab-state +
@@ -5136,9 +5540,7 @@ struct CompletionItem {
 /// Each source is best-effort: a Trino outage skips its symbols
 /// but still returns warehouses + history. The endpoint never
 /// fails the request -- Monaco just gets a shorter list.
-async fn studio_completions_handler(
-    State(state): State<AppState>,
-) -> axum::Json<CompletionSource> {
+async fn studio_completions_handler(State(state): State<AppState>) -> axum::Json<CompletionSource> {
     let mut items: Vec<CompletionItem> = Vec::new();
 
     // Trino symbols. Trino's `SHOW CATALOGS` / `SHOW SCHEMAS FROM
@@ -5214,7 +5616,14 @@ async fn studio_completions_handler(
     let history = load_studio_history_all(state.store.as_deref()).await;
     let mut seen_first_lines = std::collections::HashSet::new();
     for entry in history.entries.into_iter().take(20) {
-        let first_line: String = entry.sql.lines().next().unwrap_or("").chars().take(60).collect();
+        let first_line: String = entry
+            .sql
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(60)
+            .collect();
         if first_line.trim().is_empty() {
             continue;
         }
@@ -5369,8 +5778,16 @@ async fn studio_sql_execute_handler(
     // a Run round-trip.
     let post_q = StudioQuery {
         sql: None,
-        open: if form.open.is_empty() { None } else { Some(form.open.clone()) },
-        active: if form.active.is_empty() { None } else { Some(form.active.clone()) },
+        open: if form.open.is_empty() {
+            None
+        } else {
+            Some(form.open.clone())
+        },
+        active: if form.active.is_empty() {
+            None
+        } else {
+            Some(form.active.clone())
+        },
         flash: None,
         dir: None,
     };
@@ -5423,13 +5840,18 @@ async fn studio_cell_run_handler(
         CellKind::Sql => {
             let Some(url) = discover_trino_endpoint(state.store.as_deref()).await else {
                 return axum::Json(CellOutput::SqlErr {
-                    message: "Trino isn't installed or discoverable. Install it from /install.".into(),
+                    message: "Trino isn't installed or discoverable. Install it from /install."
+                        .into(),
                     duration_ms: t0.elapsed().as_millis(),
                     executed_at: started,
                 });
             };
             match execute_sql_against_trino(&url, &form.content).await {
-                SqlOutcome::Ok { columns, rows, duration_ms } => axum::Json(CellOutput::SqlOk {
+                SqlOutcome::Ok {
+                    columns,
+                    rows,
+                    duration_ms,
+                } => axum::Json(CellOutput::SqlOk {
                     columns: columns
                         .into_iter()
                         .map(|c| CellColumn {
@@ -5570,7 +5992,7 @@ fn render_python_df_html(df: &DataFrameOutput) -> String {
     format!(
         r#"<div class="cz-studio-results-header" style="margin-top:0.4rem;">
 <span class="cz-studio-results-eyebrow">DataFrame</span>
-<span class="cz-studio-results-count">{rows} of {total} rows · {origin}</span>
+<span class="cz-studio-results-count">{rows} of {total} rows &middot; {origin}</span>
 </div>
 {trunc}
 <div class="cz-studio-results-table-wrap"><table class="cz-studio-results-table cz-cell-table"><thead><tr>{header}</tr></thead><tbody>{body}</tbody></table></div>"#,
@@ -5620,9 +6042,7 @@ fn split_dataframe_marker(
 /// (with one starter SQL cell) and redirect into the editor
 /// with it open. Hooked to the "New notebook" button in the
 /// file-tree.
-async fn studio_notebook_new_handler(
-    State(state): State<AppState>,
-) -> axum::response::Redirect {
+async fn studio_notebook_new_handler(State(state): State<AppState>) -> axum::response::Redirect {
     let Some(store) = state.store.as_deref() else {
         return redirect_studio_flash(None, None, "metadata store unavailable");
     };
@@ -5647,9 +6067,7 @@ async fn studio_notebook_new_handler(
     }
 }
 
-async fn studio_history_page_handler(
-    State(state): State<AppState>,
-) -> Html<String> {
+async fn studio_history_page_handler(State(state): State<AppState>) -> Html<String> {
     let l = Localizer::english();
     // Aggregate across every per-file bucket so the global history
     // page shows everything; per-file scoping happens via
@@ -5676,7 +6094,7 @@ async fn studio_history_page_handler(
                 };
                 let rows_str = e
                     .row_count
-                    .map(|n| thousands(n))
+                    .map(thousands)
                     .unwrap_or_else(|| "-".to_string());
                 let preview: String = e.sql.lines().take(2).collect::<Vec<_>>().join(" ↵ ");
                 let preview = preview.chars().take(160).collect::<String>();
@@ -5710,7 +6128,7 @@ async fn studio_history_page_handler(
 <p class="cz-studio-pane-subtitle" style="margin: 0.25rem 0 0;">Every query you've run from the editor, newest-first. Filter by substring; click Open to re-fire one.</p>
 </div>
 <span class="cz-studio-actions-spacer"></span>
-<input id="cz-history-filter" type="search" class="cz-input" placeholder="Filter queries…" style="max-width: 22rem;" />
+<input id="cz-history-filter" type="search" class="cz-input" placeholder="Filter queries..." style="max-width: 22rem;" />
 </div>
 <div class="cz-table-wrap">
 <table class="cz-table" id="cz-history-table">
@@ -5779,10 +6197,7 @@ async fn studio_sql_explain_handler(
         return axum::Json(StudioExplainResponse {
             ok: false,
             plan: None,
-            error: Some(
-                "Trino isn't installed or discoverable. Install it from /install."
-                    .into(),
-            ),
+            error: Some("Trino isn't installed or discoverable. Install it from /install.".into()),
         });
     };
     let explain_sql = format!("EXPLAIN {cleaned}");
@@ -5897,9 +6312,9 @@ fn parse_host_port(s: &str) -> Option<(String, u16)> {
 /// line LOOK like SQL", not "is this valid SQL".
 fn detect_query_language(src: &str) -> QueryLanguage {
     const SQL_HEADS: &[&str] = &[
-        "SELECT", "WITH", "INSERT", "UPDATE", "DELETE", "MERGE", "CREATE", "DROP",
-        "ALTER", "TRUNCATE", "USE", "SHOW", "DESCRIBE", "DESC", "EXPLAIN", "GRANT",
-        "REVOKE", "CALL", "REFRESH", "OPTIMIZE", "VACUUM", "ANALYZE", "COPY", "SET",
+        "SELECT", "WITH", "INSERT", "UPDATE", "DELETE", "MERGE", "CREATE", "DROP", "ALTER",
+        "TRUNCATE", "USE", "SHOW", "DESCRIBE", "DESC", "EXPLAIN", "GRANT", "REVOKE", "CALL",
+        "REFRESH", "OPTIMIZE", "VACUUM", "ANALYZE", "COPY", "SET",
     ];
     // Python default = PyIceberg (mature catalog client). Operators
     // who specifically want PySpark / DataFrame compute can pick
@@ -5995,7 +6410,8 @@ async fn execute_python_via_sail(
     // Parse the sail base URL into host + port for the sc:// URI.
     // sail_base_url is shaped like "http://127.0.0.1:50051" -- a
     // single split is cheaper than pulling in the url crate.
-    let (sail_host, sail_port) = parse_host_port(sail_base_url).unwrap_or_else(|| ("127.0.0.1".to_string(), 50051));
+    let (sail_host, sail_port) =
+        parse_host_port(sail_base_url).unwrap_or_else(|| ("127.0.0.1".to_string(), 50051));
 
     // Collect registered catalogs from vault.
     let catalog_names = match secrets {
@@ -6030,13 +6446,19 @@ async fn execute_python_via_sail(
                 "s3-secret-access-key",
             ] {
                 if let Ok(Some(v)) = s.get(&format!("{prefix}/{field}")).await {
-                    entry.insert((*field).into(), serde_json::Value::String(v.expose_secret().to_string()));
+                    entry.insert(
+                        (*field).into(),
+                        serde_json::Value::String(v.expose_secret().to_string()),
+                    );
                 }
             }
             // Lakekeeper REST URI: read live, not from vault, so it
             // tracks endpoint moves across reconciler runs.
             if let Some(lk) = discover_lakekeeper_endpoint(store).await {
-                entry.insert("lakekeeper-rest-uri".into(), serde_json::Value::String(format!("{lk}/catalog")));
+                entry.insert(
+                    "lakekeeper-rest-uri".into(),
+                    serde_json::Value::String(format!("{lk}/catalog")),
+                );
             }
             catalog_cfg.insert(name.clone(), serde_json::Value::Object(entry));
         }
@@ -6257,7 +6679,12 @@ except Exception:
         // Drop stdin so the child's `sys.stdin.read()` returns.
         drop(stdin);
     }
-    let out = match tokio::time::timeout(std::time::Duration::from_secs(120), child.wait_with_output()).await {
+    let out = match tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        child.wait_with_output(),
+    )
+    .await
+    {
         Ok(Ok(o)) => o,
         Ok(Err(e)) => {
             return PythonOutcome::Err {
@@ -6301,10 +6728,10 @@ async fn execute_python_via_pyiceberg(
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (user_code, secrets, store);
-        return PythonOutcome::Err {
+        PythonOutcome::Err {
             stdout: String::new(),
             stderr: "PyIceberg execution is Linux-only (uses the Sail venv at /var/lib/computeza/sail/).".into(),
-        };
+        }
     }
     #[cfg(target_os = "linux")]
     execute_python_via_pyiceberg_linux(user_code, secrets, store).await
@@ -6905,7 +7332,7 @@ enum SqlOutcome {
         rows: Vec<Vec<String>>,
         /// Wall-clock execution time on the server side, in
         /// milliseconds. Surfaced in the results header so the
-        /// operator can see "1,247 rows · 142 ms" Databricks-style.
+        /// operator can see "1,247 rows &middot; 142 ms" Databricks-style.
         duration_ms: u128,
     },
     Err(String),
@@ -7141,9 +7568,7 @@ async fn execute_one_trino_statement(base_url: &str, sql: &str) -> SqlOutcome {
     let mut body: serde_json::Value = match initial.json().await {
         Ok(v) => v,
         Err(e) => {
-            return SqlOutcome::Err(format!(
-                "Trino /v1/statement returned non-JSON body: {e}"
-            ));
+            return SqlOutcome::Err(format!("Trino /v1/statement returned non-JSON body: {e}"));
         }
     };
 
@@ -7170,10 +7595,7 @@ async fn execute_one_trino_statement(base_url: &str, sql: &str) -> SqlOutcome {
                     .iter()
                     .filter_map(|c| {
                         let name = c.get("name").and_then(|n| n.as_str())?.to_string();
-                        let type_ = c
-                            .get("type")
-                            .and_then(|t| t.as_str())
-                            .map(str::to_string);
+                        let type_ = c.get("type").and_then(|t| t.as_str()).map(str::to_string);
                         Some(ResultColumn { name, type_ })
                     })
                     .collect();
@@ -7256,7 +7678,7 @@ fn render_studio_files_pane(
 <div id="cz-modal-new-folder" class="cz-modal-overlay" role="dialog" aria-labelledby="cz-modal-new-folder-title" aria-modal="true">
 <a href="#" class="cz-modal-overlay-backdrop" aria-label="Close"></a>
 <div class="cz-modal">
-<a href="#" class="cz-modal-close" aria-label="Close">×</a>
+<a href="#" class="cz-modal-close" aria-label="Close">&times;</a>
 <h2 id="cz-modal-new-folder-title" class="cz-modal-title">New folder</h2>
 <p class="cz-modal-subtitle">Creates a folder placeholder so the tree shows the new path even when it's empty. Drops a tiny <code>.gitkeep</code> file inside.</p>
 <form method="post" action="/studio/folders/new">
@@ -7277,7 +7699,7 @@ fn render_studio_files_pane(
 <div id="cz-modal-import-archive" class="cz-modal-overlay" role="dialog" aria-labelledby="cz-modal-import-archive-title" aria-modal="true">
 <a href="#" class="cz-modal-overlay-backdrop" aria-label="Close"></a>
 <div class="cz-modal">
-<a href="#" class="cz-modal-close" aria-label="Close">×</a>
+<a href="#" class="cz-modal-close" aria-label="Close">&times;</a>
 <h2 id="cz-modal-import-archive-title" class="cz-modal-title">Upload .cptz archive</h2>
 <p class="cz-modal-subtitle">A .cptz is a ZIP with a <code>manifest.json</code> plus a <code>files/</code> tree. Existing files at the same path get overwritten with the archive's contents.</p>
 <form method="post" action="/studio/files/import-archive" id="cz-archive-form">
@@ -7325,9 +7747,9 @@ fn render_studio_files_pane(
 <div id="cz-modal-new-file" class="cz-modal-overlay" role="dialog" aria-labelledby="cz-modal-new-file-title" aria-modal="true">
 <a href="#" class="cz-modal-overlay-backdrop" aria-label="Close"></a>
 <div class="cz-modal">
-<a href="#" class="cz-modal-close" aria-label="Close">×</a>
+<a href="#" class="cz-modal-close" aria-label="Close">&times;</a>
 <h2 id="cz-modal-new-file-title" class="cz-modal-title">New file</h2>
-<p class="cz-modal-subtitle">Saves the editor's current contents to a new file. The extension drives syntax highlighting + the auto-route (SQL → Trino, Python → Sail).</p>
+<p class="cz-modal-subtitle">Saves the editor's current contents to a new file. The extension drives syntax highlighting + the auto-route (SQL -> Trino, Python -> Sail).</p>
 <form method="post" action="/studio/files/new" id="cz-file-new-form">
 {csrf}
 <input type="hidden" name="open" value="{open_csv}" />
@@ -7341,7 +7763,7 @@ fn render_studio_files_pane(
 <button type="button" class="cz-btn-ghost" style="font-size:0.74rem; padding:0.25rem 0.6rem;" onclick="document.getElementById('cz-file-new-path').value='/notes/untitled.txt'">.txt</button>
 <button type="button" class="cz-btn-ghost" style="font-size:0.74rem; padding:0.25rem 0.6rem;" onclick="document.getElementById('cz-file-new-path').value='/scratch/untitled.md'">.md</button>
 </div>
-<p class="cz-modal-field-hint">Empty path → /untitled.sql. Folder prefix like <code>/python/</code> groups the file in the tree.</p>
+<p class="cz-modal-field-hint">Empty path -> /untitled.sql. Folder prefix like <code>/python/</code> groups the file in the tree.</p>
 </div>
 <div class="cz-modal-actions">
 <a href="#" class="cz-btn-ghost">Cancel</a>
@@ -7356,7 +7778,10 @@ fn render_studio_files_pane(
         archive_dest_hint = if in_root {
             "Paths in the archive are preserved as-is (root-level import).".to_string()
         } else {
-            format!("Every entry will be placed under <code>/{0}/</code>.", html_escape(&current_dir))
+            format!(
+                "Every entry will be placed under <code>/{0}/</code>.",
+                html_escape(&current_dir)
+            )
         },
     );
     // File-explorer header: eyebrow plus a breadcrumb / back-button
@@ -7414,7 +7839,11 @@ fn render_studio_files_pane(
     );
 
     // Helper closures used for both file rows + folder rows.
-    let dir_q = if in_root { String::new() } else { format!("&dir={}", url_encode(&current_dir)) };
+    let dir_q = if in_root {
+        String::new()
+    } else {
+        format!("&dir={}", url_encode(&current_dir))
+    };
 
     // Build a per-file row HTML (renamed/deleted modals included so
     // the action menu's :target anchors resolve).
@@ -7444,7 +7873,7 @@ fn render_studio_files_pane(
 <div id="cz-rename-{id}" class="cz-modal-overlay" role="dialog" aria-labelledby="cz-rename-{id}-title" aria-modal="true">
 <a href="#" class="cz-modal-overlay-backdrop" aria-label="Close"></a>
 <div class="cz-modal">
-<a href="#" class="cz-modal-close" aria-label="Close">×</a>
+<a href="#" class="cz-modal-close" aria-label="Close">&times;</a>
 <h2 id="cz-rename-{id}-title" class="cz-modal-title">Rename / move file</h2>
 <p class="cz-modal-subtitle">Change the path of <code>{path}</code>. Use a leading slash; the first folder segment becomes the tree group (so renaming to a different folder doubles as Move).</p>
 <form method="post" action="/studio/files/{id}/rename">
@@ -7464,7 +7893,7 @@ fn render_studio_files_pane(
 <div id="cz-delete-{id}" class="cz-modal-overlay" role="dialog" aria-labelledby="cz-delete-{id}-title" aria-modal="true">
 <a href="#" class="cz-modal-overlay-backdrop" aria-label="Close"></a>
 <div class="cz-modal">
-<a href="#" class="cz-modal-close" aria-label="Close">×</a>
+<a href="#" class="cz-modal-close" aria-label="Close">&times;</a>
 <h2 id="cz-delete-{id}-title" class="cz-modal-title">Delete file?</h2>
 <p class="cz-modal-subtitle">This will permanently delete <code>{path}</code>. The file cannot be recovered.</p>
 <form method="post" action="/studio/files/{id}/delete">
@@ -7513,7 +7942,7 @@ fn render_studio_files_pane(
 <div id="cz-folder-rename-{folder_safe}" class="cz-modal-overlay" role="dialog" aria-modal="true">
 <a href="#" class="cz-modal-overlay-backdrop" aria-label="Close"></a>
 <div class="cz-modal">
-<a href="#" class="cz-modal-close" aria-label="Close">×</a>
+<a href="#" class="cz-modal-close" aria-label="Close">&times;</a>
 <h2 class="cz-modal-title">Rename folder /{folder_label_html}/</h2>
 <p class="cz-modal-subtitle">Rewrites the folder prefix on every file underneath.</p>
 <form method="post" action="/studio/folders/rename">
@@ -7535,7 +7964,7 @@ fn render_studio_files_pane(
 <div id="cz-folder-delete-{folder_safe}" class="cz-modal-overlay" role="dialog" aria-modal="true">
 <a href="#" class="cz-modal-overlay-backdrop" aria-label="Close"></a>
 <div class="cz-modal">
-<a href="#" class="cz-modal-close" aria-label="Close">×</a>
+<a href="#" class="cz-modal-close" aria-label="Close">&times;</a>
 <h2 class="cz-modal-title">Delete folder /{folder_label_html}/?</h2>
 <p class="cz-modal-subtitle">This permanently deletes every file under <code>/{folder_label_html}/</code>. The files cannot be recovered.</p>
 <form method="post" action="/studio/folders/delete">
@@ -7596,7 +8025,7 @@ fn render_studio_files_pane(
             .iter()
             .filter(|f| f.path.starts_with(&prefix))
             .filter(|f| !f.path.ends_with("/.gitkeep"))
-            .map(|f| render_file_row(f))
+            .map(render_file_row)
             .collect();
         if rows.is_empty() {
             r#"<div class="cz-studio-file-empty">Empty folder. Use the <strong>+</strong> button to add a file.</div>"#.to_string()
@@ -7672,7 +8101,6 @@ fn render_studio_files_pane(
 /// `build_studio_full_sidebar`), the SQL editor + results pane
 /// renders on the right.
 #[allow(clippy::too_many_arguments)] // explicit signature is the readable choice over a "render-context" bag
-
 fn render_studio_page(
     localizer: &Localizer,
     has_lakekeeper: bool,
@@ -7801,10 +8229,7 @@ fn render_studio_page(
 
     let results_html = match result {
         None => empty_state_html.clone(),
-        Some(RoutedOutcome::Sql {
-            outcome: None,
-            ..
-        }) => format!(
+        Some(RoutedOutcome::Sql { outcome: None, .. }) => format!(
             r#"<div class="cz-studio-results-empty">{}</div>"#,
             html_escape(&err_no_databend)
         ),
@@ -7819,7 +8244,12 @@ fn render_studio_page(
         ),
         Some(RoutedOutcome::Sql {
             engine,
-            outcome: Some(SqlOutcome::Ok { columns, rows, duration_ms }),
+            outcome:
+                Some(SqlOutcome::Ok {
+                    columns,
+                    rows,
+                    duration_ms,
+                }),
         }) => {
             let header: String = columns
                 .iter()
@@ -7876,7 +8306,7 @@ fn render_studio_page(
                 r##"<div class="cz-studio-results-header">
 {pill}
 <div class="cz-studio-results-tabs" role="tablist">
-  <button type="button" class="cz-studio-results-tab cz-studio-results-tab-active" data-result-tab="results" role="tab">Results <span class="cz-studio-results-count">{row_count_fmt} · {duration_label}</span></button>
+  <button type="button" class="cz-studio-results-tab cz-studio-results-tab-active" data-result-tab="results" role="tab">Results <span class="cz-studio-results-count">{row_count_fmt} &middot; {duration_label}</span></button>
   <button type="button" class="cz-studio-results-tab" data-result-tab="schema" role="tab">Schema <span class="cz-studio-results-count">{col_count}</span></button>
   <button type="button" class="cz-studio-results-tab" data-result-tab="plan" role="tab" data-original-sql="{original_sql_attr}">Plan</button>
 </div>
@@ -7907,12 +8337,7 @@ fn render_studio_page(
                 col_count = columns.len(),
             )
         }
-        Some(RoutedOutcome::Python {
-            outcome: None,
-            ..
-        }) => format!(
-            r#"<div class="cz-studio-results-empty">Sail isn't installed. Install it from <a href="/install">/install</a> to run Python/Spark queries.</div>"#
-        ),
+        Some(RoutedOutcome::Python { outcome: None, .. }) => r#"<div class="cz-studio-results-empty">Sail isn't installed. Install it from <a href="/install">/install</a> to run Python/Spark queries.</div>"#.to_string(),
         Some(RoutedOutcome::Python {
             engine,
             outcome: Some(PythonOutcome::Ok { stdout, stderr }),
@@ -7921,12 +8346,10 @@ fn render_studio_page(
             // does. Without this the single-buffer editor's "Run"
             // dumped the raw `__COMPUTEZA_DATAFRAME__...__END__` line
             // into stdout instead of rendering a table.
-            let (clean_stdout, clean_stderr, df_opt) = split_dataframe_marker(
-                PythonOutcome::Ok {
-                    stdout: stdout.clone(),
-                    stderr: stderr.clone(),
-                },
-            );
+            let (clean_stdout, clean_stderr, df_opt) = split_dataframe_marker(PythonOutcome::Ok {
+                stdout: stdout.clone(),
+                stderr: stderr.clone(),
+            });
             let df_block = match df_opt {
                 Some(Ok(df)) => render_python_df_html(&df),
                 _ => String::new(),
@@ -7981,9 +8404,9 @@ fn render_studio_page(
     // Updates client-side as they type via a small inline script.
     let initial_language = detect_query_language(sql_prefill);
     let initial_lang_label = match initial_language {
-        QueryLanguage::Sql => "SQL → Trino",
-        QueryLanguage::PyIceberg => "Python → PyIceberg",
-        QueryLanguage::Sail => "Python → Sail",
+        QueryLanguage::Sql => "SQL -> Trino",
+        QueryLanguage::PyIceberg => "Python -> PyIceberg",
+        QueryLanguage::Sail => "Python -> Sail",
     };
     let open_csv = files.open_csv();
     let active_id = files.active_id.clone().unwrap_or_default();
@@ -7993,7 +8416,11 @@ fn render_studio_page(
     // the raw sql_prefill (no file context).
     let tabs_html = {
         let scratch_active = files.active_id.is_none();
-        let scratch_class = if scratch_active { " cz-studio-tab-active" } else { "" };
+        let scratch_class = if scratch_active {
+            " cz-studio-tab-active"
+        } else {
+            ""
+        };
         // Each tab is a <div data-tab-id="..."> wrapper containing
         // the open-link anchor and (for non-scratch tabs) a close
         // anchor as a sibling. Nesting anchors is invalid HTML and
@@ -8007,7 +8434,11 @@ fn render_studio_page(
         );
         for f in &files.open {
             let is_active = files.active_id.as_deref() == Some(f.id.as_str());
-            let active = if is_active { " cz-studio-tab-active" } else { "" };
+            let active = if is_active {
+                " cz-studio-tab-active"
+            } else {
+                ""
+            };
             let basename = f.path.rsplit('/').next().unwrap_or(&f.path);
             // Close action just drops this id from the open csv;
             // doesn't delete the file. Sibling of the open-link so
@@ -8020,7 +8451,7 @@ fn render_studio_page(
                 .collect::<Vec<_>>()
                 .join(",");
             html.push_str(&format!(
-                r##"<div class="cz-studio-tab-wrap{active}" draggable="true" data-tab-id="{id_raw}"><a class="cz-studio-tab" href="/studio?open={open}&active={id}"><span class="cz-studio-tab-label" title="{path}">{label}</span></a><a class="cz-studio-tab-close" href="/studio?open={next_open}" title="Close tab (doesn't delete file)">×</a></div>"##,
+                r##"<div class="cz-studio-tab-wrap{active}" draggable="true" data-tab-id="{id_raw}"><a class="cz-studio-tab" href="/studio?open={open}&active={id}"><span class="cz-studio-tab-label" title="{path}">{label}</span></a><a class="cz-studio-tab-close" href="/studio?open={next_open}" title="Close tab (doesn't delete file)">&times;</a></div>"##,
                 open = url_encode(&open_csv),
                 next_open = url_encode(&next_open),
                 id = url_encode(&f.id),
@@ -8066,7 +8497,7 @@ fn render_studio_page(
 <div id="cz-delete-toolbar-{id}" class="cz-modal-overlay" role="dialog" aria-labelledby="cz-delete-toolbar-{id}-title" aria-modal="true">
 <a href="#" class="cz-modal-overlay-backdrop" aria-label="Close"></a>
 <div class="cz-modal">
-<a href="#" class="cz-modal-close" aria-label="Close">×</a>
+<a href="#" class="cz-modal-close" aria-label="Close">&times;</a>
 <h2 id="cz-delete-toolbar-{id}-title" class="cz-modal-title">Delete file?</h2>
 <p class="cz-modal-subtitle">This will permanently delete <code>{path}</code>. The file cannot be recovered.</p>
 <div class="cz-modal-actions">
@@ -8087,7 +8518,7 @@ fn render_studio_page(
 <div class="cz-studio-actions" style="margin-bottom: 0.5rem;">
 <div>
 <h1 class="cz-studio-pane-title" style="margin: 0;">Query editor</h1>
-<p class="cz-studio-pane-subtitle" style="margin: 0.25rem 0 0;">Type SQL for Trino or Python (PySpark) for Sail — the editor auto-routes. Ctrl/Cmd+Enter runs.</p>
+<p class="cz-studio-pane-subtitle" style="margin: 0.25rem 0 0;">Type SQL for Trino or Python (PySpark) for Sail -- the editor auto-routes. Ctrl/Cmd+Enter runs.</p>
 </div>
 <span class="cz-studio-actions-spacer"></span>
 <label class="cz-studio-tenant-select" title="Multi-tenant + multi-region routing lands in v1.0. v0.0.x runs against a single tenant on the local cluster.">
@@ -8104,23 +8535,23 @@ fn render_studio_page(
 <div class="cz-studio-editor-toolbar">
 <div class="cz-studio-lang-pill" data-lang="{lang_attr}" title="Force the routing engine. 'Auto' uses the first keyword to decide.">
   <button type="button" id="cz-sql-lang-toggle" class="cz-studio-lang-pill-button" aria-haspopup="menu" aria-expanded="false">
-    <span id="cz-sql-lang-current">Auto-detect → {lang_label}</span>
+    <span id="cz-sql-lang-current">Auto-detect -> {lang_label}</span>
     <i class="fa-solid fa-chevron-down" aria-hidden="true"></i>
   </button>
   <input type="hidden" name="language" id="cz-sql-lang-value" value="auto" />
   <div id="cz-sql-lang-menu" class="cz-studio-lang-menu" role="menu" hidden>
     <button type="button" class="cz-studio-lang-option" data-value="auto" role="menuitem">
       <span class="cz-studio-lang-option-label">Auto-detect</span>
-      <span class="cz-studio-lang-option-hint">→ <span class="cz-sql-lang-auto-target">{lang_label}</span></span>
+      <span class="cz-studio-lang-option-hint">-> <span class="cz-sql-lang-auto-target">{lang_label}</span></span>
     </button>
     <button type="button" class="cz-studio-lang-option" data-value="sql" role="menuitem">
-      <span class="cz-studio-lang-option-label">SQL → Trino</span>
+      <span class="cz-studio-lang-option-label">SQL -> Trino</span>
     </button>
     <button type="button" class="cz-studio-lang-option" data-value="pyiceberg" role="menuitem">
-      <span class="cz-studio-lang-option-label">Python → PyIceberg</span>
+      <span class="cz-studio-lang-option-label">Python -> PyIceberg</span>
     </button>
     <button type="button" class="cz-studio-lang-option" data-value="sail" role="menuitem">
-      <span class="cz-studio-lang-option-label">Python → Sail</span>
+      <span class="cz-studio-lang-option-label">Python -> Sail</span>
       <span class="cz-studio-lang-option-hint">experimental</span>
     </button>
   </div>
@@ -8183,15 +8614,15 @@ fn render_studio_page(
   }}
 
   function heuristicLabel(h) {{
-    if (h === "sql") return "SQL → Trino";
-    if (h === "sail") return "Python → Sail";
-    return "Python → PyIceberg";
+    if (h === "sql") return "SQL -> Trino";
+    if (h === "sail") return "Python -> Sail";
+    return "Python -> PyIceberg";
   }}
   function labelFor(val, heuristic) {{
-    if (val === "sql") return "SQL → Trino";
-    if (val === "pyiceberg") return "Python → PyIceberg";
-    if (val === "sail") return "Python → Sail";
-    return "Auto-detect → " + heuristicLabel(heuristic);
+    if (val === "sql") return "SQL -> Trino";
+    if (val === "pyiceberg") return "Python -> PyIceberg";
+    if (val === "sail") return "Python -> Sail";
+    return "Auto-detect -> " + heuristicLabel(heuristic);
   }}
 
   function paint() {{
@@ -8259,7 +8690,10 @@ fn render_studio_page(
         sql_run = html_escape(&sql_run),
         sql_help = html_escape(&sql_help),
         results_html = results_html,
-        lang_attr = match initial_language { QueryLanguage::Sql => "sql", QueryLanguage::PyIceberg | QueryLanguage::Sail => "python" },
+        lang_attr = match initial_language {
+            QueryLanguage::Sql => "sql",
+            QueryLanguage::PyIceberg | QueryLanguage::Sail => "python",
+        },
         lang_label = initial_lang_label,
         tabs_html = tabs_html,
         flash_html = flash_html,
@@ -8314,7 +8748,7 @@ fn render_studio_page(
 <div id="cz-studio-shortcuts" class="cz-modal-overlay" role="dialog" aria-modal="true" aria-hidden="true">
   <div class="cz-modal-overlay-backdrop" onclick="czCloseShortcuts(event)"></div>
   <div class="cz-modal">
-    <a href="#" class="cz-modal-close" onclick="czCloseShortcuts(event)" aria-label="Close">×</a>
+    <a href="#" class="cz-modal-close" onclick="czCloseShortcuts(event)" aria-label="Close">&times;</a>
     <h2 class="cz-modal-title">Keyboard shortcuts</h2>
     <table class="cz-shortcut-table">
       <tr><td><kbd>Ctrl/Cmd</kbd> + <kbd>Enter</kbd></td><td>Run current query</td></tr>
@@ -8442,7 +8876,7 @@ document.addEventListener("click", function (e) {{
     if (pane && pane.getAttribute("data-loaded") === "false") {{
       var originalSql = tab.getAttribute("data-original-sql") || "";
       pane.setAttribute("data-loaded", "pending");
-      pane.innerHTML = '<div class="cz-studio-plan-placeholder cz-muted">Fetching EXPLAIN plan…</div>';
+      pane.innerHTML = '<div class="cz-studio-plan-placeholder cz-muted">Fetching EXPLAIN plan...</div>';
       // CSRF token, same approach as autosave.
       var csrf = "";
       try {{
@@ -8621,7 +9055,7 @@ document.addEventListener("click", function (e) {{
       // saved -- common case when the operator's cursor moves but
       // body is unchanged.
       if (content === lastSaved) return;
-      setStatus("saving", "Saving…");
+      setStatus("saving", "Saving...");
       // Pull the CSRF token from the cookie that auth sets on every
       // authenticated request. Same source + same parsing the
       // global submit-listener uses (no URL-decode -- tokens are
@@ -8667,7 +9101,7 @@ document.addEventListener("click", function (e) {{
 
   function schedule() {{
     if (pending !== null) clearTimeout(pending);
-    setStatus("dirty", "Saving in 1s…");
+    setStatus("dirty", "Saving in 1s...");
     pending = setTimeout(save, 1000);
   }}
 
@@ -9025,13 +9459,10 @@ fn render_studio_notebook_page(
     username: Option<&str>,
 ) -> String {
     let _ = (has_lakekeeper, has_trino, lk_state, history);
-    let title = "Studio · Notebook";
+    let title = "Studio &middot; Notebook";
     let csrf = auth::csrf_input();
     let open_csv = files.open_csv();
-    let active_id = files
-        .active_id
-        .clone()
-        .unwrap_or_default();
+    let active_id = files.active_id.clone().unwrap_or_default();
     let active_path = files
         .active_file()
         .map(|f| f.path.clone())
@@ -9063,7 +9494,7 @@ fn render_studio_notebook_page(
 
     let main_html = format!(
         r##"<div class="cz-studio-crumbs">
-<a href="/studio">Studio</a><span class="cz-studio-crumbs-sep">/</span><span class="cz-studio-crumbs-current">Notebook · {path}</span>
+<a href="/studio">Studio</a><span class="cz-studio-crumbs-sep">/</span><span class="cz-studio-crumbs-current">Notebook &middot; {path}</span>
 </div>
 <div class="cz-studio-actions" style="margin-bottom: 0.75rem;">
 <div>
@@ -9132,7 +9563,7 @@ window.czNotebook = (function () {{
       return;
     }}
     var attempt = ++saveCounter;
-    setStatus("saving", "Saving…");
+    setStatus("saving", "Saving...");
     var b = new URLSearchParams();
     b.append("content", body);
     var csrf = csrfToken();
@@ -9173,7 +9604,7 @@ window.czNotebook = (function () {{
   }}
   function scheduleSave() {{
     if (savePending !== null) clearTimeout(savePending);
-    setStatus("dirty", "Saving in " + Math.round(SAVE_DEBOUNCE_MS / 100) / 10 + "s…");
+    setStatus("dirty", "Saving in " + Math.round(SAVE_DEBOUNCE_MS / 100) / 10 + "s...");
     savePending = setTimeout(persistNow, SAVE_DEBOUNCE_MS);
   }}
   // Flush pending save on page hide / tab close so typed content
@@ -9221,6 +9652,16 @@ window.czNotebook = (function () {{
       persistNow({{ force: true }});
     }});
   }}
+  // Ctrl/Cmd+S anywhere on the notebook page force-saves. Matches the
+  // expected file-editor reflex; prevents the browser's "Save page
+  // as..." dialog.
+  document.addEventListener("keydown", function (e) {{
+    if ((e.ctrlKey || e.metaKey) && (e.key === "s" || e.key === "S")) {{
+      e.preventDefault();
+      if (savePending !== null) clearTimeout(savePending);
+      persistNow({{ force: true }});
+    }}
+  }});
 
   function uuid() {{
     // RFC4122 v4-ish. Crypto-good when available; falls back to
@@ -9312,7 +9753,7 @@ window.czNotebook = (function () {{
       +     '<span class="cz-cell-expand-meta" data-role="meta"></span>'
       +     '<span style="flex:1"></span>'
       +     '<button type="button" class="cz-btn-ghost" data-role="copy" title="Copy to clipboard"><i class="fa-solid fa-copy"></i> Copy</button>'
-      +     '<button type="button" class="cz-btn-ghost" data-role="close" title="Close (Esc)">×</button>'
+      +     '<button type="button" class="cz-btn-ghost" data-role="close" title="Close (Esc)">&times;</button>'
       +   '</div>'
       +   '<pre class="cz-cell-expand-body" data-role="body"></pre>'
       + '</div>';
@@ -9349,7 +9790,7 @@ window.czNotebook = (function () {{
     var p = prettifyCellValue(raw);
     m.querySelector('[data-role="body"]').textContent = p.text;
     m.querySelector('[data-role="meta"]').textContent =
-      (p.pretty ? "JSON · " : "") + p.text.length + " chars";
+      (p.pretty ? "JSON &middot; " : "") + p.text.length + " chars";
     m.style.display = "flex";
   }}
   // Document-wide delegated click handler for any expandable cell.
@@ -9375,7 +9816,7 @@ window.czNotebook = (function () {{
       // /studio/api/sql/explain endpoint the editor uses, with the
       // current cell's SQL as the payload.
       var rowCount = out.rows.length;
-      var metaCount = thousands(rowCount) + " · " + fmtDuration(out.duration_ms);
+      var metaCount = thousands(rowCount) + " &middot; " + fmtDuration(out.duration_ms);
       var header = out.columns.map(function (c) {{ return '<th>' + escapeHtml(c.name) + '</th>'; }}).join("");
       var body = out.rows.map(function (row) {{
         return '<tr>' + row.map(function (cell) {{ return '<td>' + escapeHtml(String(cell)) + '</td>'; }}).join("") + '</tr>';
@@ -9415,11 +9856,11 @@ window.czNotebook = (function () {{
       var engineLabel = (out.engine_label || "Python");
       var bits = [];
       bits.push('<div class="cz-studio-results-header"><span class="cz-studio-engine-pill">Python</span>' +
-        (isErr ? '' : '<span class="cz-studio-results-eyebrow">stdout · ' + fmtDuration(out.duration_ms) + '</span>') +
+        (isErr ? '' : '<span class="cz-studio-results-eyebrow">stdout &middot; ' + fmtDuration(out.duration_ms) + '</span>') +
         '<span class="cz-studio-actions-spacer"></span></div>');
       if (out.dataframe) {{
         var df = out.dataframe;
-        var meta = thousands(df.rows.length) + " of " + thousands(df.total_rows) + " rows · " + (df.origin || "");
+        var meta = thousands(df.rows.length) + " of " + thousands(df.total_rows) + " rows &middot; " + (df.origin || "");
         bits.push('<div class="cz-studio-results-header" style="margin-top:0.6rem;"><span class="cz-studio-results-eyebrow">DataFrame</span><span class="cz-studio-results-count">' + meta + '</span><span class="cz-studio-actions-spacer"></span><a href="#" class="cz-studio-results-action" data-cell-action="download-csv" title="Download as CSV"><i class="fa-solid fa-download"></i></a><a href="#" class="cz-studio-results-action" data-cell-action="copy-tsv" title="Copy as TSV"><i class="fa-solid fa-copy"></i></a></div>');
         bits.push(renderTableOutput(df.columns, df.rows, df.total_rows, df.origin || "DataFrame", "cell-dataframe.csv"));
       }}
@@ -9481,9 +9922,9 @@ window.czNotebook = (function () {{
   }}
 
   function kindLabel(k) {{
-    if (k === "sql") return "SQL → Trino";
-    if (k === "sail") return "Python → Sail";
-    return "Python → PyIceberg";
+    if (k === "sql") return "SQL -> Trino";
+    if (k === "sail") return "Python -> Sail";
+    return "Python -> PyIceberg";
   }}
 
   function runCell(cellId) {{
@@ -9493,7 +9934,7 @@ window.czNotebook = (function () {{
     var cellEl = document.querySelector('[data-cell-id="' + cellId + '"]');
     if (!cellEl) return;
     var outEl = cellEl.querySelector(".cz-cell-output");
-    if (outEl) outEl.innerHTML = '<div class="cz-cell-output-empty cz-muted">Running…</div>';
+    if (outEl) outEl.innerHTML = '<div class="cz-cell-output-empty cz-muted">Running...</div>';
     var content = currentContentFor(cellEl);
     c.content = content; // capture before submit; autosave on next tick
     scheduleSave();
@@ -9538,6 +9979,43 @@ window.czNotebook = (function () {{
     return ta ? ta.value : "";
   }}
 
+  function formatCell(cellId) {{
+    var entry = findCellById(cellId);
+    if (!entry) return;
+    var c = entry.cell;
+    var cellEl = document.querySelector('[data-cell-id="' + cellId + '"]');
+    if (!cellEl) return;
+    var ta = cellEl.querySelector("textarea");
+    if (!ta) return;
+    var kind = c.kind === "sql" ? "sql" : "python";
+    var b = new URLSearchParams();
+    b.append("kind", kind);
+    b.append("content", ta.value);
+    var csrf = csrfToken();
+    if (csrf) b.append("csrf_token", csrf);
+    fetch("/studio/api/format", {{
+      method: "POST",
+      credentials: "same-origin",
+      headers: {{ "Content-Type": "application/x-www-form-urlencoded" }},
+      body: b.toString(),
+    }})
+      .then(function (r) {{ return r.json(); }})
+      .then(function (resp) {{
+        if (resp && resp.ok) {{
+          ta.value = resp.formatted;
+          c.content = resp.formatted;
+          if (savePending !== null) clearTimeout(savePending);
+          persistNow({{ force: true }});
+        }} else {{
+          console.error("[cz-format] failed:", resp && resp.error);
+          alert("Format failed: " + ((resp && resp.error) || "(unknown)"));
+        }}
+      }})
+      .catch(function (e) {{
+        console.error("[cz-format] network error:", e);
+      }});
+  }}
+
   function wireCell(cellEl) {{
     var id = cellEl.getAttribute("data-cell-id");
     // Run button
@@ -9562,6 +10040,13 @@ window.czNotebook = (function () {{
     }});
     cellEl.querySelectorAll('[data-cell-action="move-down"]').forEach(function (b) {{
       b.addEventListener("click", function () {{ moveCell(id, 1); }});
+    }});
+    // Format button: POST cell content to /studio/api/format and
+    // swap the result back into the textarea. Kind comes from the
+    // cell's current language (sql -> SQL formatter; pyiceberg /
+    // sail -> Python via black).
+    cellEl.querySelectorAll('[data-cell-action="format"]').forEach(function (b) {{
+      b.addEventListener("click", function () {{ formatCell(id); }});
     }});
     // Kind dropdown
     var sel = cellEl.querySelector(".cz-cell-kind-select");
@@ -9595,6 +10080,10 @@ window.czNotebook = (function () {{
       ta.addEventListener("blur", function () {{ syncFromTextarea(true); }});
       ta.addEventListener("keydown", function (e) {{
         if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {{ e.preventDefault(); runCell(id); }}
+        if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === "F" || e.key === "f")) {{
+          e.preventDefault();
+          formatCell(id);
+        }}
       }});
     }}
     // Result-pane tab switching (Results / Schema / Plan) + Plan
@@ -9620,7 +10109,7 @@ window.czNotebook = (function () {{
         if (pane && pane.getAttribute("data-loaded") !== "true") {{
           pane.setAttribute("data-loaded", "true");
           var sql = tab.getAttribute("data-original-sql") || "";
-          pane.innerHTML = '<div class="cz-studio-plan-placeholder cz-muted">Fetching EXPLAIN …</div>';
+          pane.innerHTML = '<div class="cz-studio-plan-placeholder cz-muted">Fetching EXPLAIN ...</div>';
           var pb = new URLSearchParams();
           pb.append("sql", sql);
           var csrf2 = csrfToken();
@@ -9703,12 +10192,13 @@ window.czNotebook = (function () {{
         <label class="cz-studio-cell-kind">\
           <span class="cz-cell-kind-current">' + escapeHtml(kindLabel(c.kind)) + '</span>\
           <select class="cz-cell-kind-select">\
-            <option value="sql"' + (c.kind === "sql" ? " selected" : "") + '>SQL → Trino</option>\
-            <option value="pyiceberg"' + (c.kind === "pyiceberg" ? " selected" : "") + '>Python → PyIceberg</option>\
-            <option value="sail"' + (c.kind === "sail" ? " selected" : "") + '>Python → Sail (experimental)</option>\
+            <option value="sql"' + (c.kind === "sql" ? " selected" : "") + '>SQL -> Trino</option>\
+            <option value="pyiceberg"' + (c.kind === "pyiceberg" ? " selected" : "") + '>Python -> PyIceberg</option>\
+            <option value="sail"' + (c.kind === "sail" ? " selected" : "") + '>Python -> Sail (experimental)</option>\
           </select>\
         </label>\
         <span class="cz-studio-actions-spacer"></span>\
+        <button type="button" data-cell-action="format" title="Format (Ctrl+Shift+F)"><i class="fa-solid fa-wand-magic-sparkles"></i></button>\
         <button type="button" data-cell-action="move-up" title="Move up"><i class="fa-solid fa-arrow-up"></i></button>\
         <button type="button" data-cell-action="move-down" title="Move down"><i class="fa-solid fa-arrow-down"></i></button>\
         <button type="button" data-cell-action="delete" title="Delete cell"><i class="fa-solid fa-trash"></i></button>\
@@ -9735,6 +10225,55 @@ window.czNotebook = (function () {{
 
   document.getElementById("cz-notebook-add-sql").addEventListener("click", function () {{ addCell("sql"); }});
   document.getElementById("cz-notebook-add-py").addEventListener("click", function () {{ addCell("pyiceberg"); }});
+
+  // Cell snippet library: a small menu of pre-baked code blocks.
+  // Clicking a snippet drops a new cell with the template body
+  // pre-filled so operators don't retype the same scaffolds.
+  var SNIPPETS = [
+    {{ label: "SQL: SHOW catalogs / schemas / tables", kind: "sql", body:
+      "-- Discover what's reachable.\nSHOW CATALOGS;\n-- SHOW SCHEMAS FROM default;\n-- SHOW TABLES FROM default.analytics;"
+    }},
+    {{ label: "SQL: time-travel via snapshot", kind: "sql", body:
+      "SELECT committed_at, snapshot_id, operation\nFROM default.analytics.\"events$snapshots\"\nORDER BY committed_at DESC;\n-- then:\n-- SELECT * FROM default.analytics.events FOR VERSION AS OF <snapshot_id>;"
+    }},
+    {{ label: "SQL: optimize + expire snapshots", kind: "sql", body:
+      "ALTER TABLE default.analytics.events EXECUTE optimize;\nALTER TABLE default.analytics.events EXECUTE expire_snapshots(retention_threshold => '7d');"
+    }},
+    {{ label: "Python: discover what cat sees", kind: "pyiceberg", body:
+      "print('catalogs :', list(catalogs.keys()))\nprint('warehouse:', cat.properties.get('warehouse', '(unknown)'))\nfor ns in cat.list_namespaces():\n    print(' ', '.'.join(ns), '->', cat.list_tables(ns))\nprint_storage()"
+    }},
+    {{ label: "Python: read a table into pandas", kind: "pyiceberg", body:
+      "tbl = cat.load_table((\"analytics\", \"events\"))\ndf = tbl.scan(limit=1000).to_pandas()\ndf"
+    }},
+    {{ label: "Python: create namespace + table + 3 rows", kind: "pyiceberg", body:
+      "import pyarrow as pa, datetime as dt\nfrom pyiceberg.exceptions import NamespaceAlreadyExistsError, TableAlreadyExistsError\nfrom pyiceberg.schema import Schema\nfrom pyiceberg.types import NestedField, LongType, StringType, TimestampType\n\ntry: cat.create_namespace('playground')\nexcept NamespaceAlreadyExistsError: pass\n\nschema = Schema(\n    NestedField(1, 'user_id', LongType(), required=False),\n    NestedField(2, 'event_type', StringType(), required=False),\n    NestedField(3, 'ts', TimestampType(), required=False),\n)\nident = ('playground', 'demo')\ntry: tbl = cat.create_table(identifier=ident, schema=schema)\nexcept TableAlreadyExistsError: tbl = cat.load_table(ident)\n\nbatch = pa.Table.from_pylist([\n    {{'user_id': 1, 'event_type': 'signup',   'ts': dt.datetime(2026, 5, 16,  9, 0)}},\n    {{'user_id': 2, 'event_type': 'login',    'ts': dt.datetime(2026, 5, 16, 10, 0)}},\n    {{'user_id': 3, 'event_type': 'purchase', 'ts': dt.datetime(2026, 5, 16, 11, 0)}},\n])\ntbl.append(batch)\ntbl.scan().to_pandas()"
+    }},
+  ];
+  var snippetWrap = document.createElement("details");
+  snippetWrap.className = "cz-cell-snippets cz-row-menu";
+  snippetWrap.innerHTML = '<summary class="cz-btn-ghost" title="Insert from snippet"><i class="fa-solid fa-bolt"></i> Snippets</summary>'
+    + '<div class="cz-row-menu-popup" style="left:auto;right:0;min-width:18rem;">'
+    + SNIPPETS.map(function (s, i) {{
+        return '<a href="#" class="cz-row-menu-item" data-snippet-idx="' + i + '">'
+          + '<i class="fa-solid fa-' + (s.kind === "sql" ? "database" : "code") + ' fa-fw"></i> '
+          + s.label.replace(/</g, "&lt;") + '</a>';
+      }}).join("")
+    + '</div>';
+  var actionsBar = document.querySelector(".cz-studio-cells-actions");
+  if (actionsBar) actionsBar.appendChild(snippetWrap);
+  snippetWrap.addEventListener("click", function (e) {{
+    var item = e.target.closest("[data-snippet-idx]");
+    if (!item) return;
+    e.preventDefault();
+    var s = SNIPPETS[parseInt(item.getAttribute("data-snippet-idx"), 10)];
+    if (!s) return;
+    var newCell = {{ id: uuid(), kind: s.kind, content: s.body }};
+    nb.cells.push(newCell);
+    rebuildCellsDom();
+    if (savePending !== null) clearTimeout(savePending);
+    persistNow({{ force: true }});
+    snippetWrap.removeAttribute("open");
+  }});
 
   // Synchronous flush via navigator.sendBeacon. Used by anything that
   // is about to navigate the page away (e.g. the catalog Refresh
@@ -9794,14 +10333,76 @@ window.czNotebook = (function () {{
     let _ = csrf;
     let _ = open_csv;
 
+    let splitter_js = render_studio_splitter_js();
     let body = format!(
         r##"<div class="cz-studio-shell" id="cz-studio-shell">
 <aside class="cz-studio-sidebar">{sidebar_html}</aside>
+<div class="cz-studio-splitter" data-splitter="sidebar" aria-hidden="true" role="separator" aria-orientation="vertical"></div>
 <aside class="cz-studio-files">{files_pane_html}</aside>
+<div class="cz-studio-splitter" data-splitter="files" aria-hidden="true" role="separator" aria-orientation="vertical"></div>
 <main class="cz-studio-main">{main_html}</main>
-</div>"##,
+</div>
+{splitter_js}"##,
     );
     render_shell(localizer, title, NavLink::Studio, &body)
+}
+
+/// Inline script: resizable splitters between the three studio
+/// panels. Drag a 4-px strip to resize a column; the chosen widths
+/// persist to localStorage and restore on next page load. Wires
+/// against any page that emits `#cz-studio-shell` + at least one
+/// `.cz-studio-splitter` handle (editor + notebook + future drill-
+/// downs share this).
+fn render_studio_splitter_js() -> &'static str {
+    r#"<script>
+(function () {
+  var shell = document.getElementById("cz-studio-shell");
+  if (!shell) return;
+  if (!shell.querySelector(".cz-studio-files")) return;
+  try {
+    var sw = parseInt(localStorage.getItem("cz-sidebar-w") || "", 10);
+    var fw = parseInt(localStorage.getItem("cz-files-w") || "", 10);
+    if (sw >= 120 && sw <= 600) shell.style.setProperty("--cz-sidebar-w", sw + "px");
+    if (fw >= 120 && fw <= 600) shell.style.setProperty("--cz-files-w", fw + "px");
+  } catch (_) {}
+  shell.classList.add("cz-studio-shell-resizable");
+  shell.querySelectorAll(".cz-studio-splitter").forEach(function (handle) {
+    var which   = handle.getAttribute("data-splitter");
+    var cssVar  = which === "sidebar" ? "--cz-sidebar-w" : "--cz-files-w";
+    var storeKey = which === "sidebar" ? "cz-sidebar-w" : "cz-files-w";
+    handle.addEventListener("mousedown", function (e) {
+      e.preventDefault();
+      handle.classList.add("cz-studio-splitter-active");
+      var startX = e.clientX;
+      var startW = parseInt(
+        getComputedStyle(shell).getPropertyValue(cssVar), 10
+      ) || 220;
+      function onMove(ev) {
+        var delta = ev.clientX - startX;
+        var next = Math.min(600, Math.max(120, startW + delta));
+        shell.style.setProperty(cssVar, next + "px");
+      }
+      function onUp() {
+        document.removeEventListener("mousemove", onMove);
+        document.removeEventListener("mouseup", onUp);
+        handle.classList.remove("cz-studio-splitter-active");
+        try {
+          var finalW = parseInt(
+            getComputedStyle(shell).getPropertyValue(cssVar), 10
+          );
+          if (finalW) localStorage.setItem(storeKey, String(finalW));
+        } catch (_) {}
+      }
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+    });
+    handle.addEventListener("dblclick", function () {
+      shell.style.setProperty(cssVar, "220px");
+      try { localStorage.removeItem(storeKey); } catch (_) {}
+    });
+  });
+})();
+</script>"#
 }
 
 /// Server-side cell skeleton -- the JS rebuilds this on add /
@@ -9818,9 +10419,9 @@ fn render_notebook_cell_skeleton(idx: usize, c: &NotebookCell) -> String {
         .iter()
         .map(|k| {
             let label = match *k {
-                "sql" => "SQL → Trino",
-                "pyiceberg" => "Python → PyIceberg",
-                _ => "Python → Sail (experimental)",
+                "sql" => "SQL -> Trino",
+                "pyiceberg" => "Python -> PyIceberg",
+                _ => "Python -> Sail (experimental)",
             };
             let sel = if *k == kind_attr { " selected" } else { "" };
             format!("<option value=\"{k}\"{sel}>{}</option>", html_escape(label))
@@ -9835,6 +10436,7 @@ fn render_notebook_cell_skeleton(idx: usize, c: &NotebookCell) -> String {
 <select class="cz-cell-kind-select">{kind_options}</select>
 </label>
 <span class="cz-studio-actions-spacer"></span>
+<button type="button" data-cell-action="format" title="Format (Ctrl+Shift+F)"><i class="fa-solid fa-wand-magic-sparkles"></i></button>
 <button type="button" data-cell-action="move-up" title="Move up"><i class="fa-solid fa-arrow-up"></i></button>
 <button type="button" data-cell-action="move-down" title="Move down"><i class="fa-solid fa-arrow-down"></i></button>
 <button type="button" data-cell-action="delete" title="Delete cell"><i class="fa-solid fa-trash"></i></button>
@@ -9853,9 +10455,10 @@ fn render_notebook_cell_skeleton(idx: usize, c: &NotebookCell) -> String {
         output_html = if c.output.is_some() {
             // Render-time placeholder; the JS hydrates immediately
             // with the proper interactive table.
-            r#"<div class="cz-cell-output-empty cz-muted">Loading output…</div>"#.to_string()
+            r#"<div class="cz-cell-output-empty cz-muted">Loading output...</div>"#.to_string()
         } else {
-            r#"<div class="cz-cell-output-empty cz-muted">No output yet. Hit Run.</div>"#.to_string()
+            r#"<div class="cz-cell-output-empty cz-muted">No output yet. Hit Run.</div>"#
+                .to_string()
         },
     )
 }
@@ -9877,7 +10480,11 @@ fn render_studio_tabs_strip(files: &StudioFilesView) -> String {
     );
     for f in &files.open {
         let is_active = files.active_id.as_deref() == Some(f.id.as_str());
-        let active = if is_active { " cz-studio-tab-active" } else { "" };
+        let active = if is_active {
+            " cz-studio-tab-active"
+        } else {
+            ""
+        };
         let basename = f.path.rsplit('/').next().unwrap_or(&f.path);
         let next_open: String = files
             .open
@@ -9887,7 +10494,7 @@ fn render_studio_tabs_strip(files: &StudioFilesView) -> String {
             .collect::<Vec<_>>()
             .join(",");
         html.push_str(&format!(
-            r##"<div class="cz-studio-tab-wrap{active}" draggable="true" data-tab-id="{id_raw}"><a class="cz-studio-tab" href="/studio?open={open}&active={id}"><span class="cz-studio-tab-label" title="{path}">{label}</span></a><a class="cz-studio-tab-close" href="/studio?open={next_open}" title="Close tab (doesn't delete file)">×</a></div>"##,
+            r##"<div class="cz-studio-tab-wrap{active}" draggable="true" data-tab-id="{id_raw}"><a class="cz-studio-tab" href="/studio?open={open}&active={id}"><span class="cz-studio-tab-label" title="{path}">{label}</span></a><a class="cz-studio-tab-close" href="/studio?open={next_open}" title="Close tab (doesn't delete file)">&times;</a></div>"##,
             open = url_encode(&open_csv),
             next_open = url_encode(&next_open),
             id = url_encode(&f.id),
@@ -9998,9 +10605,7 @@ async fn studio_bootstrap_form_handler(
 /// The handler runs synchronously rather than spawning a job because
 /// the reset is fast (~5s including a 30s readiness ceiling) and the
 /// operator is sitting on the form waiting for the next step.
-async fn studio_bootstrap_reset_handler(
-    State(state): State<AppState>,
-) -> axum::response::Redirect {
+async fn studio_bootstrap_reset_handler(State(state): State<AppState>) -> axum::response::Redirect {
     #[cfg(target_os = "linux")]
     {
         let result = computeza_driver_native::linux::lakekeeper::reset_state().await;
@@ -10019,16 +10624,13 @@ async fn studio_bootstrap_reset_handler(
         }
         let mut detail = String::from("Lakekeeper reset complete:\n");
         for step in &result.steps {
-            detail.push_str(&format!("  ✓ {step}\n"));
+            detail.push_str(&format!("  ok {step}\n"));
         }
         for warn in &result.warnings {
             detail.push_str(&format!("  ! {warn}\n"));
         }
         detail.push_str("\nVault warehouse cache cleared.\n\nNext: re-run /studio/bootstrap below to provision a fresh warehouse.");
-        axum::response::Redirect::to(&format!(
-            "/studio/bootstrap?flash={}",
-            url_encode(&detail)
-        ))
+        axum::response::Redirect::to(&format!("/studio/bootstrap?flash={}", url_encode(&detail)))
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -10081,9 +10683,7 @@ async fn studio_bootstrap_submit_handler(
                 .put("lakekeeper/default-warehouse-name", &form.warehouse_name)
                 .await;
             if let Some(id) = &ok.warehouse_id {
-                let _ = secrets
-                    .put("lakekeeper/default-warehouse-id", id)
-                    .await;
+                let _ = secrets.put("lakekeeper/default-warehouse-id", id).await;
             }
         }
     }
@@ -10190,9 +10790,7 @@ async fn read_garage_credentials_for_prefill(
 
 /// Same shape as the lakekeeper / databend discovery helpers, for
 /// Garage. The bootstrap form pre-fills the S3 endpoint from this.
-async fn discover_garage_endpoint(
-    store: Option<&computeza_state::SqliteStore>,
-) -> Option<String> {
+async fn discover_garage_endpoint(store: Option<&computeza_state::SqliteStore>) -> Option<String> {
     use computeza_state::Store;
     let store = store?;
     let rows = store.list("garage-instance", None).await.ok()?;
@@ -10380,7 +10978,7 @@ enum TrinoWiringOutcome {
     Failed { reason: String },
 }
 
-/// Auto-wire Trino → Lakekeeper-Iceberg in two steps:
+/// Auto-wire Trino -> Lakekeeper-Iceberg in two steps:
 ///   1. Write `etc/catalog/<name>.properties` via the Trino driver
 ///      helper. This is the file Trino's static catalog loader picks
 ///      up on startup -- so the catalog survives a coordinator
@@ -10455,13 +11053,12 @@ async fn wire_trino_iceberg_catalog(
                 s3_access_key: form.s3_access_key.clone(),
                 s3_secret_key: form.s3_secret_access_key.clone(),
             };
-            if let Err(e) =
-                computeza_driver_native::linux::trino::write_iceberg_rest_catalog_file(
-                    std::path::Path::new("/var/lib/computeza/trino"),
-                    &catalog_name,
-                    &cfg,
-                )
-                .await
+            if let Err(e) = computeza_driver_native::linux::trino::write_iceberg_rest_catalog_file(
+                std::path::Path::new("/var/lib/computeza/trino"),
+                &catalog_name,
+                &cfg,
+            )
+            .await
             {
                 tracing::warn!(
                     catalog = %catalog_name,
@@ -10530,13 +11127,9 @@ async fn wire_trino_iceberg_catalog(
                         try_discover_via_config(&form.warehouse_name, lakekeeper_url, Some(s)).await
                     };
                     if let Some(uuid) = to_cache {
-                        let _ = s
-                            .put("lakekeeper/default-warehouse-id", &uuid)
-                            .await;
-                        let by_name_key = format!(
-                            "lakekeeper/warehouse-id-by-name/{}",
-                            form.warehouse_name,
-                        );
+                        let _ = s.put("lakekeeper/default-warehouse-id", &uuid).await;
+                        let by_name_key =
+                            format!("lakekeeper/warehouse-id-by-name/{}", form.warehouse_name,);
                         let _ = s.put(&by_name_key, &uuid).await;
                     }
                 }
@@ -10842,11 +11435,17 @@ async fn run_lakekeeper_bootstrap(
              \n\
              The /studio catalog pane will now show this warehouse with a clickable drill-down.",
             form.project_name,
-            if project_existed { "already existed; reused" } else { "created" },
+            if project_existed {
+                "already existed; reused"
+            } else {
+                "created"
+            },
             form.warehouse_name,
             form.s3_bucket,
             form.s3_endpoint,
-            warehouse_id.as_deref().unwrap_or("(could not capture; iceberg-REST drill-down may not work)"),
+            warehouse_id
+                .as_deref()
+                .unwrap_or("(could not capture; iceberg-REST drill-down may not work)"),
         ),
         warehouse_id,
     })
@@ -10929,7 +11528,7 @@ fn render_studio_bootstrap_form(
 
 <div class="cz-setup-section">
 <p class="cz-setup-section-title">Object storage</p>
-<p class="cz-setup-section-hint">Where Lakekeeper writes Iceberg metadata + data files. By default this is the <strong>local Garage instance</strong> Computeza installs on this same host — the S3 protocol is just how Lakekeeper + Garage talk. Point at a remote S3 endpoint only if you've turned off the bundled Garage.</p>
+<p class="cz-setup-section-hint">Where Lakekeeper writes Iceberg metadata + data files. By default this is the <strong>local Garage instance</strong> Computeza installs on this same host -- the S3 protocol is just how Lakekeeper + Garage talk. Point at a remote S3 endpoint only if you've turned off the bundled Garage.</p>
 <div class="cz-setup-field">
 <label for="bs-s3-endpoint">Storage endpoint</label>
 <input id="bs-s3-endpoint" name="s3_endpoint" class="cz-input" type="text" value="{s3_endpoint}" required />
@@ -10949,7 +11548,7 @@ fn render_studio_bootstrap_form(
 
 <div class="cz-setup-section">
 <p class="cz-setup-section-title">Storage credentials</p>
-<p class="cz-setup-section-hint">Local Garage signs every metadata write with these. Auto-minted from the Garage install — paste them only if pointing at a remote S3 endpoint.</p>
+<p class="cz-setup-section-hint">Local Garage signs every metadata write with these. Auto-minted from the Garage install -- paste them only if pointing at a remote S3 endpoint.</p>
 <div class="cz-setup-field">
 <label for="bs-s3-ak">Access key ID</label>
 <input id="bs-s3-ak" name="s3_access_key" class="cz-input" type="text" required placeholder="GK..." value="{prefill_key_id}" />
@@ -11324,7 +11923,8 @@ async fn auto_bootstrap_lakekeeper(
         .map_err(|e| format!("vault read garage/lakekeeper-key-id: {e}"))?
         .ok_or_else(|| {
             "vault has no `garage/lakekeeper-key-id` -- Garage hasn't been installed yet, or its \
-             post-install bootstrap failed. Install Garage from /install first.".to_string()
+             post-install bootstrap failed. Install Garage from /install first."
+                .to_string()
         })?
         .expose_secret()
         .to_string();
@@ -11385,7 +11985,7 @@ async fn auto_bootstrap_lakekeeper(
     Ok(artifacts)
 }
 
-/// POST /install/{slug}/retry-bootstrap — re-run the post-install
+/// POST /install/{slug}/retry-bootstrap -- re-run the post-install
 /// bootstrap step for a single component without doing a full
 /// re-install. Use case: install completed cleanly (daemon up,
 /// systemd unit registered, install-config persisted) but the
@@ -11592,7 +12192,7 @@ async fn finalize_managed_install_after_success(
         });
     }
 
-    // Post-install bootstrap (v0.1 design doc §3.2). For components
+    // Post-install bootstrap (v0.1 design doc section3.2). For components
     // that need post-daemon-start setup beyond the systemd unit,
     // their driver module exposes `post_install_bootstrap` returning
     // a Vec<BootstrapArtifact>. Each artifact is persisted into the
@@ -11633,9 +12233,9 @@ async fn finalize_managed_install_after_success(
                 // hook emits connection metadata (HTTP URL, JDBC URL,
                 // default user) so the credentials.json export has
                 // everything an external SQL client needs.
-                let port = config.port.unwrap_or(
-                    computeza_driver_native::linux::trino::DEFAULT_PORT,
-                );
+                let port = config
+                    .port
+                    .unwrap_or(computeza_driver_native::linux::trino::DEFAULT_PORT);
                 Some(
                     computeza_driver_native::linux::trino::post_install_bootstrap(port)
                         .await
@@ -13858,8 +14458,7 @@ async fn uninstall_trino_confirm_handler() -> Html<String> {
 async fn uninstall_trino_handler(State(state): State<AppState>) -> Response {
     let l = Localizer::english();
     let result =
-        teardown_managed_uninstall("trino", state.store.as_deref(), state.secrets.as_deref())
-            .await;
+        teardown_managed_uninstall("trino", state.store.as_deref(), state.secrets.as_deref()).await;
     let body = match result {
         Ok(summary) => render_uninstall_result(&l, true, &summary),
         Err(detail) => render_uninstall_result(&l, false, &detail),
@@ -13875,8 +14474,7 @@ async fn uninstall_sail_confirm_handler() -> Html<String> {
 async fn uninstall_sail_handler(State(state): State<AppState>) -> Response {
     let l = Localizer::english();
     let result =
-        teardown_managed_uninstall("sail", state.store.as_deref(), state.secrets.as_deref())
-            .await;
+        teardown_managed_uninstall("sail", state.store.as_deref(), state.secrets.as_deref()).await;
     let body = match result {
         Ok(summary) => render_uninstall_result(&l, true, &summary),
         Err(detail) => render_uninstall_result(&l, false, &detail),
@@ -13888,7 +14486,7 @@ async fn uninstall_sail_handler(State(state): State<AppState>) -> Response {
 /// render_uninstall_<x>_confirm helpers are bespoke for components
 /// with custom warnings (Postgres tells the operator about data
 /// loss, Kanidm tells them about identity rotation, etc.). Trino
-/// + Sail don't need those special warnings, so they share this
+/// and Sail don't need those special warnings, so they share this
 /// minimal renderer.
 fn render_uninstall_generic_confirm(l: &Localizer, slug: &str, label: &str) -> String {
     let body = format!(
@@ -14228,7 +14826,10 @@ async fn install_job_handler(
             // rollback of a rollback, which v0.0.x doesn't support).
             if let Some(err) = &p.error {
                 if p.is_rollback {
-                    (StatusCode::OK, Html(render_uninstall_result(&l, false, err)))
+                    (
+                        StatusCode::OK,
+                        Html(render_uninstall_result(&l, false, err)),
+                    )
                 } else {
                     (
                         StatusCode::OK,
@@ -14245,7 +14846,10 @@ async fn install_job_handler(
             } else {
                 let summary = p.success_summary.clone().unwrap_or_default();
                 if p.is_rollback {
-                    (StatusCode::OK, Html(render_uninstall_result(&l, true, &summary)))
+                    (
+                        StatusCode::OK,
+                        Html(render_uninstall_result(&l, true, &summary)),
+                    )
                 } else {
                     (
                         StatusCode::OK,
@@ -16663,7 +17267,7 @@ pub fn render_landing_page(localizer: &Localizer) -> String {
                 .chars()
                 .next()
                 .map(|c| c.to_ascii_uppercase().to_string())
-                .unwrap_or_else(|| "·".into());
+                .unwrap_or_else(|| "&middot;".into());
             format!(
                 r#"<a class="cz-feature cz-stack-card" href="/components#{slug}">
 <span class="cz-feature-icon">{glyph}</span>
@@ -20306,11 +20910,11 @@ pub fn render_account(localizer: &Localizer, session: &auth::Session) -> String 
 <legend style="font-size: 0.75rem; color: var(--muted); padding: 0 0.4rem;">Timestamp display</legend>
 <label style="display: flex; align-items: center; gap: 0.6rem; padding: 0.35rem 0; cursor: pointer;">
 <input type="radio" name="cz-tz-mode" value="utc" checked />
-<span><strong>UTC</strong> — default; matches audit log entries exactly.</span>
+<span><strong>UTC</strong> -- default; matches audit log entries exactly.</span>
 </label>
 <label style="display: flex; align-items: center; gap: 0.6rem; padding: 0.35rem 0; cursor: pointer;">
 <input type="radio" name="cz-tz-mode" value="local" />
-<span><strong>Local time</strong> — convert UTC to this browser's timezone (<code id="cz-tz-detected">detecting…</code>).</span>
+<span><strong>Local time</strong> -- convert UTC to this browser's timezone (<code id="cz-tz-detected">detecting...</code>).</span>
 </label>
 </fieldset>
 <p class="cz-muted" style="margin: 0.85rem 0 0; font-size: 0.78rem;">Status: <strong id="cz-tz-status">UTC</strong></p>
@@ -21518,9 +22122,8 @@ pub fn render_install_result(localizer: &Localizer, success: bool, detail: &str)
 /// "Uninstall" so the operator isn't confused by the install-flavored
 /// chrome on what's really a teardown.
 pub fn render_uninstall_result(localizer: &Localizer, success: bool, detail: &str) -> String {
-    let mut body = render_install_result_with_credentials(
-        localizer, success, detail, &[], None, None,
-    );
+    let mut body =
+        render_install_result_with_credentials(localizer, success, detail, &[], None, None);
     // Swap install-flavored strings for uninstall ones. Cheap
     // string-replace -- the localizer keys we'd otherwise add
     // (ui-uninstall-result-title etc.) would proliferate every time
@@ -21529,7 +22132,10 @@ pub fn render_uninstall_result(localizer: &Localizer, success: bool, detail: &st
     // the two pages in sync by construction.
     body = body
         .replace(">Install result<", ">Uninstall results<")
-        .replace(">Install completed.<", ">Uninstall and removal of components completed.<")
+        .replace(
+            ">Install completed.<",
+            ">Uninstall and removal of components completed.<",
+        )
         .replace(">Install failed.<", ">Uninstall completed with errors.<");
     body
 }
@@ -22311,9 +22917,15 @@ mod tests {
 
     #[test]
     fn sql_splitter_strips_trailing_semicolon() {
-        assert_eq!(split_sql_statements("SHOW CATALOGS;"), vec!["SHOW CATALOGS"]);
+        assert_eq!(
+            split_sql_statements("SHOW CATALOGS;"),
+            vec!["SHOW CATALOGS"]
+        );
         assert_eq!(split_sql_statements("SHOW CATALOGS"), vec!["SHOW CATALOGS"]);
-        assert_eq!(split_sql_statements("SHOW CATALOGS;  \n"), vec!["SHOW CATALOGS"]);
+        assert_eq!(
+            split_sql_statements("SHOW CATALOGS;  \n"),
+            vec!["SHOW CATALOGS"]
+        );
     }
 
     #[test]

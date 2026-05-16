@@ -246,7 +246,7 @@ pub async fn install(
 }
 
 // ============================================================
-// Post-install bootstrap (per v0.1 design doc §3.2 + §3.3)
+// Post-install bootstrap (per v0.1 design doc section3.2 + section3.3)
 // ============================================================
 
 /// Name of the Garage access key we mint exclusively for
@@ -782,7 +782,7 @@ async fn wait_for_port(
 // test failure rather than a runtime "no node ID found" error
 // (which would only fire on a fresh install at a customer site).
 //
-// Item 10 of v0.1 §8.1 -- the integration-style "v0.0.x -> v0.1
+// Item 10 of v0.1 section8.1 -- the integration-style "v0.0.x -> v0.1
 // idempotent re-bootstrap" smoke test requires a live Garage +
 // Lakekeeper and is a CI concern (lands once we have a linux
 // runner). Unit-level coverage here is the first half.

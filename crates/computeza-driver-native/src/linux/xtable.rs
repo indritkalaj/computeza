@@ -195,8 +195,7 @@ pub async fn install(
         //    forward-compatible: compile-target 11 + runtime 21 OK).
         progress.set_phase(InstallPhase::DetectingBinaries);
         progress.set_message("Verifying Maven + JDK 11 are present for the xtable source build");
-        let need_install =
-            require_on_path("mvn").await.is_err() || locate_jdk11().await.is_err();
+        let need_install = require_on_path("mvn").await.is_err() || locate_jdk11().await.is_err();
         if need_install {
             progress.set_phase(InstallPhase::Downloading);
             progress.set_message(
@@ -504,9 +503,8 @@ async fn ensure_xtable_source_extracted(
         return Ok(extracted);
     }
 
-    let url = format!(
-        "https://github.com/apache/incubator-xtable/archive/refs/tags/{version}.tar.gz"
-    );
+    let url =
+        format!("https://github.com/apache/incubator-xtable/archive/refs/tags/{version}.tar.gz");
     let tarball = src_root.join(format!("xtable-{version}.tar.gz"));
     let resp = reqwest::get(&url)
         .await

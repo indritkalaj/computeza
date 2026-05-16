@@ -68,10 +68,7 @@ impl SailEndpoint {
             .unwrap_or(&self.base_url);
         let s = s.split('/').next().unwrap_or("");
         match s.rsplit_once(':') {
-            Some((h, p)) if !h.is_empty() => (
-                h.to_string(),
-                p.parse::<u16>().unwrap_or(50051),
-            ),
+            Some((h, p)) if !h.is_empty() => (h.to_string(), p.parse::<u16>().unwrap_or(50051)),
             _ => ("127.0.0.1".to_string(), 50051),
         }
     }

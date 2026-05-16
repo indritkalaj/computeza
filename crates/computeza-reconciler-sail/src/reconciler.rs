@@ -128,11 +128,7 @@ impl<D: Driver + 'static> Reconciler for SailReconciler<D> {
         Ok(status)
     }
 
-    async fn plan(
-        &self,
-        _desired: &SailSpec,
-        _actual: &SailStatus,
-    ) -> Result<(), CoreError> {
+    async fn plan(&self, _desired: &SailSpec, _actual: &SailStatus) -> Result<(), CoreError> {
         Ok(())
     }
 

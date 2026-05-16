@@ -330,7 +330,9 @@ fn extract_tar_gz(archive_path: &Path, dest: &Path) -> Result<(), FetchError> {
     // is 0x1f 0x8b -- anything else means the upstream URL didn't
     // actually serve a tar.gz (CDN redirect dropped, mirror down,
     // hot link block, etc.).
-    let file_size = std::fs::metadata(archive_path).map(|m| m.len()).unwrap_or(0);
+    let file_size = std::fs::metadata(archive_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
     let head: [u8; 8] = {
         let mut buf = [0u8; 8];
         if let Ok(mut f) = std::fs::File::open(archive_path) {
@@ -403,7 +405,10 @@ fn extract_via_system_tar(archive_path: &Path, dest: &Path) -> Result<(), FetchE
             path: archive_path.to_path_buf(),
             message: format!(
                 "system tar exit {}: {}",
-                out.status.code().map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
+                out.status
+                    .code()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "?".into()),
                 stderr.lines().take(5).collect::<Vec<_>>().join(" / ")
             ),
         });

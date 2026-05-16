@@ -182,12 +182,7 @@ pub async fn install(
     let pysail_spec = format!("pysail=={version}");
     let pyspark_spec = format!("pyspark-client=={DEFAULT_PYSPARK_CLIENT_VERSION}");
     let out = Command::new(&venv_pip)
-        .args([
-            "install",
-            "--no-cache-dir",
-            &pysail_spec,
-            &pyspark_spec,
-        ])
+        .args(["install", "--no-cache-dir", &pysail_spec, &pyspark_spec])
         .output()
         .await
         .map_err(|e| ServiceError::Io(std::io::Error::other(format!("pip install: {e}"))))?;
@@ -244,6 +239,29 @@ pub async fn install(
         }
     }
 
+    // Install Python formatters (`black`, `ruff`) so Studio's
+    // "Format" command works against any Python cell. Non-fatal:
+    // the formatter is a convenience; cell execution still works
+    // if the install fails (e.g. offline host).
+    let fmt_out = Command::new(&venv_pip)
+        .args(["install", "--no-cache-dir", "black", "ruff"])
+        .output()
+        .await;
+    match fmt_out {
+        Ok(o) if o.status.success() => {
+            tracing::info!("sail install: black + ruff installed for Studio's Format command");
+        }
+        Ok(o) => {
+            tracing::warn!(
+                stderr = %String::from_utf8_lossy(&o.stderr),
+                "sail install: pip install black ruff returned non-zero; Format command will be unavailable"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "sail install: pip install black ruff failed to spawn");
+        }
+    }
+
     // Sanity-check the binary exists where we expect.
     if !tokio::fs::try_exists(&venv_sail).await.unwrap_or(false) {
         return Err(ServiceError::BinaryMissing {
@@ -287,12 +305,9 @@ pub async fn install(
     // --- Step 5: wait for port -----------------------------------
     progress.set_phase(InstallPhase::WaitingForReady);
     progress.set_message(format!("Waiting for Spark Connect on {}", opts.port));
-    if let Err(e) = super::service::wait_for_port(
-        "127.0.0.1",
-        opts.port,
-        std::time::Duration::from_secs(60),
-    )
-    .await
+    if let Err(e) =
+        super::service::wait_for_port("127.0.0.1", opts.port, std::time::Duration::from_secs(60))
+            .await
     {
         if matches!(e, ServiceError::NotReady { .. }) {
             let tail = systemctl::journal_tail(&opts.unit_name, 80).await;
@@ -384,7 +399,13 @@ async fn ensure_python_runtime() -> std::result::Result<(), String> {
     }
     // apt (Debian/Ubuntu) -- common case for our managed Linux
     // install path. dnf path is the fallback for RHEL/Fedora family.
-    if Command::new("apt-get").arg("--version").output().await.map(|o| o.status.success()).unwrap_or(false) {
+    if Command::new("apt-get")
+        .arg("--version")
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
         // Run apt-get update first so we don't fail on stale indexes.
         // Lockfile-busy is rare for this short window; we don't
         // attempt to wait for /var/lib/dpkg/lock-frontend.
@@ -421,7 +442,13 @@ async fn ensure_python_runtime() -> std::result::Result<(), String> {
         }
         return Ok(());
     }
-    if Command::new("dnf").arg("--version").output().await.map(|o| o.status.success()).unwrap_or(false) {
+    if Command::new("dnf")
+        .arg("--version")
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
         let out = Command::new("dnf")
             .args(["install", "-y", "python3", "python3-pip"])
             .output()
@@ -513,9 +540,9 @@ fn derive_versioned_venv_pkg_from_python(py: &std::path::Path) -> Option<String>
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    let version = combined.split_whitespace().find(|t| {
-        t.chars().next().is_some_and(|c| c.is_ascii_digit()) && t.contains('.')
-    })?;
+    let version = combined
+        .split_whitespace()
+        .find(|t| t.chars().next().is_some_and(|c| c.is_ascii_digit()) && t.contains('.'))?;
     let mut parts = version.split('.');
     let major = parts.next()?;
     let minor = parts.next()?;

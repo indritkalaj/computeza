@@ -256,7 +256,8 @@ pub async fn uninstall(opts: UninstallOptions) -> Result<Uninstalled, ServiceErr
     // Best-effort: if Postgres is already stopped (e.g. uninstalled
     // in the same rollback before Lakekeeper) the DROP fails
     // silently. The service uninstall continues either way.
-    let mut out = service::uninstall_service("lakekeeper", &opts.root_dir, &opts.unit_name, None).await?;
+    let mut out =
+        service::uninstall_service("lakekeeper", &opts.root_dir, &opts.unit_name, None).await?;
     if let Err(e) = drop_lakekeeper_postgres_database().await {
         out.warn(format!("postgres cleanup: {e}"));
     } else {
@@ -391,7 +392,13 @@ async fn drop_lakekeeper_postgres_database() -> std::result::Result<(), String> 
         .output()
         .await;
     let drop = Command::new("sudo")
-        .args(["-u", "postgres", "psql", "-c", "DROP DATABASE IF EXISTS lakekeeper;"])
+        .args([
+            "-u",
+            "postgres",
+            "psql",
+            "-c",
+            "DROP DATABASE IF EXISTS lakekeeper;",
+        ])
         .output()
         .await
         .map_err(|e| format!("spawn psql DROP: {e}"))?;

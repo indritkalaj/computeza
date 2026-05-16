@@ -570,7 +570,10 @@ async fn reconcile_tick(
                 None => None,
             };
             if let Some(token) = token_opt {
-                let rows = store.list("kanidm-instance", None).await.unwrap_or_default();
+                let rows = store
+                    .list("kanidm-instance", None)
+                    .await
+                    .unwrap_or_default();
                 for sr in rows {
                     let spec: KanidmSpec = match serde_json::from_value(sr.spec.clone()) {
                         Ok(s) => s,
@@ -579,12 +582,11 @@ async fn reconcile_tick(
                             continue;
                         }
                     };
-                    let reconciler: KanidmReconciler<NoOpDriver> =
-                        KanidmReconciler::new(
-                            spec.endpoint.clone(),
-                            SecretString::from(token.clone()),
-                        )
-                        .with_state(store.clone(), &sr.key.name);
+                    let reconciler: KanidmReconciler<NoOpDriver> = KanidmReconciler::new(
+                        spec.endpoint.clone(),
+                        SecretString::from(token.clone()),
+                    )
+                    .with_state(store.clone(), &sr.key.name);
                     let _ = reconciler.observe(&ctx).await;
                 }
             }
@@ -597,7 +599,10 @@ async fn reconcile_tick(
         // ---- garage-instance ----
         {
             use computeza_reconciler_garage::{GarageReconciler, GarageSpec};
-            let rows = store.list("garage-instance", None).await.unwrap_or_default();
+            let rows = store
+                .list("garage-instance", None)
+                .await
+                .unwrap_or_default();
             for sr in rows {
                 let spec: GarageSpec = match serde_json::from_value(sr.spec.clone()) {
                     Ok(s) => s,
@@ -616,7 +621,10 @@ async fn reconcile_tick(
         // ---- lakekeeper-instance ----
         {
             use computeza_reconciler_lakekeeper::{LakekeeperReconciler, LakekeeperSpec};
-            let rows = store.list("lakekeeper-instance", None).await.unwrap_or_default();
+            let rows = store
+                .list("lakekeeper-instance", None)
+                .await
+                .unwrap_or_default();
             for sr in rows {
                 let spec: LakekeeperSpec = match serde_json::from_value(sr.spec.clone()) {
                     Ok(s) => s,
@@ -635,7 +643,10 @@ async fn reconcile_tick(
         // ---- databend-instance ----
         {
             use computeza_reconciler_databend::{DatabendReconciler, DatabendSpec};
-            let rows = store.list("databend-instance", None).await.unwrap_or_default();
+            let rows = store
+                .list("databend-instance", None)
+                .await
+                .unwrap_or_default();
             for sr in rows {
                 let spec: DatabendSpec = match serde_json::from_value(sr.spec.clone()) {
                     Ok(s) => s,
@@ -654,7 +665,10 @@ async fn reconcile_tick(
         // ---- qdrant-instance ----
         {
             use computeza_reconciler_qdrant::{QdrantReconciler, QdrantSpec};
-            let rows = store.list("qdrant-instance", None).await.unwrap_or_default();
+            let rows = store
+                .list("qdrant-instance", None)
+                .await
+                .unwrap_or_default();
             for sr in rows {
                 let spec: QdrantSpec = match serde_json::from_value(sr.spec.clone()) {
                     Ok(s) => s,
@@ -673,7 +687,10 @@ async fn reconcile_tick(
         // ---- restate-instance ----
         {
             use computeza_reconciler_restate::{RestateReconciler, RestateSpec};
-            let rows = store.list("restate-instance", None).await.unwrap_or_default();
+            let rows = store
+                .list("restate-instance", None)
+                .await
+                .unwrap_or_default();
             for sr in rows {
                 let spec: RestateSpec = match serde_json::from_value(sr.spec.clone()) {
                     Ok(s) => s,
@@ -692,7 +709,10 @@ async fn reconcile_tick(
         // ---- greptime-instance ----
         {
             use computeza_reconciler_greptime::{GreptimeReconciler, GreptimeSpec};
-            let rows = store.list("greptime-instance", None).await.unwrap_or_default();
+            let rows = store
+                .list("greptime-instance", None)
+                .await
+                .unwrap_or_default();
             for sr in rows {
                 let spec: GreptimeSpec = match serde_json::from_value(sr.spec.clone()) {
                     Ok(s) => s,
@@ -711,7 +731,10 @@ async fn reconcile_tick(
         // ---- grafana-instance ----
         {
             use computeza_reconciler_grafana::{GrafanaReconciler, GrafanaSpec};
-            let rows = store.list("grafana-instance", None).await.unwrap_or_default();
+            let rows = store
+                .list("grafana-instance", None)
+                .await
+                .unwrap_or_default();
             for sr in rows {
                 let spec: GrafanaSpec = match serde_json::from_value(sr.spec.clone()) {
                     Ok(s) => s,
@@ -730,7 +753,10 @@ async fn reconcile_tick(
         // ---- openfga-instance ----
         {
             use computeza_reconciler_openfga::{OpenFgaReconciler, OpenFgaSpec};
-            let rows = store.list("openfga-instance", None).await.unwrap_or_default();
+            let rows = store
+                .list("openfga-instance", None)
+                .await
+                .unwrap_or_default();
             for sr in rows {
                 let spec: OpenFgaSpec = match serde_json::from_value(sr.spec.clone()) {
                     Ok(s) => s,

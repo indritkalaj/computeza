@@ -1,4 +1,4 @@
-# Studio · Python (PyIceberg) cell reference
+# Studio &middot; Python (PyIceberg) cell reference
 
 The Python cells in Studio's notebook editor execute against PyIceberg
 inside a managed Python venv. **The Computeza wrapper pre-loads your
@@ -7,7 +7,7 @@ diverges from a stock PyIceberg script in a few small but important
 ways.
 
 This document is the reference for cell-time usage. Everything outside
-those small differences is plain upstream PyIceberg — see
+those small differences is plain upstream PyIceberg -- see
 <https://py.iceberg.apache.org/api/> for the full API.
 
 ## What the wrapper does for you
@@ -31,9 +31,9 @@ executes:
 
 | Name        | Type   | What it is                                        |
 | ----------- | ------ | ------------------------------------------------- |
-| `catalogs`  | `dict` | `{ "<name>": Catalog }` — every registered catalog |
+| `catalogs`  | `dict` | `{ "<name>": Catalog }` -- every registered catalog |
 | `cat`       | `Catalog` | The **first** entry in `catalogs`, as a shortcut |
-| `cat_<name>` | `Catalog` | One alias per registered catalog name (sanitised: `default` → `cat_default`) |
+| `cat_<name>` | `Catalog` | One alias per registered catalog name (sanitised: `default` -> `cat_default`) |
 
 That means your first cell can be one line:
 
@@ -41,7 +41,7 @@ That means your first cell can be one line:
 cat.list_namespaces()
 ```
 
-…and the wrapper has handled everything from credentials to remote
+...and the wrapper has handled everything from credentials to remote
 signing for you.
 
 ## What NOT to write
@@ -99,7 +99,7 @@ cat.load_table(("default", "analytics.events"))
 cat.load_table(("analytics.events",))
 ```
 
-Catalog → namespace → table. Never include the catalog in the table
+Catalog -> namespace -> table. Never include the catalog in the table
 identifier; switch catalogs via `catalogs[<name>]` instead.
 
 ## Discovery
@@ -169,7 +169,7 @@ Iceberg fields declared `required=True` must have PyArrow fields with
 
 ```
 ValueError: Mismatch in fields:
-  ❌ 1: user_id: required long      | 1: user_id: optional long
+  x 1: user_id: required long      | 1: user_id: optional long
 ```
 
 The fix is on the PyArrow side:
@@ -256,14 +256,14 @@ output, the same way Jupyter does. Make the last line bare:
 
 ```python
 df = tbl.scan().to_pandas()
-df                                 # → renders as an interactive table
+df                                 # -> renders as an interactive table
 ```
 
 vs.
 
 ```python
 df = tbl.scan().to_pandas()
-print(df)                          # → renders as raw stdout text
+print(df)                          # -> renders as raw stdout text
 ```
 
 What it renders interactively:
@@ -277,7 +277,7 @@ What it renders interactively:
 | anything else                  | `repr()` in stdout       |
 
 Output rows are capped at 1 000; the widget shows
-`Showing N of total · pandas.DataFrame` so you know it's truncated.
+`Showing N of total &middot; pandas.DataFrame` so you know it's truncated.
 For wider tables, scroll horizontally inside the widget.
 
 ## Multi-catalog usage
@@ -318,7 +318,7 @@ print("pyiceberg:", pyiceberg.__version__, "pyarrow:", pyarrow.__version__,
       "python:", sys.version.split()[0])
 print("catalogs:", list(catalogs.keys()))
 print("AWS env :", {
-    k: (v[:6] + "…" if v else "(empty)")
+    k: (v[:6] + "..." if v else "(empty)")
     for k, v in os.environ.items()
     if k.startswith("AWS_")
 })
@@ -331,19 +331,19 @@ print("namespaces:", cat.list_namespaces())
 Expected:
 
 - `pyiceberg` ≥ `0.10.0`
-- `python` `3.10`–`3.14`
-- `catalogs` is non-empty (if it's `[]`, the warehouse isn't wired —
+- `python` `3.10`-`3.14`
+- `catalogs` is non-empty (if it's `[]`, the warehouse isn't wired --
   open the warehouse page and click **Connect to SQL**)
 - All `AWS_*` vars populated
 - `remote-signing-enabled?` is `(stripped)` (this is the wrapper's
-  fix; if it shows `true`, you're on an older build — pull and
+  fix; if it shows `true`, you're on an older build -- pull and
   rebuild)
 
 ## Troubleshooting
 
-### `URI missing, please provide using --uri…`
+### `URI missing, please provide using --uri...`
 
-You called `load_catalog("default")` yourself. Don't — use the
+You called `load_catalog("default")` yourself. Don't -- use the
 pre-bound `cat` instead. See [What NOT to write](#what-not-to-write).
 
 ### `NoSuchNamespaceError: Namespace with name 'X' does not exist`
@@ -351,7 +351,7 @@ pre-bound `cat` instead. See [What NOT to write](#what-not-to-write).
 The namespace literally isn't in this warehouse. Run the
 [discovery snippet](#discovery) to see what's actually there. Common
 slip: passing the catalog name as the namespace
-(`cat.list_tables("default")` — `default` is the *catalog*, not a
+(`cat.list_tables("default")` -- `default` is the *catalog*, not a
 namespace inside it).
 
 ### `NamespacePartContainsDot: Namespace parts cannot contain '.'`
@@ -368,14 +368,14 @@ The S3 write call landed without credentials. Verify:
 
 ```python
 import os
-print({k: v[:6] + "…" if v else "(empty)"
+print({k: v[:6] + "..." if v else "(empty)"
        for k, v in os.environ.items()
        if k.startswith("AWS_")})
 ```
 
 Every `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_REGION` /
 `AWS_ENDPOINT_URL` should be populated. If any are empty, you're on
-an older build of the wrapper — pull and rebuild
+an older build of the wrapper -- pull and rebuild
 (`git pull && cargo build --bin computeza && sudo systemctl restart
 computeza`).
 
@@ -390,7 +390,7 @@ each `load_catalog` and each `cat.load_table()`. Verify with:
 print(tbl.io.properties.get("s3.remote-signing-enabled", "(stripped)"))
 ```
 
-If this prints `true`, you're on a pre-strip wrapper — pull and
+If this prints `true`, you're on a pre-strip wrapper -- pull and
 rebuild.
 
 ### `ValueError: Mismatch in fields`
@@ -408,5 +408,5 @@ venv. Restart `computeza serve` so the cell wrapper is re-emitted.
 
 Likely a `DataFrame` with `object`-dtype list/dict columns; pre-pandas
 2.x the wrapper's `pd.isna(v)` check raised on those and silently
-dropped the marker line. The current wrapper is scalar-safe — pull and
+dropped the marker line. The current wrapper is scalar-safe -- pull and
 rebuild if you still see this.

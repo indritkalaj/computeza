@@ -391,7 +391,8 @@ pub async fn ensure_bundled_temurin_jre(
     component_root: &std::path::Path,
     progress: &crate::progress::ProgressHandle,
 ) -> Result<PathBuf, std::io::Error> {
-    ensure_bundled_temurin_jre_inner(component_root, &TEMURIN_JRE_21_X86_64_LINUX, "21", progress).await
+    ensure_bundled_temurin_jre_inner(component_root, &TEMURIN_JRE_21_X86_64_LINUX, "21", progress)
+        .await
 }
 
 /// Java 25 LTS variant of [`ensure_bundled_temurin_jre`]. Trino 459+
@@ -402,7 +403,8 @@ pub async fn ensure_bundled_temurin_jre_25(
     component_root: &std::path::Path,
     progress: &crate::progress::ProgressHandle,
 ) -> Result<PathBuf, std::io::Error> {
-    ensure_bundled_temurin_jre_inner(component_root, &TEMURIN_JRE_25_X86_64_LINUX, "25", progress).await
+    ensure_bundled_temurin_jre_inner(component_root, &TEMURIN_JRE_25_X86_64_LINUX, "25", progress)
+        .await
 }
 
 #[cfg(target_os = "linux")]

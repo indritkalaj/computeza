@@ -141,11 +141,7 @@ impl<D: Driver + 'static> Reconciler for TrinoReconciler<D> {
         Ok(status)
     }
 
-    async fn plan(
-        &self,
-        _desired: &TrinoSpec,
-        _actual: &TrinoStatus,
-    ) -> Result<(), CoreError> {
+    async fn plan(&self, _desired: &TrinoSpec, _actual: &TrinoStatus) -> Result<(), CoreError> {
         Ok(())
     }
 

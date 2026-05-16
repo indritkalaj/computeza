@@ -293,7 +293,10 @@ pub async fn uninstall_service(
     if fs::try_exists(&dropin_dir).await.unwrap_or(false) {
         match fs::remove_dir_all(&dropin_dir).await {
             Ok(()) => out.ok(format!("removed drop-in dir {}", dropin_dir.display())),
-            Err(e) => out.warn(format!("removing drop-in dir {}: {e}", dropin_dir.display())),
+            Err(e) => out.warn(format!(
+                "removing drop-in dir {}: {e}",
+                dropin_dir.display()
+            )),
         }
     }
     // systemd may still hold a failed-unit reference even after the
@@ -357,7 +360,9 @@ pub async fn uninstall_service(
                 if entries.next_entry().await.ok().flatten().is_none() {
                     match fs::remove_dir(parent).await {
                         Ok(()) => out.ok(format!("removed empty parent {}", parent.display())),
-                        Err(e) => tracing::info!(parent = %parent.display(), error = %e, "uninstall: parent not empty / could not remove (informational)"),
+                        Err(e) => {
+                            tracing::info!(parent = %parent.display(), error = %e, "uninstall: parent not empty / could not remove (informational)")
+                        }
                     }
                 }
             }
@@ -575,7 +580,11 @@ async fn single_subdir_containing(dir: &Path, binary_name: &str) -> Option<PathB
     }
 }
 
-pub(super) async fn wait_for_port(host: &str, port: u16, timeout: Duration) -> Result<(), ServiceError> {
+pub(super) async fn wait_for_port(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+) -> Result<(), ServiceError> {
     let deadline = Instant::now() + timeout;
     let addr = format!("{host}:{port}");
     loop {

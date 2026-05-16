@@ -73,15 +73,13 @@ pub const DEFAULT_PORT: u16 = 8088;
 /// Maven build at install time). The canonical download URL is
 /// `https://repo1.maven.org/maven2/io/trino/trino-server/<v>/trino-server-<v>.tar.gz`
 /// per Trino's own install docs.
-const TRINO_BUNDLES: &[Bundle] = &[
-    Bundle {
-        version: "470",
-        url: "https://repo1.maven.org/maven2/io/trino/trino-server/470/trino-server-470.tar.gz",
-        kind: ArchiveKind::TarGz,
-        sha256: None,
-        bin_subpath: "bin",
-    },
-];
+const TRINO_BUNDLES: &[Bundle] = &[Bundle {
+    version: "470",
+    url: "https://repo1.maven.org/maven2/io/trino/trino-server/470/trino-server-470.tar.gz",
+    kind: ArchiveKind::TarGz,
+    sha256: None,
+    bin_subpath: "bin",
+}];
 
 pub fn available_versions() -> &'static [Bundle] {
     TRINO_BUNDLES
@@ -233,12 +231,14 @@ pub async fn install(
         .await
         .map_err(ServiceError::Fetch)?;
     let version_root = cache_root.join(bundle.version);
-    let install_dir = find_trino_install_root(&version_root).await.ok_or_else(|| {
-        ServiceError::Io(std::io::Error::other(format!(
-            "Trino extract: no trino-server-<v>/ directory found under {}",
-            version_root.display()
-        )))
-    })?;
+    let install_dir = find_trino_install_root(&version_root)
+        .await
+        .ok_or_else(|| {
+            ServiceError::Io(std::io::Error::other(format!(
+                "Trino extract: no trino-server-<v>/ directory found under {}",
+                version_root.display()
+            )))
+        })?;
     let bin_dir = install_dir.join("bin");
 
     let etc_dir = install_dir.join("etc");
@@ -277,11 +277,7 @@ pub async fn install(
             if body.starts_with("#!/usr/bin/env python\n")
                 || body.starts_with("#!/usr/bin/env python\r\n")
             {
-                let patched = body.replacen(
-                    "#!/usr/bin/env python",
-                    "#!/usr/bin/env python3",
-                    1,
-                );
+                let patched = body.replacen("#!/usr/bin/env python", "#!/usr/bin/env python3", 1);
                 fs::write(&entry, patched).await?;
                 info!(path = %entry.display(), "trino: patched python shebang to python3");
             }
@@ -363,12 +359,8 @@ pub async fn install(
 
     progress.set_phase(InstallPhase::WaitingForReady);
     progress.set_message(format!("Waiting for Trino HTTP on {}", opts.port));
-    if let Err(e) = service::wait_for_port(
-        "127.0.0.1",
-        opts.port,
-        std::time::Duration::from_secs(120),
-    )
-    .await
+    if let Err(e) =
+        service::wait_for_port("127.0.0.1", opts.port, std::time::Duration::from_secs(120)).await
     {
         if matches!(e, ServiceError::NotReady { .. }) {
             let tail = super::systemctl::journal_tail(&opts.unit_name, 80).await;
@@ -385,11 +377,7 @@ pub async fn install(
     // Drop a thin shim into /usr/local/bin so operators can
     // `computeza-trino-cli` from anywhere. The Trino CLI is a
     // separate JAR download; v0.0.x just exposes the launcher.
-    let _ = super::path::register(
-        "trino",
-        &entry,
-    )
-    .await;
+    let _ = super::path::register("trino", &entry).await;
 
     Ok(InstalledService {
         bin_dir,
@@ -415,13 +403,15 @@ impl Default for UninstallOptions {
 }
 
 pub async fn uninstall(opts: UninstallOptions) -> Result<Uninstalled, ServiceError> {
-    super::service::uninstall_service("trino", &opts.root_dir, &opts.unit_name, Some("trino"))
-        .await
+    super::service::uninstall_service("trino", &opts.root_dir, &opts.unit_name, Some("trino")).await
 }
 
 pub async fn detect_installed() -> Vec<crate::detect::DetectedInstall> {
     let root = PathBuf::from("/var/lib/computeza/trino");
-    if !tokio::fs::try_exists(root.join("data")).await.unwrap_or(false) {
+    if !tokio::fs::try_exists(root.join("data"))
+        .await
+        .unwrap_or(false)
+    {
         return Vec::new();
     }
     vec![crate::detect::DetectedInstall {
@@ -636,17 +626,15 @@ pub struct TrinoIcebergRestConfig {
 pub async fn restart_and_wait(unit_name: &str, port: u16) -> Result<(), ServiceError> {
     super::systemctl::run(&["restart", unit_name])
         .await
-        .map_err(|e| ServiceError::Io(std::io::Error::other(format!(
-            "systemctl restart {unit_name}: {e}"
-        ))))?;
+        .map_err(|e| {
+            ServiceError::Io(std::io::Error::other(format!(
+                "systemctl restart {unit_name}: {e}"
+            )))
+        })?;
     // Coordinator restart usually re-binds inside 30s; give it
     // 90s of headroom for cold JIT.
-    if let Err(e) = service::wait_for_port(
-        "127.0.0.1",
-        port,
-        std::time::Duration::from_secs(90),
-    )
-    .await
+    if let Err(e) =
+        service::wait_for_port("127.0.0.1", port, std::time::Duration::from_secs(90)).await
     {
         if matches!(e, ServiceError::NotReady { .. }) {
             let tail = super::systemctl::journal_tail(unit_name, 40).await;

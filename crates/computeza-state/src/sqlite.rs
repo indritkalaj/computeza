@@ -193,8 +193,7 @@ impl SqliteStore {
         retention_days: i64,
         force_ids: &[String],
     ) -> Result<u64> {
-        let cutoff = (Utc::now() - chrono::Duration::days(retention_days))
-            .to_rfc3339();
+        let cutoff = (Utc::now() - chrono::Duration::days(retention_days)).to_rfc3339();
         let mut total = sqlx::query(
             "DELETE FROM studio_files WHERE trashed_at IS NOT NULL AND trashed_at < ?1",
         )
@@ -203,13 +202,12 @@ impl SqliteStore {
         .await?
         .rows_affected();
         for id in force_ids {
-            let n = sqlx::query(
-                "DELETE FROM studio_files WHERE id = ?1 AND trashed_at IS NOT NULL",
-            )
-            .bind(id)
-            .execute(&self.pool)
-            .await?
-            .rows_affected();
+            let n =
+                sqlx::query("DELETE FROM studio_files WHERE id = ?1 AND trashed_at IS NOT NULL")
+                    .bind(id)
+                    .execute(&self.pool)
+                    .await?
+                    .rows_affected();
             total += n;
         }
         Ok(total)
@@ -245,11 +243,7 @@ impl SqliteStore {
     /// Create a new file. Returns the populated record. Fails with
     /// PathConflict if the path already exists -- callers can choose
     /// to update-in-place instead.
-    pub async fn studio_files_create(
-        &self,
-        path: &str,
-        content: &str,
-    ) -> Result<StudioFile> {
+    pub async fn studio_files_create(&self, path: &str, content: &str) -> Result<StudioFile> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
         sqlx::query(
