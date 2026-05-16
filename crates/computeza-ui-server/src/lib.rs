@@ -729,12 +729,14 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/storage", get(storage_page_handler))
         .route("/admin/smtp", get(admin_smtp_handler).post(admin_smtp_submit_handler))
         .route("/api/health/all", get(api_health_all_handler))
+        .route("/api/version", get(api_version_handler))
         .route("/api/test/echo", post(api_test_echo_handler))
         .route("/help/sitemap", get(help_sitemap_handler))
         .route("/about", get(about_page_handler))
         .route("/storage/connect/aws", get(storage_connect_aws_form_handler).post(storage_connect_aws_submit_handler))
         .route("/account/password", get(account_password_form_handler).post(account_password_submit_handler))
         .route("/volumes", get(volumes_page_handler).post(volumes_create_handler))
+        .route("/volumes/delete", post(volumes_delete_handler))
         .route(
             "/studio/api/completions",
             get(studio_completions_handler),
@@ -5476,13 +5478,19 @@ async fn volumes_page_handler(State(state): State<AppState>) -> Html<String> {
         volumes
             .iter()
             .map(|v| {
+                let qualified = format!("{}.{}.{}", v.catalog, v.schema, v.name);
                 format!(
-                    r#"<tr>
-<td class="cz-cell-mono">{cat}.{sch}.{name}</td>
+                    r##"<tr>
+<td class="cz-cell-mono">{qualified_esc}</td>
 <td class="cz-cell-mono cz-cell-dim">{path}</td>
 <td><code>/Volumes/{cat}/{sch}/{name}/</code></td>
-<td><button type="button" class="cz-tree-copy" data-copy="{cat}.{sch}.{name}" title="Copy"><i class="fa-solid fa-copy"></i></button></td>
-</tr>"#,
+<td>
+<button type="button" class="cz-tree-copy" data-copy="{qualified_esc}" title="Copy"><i class="fa-solid fa-copy"></i></button>
+<form method="post" action="/volumes/delete" style="margin:0;display:inline;">{csrf}<input type="hidden" name="name" value="{qualified_esc}" /><button type="submit" class="cz-btn-ghost" title="Delete this volume binding (the underlying storage is NOT deleted)" onclick="return confirm('Delete the volume binding for {qualified_esc}? The underlying S3 prefix is NOT removed.');"><i class="fa-solid fa-trash"></i></button></form>
+</td>
+</tr>"##,
+                    qualified_esc = html_escape(&qualified),
+                    csrf = csrf,
                     cat = html_escape(&v.catalog),
                     sch = html_escape(&v.schema),
                     name = html_escape(&v.name),
@@ -5536,6 +5544,23 @@ async fn volumes_create_handler(
         let _ = store
             .save(&key, &serde_json::to_value(&form).unwrap_or_default(), None)
             .await;
+    }
+    axum::response::Redirect::to("/volumes")
+}
+
+#[derive(serde::Deserialize)]
+struct VolumeDeleteForm {
+    name: String,
+}
+
+async fn volumes_delete_handler(
+    State(state): State<AppState>,
+    axum::extract::Form(form): axum::extract::Form<VolumeDeleteForm>,
+) -> axum::response::Redirect {
+    use computeza_state::Store;
+    if let Some(store) = state.store.as_deref() {
+        let key = computeza_state::ResourceKey::cluster_scoped("volume-instance", form.name);
+        let _ = store.delete(&key, None).await;
     }
     axum::response::Redirect::to("/volumes")
 }
@@ -5708,6 +5733,16 @@ struct EchoBody {
     payload: String,
     #[serde(default)]
     csrf_token: String,
+}
+
+async fn api_version_handler() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({
+        "name": env!("CARGO_PKG_NAME"),
+        "version": env!("CARGO_PKG_VERSION"),
+        "rust_minimum": env!("CARGO_PKG_RUST_VERSION"),
+        "homepage": env!("CARGO_PKG_HOMEPAGE"),
+        "license_ref": env!("CARGO_PKG_LICENSE"),
+    }))
 }
 
 async fn api_test_echo_handler(
@@ -10293,6 +10328,9 @@ fn render_studio_notebook_page(
 <div class="cz-studio-cells-actions">
 <button type="button" class="cz-btn-ghost" id="cz-notebook-add-sql"><i class="fa-solid fa-plus"></i> Add SQL cell</button>
 <button type="button" class="cz-btn-ghost" id="cz-notebook-add-py"><i class="fa-solid fa-plus"></i> Add Python cell</button>
+<span style="flex:1"></span>
+<button type="button" class="cz-btn-ghost" id="cz-notebook-run-all" title="Run every cell top to bottom"><i class="fa-solid fa-forward"></i> Run all</button>
+<button type="button" class="cz-btn-ghost" id="cz-notebook-clear-outputs" title="Clear every cell's output (does not delete the cell)"><i class="fa-solid fa-broom"></i> Clear outputs</button>
 </div>
 <script type="application/json" id="cz-notebook-state">{nb_json}</script>
 {csrf_template}
@@ -11091,6 +11129,47 @@ window.czNotebook = (function () {{
 
   document.getElementById("cz-notebook-add-sql").addEventListener("click", function () {{ addCell("sql"); }});
   document.getElementById("cz-notebook-add-py").addEventListener("click", function () {{ addCell("pyiceberg"); }});
+
+  // Run-all + Clear-outputs. Run-all walks cells in order and fires
+  // runCell sequentially so the operator can sanity-check a whole
+  // notebook with one click. Clear-outputs wipes c.output for every
+  // cell + repaints + force-saves.
+  var runAllBtn = document.getElementById("cz-notebook-run-all");
+  if (runAllBtn) {{
+    runAllBtn.addEventListener("click", async function () {{
+      runAllBtn.disabled = true;
+      var orig = runAllBtn.innerHTML;
+      try {{
+        for (var i = 0; i < nb.cells.length; i++) {{
+          var c = nb.cells[i];
+          runAllBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Running ' + (i + 1) + '/' + nb.cells.length;
+          // Use a promise so we sequence runs even though runCell is
+          // fire-and-forget. Wait for the result by polling c.output
+          // (capped at 60s per cell). Stops on errors? No -- keep
+          // going so the operator sees every cell's outcome.
+          var before = c.output;
+          runCell(c.id);
+          var waited = 0;
+          while (c.output === before && waited < 60000) {{
+            await new Promise(function (r) {{ setTimeout(r, 200); }});
+            waited += 200;
+          }}
+        }}
+      }} finally {{
+        runAllBtn.innerHTML = orig;
+        runAllBtn.disabled = false;
+      }}
+    }});
+  }}
+  var clearBtn = document.getElementById("cz-notebook-clear-outputs");
+  if (clearBtn) {{
+    clearBtn.addEventListener("click", function () {{
+      nb.cells.forEach(function (c) {{ c.output = null; }});
+      rebuildCellsDom();
+      if (savePending !== null) clearTimeout(savePending);
+      persistNow({{ force: true }});
+    }});
+  }}
 
   // Cell snippet library: a small menu of pre-baked code blocks.
   // Clicking a snippet drops a new cell with the template body
