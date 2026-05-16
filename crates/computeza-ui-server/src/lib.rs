@@ -4783,7 +4783,12 @@ async fn studio_sql_execute_handler(
             // into its own venv so PyIceberg works without Sail.)
             let outcome = match &sail {
                 Some(_) => Some(
-                    execute_python_via_pyiceberg(&form.sql, state.secrets.as_deref()).await,
+                    execute_python_via_pyiceberg(
+                        &form.sql,
+                        state.secrets.as_deref(),
+                        state.store.as_deref(),
+                    )
+                    .await,
                 ),
                 None => None,
             };
@@ -4795,7 +4800,13 @@ async fn studio_sql_execute_handler(
         QueryLanguage::Sail => {
             let outcome = match &sail {
                 Some(url) => Some(
-                    execute_python_via_sail(url, &form.sql, state.secrets.as_deref()).await,
+                    execute_python_via_sail(
+                        url,
+                        &form.sql,
+                        state.secrets.as_deref(),
+                        state.store.as_deref(),
+                    )
+                    .await,
                 ),
                 None => None,
             };
@@ -4929,7 +4940,12 @@ async fn studio_cell_run_handler(
         CellKind::PyIceberg | CellKind::Sail => {
             let outcome = match kind {
                 CellKind::PyIceberg => {
-                    execute_python_via_pyiceberg(&form.content, state.secrets.as_deref()).await
+                    execute_python_via_pyiceberg(
+                        &form.content,
+                        state.secrets.as_deref(),
+                        state.store.as_deref(),
+                    )
+                    .await
                 }
                 _ => {
                     let url = match discover_sail_endpoint(state.store.as_deref()).await {
@@ -4943,8 +4959,13 @@ async fn studio_cell_run_handler(
                             });
                         }
                     };
-                    execute_python_via_sail(&url, &form.content, state.secrets.as_deref())
-                        .await
+                    execute_python_via_sail(
+                        &url,
+                        &form.content,
+                        state.secrets.as_deref(),
+                        state.store.as_deref(),
+                    )
+                    .await
                 }
             };
             // Both executors emit a magic-line into stdout that
@@ -5376,6 +5397,7 @@ async fn execute_python_via_sail(
     _sail_base_url: &str,
     _user_code: &str,
     _secrets: Option<&computeza_secrets::SecretsStore>,
+    _store: Option<&computeza_state::SqliteStore>,
 ) -> PythonOutcome {
     PythonOutcome::Err {
         stdout: String::new(),
@@ -5388,6 +5410,7 @@ async fn execute_python_via_sail(
     sail_base_url: &str,
     user_code: &str,
     secrets: Option<&computeza_secrets::SecretsStore>,
+    store: Option<&computeza_state::SqliteStore>,
 ) -> PythonOutcome {
     use secrecy::ExposeSecret;
     use tokio::io::AsyncWriteExt;
@@ -5449,7 +5472,7 @@ async fn execute_python_via_sail(
             }
             // Lakekeeper REST URI: read live, not from vault, so it
             // tracks endpoint moves across reconciler runs.
-            if let Some(lk) = discover_lakekeeper_endpoint(None).await {
+            if let Some(lk) = discover_lakekeeper_endpoint(store).await {
                 entry.insert("lakekeeper-rest-uri".into(), serde_json::Value::String(format!("{lk}/catalog")));
             }
             catalog_cfg.insert(name.clone(), serde_json::Value::Object(entry));
@@ -5659,23 +5682,25 @@ except Exception:
 async fn execute_python_via_pyiceberg(
     user_code: &str,
     secrets: Option<&computeza_secrets::SecretsStore>,
+    store: Option<&computeza_state::SqliteStore>,
 ) -> PythonOutcome {
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (user_code, secrets);
+        let _ = (user_code, secrets, store);
         return PythonOutcome::Err {
             stdout: String::new(),
             stderr: "PyIceberg execution is Linux-only (uses the Sail venv at /var/lib/computeza/sail/).".into(),
         };
     }
     #[cfg(target_os = "linux")]
-    execute_python_via_pyiceberg_linux(user_code, secrets).await
+    execute_python_via_pyiceberg_linux(user_code, secrets, store).await
 }
 
 #[cfg(target_os = "linux")]
 async fn execute_python_via_pyiceberg_linux(
     user_code: &str,
     secrets: Option<&computeza_secrets::SecretsStore>,
+    store: Option<&computeza_state::SqliteStore>,
 ) -> PythonOutcome {
     use secrecy::ExposeSecret;
     use tokio::io::AsyncWriteExt;
@@ -5731,7 +5756,7 @@ async fn execute_python_via_pyiceberg_linux(
                     );
                 }
             }
-            if let Some(lk) = discover_lakekeeper_endpoint(None).await {
+            if let Some(lk) = discover_lakekeeper_endpoint(store).await {
                 entry.insert(
                     "lakekeeper-rest-uri".into(),
                     serde_json::Value::String(format!("{lk}/catalog")),
