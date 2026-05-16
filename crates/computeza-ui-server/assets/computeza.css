@@ -1350,6 +1350,13 @@ a.cz-card:hover {
 }
 .cz-studio-folder-row:hover { background: var(--navy-3); }
 .cz-studio-folder-icon { color: var(--lavender); }
+/* .Trash row: same shape as a folder row, but the trash icon is
+   red and the label is the only thing the user can't delete or
+   rename. Sits at the bottom of the root view. */
+.cz-studio-trash-row { margin-top: 0.5rem; padding-top: 0.5rem; border-top: 1px dashed var(--line); }
+.cz-studio-trash-row .cz-studio-folder-row { color: var(--ink); }
+.cz-studio-trash-row .cz-studio-folder-row:hover { background: rgba(255, 99, 99, 0.08); }
+.cz-studio-trash-icon { color: var(--fail); }
 
 /* Per-row 3-dot menu (file + folder). Native <details>/<summary>
    toggles the popup with zero JS; the popup is absolute-positioned

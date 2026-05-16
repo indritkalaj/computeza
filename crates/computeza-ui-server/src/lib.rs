@@ -224,6 +224,26 @@ pub async fn serve(addr: SocketAddr) -> anyhow::Result<()> {
 /// Boot the operator console with a fully-populated `AppState`. Awaits
 /// forever (until the process is signalled to terminate).
 pub async fn serve_with_state(addr: SocketAddr, state: AppState) -> anyhow::Result<()> {
+    // Trash sweeper: at boot, hard-delete any studio_files row whose
+    // trashed_at is older than the retention window. This is the
+    // simplest schedule that still bounds disk -- if the process is
+    // restarted at least once a month (systemd handles that on
+    // upgrade), the sweep runs. A long-running scheduler is overkill
+    // for v0.0.x; we can promote it to a recurring task later.
+    if let Some(store) = state.store.as_ref() {
+        match store
+            .studio_files_purge_trash(TRASH_RETENTION_DAYS, &[])
+            .await
+        {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(
+                purged = n,
+                retention_days = TRASH_RETENTION_DAYS,
+                "studio trash sweeper: hard-deleted rows older than retention",
+            ),
+            Err(e) => tracing::warn!(error = %e, "studio trash sweeper failed"),
+        }
+    }
     let app = router_with_state(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "computeza ui-server listening; visit / for the operator console, /healthz for liveness, /api/state/info for the metadata-store summary");
@@ -697,6 +717,10 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/studio/folders/rename", post(studio_folder_rename_handler))
         .route("/studio/folders/delete", post(studio_folder_delete_handler))
         .route("/studio/folders/export", get(studio_folder_export_handler))
+        .route("/studio/trash", get(studio_trash_page_handler))
+        .route("/studio/trash/restore", post(studio_trash_restore_handler))
+        .route("/studio/trash/purge", post(studio_trash_purge_handler))
+        .route("/studio/trash/empty", post(studio_trash_empty_handler))
         .route(
             "/studio/api/completions",
             get(studio_completions_handler),
@@ -2874,7 +2898,7 @@ async fn render_studio_storage_section(state: &AppState) -> String {
     let garage = discover_garage_endpoint(state.store.as_deref()).await;
     let row = match garage {
         Some(url) => format!(
-            r##"<li class="cz-tree-item"><div class="cz-tree-row"><span class="cz-tree-toggle"></span><span class="cz-tree-icon cz-storage-icon" title="Garage (managed)">◈</span><span class="cz-tree-label">garage</span><span class="cz-tree-storage-endpoint" title="{ep}">live</span><button type="button" class="cz-tree-copy" data-copy="{ep}" title="Copy endpoint {ep}" aria-label="Copy endpoint"><i class="fa-solid fa-copy"></i></button></div></li>"##,
+            r##"<li class="cz-tree-item"><div class="cz-tree-row"><span class="cz-tree-toggle"></span><span class="cz-tree-icon cz-storage-icon" title="Local Garage object store (S3-compatible API)">◈</span><span class="cz-tree-label">Computeza Local Storage</span><span class="cz-tree-storage-endpoint" title="{ep}">live</span><button type="button" class="cz-tree-copy" data-copy="{ep}" title="Copy endpoint {ep}" aria-label="Copy endpoint"><i class="fa-solid fa-copy"></i></button></div></li>"##,
             ep = html_escape(&url),
         ),
         None => r#"<li class="cz-tree-empty">No storage configured yet.</li>"#.to_string(),
@@ -4045,29 +4069,66 @@ async fn studio_file_autosave_api_handler(
     axum::extract::Form(form): axum::extract::Form<FileAutosaveForm>,
 ) -> axum::http::StatusCode {
     let Some(store) = state.store.as_deref() else {
+        tracing::warn!(file_id = %id, "autosave: store unavailable");
         return axum::http::StatusCode::SERVICE_UNAVAILABLE;
     };
+    let content_len = form.content.len();
+    let existing = store.studio_files_get(&id).await;
+    let (file_path, prev_len, prev_empty) = match &existing {
+        Ok(Some(f)) => (f.path.clone(), f.content.len(), f.content.is_empty()),
+        Ok(None) => {
+            tracing::warn!(file_id = %id, content_len, "autosave: file not found");
+            return axum::http::StatusCode::NOT_FOUND;
+        }
+        Err(e) => {
+            tracing::warn!(file_id = %id, error = %e, "autosave: studio_files_get failed");
+            return axum::http::StatusCode::INTERNAL_SERVER_ERROR;
+        }
+    };
+    let was_ipynb = is_ipynb_path(&file_path);
     // Translate the incoming body if the file is a .ipynb notebook
     // -- the client always sends the computeza-native shape (one
     // shared JS path for both .notebook and .ipynb), but on-disk
     // .ipynb files must be in Jupyter format so Jupyter / VSCode /
     // Databricks can open them. .notebook files round-trip native
     // and skip the translation.
-    let content_to_store = match store.studio_files_get(&id).await {
-        Ok(Some(file)) if is_ipynb_path(&file.path) => {
-            let nb = Notebook::parse_or_fresh(&form.content);
-            notebook_to_file_content(&file.path, &nb)
-        }
-        _ => form.content.clone(),
+    let content_to_store = if was_ipynb {
+        let nb = Notebook::parse_or_fresh(&form.content);
+        notebook_to_file_content(&file_path, &nb)
+    } else {
+        form.content.clone()
+    };
+    let stored_len = content_to_store.len();
+    let changed = match &existing {
+        Ok(Some(f)) => f.content != content_to_store,
+        _ => true,
     };
     match store
         .studio_files_update(&id, None, Some(&content_to_store))
         .await
     {
-        Ok(Some(_)) => axum::http::StatusCode::NO_CONTENT,
-        Ok(None) => axum::http::StatusCode::NOT_FOUND,
+        Ok(Some(_)) => {
+            // Server-side breadcrumb so we can correlate the client's
+            // [cz-autosave] console line with what landed in SQLite.
+            tracing::info!(
+                file_id = %id,
+                path = %file_path,
+                content_len,
+                stored_len,
+                prev_len,
+                changed,
+                will_snapshot = changed && !prev_empty,
+                ipynb = was_ipynb,
+                "autosave ok",
+            );
+            axum::http::StatusCode::NO_CONTENT
+        }
+        Ok(None) => {
+            tracing::warn!(file_id = %id, "autosave: studio_files_update returned None");
+            axum::http::StatusCode::NOT_FOUND
+        }
         Err(e) => {
-            tracing::warn!(error = %e, file_id = %id, "autosave failed");
+            tracing::warn!(file_id = %id, error = %e, "autosave: studio_files_update failed");
             axum::http::StatusCode::INTERNAL_SERVER_ERROR
         }
     }
@@ -4208,7 +4269,10 @@ async fn studio_file_delete_handler(
     let Some(store) = state.store.as_deref() else {
         return redirect_studio_flash(Some(form.open.clone()), None, "metadata store unavailable");
     };
-    let removed = store.studio_files_delete(&id).await.unwrap_or(false);
+    // Soft-delete: move to .Trash instead of dropping the row. The
+    // operator can restore from the .Trash view for 30 days; after
+    // that the startup sweeper hard-deletes.
+    let removed = store.studio_files_trash(&id).await.unwrap_or(false);
     // Drop the deleted id from the open list and pick a sensible
     // active tab (the previous one if any).
     let open: Vec<String> = form
@@ -4770,7 +4834,9 @@ async fn studio_folder_delete_handler(
     };
     let mut deleted = 0usize;
     for f in all.iter().filter(|f| f.path.starts_with(&prefix)) {
-        if store.studio_files_delete(&f.id).await.unwrap_or(false) {
+        // Cascading soft-delete: files inside the folder land in
+        // .Trash with the same retention as direct file deletes.
+        if store.studio_files_trash(&f.id).await.unwrap_or(false) {
             deleted += 1;
         }
     }
@@ -4839,6 +4905,171 @@ async fn studio_folder_export_handler(
         bytes,
     )
         .into_response()
+}
+
+// ============================================================
+// .Trash -- soft-delete views (restore / permanent-delete)
+// ============================================================
+//
+// Files deleted from the workspace get a `trashed_at` timestamp
+// instead of being dropped. The .Trash UI surfaces them with
+// Restore + Permanent delete actions; rows older than the retention
+// window (30 days) get hard-deleted by the startup sweeper.
+
+const TRASH_RETENTION_DAYS: i64 = 30;
+
+#[derive(serde::Deserialize)]
+struct TrashIdForm {
+    id: String,
+}
+
+async fn studio_trash_restore_handler(
+    State(state): State<AppState>,
+    axum::extract::Form(form): axum::extract::Form<TrashIdForm>,
+) -> axum::response::Redirect {
+    let Some(store) = state.store.as_deref() else {
+        return axum::response::Redirect::to("/studio/trash?flash=metadata+store+unavailable");
+    };
+    let ok = store.studio_files_restore(&form.id).await.unwrap_or(false);
+    let flash = if ok { "restored" } else { "not in trash" };
+    axum::response::Redirect::to(&format!("/studio/trash?flash={}", url_encode(flash)))
+}
+
+async fn studio_trash_purge_handler(
+    State(state): State<AppState>,
+    axum::extract::Form(form): axum::extract::Form<TrashIdForm>,
+) -> axum::response::Redirect {
+    let Some(store) = state.store.as_deref() else {
+        return axum::response::Redirect::to("/studio/trash?flash=metadata+store+unavailable");
+    };
+    // Empty force_ids slice -- pass the one we want to purge.
+    let n = store
+        .studio_files_purge_trash(TRASH_RETENTION_DAYS, &[form.id.clone()])
+        .await
+        .unwrap_or(0);
+    let flash = if n > 0 { "permanently deleted" } else { "not in trash" };
+    axum::response::Redirect::to(&format!("/studio/trash?flash={}", url_encode(flash)))
+}
+
+async fn studio_trash_empty_handler(
+    State(state): State<AppState>,
+) -> axum::response::Redirect {
+    let Some(store) = state.store.as_deref() else {
+        return axum::response::Redirect::to("/studio/trash?flash=metadata+store+unavailable");
+    };
+    let trashed = store.studio_files_list_trash().await.unwrap_or_default();
+    let ids: Vec<String> = trashed.iter().map(|f| f.id.clone()).collect();
+    // retention=0 plus explicit force_ids ensures everything currently
+    // in trash gets hard-deleted regardless of how old it is.
+    let n = store
+        .studio_files_purge_trash(0, &ids)
+        .await
+        .unwrap_or(0);
+    axum::response::Redirect::to(&format!(
+        "/studio/trash?flash={}",
+        url_encode(&format!("emptied trash ({n} files)"))
+    ))
+}
+
+#[derive(serde::Deserialize)]
+struct TrashPageQuery {
+    #[serde(default)]
+    flash: Option<String>,
+}
+
+async fn studio_trash_page_handler(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<TrashPageQuery>,
+) -> Html<String> {
+    let l = Localizer::english();
+    let Some(store) = state.store.as_deref() else {
+        return Html(render_shell(
+            &l,
+            "Trash",
+            NavLink::Studio,
+            "<section class=\"cz-section\"><p>Metadata store is not configured.</p></section>",
+        ));
+    };
+    let trashed = store.studio_files_list_trash().await.unwrap_or_default();
+    let csrf = auth::csrf_input();
+    let flash_html = q
+        .flash
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            format!(
+                r#"<div class="cz-flash" style="margin-bottom: 1rem;">{}</div>"#,
+                html_escape(s),
+            )
+        })
+        .unwrap_or_default();
+    let rows: String = if trashed.is_empty() {
+        r#"<tr><td colspan="4" class="cz-cell-dim" style="text-align:center; padding:1.5rem;">Trash is empty.</td></tr>"#.to_string()
+    } else {
+        trashed
+            .iter()
+            .map(|f| {
+                let ts = f.trashed_at.as_deref().unwrap_or("?");
+                let days_left = match chrono::DateTime::parse_from_rfc3339(ts) {
+                    Ok(t) => {
+                        let trashed_at_utc = t.with_timezone(&chrono::Utc);
+                        let elapsed = chrono::Utc::now() - trashed_at_utc;
+                        TRASH_RETENTION_DAYS - elapsed.num_days()
+                    }
+                    Err(_) => TRASH_RETENTION_DAYS,
+                };
+                format!(
+                    r##"<tr>
+<td class="cz-cell-mono">{path}</td>
+<td class="cz-cell-mono cz-cell-dim"><span data-ts-utc="{ts}">{ts}</span></td>
+<td class="cz-cell-dim">{days_left}d</td>
+<td>
+<form method="post" action="/studio/trash/restore" style="margin:0;display:inline;">{csrf}<input type="hidden" name="id" value="{id}" /><button type="submit" class="cz-btn-ghost" title="Restore this file to the workspace"><i class="fa-solid fa-rotate-left"></i> Restore</button></form>
+<a href="/studio/files/{id_enc}/export" class="cz-btn-ghost" title="Download a copy without restoring"><i class="fa-solid fa-download"></i> Export</a>
+<form method="post" action="/studio/trash/purge" style="margin:0;display:inline;">{csrf}<input type="hidden" name="id" value="{id}" /><button type="submit" class="cz-btn-danger" title="Hard delete -- cannot be undone"><i class="fa-solid fa-fire"></i> Delete now</button></form>
+</td>
+</tr>"##,
+                    csrf = csrf,
+                    path = html_escape(&f.path),
+                    ts = html_escape(ts),
+                    days_left = days_left.max(0),
+                    id = html_escape(&f.id),
+                    id_enc = url_encode(&f.id),
+                )
+            })
+            .collect()
+    };
+    let empty_button = if trashed.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r##"<form method="post" action="/studio/trash/empty" style="margin-top: 1rem;">{csrf}<button type="submit" class="cz-btn-danger" title="Hard delete every file currently in trash"><i class="fa-solid fa-fire"></i> Empty trash ({n} files)</button></form>"##,
+            csrf = csrf,
+            n = trashed.len(),
+        )
+    };
+    let body = format!(
+        r##"<section class="cz-hero">
+<h1><i class="fa-solid fa-trash"></i> Trash</h1>
+<p class="cz-muted">Files and folders you deleted. They stay here for {retention} days, then get hard-deleted automatically. Use Restore to move a file back, Export to download a copy without restoring, or Delete now to skip the retention window.</p>
+</section>
+<section class="cz-section">
+{flash_html}
+<div class="cz-table-wrap">
+<table class="cz-table">
+<thead><tr><th>Path</th><th>Trashed</th><th>Days left</th><th>Actions</th></tr></thead>
+<tbody>{rows}</tbody>
+</table>
+</div>
+{empty_button}
+<p style="margin-top:1rem;"><a href="/studio" class="cz-btn-ghost">← Back to editor</a></p>
+</section>"##,
+        retention = TRASH_RETENTION_DAYS,
+        flash_html = flash_html,
+        rows = rows,
+        empty_button = empty_button,
+    );
+    Html(render_shell(&l, "Trash", NavLink::Studio, &body))
 }
 
 /// Build the /studio redirect URL with the standard tab-state +
@@ -7245,8 +7476,18 @@ fn render_studio_files_pane(
         )
     };
 
+    // Pin a .Trash row at the bottom of every root view -- it's
+    // always present, can't be deleted/renamed, links to the
+    // dedicated /studio/trash page where the operator can restore
+    // / export / hard-delete.
+    let trash_row = r##"<div class="cz-studio-folder-row-wrap cz-studio-trash-row">
+<a class="cz-studio-folder-row" href="/studio/trash"><i class="fa-solid fa-trash fa-fw cz-studio-trash-icon"></i><span class="cz-tree-label">.Trash</span></a>
+</div>"##;
     let tree_html: String = if files.all.is_empty() {
-        r#"<div class="cz-studio-file-empty">No saved files yet. Click <strong>+</strong> to save your current editor body as a file, or import a .cptz archive.</div>"#.to_string()
+        format!(
+            r#"<div class="cz-studio-file-empty">No saved files yet. Click <strong>+</strong> to save your current editor body as a file, or import a .cptz archive.</div>{trash_row}"#,
+            trash_row = if in_root { trash_row } else { "" },
+        )
     } else if in_root {
         // Root view: list folders (sorted), then root-level files.
         let mut folders: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -7262,7 +7503,7 @@ fn render_studio_files_pane(
         }
         let folder_rows: String = folders.iter().map(|f| render_folder_row(f)).collect();
         let root_rows: String = root_files.iter().map(|f| render_file_row(f)).collect();
-        format!("{folder_rows}{root_rows}")
+        format!("{folder_rows}{root_rows}{trash_row}")
     } else {
         // Folder view: just the files whose first segment matches
         // current_dir. Render basename only; .gitkeep placeholders are

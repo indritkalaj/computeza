@@ -62,6 +62,13 @@ const SCHEMA_STATEMENTS: &[&str] = &[
         FOREIGN KEY (file_id) REFERENCES studio_files(id) ON DELETE CASCADE
     )"#,
     r#"CREATE INDEX IF NOT EXISTS studio_file_revisions_by_file ON studio_file_revisions(file_id, created_at DESC)"#,
+    // Soft-delete: trashed_at is the RFC3339 UTC timestamp when the
+    // file was moved to .Trash. NULL means "live". The .Trash UI
+    // surfaces these for the 30-day retention window; a background
+    // sweep on startup hard-deletes any row with trashed_at older
+    // than the retention cutoff.
+    r#"ALTER TABLE studio_files ADD COLUMN trashed_at TEXT"#,
+    r#"CREATE INDEX IF NOT EXISTS studio_files_by_trash ON studio_files(trashed_at)"#,
 ];
 
 /// SQLite-backed state store.
@@ -95,7 +102,18 @@ impl SqliteStore {
             .connect_with(opts)
             .await?;
         for stmt in SCHEMA_STATEMENTS {
-            sqlx::query(stmt).execute(&pool).await?;
+            // ALTER TABLE ADD COLUMN isn't idempotent in SQLite (no
+            // "IF NOT EXISTS"); on re-open the column already exists
+            // and the statement errors with "duplicate column name".
+            // Treat that specific error as success so the migration
+            // stays idempotent. Any other error is real and propagates.
+            if let Err(e) = sqlx::query(stmt).execute(&pool).await {
+                let msg = e.to_string();
+                if msg.contains("duplicate column name") {
+                    continue;
+                }
+                return Err(e.into());
+            }
         }
         debug!(path, "opened sqlite state store");
         Ok(Self { pool })
@@ -115,13 +133,86 @@ impl SqliteStore {
     /// table has a path index + studio rarely accumulates more than
     /// a handful of files (operator-authored, not log-volume).
     pub async fn studio_files_list(&self) -> Result<Vec<StudioFile>> {
+        // Default view excludes soft-deleted files. The .Trash UI
+        // surfaces them via studio_files_list_trash().
         let rows = sqlx::query(
-            "SELECT id, path, content, created_at, updated_at \
-             FROM studio_files ORDER BY path",
+            "SELECT id, path, content, created_at, updated_at, trashed_at \
+             FROM studio_files WHERE trashed_at IS NULL ORDER BY path",
         )
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(studio_file_from_row).collect()
+    }
+
+    /// List trashed files, newest-trashed first. Used by the .Trash
+    /// view to surface restore/permanent-delete actions.
+    pub async fn studio_files_list_trash(&self) -> Result<Vec<StudioFile>> {
+        let rows = sqlx::query(
+            "SELECT id, path, content, created_at, updated_at, trashed_at \
+             FROM studio_files WHERE trashed_at IS NOT NULL ORDER BY trashed_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(studio_file_from_row).collect()
+    }
+
+    /// Move a file to .Trash (soft delete). Returns true on success,
+    /// false if the file didn't exist. Idempotent on already-trashed
+    /// rows (just refreshes the timestamp).
+    pub async fn studio_files_trash(&self, id: &str) -> Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        let n = sqlx::query("UPDATE studio_files SET trashed_at = ?1 WHERE id = ?2")
+            .bind(&now)
+            .bind(id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(n > 0)
+    }
+
+    /// Restore a trashed file back into the workspace. Returns false
+    /// if the file didn't exist or wasn't trashed.
+    pub async fn studio_files_restore(&self, id: &str) -> Result<bool> {
+        let n = sqlx::query(
+            "UPDATE studio_files SET trashed_at = NULL \
+             WHERE id = ?1 AND trashed_at IS NOT NULL",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(n > 0)
+    }
+
+    /// Hard-delete trashed files older than `retention_days` and any
+    /// row passed explicitly via the `force` slice. Returns the count
+    /// of rows actually deleted. Called from the studio shutdown /
+    /// startup sweeper and from the "Empty trash" button.
+    pub async fn studio_files_purge_trash(
+        &self,
+        retention_days: i64,
+        force_ids: &[String],
+    ) -> Result<u64> {
+        let cutoff = (Utc::now() - chrono::Duration::days(retention_days))
+            .to_rfc3339();
+        let mut total = sqlx::query(
+            "DELETE FROM studio_files WHERE trashed_at IS NOT NULL AND trashed_at < ?1",
+        )
+        .bind(&cutoff)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        for id in force_ids {
+            let n = sqlx::query(
+                "DELETE FROM studio_files WHERE id = ?1 AND trashed_at IS NOT NULL",
+            )
+            .bind(id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+            total += n;
+        }
+        Ok(total)
     }
 
     /// Fetch one file by id. Returns Ok(None) on miss -- callers
@@ -177,6 +268,7 @@ impl SqliteStore {
             content: content.to_string(),
             created_at: now.clone(),
             updated_at: now,
+            trashed_at: None,
         })
     }
 
@@ -235,6 +327,7 @@ impl SqliteStore {
             content: new_content.to_string(),
             created_at: existing.created_at,
             updated_at: now,
+            trashed_at: existing.trashed_at,
         }))
     }
 
@@ -313,6 +406,10 @@ pub struct StudioFile {
     pub created_at: String,
     /// RFC3339 string.
     pub updated_at: String,
+    /// Soft-delete marker. None = live; Some(rfc3339) = in .Trash
+    /// since that timestamp. Files older than the retention window
+    /// (30 days) are hard-deleted by the startup sweeper.
+    pub trashed_at: Option<String>,
 }
 
 /// One row of the studio_file_revisions table -- a snapshot of a
@@ -327,12 +424,17 @@ pub struct StudioFileRevision {
 }
 
 fn studio_file_from_row(row: sqlx::sqlite::SqliteRow) -> Result<StudioFile> {
+    // trashed_at is read defensively -- older callers that select
+    // without the column still work because try_get returns Err on
+    // missing column, which we map to None.
+    let trashed_at: Option<String> = row.try_get("trashed_at").ok().flatten();
     Ok(StudioFile {
         id: row.try_get("id")?,
         path: row.try_get("path")?,
         content: row.try_get("content")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
+        trashed_at,
     })
 }
 
