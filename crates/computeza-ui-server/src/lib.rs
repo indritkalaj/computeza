@@ -722,8 +722,13 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/studio/trash/purge", post(studio_trash_purge_handler))
         .route("/studio/trash/empty", post(studio_trash_empty_handler))
         .route("/studio/api/format", post(studio_format_handler))
-        .route("/audit", get(audit_log_page_handler))
+        // /audit is registered later (see audit_handler) -- keep that one.
+        .route("/audit/export.csv", get(audit_export_csv_handler))
         .route("/workspace", get(workspace_overview_handler))
+        .route("/sbom", get(sbom_page_handler))
+        .route("/storage", get(storage_page_handler))
+        .route("/admin/smtp", get(admin_smtp_handler).post(admin_smtp_submit_handler))
+        .route("/api/health/all", get(api_health_all_handler))
         .route(
             "/studio/api/completions",
             get(studio_completions_handler),
@@ -5181,61 +5186,256 @@ async fn studio_trash_page_handler(
 }
 
 // ============================================================
-// Audit log viewer (read-only) -- surfaces the tamper-evident
-// jsonl log under /audit. AppState carries an Arc<AuditLog>; we
-// fetch the most-recent 500 events via list_recent.
+// Audit log CSV export -- streams the recent events as CSV so
+// operators can pipe them into a spreadsheet or external SIEM.
 // ============================================================
 
-async fn audit_log_page_handler(State(state): State<AppState>) -> Html<String> {
-    let l = Localizer::english();
+async fn audit_export_csv_handler(State(state): State<AppState>) -> Response {
     let events = match state.audit.as_ref() {
-        Some(a) => a.list_recent(500).await.unwrap_or_default(),
+        Some(a) => a.list_recent(5000).await.unwrap_or_default(),
         None => Vec::new(),
     };
-    let rows: String = if events.is_empty() {
-        r#"<tr><td colspan="5" class="cz-cell-dim" style="text-align:center; padding:1.5rem;">No audit events recorded yet.</td></tr>"#.to_string()
+    let mut csv = String::from("seq,timestamp,action,actor,resource,detail\n");
+    for e in &events {
+        let detail = serde_json::to_string(&e.body.detail).unwrap_or_default();
+        let resource = e.body.resource.clone().unwrap_or_default();
+        let action = format!("{:?}", e.body.action);
+        let row = format!(
+            "{},{},{},{},{},{}\n",
+            e.body.seq,
+            csv_field(&e.body.timestamp.to_rfc3339()),
+            csv_field(&action),
+            csv_field(&e.body.actor),
+            csv_field(&resource),
+            csv_field(&detail),
+        );
+        csv.push_str(&row);
+    }
+    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    (
+        StatusCode::OK,
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/csv; charset=utf-8".to_string(),
+            ),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"computeza-audit-{ts}.csv\""),
+            ),
+        ],
+        csv,
+    )
+        .into_response()
+}
+
+fn csv_field(s: &str) -> String {
+    if s.contains(',') || s.contains('"') || s.contains('\n') {
+        format!("\"{}\"", s.replace('"', "\"\""))
     } else {
-        events
-            .iter()
-            .map(|e| {
-                let action = format!("{:?}", e.body.action);
-                let resource = e.body.resource.clone().unwrap_or_default();
-                let detail = serde_json::to_string(&e.body.detail).unwrap_or_default();
-                let detail_short: String = detail.chars().take(140).collect();
-                format!(
-                    r#"<tr>
-<td class="cz-cell-mono cz-cell-dim">{seq}</td>
-<td class="cz-cell-mono cz-cell-dim"><span data-ts-utc="{ts}">{ts}</span></td>
-<td class="cz-cell-mono"><span class="cz-badge cz-badge-info">{action}</span></td>
-<td class="cz-cell-mono">{actor}</td>
-<td class="cz-cell-mono" style="max-width:30rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="{detail_full}">{resource} {detail}</td>
+        s.to_string()
+    }
+}
+
+// ============================================================
+// SBOM (software bill of materials) -- shows installed component
+// versions + license summary at /sbom.
+// ============================================================
+
+async fn sbom_page_handler(State(state): State<AppState>) -> Html<String> {
+    let l = Localizer::english();
+    let installed = compute_installed_slugs(state.store.as_deref()).await;
+    let rows: String = COMPONENTS
+        .iter()
+        .map(|c| {
+            let installed_badge = if installed.contains(c.slug) {
+                r#"<span class="cz-badge cz-badge-ok">installed</span>"#
+            } else if c.available {
+                r#"<span class="cz-badge cz-badge-info">available</span>"#
+            } else {
+                r#"<span class="cz-badge cz-badge-warn">planned</span>"#
+            };
+            let name = l.t(c.name_key);
+            let role = l.t(c.role_key);
+            format!(
+                r#"<tr>
+<td class="cz-cell-mono">{slug}</td>
+<td><strong>{name}</strong></td>
+<td class="cz-cell-dim">{role}</td>
+<td>{badge}</td>
 </tr>"#,
-                    seq = e.body.seq,
-                    ts = html_escape(&e.body.timestamp.to_rfc3339()),
-                    action = html_escape(&action),
-                    actor = html_escape(&e.body.actor),
-                    resource = html_escape(&resource),
-                    detail = html_escape(&detail_short),
-                    detail_full = html_escape(&detail),
-                )
-            })
-            .collect()
-    };
+                slug = html_escape(c.slug),
+                name = html_escape(&name),
+                role = html_escape(&role),
+                badge = installed_badge,
+            )
+        })
+        .collect();
     let body = format!(
         r#"<section class="cz-hero">
-<h1>Audit log</h1>
-<p class="cz-muted">Tamper-evident JSONL: every administrative action signed and chained to its predecessor. Newest first; capped at 500 events for this view. Raw file: <code>audit.jsonl</code>.</p>
+<h1>Software bill of materials</h1>
+<p class="cz-muted">Managed components, their roles, and current install state on this host. Full third-party license breakdown lives in <code>docs/sbom.md</code>.</p>
 </section>
 <section class="cz-section">
 <div class="cz-table-wrap">
 <table class="cz-table">
-<thead><tr><th>#</th><th>When (UTC)</th><th>Action</th><th>Actor</th><th>Resource &middot; detail</th></tr></thead>
+<thead><tr><th>Slug</th><th>Component</th><th>Role</th><th>State</th></tr></thead>
 <tbody>{rows}</tbody>
 </table>
 </div>
+<p style="margin-top:1rem;"><a href="/install" class="cz-btn">Go to /install</a> &middot; <a href="https://github.com/indritkalaj/computeza/blob/main/docs/sbom.md" class="cz-btn-ghost" target="_blank" rel="noopener">Full license docs</a></p>
 </section>"#,
     );
-    Html(render_shell(&l, "Audit log", NavLink::Studio, &body))
+    Html(render_shell(&l, "SBOM", NavLink::Install, &body))
+}
+
+// ============================================================
+// Dedicated /storage page -- expands on the sidebar's storage
+// source row with a copyable summary card per registered backend.
+// ============================================================
+
+async fn storage_page_handler(State(state): State<AppState>) -> Html<String> {
+    let l = Localizer::english();
+    let garage = discover_garage_endpoint(state.store.as_deref()).await;
+    let card = match garage {
+        Some(endpoint) => format!(
+            r##"<div class="cz-card" style="max-width:42rem;">
+<div class="cz-card-eyebrow">Computeza Local Storage</div>
+<p>S3-compatible object store (Garage) running on this host. Used by Lakekeeper to back every Iceberg warehouse.</p>
+<dl style="display:grid;grid-template-columns:auto 1fr;gap:0.4rem 1rem;font-family:'Geist Mono',ui-monospace,monospace;font-size:0.85rem;">
+<dt class="cz-muted">Endpoint</dt><dd>{endpoint}</dd>
+<dt class="cz-muted">Protocol</dt><dd>S3 (HTTP)</dd>
+<dt class="cz-muted">Region</dt><dd>garage</dd>
+<dt class="cz-muted">Path-style access</dt><dd>true</dd>
+</dl>
+<p style="margin-top:1rem;"><a href="/install" class="cz-btn-ghost">Reinstall / replace storage</a></p>
+</div>"##,
+            endpoint = html_escape(&endpoint),
+        ),
+        None => r#"<div class="cz-card" style="max-width:42rem;"><p>No storage source registered yet. Install Garage (or another S3-compatible backend) from <a href="/install">/install</a>.</p></div>"#.to_string(),
+    };
+    let body = format!(
+        r#"<section class="cz-hero">
+<h1>Storage</h1>
+<p class="cz-muted">The actual bytes behind your Iceberg tables live here. Computeza ships Garage as the default local backend; cloud connectors (AWS S3, Azure Blob, GCS) plug in alongside.</p>
+</section>
+<section class="cz-section">
+{card}
+</section>"#,
+    );
+    Html(render_shell(&l, "Storage", NavLink::Studio, &body))
+}
+
+// ============================================================
+// SMTP config form (scaffold, deferred behaviour) -- lets the
+// operator capture host/port/user/from so the future encrypted-
+// mail rotation pipeline has a place to read from.
+// ============================================================
+
+#[derive(serde::Deserialize, Default)]
+#[allow(dead_code)] // scaffold only -- persistence ships with the v0.1+ rotation pipeline
+struct SmtpForm {
+    #[serde(default)]
+    host: String,
+    #[serde(default)]
+    port: String,
+    #[serde(default)]
+    from: String,
+    #[serde(default)]
+    flash: Option<String>,
+}
+
+async fn admin_smtp_handler() -> Html<String> {
+    render_admin_smtp_page(None)
+}
+
+async fn admin_smtp_submit_handler(
+    axum::extract::Form(_form): axum::extract::Form<SmtpForm>,
+) -> Html<String> {
+    // Scaffold: the encrypted-mail rotation pipeline is deferred
+    // (see AGENTS.md "Secrets: scheduled auto-rotation"). We accept
+    // the form for now so the surface exists; persistence lands
+    // with the rotation pipeline itself.
+    render_admin_smtp_page(Some(
+        "SMTP scaffold accepted. Encrypted-mail dispatch ships with the v0.1+ rotation pipeline (see AGENTS.md Deferred work).",
+    ))
+}
+
+fn render_admin_smtp_page(flash: Option<&str>) -> Html<String> {
+    let l = Localizer::english();
+    let csrf = auth::csrf_input();
+    let flash_html = flash
+        .map(|m| {
+            format!(
+                r#"<div class="cz-flash" style="margin-bottom:1rem;">{}</div>"#,
+                html_escape(m)
+            )
+        })
+        .unwrap_or_default();
+    let body = format!(
+        r##"<section class="cz-hero">
+<h1>SMTP &middot; outbound mail</h1>
+<p class="cz-muted">Where to send PGP-encrypted secret-rotation notifications. Scaffold only -- the dispatch pipeline is part of the v0.1+ rotation milestone.</p>
+</section>
+<section class="cz-section" style="max-width:36rem;">
+{flash_html}
+<form method="post" action="/admin/smtp" class="cz-form">
+{csrf}
+<label for="smtp-host">SMTP host</label>
+<input id="smtp-host" name="host" class="cz-input" type="text" placeholder="smtp.example.com" />
+<label for="smtp-port">SMTP port</label>
+<input id="smtp-port" name="port" class="cz-input" type="number" placeholder="587" min="1" max="65535" />
+<label for="smtp-from">From address</label>
+<input id="smtp-from" name="from" class="cz-input" type="email" placeholder="computeza@example.com" />
+<button type="submit" class="cz-btn-primary" style="align-self:flex-start;">Save (deferred)</button>
+</form>
+</section>"##,
+    );
+    Html(render_shell(&l, "SMTP config", NavLink::Studio, &body))
+}
+
+// ============================================================
+// /api/health/all -- JSON aggregate across every reconciler-
+// observed component so external monitoring can scrape ONE URL.
+// ============================================================
+
+#[derive(serde::Serialize)]
+struct HealthAllResponse {
+    ok: bool,
+    components: Vec<HealthComponent>,
+}
+
+#[derive(serde::Serialize)]
+struct HealthComponent {
+    slug: String,
+    installed: bool,
+    endpoint: Option<String>,
+}
+
+async fn api_health_all_handler(State(state): State<AppState>) -> axum::Json<HealthAllResponse> {
+    let installed = compute_installed_slugs(state.store.as_deref()).await;
+    let mut components = Vec::new();
+    let lk = discover_lakekeeper_endpoint(state.store.as_deref()).await;
+    let trino = discover_trino_endpoint(state.store.as_deref()).await;
+    let sail = discover_sail_endpoint(state.store.as_deref()).await;
+    let garage = discover_garage_endpoint(state.store.as_deref()).await;
+    for c in COMPONENTS {
+        let installed_flag = installed.contains(c.slug);
+        let endpoint = match c.slug {
+            "lakekeeper" => lk.clone(),
+            "trino" => trino.clone(),
+            "sail" => sail.clone(),
+            "garage" => garage.clone(),
+            _ => None,
+        };
+        components.push(HealthComponent {
+            slug: c.slug.to_string(),
+            installed: installed_flag,
+            endpoint,
+        });
+    }
+    let ok = components.iter().any(|c| c.installed);
+    axum::Json(HealthAllResponse { ok, components })
 }
 
 // ============================================================
@@ -16949,6 +17149,10 @@ pub fn render_shell(
     <a href="/admin/groups" class="cz-sidenav-item {ngrp}" data-label="{nav_admin_groups}"><i class="fa-solid fa-users fa-fw"></i><span class="cz-sidenav-label">{nav_admin_groups}</span></a>
     <a href="/admin/tenants" class="cz-sidenav-item {nwsp}" data-label="{nav_admin_tenants}"><i class="fa-solid fa-building fa-fw"></i><span class="cz-sidenav-label">{nav_admin_tenants}</span></a>
     <a href="/admin/license" class="cz-sidenav-item {nlic}" data-label="{nav_admin_license}"><i class="fa-solid fa-certificate fa-fw"></i><span class="cz-sidenav-label">{nav_admin_license}</span></a>
+    <a href="/admin/smtp" class="cz-sidenav-item" data-label="SMTP"><i class="fa-solid fa-envelope fa-fw"></i><span class="cz-sidenav-label">SMTP</span></a>
+    <a href="/sbom" class="cz-sidenav-item" data-label="SBOM"><i class="fa-solid fa-list-check fa-fw"></i><span class="cz-sidenav-label">SBOM</span></a>
+    <a href="/storage" class="cz-sidenav-item" data-label="Storage"><i class="fa-solid fa-hard-drive fa-fw"></i><span class="cz-sidenav-label">Storage</span></a>
+    <a href="/workspace" class="cz-sidenav-item" data-label="Workspace"><i class="fa-solid fa-table-cells fa-fw"></i><span class="cz-sidenav-label">Workspace</span></a>
   </div>
   <div class="cz-sidenav-spacer"></div>
 </nav>
