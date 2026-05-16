@@ -1255,6 +1255,20 @@ a.cz-card:hover {
 }
 
 /* File tree rows -- folder + file lines */
+.cz-studio-file-folder-wrap {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.25rem;
+  padding-right: 0.35rem;
+}
+.cz-studio-file-folder-wrap .cz-studio-file-folder {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .cz-studio-file-folder {
   font-family: 'Geist Mono', ui-monospace, monospace;
   font-size: 0.72rem;
@@ -1262,6 +1276,78 @@ a.cz-card:hover {
   padding: 0.35rem 0.5rem 0.15rem;
   text-transform: uppercase;
   letter-spacing: 0.05em;
+}
+
+/* Per-row 3-dot menu (file + folder). Native <details>/<summary>
+   toggles the popup with zero JS; the popup is absolute-positioned
+   right-aligned to the trigger so it doesn't push the row content
+   around. A page-level JS snippet (in the files pane template)
+   closes other open menus when one is opened. */
+.cz-row-menu {
+  position: relative;
+  display: inline-block;
+}
+.cz-row-menu > summary {
+  list-style: none;
+  cursor: pointer;
+  padding: 0.15rem 0.35rem;
+  border-radius: 3px;
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1;
+  transition: background 0.1s ease, color 0.1s ease;
+}
+.cz-row-menu > summary::-webkit-details-marker { display: none; }
+.cz-row-menu > summary:hover { color: var(--ink); background: var(--navy); }
+.cz-row-menu[open] > summary { color: var(--ink); background: var(--navy); }
+.cz-row-menu-popup {
+  position: absolute;
+  top: calc(100% + 0.2rem);
+  right: 0;
+  z-index: 300;
+  min-width: 11rem;
+  background: var(--navy-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-card);
+  padding: 0.25rem;
+  display: flex;
+  flex-direction: column;
+}
+.cz-row-menu-form { margin: 0; display: block; }
+.cz-row-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.4rem 0.6rem;
+  border-radius: 3px;
+  font-size: 0.78rem;
+  color: var(--ink);
+  text-decoration: none;
+  cursor: pointer;
+  background: transparent;
+  border: none;
+  width: 100%;
+  text-align: left;
+  font-family: inherit;
+}
+.cz-row-menu-item:hover { background: var(--navy); }
+.cz-row-menu-item-danger { color: var(--fail); }
+.cz-row-menu-item-danger:hover { background: rgba(255, 99, 99, 0.12); }
+/* File-row reveal: the 3-dot trigger fades in on hover so the row
+   stays calm at rest. Folder-row trigger is always visible (the
+   row already shows the folder label as the dominant element). */
+.cz-studio-file-row-wrap { position: relative; display: flex; align-items: center; }
+.cz-studio-file-row-wrap > .cz-studio-file-row { flex: 1; min-width: 0; }
+.cz-studio-file-row-wrap > .cz-file-menu > summary {
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease;
+}
+.cz-studio-file-row-wrap:hover > .cz-file-menu > summary,
+.cz-studio-file-row-wrap > .cz-file-menu[open] > summary {
+  opacity: 1;
+  pointer-events: auto;
 }
 .cz-studio-file-row-wrap {
   position: relative;

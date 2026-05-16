@@ -694,6 +694,9 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/studio/files/export-archive", get(studio_files_export_archive_handler))
         .route("/studio/files/import-archive", post(studio_files_import_archive_handler))
         .route("/studio/folders/new", post(studio_folder_new_handler))
+        .route("/studio/folders/rename", post(studio_folder_rename_handler))
+        .route("/studio/folders/delete", post(studio_folder_delete_handler))
+        .route("/studio/folders/export", get(studio_folder_export_handler))
         .route(
             "/studio/api/completions",
             get(studio_completions_handler),
@@ -4421,6 +4424,164 @@ async fn studio_folder_new_handler(
     }
 }
 
+/// POST /studio/folders/rename -- rewrite the folder prefix on every
+/// file whose path starts with `old/`. Folders in studio_files are
+/// implicit, so renaming a folder is "rename every file under it"
+/// (including the .gitkeep placeholder if present).
+#[derive(serde::Deserialize)]
+struct FolderRenameForm {
+    /// Current folder name (no leading/trailing slash, e.g. "sql").
+    old: String,
+    /// New folder name. Same shape as `old`.
+    new: String,
+    #[serde(default)]
+    open: String,
+}
+
+async fn studio_folder_rename_handler(
+    State(state): State<AppState>,
+    axum::extract::Form(form): axum::extract::Form<FolderRenameForm>,
+) -> axum::response::Redirect {
+    let Some(store) = state.store.as_deref() else {
+        return redirect_studio_flash(Some(form.open), None, "metadata store unavailable");
+    };
+    let old = form.old.trim().trim_matches('/').to_string();
+    let new = form.new.trim().trim_matches('/').to_string();
+    if old.is_empty() || new.is_empty() {
+        return redirect_studio_flash(Some(form.open), None, "rename folder: both names required");
+    }
+    if old == new {
+        return redirect_studio_flash(Some(form.open), None, "rename folder: same name");
+    }
+    let old_prefix = format!("/{old}/");
+    let new_prefix = format!("/{new}/");
+    let all = match store.studio_files_list().await {
+        Ok(a) => a,
+        Err(e) => return redirect_studio_flash(Some(form.open), None, &format!("list: {e}")),
+    };
+    let mut renamed = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+    for f in all.iter().filter(|f| f.path.starts_with(&old_prefix)) {
+        let new_path = format!("{new_prefix}{}", &f.path[old_prefix.len()..]);
+        match store.studio_files_update(&f.id, Some(&new_path), None).await {
+            Ok(Some(_)) => renamed += 1,
+            Ok(None) => errors.push(format!("{} not found", f.path)),
+            Err(e) => errors.push(format!("{}: {e}", f.path)),
+        }
+    }
+    let msg = if errors.is_empty() {
+        format!("renamed folder /{old}/ -> /{new}/ ({renamed} files)")
+    } else {
+        format!(
+            "renamed {renamed} files; {} errors (first: {})",
+            errors.len(),
+            errors.first().cloned().unwrap_or_default()
+        )
+    };
+    redirect_studio_flash(Some(form.open), None, &msg)
+}
+
+/// POST /studio/folders/delete -- delete every file whose path starts
+/// with `/<name>/`. Cascades through the .gitkeep placeholder + any
+/// real files inside; the folder vanishes from the tree once the last
+/// file is gone (folders are implicit).
+#[derive(serde::Deserialize)]
+struct FolderDeleteForm {
+    /// Folder name without slashes (e.g. "sql").
+    name: String,
+    #[serde(default)]
+    open: String,
+}
+
+async fn studio_folder_delete_handler(
+    State(state): State<AppState>,
+    axum::extract::Form(form): axum::extract::Form<FolderDeleteForm>,
+) -> axum::response::Redirect {
+    let Some(store) = state.store.as_deref() else {
+        return redirect_studio_flash(Some(form.open), None, "metadata store unavailable");
+    };
+    let name = form.name.trim().trim_matches('/').to_string();
+    if name.is_empty() {
+        return redirect_studio_flash(Some(form.open), None, "delete folder: name required");
+    }
+    let prefix = format!("/{name}/");
+    let all = match store.studio_files_list().await {
+        Ok(a) => a,
+        Err(e) => return redirect_studio_flash(Some(form.open), None, &format!("list: {e}")),
+    };
+    let mut deleted = 0usize;
+    for f in all.iter().filter(|f| f.path.starts_with(&prefix)) {
+        if store.studio_files_delete(&f.id).await.unwrap_or(false) {
+            deleted += 1;
+        }
+    }
+    // Trim any deleted ids out of the `open` csv so the redirect
+    // doesn't try to reopen a tab whose file is gone.
+    let still_open: Vec<String> = form
+        .open
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .filter(|id| !all.iter().any(|f| &f.id == id && f.path.starts_with(&prefix)))
+        .map(str::to_string)
+        .collect();
+    redirect_studio_flash(
+        Some(still_open.join(",")),
+        None,
+        &format!("deleted folder /{name}/ ({deleted} files)"),
+    )
+}
+
+#[derive(serde::Deserialize)]
+struct FolderExportQuery {
+    name: String,
+}
+
+/// GET /studio/folders/export?name=<folder> -- download a .cptz zip
+/// containing every file under `/<folder>/`. Manifest mirrors the
+/// workspace-wide export shape so a folder export can be re-imported
+/// via /studio/files/import-archive without changes.
+async fn studio_folder_export_handler(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<FolderExportQuery>,
+) -> Response {
+    let Some(store) = state.store.as_deref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "metadata store unavailable").into_response();
+    };
+    let name = q.name.trim().trim_matches('/').to_string();
+    if name.is_empty() {
+        return (StatusCode::BAD_REQUEST, "name required").into_response();
+    }
+    let prefix = format!("/{name}/");
+    let files = match store.studio_files_list().await {
+        Ok(f) => f.into_iter().filter(|f| f.path.starts_with(&prefix)).collect::<Vec<_>>(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("list: {e}")).into_response(),
+    };
+    if files.is_empty() {
+        return (StatusCode::NOT_FOUND, format!("no files under /{name}/")).into_response();
+    }
+    let bytes = match build_cptz_archive(&files) {
+        Ok(b) => b,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    let safe: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    (
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, "application/zip".to_string()),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{safe}-{ts}.cptz\""),
+            ),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
 /// Build the /studio redirect URL with the standard tab-state +
 /// flash-message query string. None values are omitted from the
 /// query so the URL stays compact.
@@ -6019,11 +6180,11 @@ fn render_studio_files_pane(files: &StudioFilesView) -> String {
     // empty file.
     let actions = format!(
         r##"<div class="cz-studio-files-actions">
-<a href="#cz-modal-new-file" data-tooltip="New file"><i class="fa-solid fa-plus"></i></a>
-<a href="#cz-modal-new-folder" data-tooltip="New folder"><i class="fa-solid fa-folder-plus"></i></a>
-<form method="post" action="/studio/notebooks/new" style="margin:0;display:inline;">{csrf}<button type="submit" data-tooltip="New notebook" class="cz-studio-files-action-btn"><i class="fa-solid fa-book"></i></button></form>
-<a href="#cz-modal-import-archive" data-tooltip="Upload .cptz archive"><i class="fa-solid fa-file-arrow-up"></i></a>
-<a href="/studio/files/export-archive" data-tooltip="Export workspace as .cptz"><i class="fa-solid fa-file-zipper"></i></a>
+<a href="#cz-modal-new-file" title="New file" data-tooltip="New file" aria-label="New file"><i class="fa-solid fa-plus"></i></a>
+<a href="#cz-modal-new-folder" title="New folder" data-tooltip="New folder" aria-label="New folder"><i class="fa-solid fa-folder-plus"></i></a>
+<form method="post" action="/studio/notebooks/new" style="margin:0;display:inline;">{csrf}<button type="submit" title="New notebook" data-tooltip="New notebook" aria-label="New notebook" class="cz-studio-files-action-btn"><i class="fa-solid fa-book"></i></button></form>
+<a href="#cz-modal-import-archive" title="Upload .cptz archive" data-tooltip="Upload .cptz archive" aria-label="Upload .cptz archive"><i class="fa-solid fa-file-arrow-up"></i></a>
+<a href="/studio/files/export-archive" title="Export workspace as .cptz" data-tooltip="Export workspace as .cptz" aria-label="Export workspace as .cptz"><i class="fa-solid fa-file-zipper"></i></a>
 </div>
 <div id="cz-modal-new-folder" class="cz-modal-overlay" role="dialog" aria-labelledby="cz-modal-new-folder-title" aria-modal="true">
 <a href="#" class="cz-modal-overlay-backdrop" aria-label="Close"></a>
@@ -6142,12 +6303,77 @@ fn render_studio_files_pane(files: &StudioFilesView) -> String {
         groups.entry(folder).or_default().push(f);
     }
     let tree_html: String = if files.all.is_empty() {
-        r#"<div class="cz-studio-file-empty">No saved files yet. Click <strong>+</strong> to save your current editor body as a file, or import a .cptz archive (coming soon).</div>"#.to_string()
+        r#"<div class="cz-studio-file-empty">No saved files yet. Click <strong>+</strong> to save your current editor body as a file, or import a .cptz archive.</div>"#.to_string()
     } else {
         groups
             .iter()
             .map(|(folder, items)| {
-                let folder_label = if folder == "root" { "/".to_string() } else { format!("/{folder}/") };
+                let is_root_group = folder == "root";
+                let folder_label = if is_root_group { "/".to_string() } else { format!("/{folder}/") };
+                // Folder-level 3-dot actions menu (rename / export /
+                // delete). Root group has no actions because "root"
+                // isn't a real folder -- it's the bucket for files
+                // sitting at the top-level path.
+                let folder_actions = if is_root_group {
+                    String::new()
+                } else {
+                    let folder_enc = url_encode(folder);
+                    let folder_safe = folder.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect::<String>();
+                    format!(
+                        r##"<details class="cz-row-menu cz-folder-menu">
+<summary title="Folder actions" aria-label="Folder actions"><i class="fa-solid fa-ellipsis-vertical"></i></summary>
+<div class="cz-row-menu-popup">
+<a href="#cz-folder-rename-{folder_safe}" class="cz-row-menu-item"><i class="fa-solid fa-pen fa-fw"></i> Rename folder</a>
+<a href="/studio/folders/export?name={folder_enc}" class="cz-row-menu-item"><i class="fa-solid fa-file-zipper fa-fw"></i> Export as .cptz</a>
+<a href="#cz-folder-delete-{folder_safe}" class="cz-row-menu-item cz-row-menu-item-danger"><i class="fa-solid fa-trash fa-fw"></i> Delete folder</a>
+</div>
+</details>
+<div id="cz-folder-rename-{folder_safe}" class="cz-modal-overlay" role="dialog" aria-modal="true">
+<a href="#" class="cz-modal-overlay-backdrop" aria-label="Close"></a>
+<div class="cz-modal">
+<a href="#" class="cz-modal-close" aria-label="Close">×</a>
+<h2 class="cz-modal-title">Rename folder /{folder_label_html}/</h2>
+<p class="cz-modal-subtitle">Rewrites the folder prefix on every file underneath. The tree regroups on next load.</p>
+<form method="post" action="/studio/folders/rename">
+{csrf}
+<input type="hidden" name="open" value="{open_csv_enc}" />
+<input type="hidden" name="old" value="{folder_label_html}" />
+<div class="cz-modal-field">
+<label for="cz-folder-rename-input-{folder_safe}">New folder name</label>
+<input id="cz-folder-rename-input-{folder_safe}" type="text" name="new" value="{folder_label_html}" class="cz-input" required autofocus />
+<p class="cz-modal-field-hint">Use slashes for nested folders, e.g. <code>analytics/v2/staging</code>.</p>
+</div>
+<div class="cz-modal-actions">
+<a href="#" class="cz-btn-ghost">Cancel</a>
+<button type="submit" class="cz-btn-primary">Rename folder</button>
+</div>
+</form>
+</div>
+</div>
+<div id="cz-folder-delete-{folder_safe}" class="cz-modal-overlay" role="dialog" aria-modal="true">
+<a href="#" class="cz-modal-overlay-backdrop" aria-label="Close"></a>
+<div class="cz-modal">
+<a href="#" class="cz-modal-close" aria-label="Close">×</a>
+<h2 class="cz-modal-title">Delete folder /{folder_label_html}/?</h2>
+<p class="cz-modal-subtitle">This permanently deletes every file under <code>/{folder_label_html}/</code>. The files cannot be recovered.</p>
+<form method="post" action="/studio/folders/delete">
+{csrf}
+<input type="hidden" name="open" value="{open_csv_enc}" />
+<input type="hidden" name="name" value="{folder_label_html}" />
+<div class="cz-modal-actions">
+<a href="#" class="cz-btn-ghost">Cancel</a>
+<button type="submit" class="cz-btn-danger">Delete folder</button>
+</div>
+</form>
+</div>
+</div>"##,
+                        csrf = csrf,
+                        open_csv_enc = html_escape(&open_csv),
+                        folder_enc = folder_enc,
+                        folder_safe = folder_safe,
+                        folder_label_html = html_escape(folder),
+                    )
+                };
                 let rows: String = items
                     .iter()
                     .map(|f| {
@@ -6168,28 +6394,33 @@ fn render_studio_files_pane(files: &StudioFilesView) -> String {
                             next_open.push(&f.id);
                         }
                         let next_open_csv = next_open.join(",");
-                        // Hover-revealed actions on the row. Rename
-                        // is a :target-anchored modal centered on
-                        // the page (the previous inline popover
-                        // spilled out of the 220px-wide files pane).
-                        // Duplicate/delete are tiny inline forms;
-                        // export is a GET download.
+                        // Per-file 3-dot actions menu. Native <details>
+                        // toggles the popup with zero JS; the popup is
+                        // absolute-positioned right-aligned to the
+                        // ellipsis trigger. Items expand to per-file
+                        // operations via :target-anchored modals
+                        // (rename / delete) or inline forms (duplicate)
+                        // or direct GETs (download).
                         format!(
                             r##"<div class="cz-studio-file-row-wrap">
 <a class="cz-studio-file-row{active}" href="/studio?open={open}&active={id}"><span class="cz-tree-label" title="{path}">{label}</span></a>
-<div class="cz-studio-file-row-actions">
-<a href="#cz-rename-{id}" title="Rename" class="cz-file-row-rename"><i class="fa-solid fa-pen"></i></a>
-<form method="post" action="/studio/files/{id}/duplicate" style="margin:0;display:inline;">{csrf}<input type="hidden" name="open" value="{open}" /><button type="submit" title="Duplicate"><i class="fa-solid fa-copy"></i></button></form>
-<a href="/studio/files/{id}/export" title="Download"><i class="fa-solid fa-download"></i></a>
-<a href="#cz-delete-{id}" title="Delete" class="cz-file-row-delete"><i class="fa-solid fa-trash"></i></a>
+<details class="cz-row-menu cz-file-menu">
+<summary title="File actions" aria-label="File actions"><i class="fa-solid fa-ellipsis-vertical"></i></summary>
+<div class="cz-row-menu-popup">
+<a href="#cz-rename-{id}" class="cz-row-menu-item"><i class="fa-solid fa-pen fa-fw"></i> Rename</a>
+<a href="#cz-rename-{id}" class="cz-row-menu-item"><i class="fa-solid fa-arrows-up-down-left-right fa-fw"></i> Move...</a>
+<form method="post" action="/studio/files/{id}/duplicate" class="cz-row-menu-form">{csrf}<input type="hidden" name="open" value="{open}" /><button type="submit" class="cz-row-menu-item"><i class="fa-solid fa-copy fa-fw"></i> Duplicate</button></form>
+<a href="/studio/files/{id}/export" class="cz-row-menu-item"><i class="fa-solid fa-download fa-fw"></i> Download</a>
+<a href="#cz-delete-{id}" class="cz-row-menu-item cz-row-menu-item-danger"><i class="fa-solid fa-trash fa-fw"></i> Delete</a>
 </div>
+</details>
 </div>
 <div id="cz-rename-{id}" class="cz-modal-overlay" role="dialog" aria-labelledby="cz-rename-{id}-title" aria-modal="true">
 <a href="#" class="cz-modal-overlay-backdrop" aria-label="Close"></a>
 <div class="cz-modal">
 <a href="#" class="cz-modal-close" aria-label="Close">×</a>
-<h2 id="cz-rename-{id}-title" class="cz-modal-title">Rename file</h2>
-<p class="cz-modal-subtitle">Change the path of <code>{path}</code>. Use a leading slash; the first folder segment becomes the tree group.</p>
+<h2 id="cz-rename-{id}-title" class="cz-modal-title">Rename / move file</h2>
+<p class="cz-modal-subtitle">Change the path of <code>{path}</code>. Use a leading slash; the first folder segment becomes the tree group (so renaming to a different folder doubles as Move).</p>
 <form method="post" action="/studio/files/{id}/rename">
 {csrf}
 <input type="hidden" name="open" value="{open}" />
@@ -6199,7 +6430,7 @@ fn render_studio_files_pane(files: &StudioFilesView) -> String {
 </div>
 <div class="cz-modal-actions">
 <a href="#" class="cz-btn-ghost">Cancel</a>
-<button type="submit" class="cz-btn-primary">Rename</button>
+<button type="submit" class="cz-btn-primary">Save</button>
 </div>
 </form>
 </div>
@@ -6229,8 +6460,9 @@ fn render_studio_files_pane(files: &StudioFilesView) -> String {
                     })
                     .collect();
                 format!(
-                    r#"<div class="cz-studio-file-folder">{folder_label}</div>{rows}"#,
+                    r#"<div class="cz-studio-file-folder-wrap"><div class="cz-studio-file-folder"><i class="fa-solid fa-folder fa-fw"></i> {folder_label}</div>{folder_actions}</div>{rows}"#,
                     folder_label = html_escape(&folder_label),
+                    folder_actions = folder_actions,
                 )
             })
             .collect()
@@ -6248,10 +6480,30 @@ fn render_studio_files_pane(files: &StudioFilesView) -> String {
   var form = document.getElementById("cz-file-new-form");
   var hidden = document.getElementById("cz-file-new-content");
   var ta = document.getElementById("cz-sql-textarea");
-  if (!form || !hidden || !ta) return;
-  form.addEventListener("submit", function() {{
-    hidden.value = ta.value;
+  if (form && hidden && ta) {{
+    form.addEventListener("submit", function() {{
+      hidden.value = ta.value;
+    }});
+  }}
+  // Single-popup behavior for the per-row 3-dot menus: opening one
+  // closes any others, and clicking outside any menu closes the
+  // currently-open one. Native <details> wouldn't do this by
+  // itself (it allows arbitrarily many to be open).
+  document.addEventListener("click", function(e) {{
+    var allMenus = document.querySelectorAll("details.cz-row-menu[open]");
+    allMenus.forEach(function(m) {{
+      if (!m.contains(e.target)) m.removeAttribute("open");
+    }});
   }});
+  document.addEventListener("toggle", function(e) {{
+    var t = e.target;
+    if (!(t instanceof HTMLDetailsElement)) return;
+    if (!t.classList.contains("cz-row-menu")) return;
+    if (!t.open) return;
+    document.querySelectorAll("details.cz-row-menu[open]").forEach(function(m) {{
+      if (m !== t) m.removeAttribute("open");
+    }});
+  }}, true);
 }})();
 </script>"##
     )
