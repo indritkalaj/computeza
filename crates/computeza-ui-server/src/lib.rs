@@ -735,8 +735,8 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/about", get(about_page_handler))
         .route("/storage/connect/aws", get(storage_connect_aws_form_handler).post(storage_connect_aws_submit_handler))
         .route("/account/password", get(account_password_form_handler).post(account_password_submit_handler))
-        .route("/volumes", get(volumes_page_handler).post(volumes_create_handler))
-        .route("/volumes/delete", post(volumes_delete_handler))
+        .route("/files", get(files_page_handler).post(files_create_handler))
+        .route("/files/delete", post(files_delete_handler))
         .route(
             "/studio/api/completions",
             get(studio_completions_handler),
@@ -2967,6 +2967,10 @@ struct SidebarWarehouseNode {
 struct SidebarNamespaceNode {
     qualified: String,
     tables: Option<Result<Vec<String>, String>>,
+    /// File-binding names registered under this (catalog, namespace).
+    /// Sourced from the `volume-instance/*` rows in the metadata store;
+    /// surfaced under the "Files" separator in the sidebar tree.
+    file_bindings: Vec<String>,
 }
 
 /// Where the user currently is. Drives which subtrees render expanded
@@ -3040,6 +3044,9 @@ async fn load_namespaces_for_sidebar(
         .unwrap_or_default();
     let mut nodes: Vec<SidebarNamespaceNode> = Vec::with_capacity(qualified_names.len());
     let _ = focus; // tables are now eager-loaded for every namespace
+                   // Pre-fetch all file bindings once; filter per-namespace below
+                   // so we don't N+1 the metadata store.
+    let all_bindings = load_file_bindings(state.store.as_deref()).await;
     for qualified in qualified_names {
         let ns_encoded = qualified.split('.').collect::<Vec<_>>().join("%1F");
         let tpath = format!(
@@ -3063,7 +3070,16 @@ async fn load_namespaces_for_sidebar(
                         .unwrap_or_default()
                 }),
         );
-        nodes.push(SidebarNamespaceNode { qualified, tables });
+        let file_bindings: Vec<String> = all_bindings
+            .iter()
+            .filter(|b| b.catalog == warehouse && b.schema == qualified)
+            .map(|b| b.name.clone())
+            .collect();
+        nodes.push(SidebarNamespaceNode {
+            qualified,
+            tables,
+            file_bindings,
+        });
     }
     Ok(nodes)
 }
@@ -3313,19 +3329,34 @@ fn render_sidebar_namespace(
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
             .collect::<String>(),
     );
-    // Files / Functions buckets are reserved here for future RLS /
-    // governance surfaces. The catalog doesn't expose them yet, so
-    // they render as empty placeholders -- the structure is what
-    // matters for now so RLS scopes (catalog.schema.<bucket>.<name>)
-    // have a settled home in the tree.
+    // Files / Functions buckets sit alongside Tables under every
+    // namespace. Files is populated from the file-binding metadata
+    // (v0.0.x: list + delete from inline; full management lives at
+    // /files). Functions is still a placeholder pending the
+    // engine-bridge work.
+    let files_children: String = if node.file_bindings.is_empty() {
+        r##"<li class="cz-tree-empty">No file bindings yet. <a href="/files" style="color:var(--lavender);">Create one</a>.</li>"##.to_string()
+    } else {
+        node.file_bindings
+            .iter()
+            .map(|fname| {
+                let copy = format!("{warehouse}.{}.{fname}", &node.qualified);
+                format!(
+                    r##"<li class="cz-tree-item"><div class="cz-tree-row cz-tree-leaf"><span class="cz-tree-toggle"></span><span class="cz-tree-icon">[F]</span><span class="cz-tree-label">{name}</span><a href="/files" class="cz-tree-action" title="Manage file bindings" aria-label="Manage"><i class="fa-solid fa-gear"></i></a><button type="button" class="cz-tree-copy" data-copy="{copy}" title="Copy {copy}" aria-label="Copy {copy}"><i class="fa-solid fa-copy"></i></button></div></li>"##,
+                    name = html_escape(fname),
+                    copy = html_escape(&copy),
+                )
+            })
+            .collect()
+    };
     let separators = format!(
         r##"<li class="cz-tree-item"><details class="cz-tree-details cz-tree-separator" data-tree-key="ns-tables:{ns_safe}" open>
 <summary class="cz-tree-row cz-tree-separator-row"><span class="cz-tree-toggle"></span><span class="cz-tree-icon">[#]</span><span class="cz-tree-label cz-cell-dim">Tables</span></summary>
 <ul class="cz-tree-children">{tables}</ul>
 </details></li>
 <li class="cz-tree-item"><details class="cz-tree-details cz-tree-separator" data-tree-key="ns-files:{ns_safe}">
-<summary class="cz-tree-row cz-tree-separator-row"><span class="cz-tree-toggle"></span><span class="cz-tree-icon">[F]</span><span class="cz-tree-label cz-cell-dim">Files</span></summary>
-<ul class="cz-tree-children"><li class="cz-tree-empty">No files. (RLS-scoped file resources land in v0.1+.)</li></ul>
+<summary class="cz-tree-row cz-tree-separator-row"><span class="cz-tree-toggle"></span><span class="cz-tree-icon">[F]</span><span class="cz-tree-label cz-cell-dim">Files</span><a href="/files" class="cz-tree-action" title="Add file binding"><i class="fa-solid fa-plus"></i></a></summary>
+<ul class="cz-tree-children">{files}</ul>
 </details></li>
 <li class="cz-tree-item"><details class="cz-tree-details cz-tree-separator" data-tree-key="ns-fns:{ns_safe}">
 <summary class="cz-tree-row cz-tree-separator-row"><span class="cz-tree-toggle"></span><span class="cz-tree-icon">[fx]</span><span class="cz-tree-label cz-cell-dim">Functions</span></summary>
@@ -3333,6 +3364,7 @@ fn render_sidebar_namespace(
 </details></li>"##,
         ns_safe = ns_safe,
         tables = tables_children,
+        files = files_children,
     );
     let children_block = format!(r#"<ul class="cz-tree-children">{separators}</ul>"#);
     let copy_full = format!("{warehouse}.{}", &node.qualified);
@@ -5440,42 +5472,50 @@ fn render_admin_smtp_page(flash: Option<&str>) -> Html<String> {
 }
 
 // ============================================================
-// /volumes -- Databricks-style named storage containers.
-// A "Volume" maps a logical name (catalog.schema.volume) to a path
-// prefix in the storage backend (today: Garage). Files inside the
-// volume are addressable as /Volumes/<catalog>/<schema>/<volume>/<path>
-// at read time. v0.0.x: list + create the named record; full read /
-// write through the engine bridges lands with the connector
-// reconciler work.
+// /files -- named storage containers (Databricks Volumes-style),
+// scoped to catalog.schema.name. Files inside read as
+// /Files/<catalog>/<schema>/<name>/<path>. v0.0.x: list + create
+// + delete the named record; read / write through the engine
+// bridges arrives with the connector reconciler. Internally the
+// metadata-store kind is still "volume-instance" so older saved
+// rows (from when the surface was called Volumes) continue to
+// load without a migration -- the UI label is what changed.
 // ============================================================
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
-struct VolumeSpec {
+struct FileBindingSpec {
     catalog: String,
     schema: String,
     name: String,
     path_prefix: String,
 }
 
-async fn volumes_page_handler(State(state): State<AppState>) -> Html<String> {
+/// Load all file bindings from the metadata store. Used both by the
+/// /files page and by the catalog sidebar's per-namespace "Files"
+/// separator (which filters this list to its own catalog + schema).
+async fn load_file_bindings(store: Option<&computeza_state::SqliteStore>) -> Vec<FileBindingSpec> {
     use computeza_state::Store;
+    let Some(store) = store else {
+        return Vec::new();
+    };
+    store
+        .list("volume-instance", None)
+        .await
+        .ok()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|sr| serde_json::from_value::<FileBindingSpec>(sr.spec).ok())
+        .collect()
+}
+
+async fn files_page_handler(State(state): State<AppState>) -> Html<String> {
     let l = Localizer::english();
     let csrf = auth::csrf_input();
-    let volumes: Vec<VolumeSpec> = match state.store.as_deref() {
-        Some(store) => store
-            .list("volume-instance", None)
-            .await
-            .ok()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|sr| serde_json::from_value::<VolumeSpec>(sr.spec).ok())
-            .collect(),
-        None => Vec::new(),
-    };
-    let rows: String = if volumes.is_empty() {
-        r#"<tr><td colspan="4" class="cz-cell-dim" style="text-align:center; padding:1.5rem;">No volumes yet. Create one below.</td></tr>"#.to_string()
+    let bindings = load_file_bindings(state.store.as_deref()).await;
+    let rows: String = if bindings.is_empty() {
+        r#"<tr><td colspan="4" class="cz-cell-dim" style="text-align:center; padding:1.5rem;">No file bindings yet. Create one below.</td></tr>"#.to_string()
     } else {
-        volumes
+        bindings
             .iter()
             .map(|v| {
                 let qualified = format!("{}.{}.{}", v.catalog, v.schema, v.name);
@@ -5483,10 +5523,10 @@ async fn volumes_page_handler(State(state): State<AppState>) -> Html<String> {
                     r##"<tr>
 <td class="cz-cell-mono">{qualified_esc}</td>
 <td class="cz-cell-mono cz-cell-dim">{path}</td>
-<td><code>/Volumes/{cat}/{sch}/{name}/</code></td>
+<td><code>/Files/{cat}/{sch}/{name}/</code></td>
 <td>
 <button type="button" class="cz-tree-copy" data-copy="{qualified_esc}" title="Copy"><i class="fa-solid fa-copy"></i></button>
-<form method="post" action="/volumes/delete" style="margin:0;display:inline;">{csrf}<input type="hidden" name="name" value="{qualified_esc}" /><button type="submit" class="cz-btn-ghost" title="Delete this volume binding (the underlying storage is NOT deleted)" onclick="return confirm('Delete the volume binding for {qualified_esc}? The underlying S3 prefix is NOT removed.');"><i class="fa-solid fa-trash"></i></button></form>
+<form method="post" action="/files/delete" style="margin:0;display:inline;">{csrf}<input type="hidden" name="name" value="{qualified_esc}" /><button type="submit" class="cz-btn-ghost" title="Delete this file binding (the underlying storage is NOT deleted)" onclick="return confirm('Delete the file binding for {qualified_esc}? The underlying S3 prefix is NOT removed.');"><i class="fa-solid fa-trash"></i></button></form>
 </td>
 </tr>"##,
                     qualified_esc = html_escape(&qualified),
@@ -5501,8 +5541,9 @@ async fn volumes_page_handler(State(state): State<AppState>) -> Html<String> {
     };
     let body = format!(
         r##"<section class="cz-hero">
-<h1>Volumes</h1>
-<p class="cz-muted">Named storage containers under <code>catalog.schema.volume</code>. Files inside read as <code>/Volumes/&lt;catalog&gt;/&lt;schema&gt;/&lt;volume&gt;/&lt;path&gt;</code> -- like Databricks Volumes. v0.0.x records the named binding; engine-bridge read/write paths arrive with the connector reconciler.</p>
+<h1>Files</h1>
+<p class="cz-muted">Named storage containers under <code>catalog.schema.file</code>. Bytes inside read as <code>/Files/&lt;catalog&gt;/&lt;schema&gt;/&lt;file&gt;/&lt;path&gt;</code> -- the Databricks-Volumes pattern, renamed Files here. v0.0.x records the named binding; engine-bridge read/write paths arrive with the connector reconciler.</p>
+<p class="cz-muted" style="margin-top:0.25rem;font-size:0.85rem;">This page is the management surface; bindings also appear in the catalog sidebar under each namespace's <strong>Files</strong> group, alongside its tables.</p>
 </section>
 <section class="cz-section">
 <div class="cz-table-wrap">
@@ -5514,28 +5555,28 @@ async fn volumes_page_handler(State(state): State<AppState>) -> Html<String> {
 </section>
 <section class="cz-section" style="max-width:42rem;">
 <div class="cz-card">
-<h3 style="margin-top:0;">Create a volume</h3>
-<form method="post" action="/volumes" class="cz-form">
+<h3 style="margin-top:0;">Create a file binding</h3>
+<form method="post" action="/files" class="cz-form">
 {csrf}
 <label for="vol-cat">Catalog</label>
 <input id="vol-cat" name="catalog" class="cz-input" type="text" placeholder="default" required pattern="[A-Za-z0-9_-]+" />
 <label for="vol-sch">Schema (namespace)</label>
 <input id="vol-sch" name="schema" class="cz-input" type="text" placeholder="analytics" required pattern="[A-Za-z0-9_.-]+" />
-<label for="vol-name">Volume name</label>
+<label for="vol-name">File binding name</label>
 <input id="vol-name" name="name" class="cz-input" type="text" placeholder="raw_uploads" required pattern="[A-Za-z0-9_-]+" />
 <label for="vol-path">Storage prefix</label>
-<input id="vol-path" name="path_prefix" class="cz-input" type="text" placeholder="s3://lakekeeper-default/default/volumes/raw_uploads/" required />
-<button type="submit" class="cz-btn-primary" style="align-self:flex-start;">Create volume</button>
+<input id="vol-path" name="path_prefix" class="cz-input" type="text" placeholder="s3://lakekeeper-default/default/files/raw_uploads/" required />
+<button type="submit" class="cz-btn-primary" style="align-self:flex-start;">Create file binding</button>
 </form>
 </div>
 </section>"##,
     );
-    Html(render_shell(&l, "Volumes", NavLink::Studio, &body))
+    Html(render_shell(&l, "Files", NavLink::Studio, &body))
 }
 
-async fn volumes_create_handler(
+async fn files_create_handler(
     State(state): State<AppState>,
-    axum::extract::Form(form): axum::extract::Form<VolumeSpec>,
+    axum::extract::Form(form): axum::extract::Form<FileBindingSpec>,
 ) -> axum::response::Redirect {
     use computeza_state::Store;
     if let Some(store) = state.store.as_deref() {
@@ -5545,24 +5586,24 @@ async fn volumes_create_handler(
             .save(&key, &serde_json::to_value(&form).unwrap_or_default(), None)
             .await;
     }
-    axum::response::Redirect::to("/volumes")
+    axum::response::Redirect::to("/files")
 }
 
 #[derive(serde::Deserialize)]
-struct VolumeDeleteForm {
+struct FileBindingDeleteForm {
     name: String,
 }
 
-async fn volumes_delete_handler(
+async fn files_delete_handler(
     State(state): State<AppState>,
-    axum::extract::Form(form): axum::extract::Form<VolumeDeleteForm>,
+    axum::extract::Form(form): axum::extract::Form<FileBindingDeleteForm>,
 ) -> axum::response::Redirect {
     use computeza_state::Store;
     if let Some(store) = state.store.as_deref() {
         let key = computeza_state::ResourceKey::cluster_scoped("volume-instance", form.name);
         let _ = store.delete(&key, None).await;
     }
-    axum::response::Redirect::to("/volumes")
+    axum::response::Redirect::to("/files")
 }
 
 // ============================================================
@@ -17900,7 +17941,6 @@ pub fn render_shell(
     <a href="/storage" class="cz-sidenav-item" data-label="Storage"><i class="fa-solid fa-hard-drive fa-fw"></i><span class="cz-sidenav-label">Storage</span></a>
     <a href="/workspace" class="cz-sidenav-item" data-label="Workspace"><i class="fa-solid fa-table-cells fa-fw"></i><span class="cz-sidenav-label">Workspace</span></a>
     <a href="/help/sitemap" class="cz-sidenav-item" data-label="Sitemap"><i class="fa-solid fa-sitemap fa-fw"></i><span class="cz-sidenav-label">Sitemap</span></a>
-    <a href="/volumes" class="cz-sidenav-item" data-label="Volumes"><i class="fa-solid fa-boxes-stacked fa-fw"></i><span class="cz-sidenav-label">Volumes</span></a>
     <a href="/about" class="cz-sidenav-item" data-label="About"><i class="fa-solid fa-circle-info fa-fw"></i><span class="cz-sidenav-label">About</span></a>
   </div>
   <div class="cz-sidenav-spacer"></div>
