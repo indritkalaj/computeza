@@ -11963,7 +11963,7 @@ async fn run_pyiceberg_install_with_progress(
     progress: &ProgressHandle,
     _config: &InstallConfig,
 ) -> Result<(String, u16), String> {
-    use crate::progress::InstallPhase;
+    use computeza_driver_native::progress::InstallPhase;
     use tokio::process::Command;
 
     let venv_dir = std::path::PathBuf::from("/var/lib/computeza/sail/venv");
