@@ -671,6 +671,7 @@ pub fn router_with_state(state: AppState) -> Router {
             get(studio_completions_handler),
         )
         .route("/studio/api/sql/explain", post(studio_sql_explain_handler))
+        .route("/studio/history", get(studio_history_page_handler))
         .route(
             "/studio/bootstrap",
             get(studio_bootstrap_form_handler).post(studio_bootstrap_submit_handler),
@@ -2439,7 +2440,7 @@ async fn build_studio_full_sidebar(state: &AppState, focus: SidebarFocus<'_>) ->
         r#"{tree_html}
 <section class="cz-studio-sidebar-section">
 <details class="cz-studio-recent-details">
-<summary class="cz-studio-sidebar-eyebrow cz-studio-recent-summary"><span><span class="cz-studio-recent-chevron"></span>Recent ({n})</span></summary>
+<summary class="cz-studio-sidebar-eyebrow cz-studio-recent-summary"><span><span class="cz-studio-recent-chevron"></span>Recent ({n})</span><a href="/studio/history" class="cz-studio-sidebar-action" title="Open full query history">All →</a></summary>
 <div class="cz-studio-recent-body">{recent_html}</div>
 </details>
 </section>"#,
@@ -4126,6 +4127,99 @@ async fn studio_sql_execute_handler(
         &sidebar,
         &files,
     ))
+}
+
+async fn studio_history_page_handler(
+    State(state): State<AppState>,
+) -> Html<String> {
+    let l = Localizer::english();
+    let history = load_studio_history(state.store.as_deref()).await;
+    let sidebar = build_studio_full_sidebar(&state, SidebarFocus::default()).await;
+    let csrf = auth::csrf_input();
+
+    // Per-row rendering. Each row carries the SQL in a hidden form
+    // that re-prefills the editor; the prefill is a GET with the
+    // SQL in the query string so 'Open in new tab' (middle-click)
+    // works natively without a re-render.
+    let rows: String = if history.entries.is_empty() {
+        r#"<tr><td colspan="5" class="cz-cell-dim" style="text-align:center; padding:1.5rem;">No queries yet. Run one from the editor; it'll show up here.</td></tr>"#.to_string()
+    } else {
+        history
+            .entries
+            .iter()
+            .map(|e| {
+                let status_badge = if e.ok {
+                    r#"<span class="cz-badge cz-badge-ok">ok</span>"#
+                } else {
+                    r#"<span class="cz-badge cz-badge-fail">err</span>"#
+                };
+                let rows_str = e
+                    .row_count
+                    .map(|n| thousands(n))
+                    .unwrap_or_else(|| "-".to_string());
+                let preview: String = e.sql.lines().take(2).collect::<Vec<_>>().join(" ↵ ");
+                let preview = preview.chars().take(160).collect::<String>();
+                let ts = e.executed_at.to_rfc3339();
+                format!(
+                    r##"<tr data-sql-needle="{needle}">
+<td class="cz-cell-mono cz-cell-dim"><span data-ts-utc="{ts}">{ts}</span></td>
+<td>{status_badge}</td>
+<td class="cz-cell-mono cz-cell-dim">{rows_str}</td>
+<td class="cz-cell-mono" style="max-width: 38rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{preview}</td>
+<td><a href="/studio?sql={sql_enc}" class="cz-btn-ghost">Open</a></td>
+</tr>"##,
+                    ts = html_escape(&ts),
+                    status_badge = status_badge,
+                    rows_str = html_escape(&rows_str),
+                    preview = html_escape(&preview),
+                    sql_enc = url_encode(&e.sql),
+                    needle = html_escape(&e.sql.to_lowercase()),
+                )
+            })
+            .collect()
+    };
+    let _ = csrf;
+    let main_html = format!(
+        r##"<div class="cz-studio-crumbs">
+<a href="/studio">Studio</a><span class="cz-studio-crumbs-sep">/</span><span class="cz-studio-crumbs-current">Query history</span>
+</div>
+<div class="cz-studio-actions" style="margin-bottom: 0.75rem;">
+<div>
+<h1 class="cz-studio-pane-title" style="margin: 0;">Query history</h1>
+<p class="cz-studio-pane-subtitle" style="margin: 0.25rem 0 0;">Every query you've run from the editor, newest-first. Filter by substring; click Open to re-fire one.</p>
+</div>
+<span class="cz-studio-actions-spacer"></span>
+<input id="cz-history-filter" type="search" class="cz-input" placeholder="Filter queries…" style="max-width: 22rem;" />
+</div>
+<div class="cz-table-wrap">
+<table class="cz-table" id="cz-history-table">
+<thead><tr><th>Executed at</th><th>Status</th><th>Rows</th><th>Query</th><th></th></tr></thead>
+<tbody>{rows}</tbody>
+</table>
+</div>
+<script>
+(function () {{
+  var input = document.getElementById("cz-history-filter");
+  var table = document.getElementById("cz-history-table");
+  if (!input || !table) return;
+  input.addEventListener("input", function () {{
+    var needle = (input.value || "").toLowerCase();
+    table.querySelectorAll("tbody tr").forEach(function (row) {{
+      var hay = (row.getAttribute("data-sql-needle") || "");
+      row.style.display = (!needle || hay.indexOf(needle) >= 0) ? "" : "none";
+    }});
+  }});
+}})();
+</script>"##,
+        rows = rows,
+    );
+    let body = format!(
+        r##"<div class="cz-studio-shell">
+<aside class="cz-studio-sidebar">{sidebar}</aside>
+<main class="cz-studio-main">{main_html}</main>
+</div>"##,
+    );
+    Html(render_shell(&l, "Query history", NavLink::Studio, &body))
 }
 
 #[derive(serde::Deserialize)]
