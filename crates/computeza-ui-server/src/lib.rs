@@ -11981,7 +11981,7 @@ async fn run_pyiceberg_install_with_progress(
     // pip install below may still succeed if the venv's interpreter
     // has published wheels, in which case the apt step is moot.
     progress.set_phase(InstallPhase::DetectingBinaries);
-    progress.set_message("apt-get install python3-dev build-essential".into());
+    progress.set_message("apt-get install python3-dev build-essential");
     let apt = Command::new("apt-get")
         .args([
             "install",
@@ -12005,7 +12005,7 @@ async fn run_pyiceberg_install_with_progress(
     // Step 2: pip install into Sail's venv. No --only-binary so pip
     // can fall back to a source build when the interpreter has no
     // wheel published upstream.
-    progress.set_message("pip install pyiceberg[pyarrow,s3fs]".into());
+    progress.set_message("pip install pyiceberg[pyarrow,s3fs]");
     let pip = Command::new(&venv_pip)
         .args([
             "install",
