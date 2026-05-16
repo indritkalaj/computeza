@@ -734,6 +734,7 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/about", get(about_page_handler))
         .route("/storage/connect/aws", get(storage_connect_aws_form_handler).post(storage_connect_aws_submit_handler))
         .route("/account/password", get(account_password_form_handler).post(account_password_submit_handler))
+        .route("/volumes", get(volumes_page_handler).post(volumes_create_handler))
         .route(
             "/studio/api/completions",
             get(studio_completions_handler),
@@ -3280,7 +3281,12 @@ fn render_sidebar_namespace(
 ) -> String {
     let is_current = focus.namespace == Some(node.qualified.as_str());
     let open_attr = if is_current { " open" } else { "" };
-    let children_html = match &node.tables {
+    // Group child entities under non-clickable separators so the
+    // visual tree grows a Tables / Files / Functions row under each
+    // namespace. The qualified-name READING stays at 3 levels
+    // (catalog.schema.table) -- the separator rows are pure UI;
+    // they don't appear in any copy buffer or identifier.
+    let tables_children: String = match &node.tables {
         Some(Ok(tbls)) if tbls.is_empty() => {
             r#"<li class="cz-tree-empty">No tables yet.</li>"#.to_string()
         }
@@ -3294,7 +3300,39 @@ fn render_sidebar_namespace(
         ),
         None => String::new(),
     };
-    let children_block = format!(r#"<ul class="cz-tree-children">{children_html}</ul>"#);
+    let ns_safe = format!(
+        "{}-{}",
+        warehouse
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect::<String>(),
+        node.qualified
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect::<String>(),
+    );
+    // Files / Functions buckets are reserved here for future RLS /
+    // governance surfaces. The catalog doesn't expose them yet, so
+    // they render as empty placeholders -- the structure is what
+    // matters for now so RLS scopes (catalog.schema.<bucket>.<name>)
+    // have a settled home in the tree.
+    let separators = format!(
+        r##"<li class="cz-tree-item"><details class="cz-tree-details cz-tree-separator" data-tree-key="ns-tables:{ns_safe}" open>
+<summary class="cz-tree-row cz-tree-separator-row"><span class="cz-tree-toggle"></span><span class="cz-tree-icon">[#]</span><span class="cz-tree-label cz-cell-dim">Tables</span></summary>
+<ul class="cz-tree-children">{tables}</ul>
+</details></li>
+<li class="cz-tree-item"><details class="cz-tree-details cz-tree-separator" data-tree-key="ns-files:{ns_safe}">
+<summary class="cz-tree-row cz-tree-separator-row"><span class="cz-tree-toggle"></span><span class="cz-tree-icon">[F]</span><span class="cz-tree-label cz-cell-dim">Files</span></summary>
+<ul class="cz-tree-children"><li class="cz-tree-empty">No files. (RLS-scoped file resources land in v0.1+.)</li></ul>
+</details></li>
+<li class="cz-tree-item"><details class="cz-tree-details cz-tree-separator" data-tree-key="ns-fns:{ns_safe}">
+<summary class="cz-tree-row cz-tree-separator-row"><span class="cz-tree-toggle"></span><span class="cz-tree-icon">[fx]</span><span class="cz-tree-label cz-cell-dim">Functions</span></summary>
+<ul class="cz-tree-children"><li class="cz-tree-empty">No functions. (User-defined functions land with the engine-bridge work.)</li></ul>
+</details></li>"##,
+        ns_safe = ns_safe,
+        tables = tables_children,
+    );
+    let children_block = format!(r#"<ul class="cz-tree-children">{separators}</ul>"#);
     let copy_full = format!("{warehouse}.{}", &node.qualified);
     // The "create table" deep link lands on the namespace's page on
     // the catalog browser; that page already carries the table-creation
@@ -5397,6 +5435,109 @@ fn render_admin_smtp_page(flash: Option<&str>) -> Html<String> {
 </section>"##,
     );
     Html(render_shell(&l, "SMTP config", NavLink::Studio, &body))
+}
+
+// ============================================================
+// /volumes -- Databricks-style named storage containers.
+// A "Volume" maps a logical name (catalog.schema.volume) to a path
+// prefix in the storage backend (today: Garage). Files inside the
+// volume are addressable as /Volumes/<catalog>/<schema>/<volume>/<path>
+// at read time. v0.0.x: list + create the named record; full read /
+// write through the engine bridges lands with the connector
+// reconciler work.
+// ============================================================
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+struct VolumeSpec {
+    catalog: String,
+    schema: String,
+    name: String,
+    path_prefix: String,
+}
+
+async fn volumes_page_handler(State(state): State<AppState>) -> Html<String> {
+    use computeza_state::Store;
+    let l = Localizer::english();
+    let csrf = auth::csrf_input();
+    let volumes: Vec<VolumeSpec> = match state.store.as_deref() {
+        Some(store) => store
+            .list("volume-instance", None)
+            .await
+            .ok()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|sr| serde_json::from_value::<VolumeSpec>(sr.spec).ok())
+            .collect(),
+        None => Vec::new(),
+    };
+    let rows: String = if volumes.is_empty() {
+        r#"<tr><td colspan="4" class="cz-cell-dim" style="text-align:center; padding:1.5rem;">No volumes yet. Create one below.</td></tr>"#.to_string()
+    } else {
+        volumes
+            .iter()
+            .map(|v| {
+                format!(
+                    r#"<tr>
+<td class="cz-cell-mono">{cat}.{sch}.{name}</td>
+<td class="cz-cell-mono cz-cell-dim">{path}</td>
+<td><code>/Volumes/{cat}/{sch}/{name}/</code></td>
+<td><button type="button" class="cz-tree-copy" data-copy="{cat}.{sch}.{name}" title="Copy"><i class="fa-solid fa-copy"></i></button></td>
+</tr>"#,
+                    cat = html_escape(&v.catalog),
+                    sch = html_escape(&v.schema),
+                    name = html_escape(&v.name),
+                    path = html_escape(&v.path_prefix),
+                )
+            })
+            .collect()
+    };
+    let body = format!(
+        r##"<section class="cz-hero">
+<h1>Volumes</h1>
+<p class="cz-muted">Named storage containers under <code>catalog.schema.volume</code>. Files inside read as <code>/Volumes/&lt;catalog&gt;/&lt;schema&gt;/&lt;volume&gt;/&lt;path&gt;</code> -- like Databricks Volumes. v0.0.x records the named binding; engine-bridge read/write paths arrive with the connector reconciler.</p>
+</section>
+<section class="cz-section">
+<div class="cz-table-wrap">
+<table class="cz-table">
+<thead><tr><th>Identifier</th><th>Storage prefix</th><th>Read path</th><th></th></tr></thead>
+<tbody>{rows}</tbody>
+</table>
+</div>
+</section>
+<section class="cz-section" style="max-width:42rem;">
+<div class="cz-card">
+<h3 style="margin-top:0;">Create a volume</h3>
+<form method="post" action="/volumes" class="cz-form">
+{csrf}
+<label for="vol-cat">Catalog</label>
+<input id="vol-cat" name="catalog" class="cz-input" type="text" placeholder="default" required pattern="[A-Za-z0-9_-]+" />
+<label for="vol-sch">Schema (namespace)</label>
+<input id="vol-sch" name="schema" class="cz-input" type="text" placeholder="analytics" required pattern="[A-Za-z0-9_.-]+" />
+<label for="vol-name">Volume name</label>
+<input id="vol-name" name="name" class="cz-input" type="text" placeholder="raw_uploads" required pattern="[A-Za-z0-9_-]+" />
+<label for="vol-path">Storage prefix</label>
+<input id="vol-path" name="path_prefix" class="cz-input" type="text" placeholder="s3://lakekeeper-default/default/volumes/raw_uploads/" required />
+<button type="submit" class="cz-btn-primary" style="align-self:flex-start;">Create volume</button>
+</form>
+</div>
+</section>"##,
+    );
+    Html(render_shell(&l, "Volumes", NavLink::Studio, &body))
+}
+
+async fn volumes_create_handler(
+    State(state): State<AppState>,
+    axum::extract::Form(form): axum::extract::Form<VolumeSpec>,
+) -> axum::response::Redirect {
+    use computeza_state::Store;
+    if let Some(store) = state.store.as_deref() {
+        let name = format!("{}.{}.{}", form.catalog, form.schema, form.name);
+        let key = computeza_state::ResourceKey::cluster_scoped("volume-instance", name);
+        let _ = store
+            .save(&key, &serde_json::to_value(&form).unwrap_or_default(), None)
+            .await;
+    }
+    axum::response::Redirect::to("/volumes")
 }
 
 // ============================================================
@@ -8255,6 +8396,7 @@ fn render_studio_files_pane(
 <a href="#cz-modal-new-file" title="New file" data-tooltip="New file" aria-label="New file"><i class="fa-solid fa-plus"></i></a>
 <a href="#cz-modal-new-folder" title="New folder" data-tooltip="New folder" aria-label="New folder"><i class="fa-solid fa-folder-plus"></i></a>
 <form method="post" action="/studio/notebooks/new" style="margin:0;display:inline;">{csrf}<button type="submit" title="New notebook" data-tooltip="New notebook" aria-label="New notebook" class="cz-studio-files-action-btn"><i class="fa-solid fa-book"></i></button></form>
+<a href="#cz-modal-upload-file" title="Upload a single file" data-tooltip="Upload file" aria-label="Upload file"><i class="fa-solid fa-upload"></i></a>
 <a href="#cz-modal-import-archive" title="Upload .cptz archive" data-tooltip="Upload .cptz archive" aria-label="Upload .cptz archive"><i class="fa-solid fa-file-arrow-up"></i></a>
 <a href="/studio/files/export-archive" title="Export workspace as .cptz" data-tooltip="Export workspace as .cptz" aria-label="Export workspace as .cptz"><i class="fa-solid fa-file-zipper"></i></a>
 </div>
@@ -8354,9 +8496,64 @@ fn render_studio_files_pane(
 </div>
 </form>
 </div>
+</div>
+<div id="cz-modal-upload-file" class="cz-modal-overlay" role="dialog" aria-modal="true">
+<a href="#" class="cz-modal-overlay-backdrop" aria-label="Close"></a>
+<div class="cz-modal">
+<a href="#" class="cz-modal-close" aria-label="Close">&times;</a>
+<h2 class="cz-modal-title">Upload a file</h2>
+<p class="cz-modal-subtitle">Reads the file locally and saves it into the workspace at the path you choose. Text-only for now (binary uploads need a multipart endpoint; lands in a follow-up).</p>
+<form method="post" action="/studio/files/new" id="cz-upload-form">
+{csrf}
+<input type="hidden" name="open" value="{open_csv}" />
+<input type="hidden" name="content" id="cz-upload-content" value="" />
+<div class="cz-modal-field">
+<label for="cz-upload-picker">File on your computer</label>
+<input id="cz-upload-picker" type="file" accept=".sql,.py,.txt,.md,.json,.yaml,.yml,.csv,.notebook,.ipynb" required />
+</div>
+<div class="cz-modal-field">
+<label for="cz-upload-path">Save as path in workspace</label>
+<input id="cz-upload-path" type="text" name="path" class="cz-input" placeholder="/uploads/&lt;filename&gt;" />
+<p class="cz-modal-field-hint">Auto-fills with <code>/{upload_dest}/&lt;filename&gt;</code> when the file is picked. Override to change.</p>
+</div>
+<div class="cz-modal-actions">
+<a href="#" class="cz-btn-ghost">Cancel</a>
+<button type="submit" class="cz-btn-primary">Upload</button>
+</div>
+</form>
+<script>
+(function () {{
+  var form = document.getElementById("cz-upload-form");
+  var picker = document.getElementById("cz-upload-picker");
+  var path = document.getElementById("cz-upload-path");
+  var content = document.getElementById("cz-upload-content");
+  if (!form || !picker || !path || !content) return;
+  picker.addEventListener("change", function () {{
+    if (!picker.files || !picker.files[0]) return;
+    var f = picker.files[0];
+    if (!path.value) {{
+      var dest = "{upload_dest}";
+      path.value = "/" + (dest ? (dest + "/") : "uploads/") + f.name;
+    }}
+  }});
+  form.addEventListener("submit", function (e) {{
+    if (!picker.files || !picker.files[0]) return;
+    e.preventDefault();
+    var reader = new FileReader();
+    reader.onload = function () {{
+      content.value = reader.result || "";
+      form.submit();
+    }};
+    reader.onerror = function () {{ alert("Could not read the file."); }};
+    reader.readAsText(picker.files[0]);
+  }});
+}})();
+</script>
+</div>
 </div>"##,
         csrf = csrf,
         open_csv = html_escape(&open_csv),
+        upload_dest = html_escape(&current_dir),
         archive_dest = html_escape(&current_dir),
         archive_dest_hint = if in_root {
             "Paths in the archive are preserved as-is (root-level import).".to_string()
@@ -17624,6 +17821,8 @@ pub fn render_shell(
     <a href="/storage" class="cz-sidenav-item" data-label="Storage"><i class="fa-solid fa-hard-drive fa-fw"></i><span class="cz-sidenav-label">Storage</span></a>
     <a href="/workspace" class="cz-sidenav-item" data-label="Workspace"><i class="fa-solid fa-table-cells fa-fw"></i><span class="cz-sidenav-label">Workspace</span></a>
     <a href="/help/sitemap" class="cz-sidenav-item" data-label="Sitemap"><i class="fa-solid fa-sitemap fa-fw"></i><span class="cz-sidenav-label">Sitemap</span></a>
+    <a href="/volumes" class="cz-sidenav-item" data-label="Volumes"><i class="fa-solid fa-boxes-stacked fa-fw"></i><span class="cz-sidenav-label">Volumes</span></a>
+    <a href="/about" class="cz-sidenav-item" data-label="About"><i class="fa-solid fa-circle-info fa-fw"></i><span class="cz-sidenav-label">About</span></a>
   </div>
   <div class="cz-sidenav-spacer"></div>
 </nav>
