@@ -3112,9 +3112,17 @@ fn render_sidebar_tree_js() -> &'static str {
   }, true);
 
   // Refresh button -- full reload so the server re-queries Lakekeeper.
+  // Flushes any open notebook's typed-but-not-saved content first so
+  // the reload doesn't drop pending edits. sendBeacon is synchronous-
+  // enough for the browser to deliver the POST even as we navigate.
   document.querySelectorAll(".cz-catalog-refresh").forEach(function (a) {
     a.addEventListener("click", function (e) {
       e.preventDefault();
+      try {
+        if (window.czNotebook && typeof window.czNotebook.flushBeacon === "function") {
+          window.czNotebook.flushBeacon();
+        }
+      } catch (_e) {}
       window.location.reload();
     });
   });
@@ -8660,10 +8668,16 @@ window.czNotebook = (function () {{
 
   var savePending = null;
   var lastSaved = null;
+  var SAVE_DEBOUNCE_MS = 400;
+  var saveCounter = 0;
   function persistNow(opts) {{
     savePending = null;
     var body = JSON.stringify(nb, null, 2);
-    if (body === lastSaved && !(opts && opts.force)) return;
+    if (body === lastSaved && !(opts && opts.force)) {{
+      console.info("[cz-autosave] skip: no change since last save");
+      return;
+    }}
+    var attempt = ++saveCounter;
     setStatus("saving", "Saving…");
     var b = new URLSearchParams();
     b.append("content", body);
@@ -8671,7 +8685,7 @@ window.czNotebook = (function () {{
     if (csrf) b.append("csrf_token", csrf);
     if (!FILE_ID) {{
       setStatus("error", "No file id");
-      console.error("notebook autosave skipped: FILE_ID is empty");
+      console.error("[cz-autosave] skipped: FILE_ID is empty");
       return;
     }}
     var fetchOpts = {{
@@ -8682,42 +8696,66 @@ window.czNotebook = (function () {{
     }};
     // keepalive lets the browser finish the POST during page unload.
     if (opts && opts.keepalive) fetchOpts.keepalive = true;
+    var t0 = performance.now();
+    console.info("[cz-autosave] #" + attempt + " POST", FILE_ID, "(" + body.length + " bytes)");
     fetch("/studio/api/files/" + encodeURIComponent(FILE_ID) + "/autosave", fetchOpts)
       .then(function (r) {{
+        var ms = Math.round(performance.now() - t0);
         if (r.ok) {{
           lastSaved = body;
           var when = new Date();
           var hh = pad(when.getHours()), mm = pad(when.getMinutes()), ss = pad(when.getSeconds());
           setStatus("idle", "Saved " + hh + ":" + mm + ":" + ss);
+          console.info("[cz-autosave] #" + attempt + " ok (" + r.status + ", " + ms + "ms)");
         }} else {{
           setStatus("error", "Save failed (" + r.status + ")");
-          console.error("notebook autosave failed:", r.status, r.statusText);
+          console.error("[cz-autosave] #" + attempt + " failed:", r.status, r.statusText);
         }}
       }})
       .catch(function (e) {{
         setStatus("error", "Save failed (network)");
-        console.error("notebook autosave network error:", e);
+        console.error("[cz-autosave] #" + attempt + " network error:", e);
       }});
   }}
   function scheduleSave() {{
     if (savePending !== null) clearTimeout(savePending);
-    setStatus("dirty", "Saving in 1s…");
-    savePending = setTimeout(persistNow, 1000);
+    setStatus("dirty", "Saving in " + Math.round(SAVE_DEBOUNCE_MS / 100) / 10 + "s…");
+    savePending = setTimeout(persistNow, SAVE_DEBOUNCE_MS);
   }}
   // Flush pending save on page hide / tab close so typed content
   // doesn't get stranded. keepalive:true tells the browser to finish
   // the POST even after the page is gone.
-  window.addEventListener("beforeunload", function () {{
-    if (savePending !== null) {{
-      clearTimeout(savePending);
+  // beforeunload + visibilitychange fire on tab close, page reload,
+  // and in-app navigation. We try sendBeacon first because it has no
+  // 64KB cap (the keepalive fetch path does) and the browser is
+  // contractually required to deliver it.
+  function unloadFlush() {{
+    if (savePending !== null) clearTimeout(savePending);
+    var body = JSON.stringify(nb, null, 2);
+    if (body === lastSaved) return;
+    if (!FILE_ID) return;
+    var params = new URLSearchParams();
+    params.append("content", body);
+    var csrf = csrfToken();
+    if (csrf) params.append("csrf_token", csrf);
+    var blob = new Blob([params.toString()], {{
+      type: "application/x-www-form-urlencoded;charset=UTF-8",
+    }});
+    var ok = false;
+    try {{
+      ok = navigator.sendBeacon
+        && navigator.sendBeacon(
+          "/studio/api/files/" + encodeURIComponent(FILE_ID) + "/autosave",
+          blob
+        );
+    }} catch (_e) {{}}
+    if (!ok) {{
       persistNow({{ keepalive: true, force: true }});
     }}
-  }});
+  }}
+  window.addEventListener("beforeunload", unloadFlush);
   document.addEventListener("visibilitychange", function () {{
-    if (document.visibilityState === "hidden" && savePending !== null) {{
-      clearTimeout(savePending);
-      persistNow({{ keepalive: true, force: true }});
-    }}
+    if (document.visibilityState === "hidden") unloadFlush();
   }});
   // Clicking the autosave badge force-saves immediately. Helpful when
   // the operator wants to reload right after typing and doesn't want
@@ -8969,13 +9007,30 @@ window.czNotebook = (function () {{
       var entry = findCellById(id);
       if (entry) {{ entry.cell.kind = sel.value; repaintCell(cellEl); scheduleSave(); }}
     }});
-    // Textarea autosave + keyboard run
+    // Textarea autosave + keyboard run.
+    //   input  -> mirror value into model + debounced save (typing fast
+    //             won't thrash the endpoint)
+    //   blur   -> click-away forces an immediate save so navigation /
+    //             tab-switch never strands typed content
+    //   change -> covers paste / drag-drop / dictation that some
+    //             browsers fire WITHOUT a corresponding input event
     var ta = cellEl.querySelector("textarea");
     if (ta) {{
-      ta.addEventListener("input", function () {{
+      function syncFromTextarea(force) {{
         var entry = findCellById(id);
-        if (entry) {{ entry.cell.content = ta.value; scheduleSave(); }}
-      }});
+        if (!entry) return;
+        if (entry.cell.content === ta.value && !force) return;
+        entry.cell.content = ta.value;
+        if (force) {{
+          if (savePending !== null) clearTimeout(savePending);
+          persistNow({{ force: true }});
+        }} else {{
+          scheduleSave();
+        }}
+      }}
+      ta.addEventListener("input", function () {{ syncFromTextarea(false); }});
+      ta.addEventListener("change", function () {{ syncFromTextarea(false); }});
+      ta.addEventListener("blur", function () {{ syncFromTextarea(true); }});
       ta.addEventListener("keydown", function (e) {{
         if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {{ e.preventDefault(); runCell(id); }}
       }});
@@ -9119,7 +9174,50 @@ window.czNotebook = (function () {{
   document.getElementById("cz-notebook-add-sql").addEventListener("click", function () {{ addCell("sql"); }});
   document.getElementById("cz-notebook-add-py").addEventListener("click", function () {{ addCell("pyiceberg"); }});
 
-  return {{ nb: nb, rebuild: rebuildCellsDom }};
+  // Synchronous flush via navigator.sendBeacon. Used by anything that
+  // is about to navigate the page away (e.g. the catalog Refresh
+  // button) so typed-but-not-yet-debounce-saved content lands on the
+  // server before the navigation kills the JS context. sendBeacon is
+  // guaranteed-delivery and works around the keepalive 64KB cap.
+  function flushBeacon() {{
+    if (savePending !== null) {{
+      clearTimeout(savePending);
+      savePending = null;
+    }}
+    if (!FILE_ID) return false;
+    var body = JSON.stringify(nb, null, 2);
+    if (body === lastSaved) return true;
+    // The autosave handler uses axum::Form which only parses
+    // application/x-www-form-urlencoded. sendBeacon defaults to
+    // multipart for FormData, so wrap the payload in an explicit
+    // Blob with the right Content-Type.
+    var params = new URLSearchParams();
+    params.append("content", body);
+    var csrf = csrfToken();
+    if (csrf) params.append("csrf_token", csrf);
+    var blob = new Blob([params.toString()], {{
+      type: "application/x-www-form-urlencoded;charset=UTF-8",
+    }});
+    var sent = false;
+    try {{
+      if (navigator.sendBeacon) {{
+        sent = navigator.sendBeacon(
+          "/studio/api/files/" + encodeURIComponent(FILE_ID) + "/autosave",
+          blob
+        );
+      }}
+    }} catch (_e) {{}}
+    if (sent) {{
+      lastSaved = body;
+      console.info("[cz-autosave] beacon flush ok (" + body.length + " bytes)");
+    }} else {{
+      console.warn("[cz-autosave] beacon flush failed; falling back to keepalive fetch");
+      persistNow({{ keepalive: true, force: true }});
+    }}
+    return sent;
+  }}
+
+  return {{ nb: nb, rebuild: rebuildCellsDom, flushBeacon: flushBeacon }};
 }})();
 </script>"##,
         path = html_escape(&active_path),
