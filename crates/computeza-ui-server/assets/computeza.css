@@ -1278,6 +1278,69 @@ a.cz-card:hover {
   letter-spacing: 0.05em;
 }
 
+/* File-explorer breadcrumb + back button. Renders just below the
+   eyebrow when the pane is in folder-view mode. */
+.cz-studio-files-crumb {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.35rem 0.5rem;
+  border-bottom: 1px solid var(--line);
+  font-family: 'Geist Mono', ui-monospace, monospace;
+  font-size: 0.74rem;
+  color: var(--muted);
+}
+.cz-studio-files-back {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.4rem;
+  height: 1.4rem;
+  border-radius: 4px;
+  color: var(--muted);
+  text-decoration: none;
+  transition: background 0.1s ease, color 0.1s ease;
+}
+.cz-studio-files-back:hover { color: var(--ink); background: var(--navy); }
+.cz-studio-files-crumb-sep { color: var(--muted); opacity: 0.5; }
+.cz-studio-files-crumb-current { color: var(--ink); font-weight: 500; }
+.cz-studio-files-crumb-root { color: var(--muted); display: inline-flex; align-items: center; gap: 0.4rem; }
+
+/* Folder rows in root view: clickable, drill into the folder.
+   Visually similar to file rows but with a folder icon + slightly
+   bolder weight so they read as distinct affordances. */
+.cz-studio-folder-row-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+.cz-studio-folder-row-wrap > .cz-studio-folder-row { flex: 1; min-width: 0; }
+.cz-studio-folder-row-wrap > .cz-folder-menu > summary {
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease;
+}
+.cz-studio-folder-row-wrap:hover > .cz-folder-menu > summary,
+.cz-studio-folder-row-wrap > .cz-folder-menu[open] > summary {
+  opacity: 1;
+  pointer-events: auto;
+}
+.cz-studio-folder-row {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.35rem 0.5rem;
+  border-radius: 5px;
+  color: var(--ink);
+  text-decoration: none;
+  font-family: 'Geist Mono', ui-monospace, monospace;
+  font-size: 0.78rem;
+  font-weight: 500;
+  transition: background 0.1s ease;
+}
+.cz-studio-folder-row:hover { background: var(--navy-3); }
+.cz-studio-folder-icon { color: var(--lavender); }
+
 /* Per-row 3-dot menu (file + folder). Native <details>/<summary>
    toggles the popup with zero JS; the popup is absolute-positioned
    right-aligned to the trigger so it doesn't push the row content

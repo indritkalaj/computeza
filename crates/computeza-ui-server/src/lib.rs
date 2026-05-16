@@ -3569,6 +3569,11 @@ struct StudioQuery {
     active: Option<String>,
     /// Flash banner after a file action (save/import/etc).
     flash: Option<String>,
+    /// File-browser current directory. None / empty = root (lists
+    /// every top-level folder + root-level files). When set, the
+    /// browser shows just that folder's contents with a breadcrumb
+    /// back to root -- the file-explorer drill-down UX.
+    dir: Option<String>,
 }
 
 /// In-memory snapshot of the workspace-files state for one render
@@ -3675,6 +3680,7 @@ async fn studio_handler(
                 &notebook,
                 &sidebar,
                 &files,
+                q.dir.as_deref(),
             ));
         }
     }
@@ -3698,6 +3704,7 @@ async fn studio_handler(
         None,
         &sidebar,
         &files,
+        q.dir.as_deref(),
     ))
 }
 
@@ -4910,6 +4917,7 @@ async fn studio_sql_execute_handler(
         open: if form.open.is_empty() { None } else { Some(form.open.clone()) },
         active: if form.active.is_empty() { None } else { Some(form.active.clone()) },
         flash: None,
+        dir: None,
     };
     let files = build_studio_files_view(&state, &post_q).await;
     Html(render_studio_page(
@@ -4922,6 +4930,7 @@ async fn studio_sql_execute_handler(
         Some(routed),
         &sidebar,
         &files,
+        None,
     ))
 }
 
@@ -6266,9 +6275,15 @@ async fn execute_sql_against_trino(base_url: &str, sql: &str) -> SqlOutcome {
 /// from the path prefixes -- folders are implicit. Each row links
 /// to /studio?open=...&active=<id> which the next render uses to
 /// drop the file's content into the editor and highlight its tab.
-fn render_studio_files_pane(files: &StudioFilesView) -> String {
+fn render_studio_files_pane(files: &StudioFilesView, current_dir: Option<&str>) -> String {
     let csrf = auth::csrf_input();
     let open_csv = files.open_csv();
+    // Normalize the current dir: strip surrounding slashes so "/foo/"
+    // and "foo" map to the same bucket. An empty string is root.
+    let current_dir = current_dir
+        .map(|s| s.trim().trim_matches('/').to_string())
+        .unwrap_or_default();
+    let in_root = current_dir.is_empty();
     // Eyebrow + action buttons (new / export-archive).
     // The "new file" form has a path input so the operator picks
     // both the name AND the file type (extension drives both syntax
@@ -6382,126 +6397,50 @@ fn render_studio_files_pane(files: &StudioFilesView) -> String {
         csrf = csrf,
         open_csv = html_escape(&open_csv),
     );
+    // File-explorer header: eyebrow plus a breadcrumb / back-button
+    // strip that mirrors a typical file manager. In root the strip is
+    // a single "/" label; inside a folder it's a back arrow + the
+    // folder name.
+    let crumb_html = if in_root {
+        format!(
+            r#"<div class="cz-studio-files-crumb"><span class="cz-studio-files-crumb-root"><i class="fa-solid fa-house fa-fw"></i> /</span></div>"#
+        )
+    } else {
+        format!(
+            r##"<div class="cz-studio-files-crumb">
+<a class="cz-studio-files-back" href="/studio?open={open}" title="Back to all files" aria-label="Back"><i class="fa-solid fa-arrow-left fa-fw"></i></a>
+<span class="cz-studio-files-crumb-sep">/</span>
+<span class="cz-studio-files-crumb-current" title="/{dir}/">{dir_label}</span>
+</div>"##,
+            open = html_escape(&open_csv),
+            dir = html_escape(&current_dir),
+            dir_label = html_escape(&current_dir),
+        )
+    };
     let eyebrow = format!(
-        r#"<div class="cz-studio-files-eyebrow"><span>Files ({n})</span>{actions}</div>"#,
+        r#"<div class="cz-studio-files-eyebrow"><span>Files ({n})</span>{actions}</div>{crumb}"#,
         n = files.all.len(),
         actions = actions,
+        crumb = crumb_html,
     );
-    // Tree: group by leading folder segment (first '/' after the
-    // root). Files at the top level go under "Untitled". Deeper
-    // nesting is collapsed to a single level for v1.
-    let mut groups: std::collections::BTreeMap<String, Vec<&computeza_state::StudioFile>> =
-        std::collections::BTreeMap::new();
-    for f in &files.all {
-        let trimmed = f.path.trim_start_matches('/');
-        let folder = match trimmed.split_once('/') {
-            Some((dir, _)) if !dir.is_empty() => dir.to_string(),
-            _ => "root".to_string(),
-        };
-        groups.entry(folder).or_default().push(f);
-    }
-    let tree_html: String = if files.all.is_empty() {
-        r#"<div class="cz-studio-file-empty">No saved files yet. Click <strong>+</strong> to save your current editor body as a file, or import a .cptz archive.</div>"#.to_string()
-    } else {
-        groups
-            .iter()
-            .map(|(folder, items)| {
-                let is_root_group = folder == "root";
-                let folder_label = if is_root_group { "/".to_string() } else { format!("/{folder}/") };
-                // Folder-level 3-dot actions menu (rename / export /
-                // delete). Root group has no actions because "root"
-                // isn't a real folder -- it's the bucket for files
-                // sitting at the top-level path.
-                let folder_actions = if is_root_group {
-                    String::new()
-                } else {
-                    let folder_enc = url_encode(folder);
-                    let folder_safe = folder.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect::<String>();
-                    format!(
-                        r##"<details class="cz-row-menu cz-folder-menu">
-<summary title="Folder actions" aria-label="Folder actions"><i class="fa-solid fa-ellipsis-vertical"></i></summary>
-<div class="cz-row-menu-popup">
-<a href="#cz-folder-rename-{folder_safe}" class="cz-row-menu-item"><i class="fa-solid fa-pen fa-fw"></i> Rename folder</a>
-<a href="/studio/folders/export?name={folder_enc}" class="cz-row-menu-item"><i class="fa-solid fa-file-zipper fa-fw"></i> Export as .cptz</a>
-<a href="#cz-folder-delete-{folder_safe}" class="cz-row-menu-item cz-row-menu-item-danger"><i class="fa-solid fa-trash fa-fw"></i> Delete folder</a>
-</div>
-</details>
-<div id="cz-folder-rename-{folder_safe}" class="cz-modal-overlay" role="dialog" aria-modal="true">
-<a href="#" class="cz-modal-overlay-backdrop" aria-label="Close"></a>
-<div class="cz-modal">
-<a href="#" class="cz-modal-close" aria-label="Close">×</a>
-<h2 class="cz-modal-title">Rename folder /{folder_label_html}/</h2>
-<p class="cz-modal-subtitle">Rewrites the folder prefix on every file underneath. The tree regroups on next load.</p>
-<form method="post" action="/studio/folders/rename">
-{csrf}
-<input type="hidden" name="open" value="{open_csv_enc}" />
-<input type="hidden" name="old" value="{folder_label_html}" />
-<div class="cz-modal-field">
-<label for="cz-folder-rename-input-{folder_safe}">New folder name</label>
-<input id="cz-folder-rename-input-{folder_safe}" type="text" name="new" value="{folder_label_html}" class="cz-input" required autofocus />
-<p class="cz-modal-field-hint">Use slashes for nested folders, e.g. <code>analytics/v2/staging</code>.</p>
-</div>
-<div class="cz-modal-actions">
-<a href="#" class="cz-btn-ghost">Cancel</a>
-<button type="submit" class="cz-btn-primary">Rename folder</button>
-</div>
-</form>
-</div>
-</div>
-<div id="cz-folder-delete-{folder_safe}" class="cz-modal-overlay" role="dialog" aria-modal="true">
-<a href="#" class="cz-modal-overlay-backdrop" aria-label="Close"></a>
-<div class="cz-modal">
-<a href="#" class="cz-modal-close" aria-label="Close">×</a>
-<h2 class="cz-modal-title">Delete folder /{folder_label_html}/?</h2>
-<p class="cz-modal-subtitle">This permanently deletes every file under <code>/{folder_label_html}/</code>. The files cannot be recovered.</p>
-<form method="post" action="/studio/folders/delete">
-{csrf}
-<input type="hidden" name="open" value="{open_csv_enc}" />
-<input type="hidden" name="name" value="{folder_label_html}" />
-<div class="cz-modal-actions">
-<a href="#" class="cz-btn-ghost">Cancel</a>
-<button type="submit" class="cz-btn-danger">Delete folder</button>
-</div>
-</form>
-</div>
-</div>"##,
-                        csrf = csrf,
-                        open_csv_enc = html_escape(&open_csv),
-                        folder_enc = folder_enc,
-                        folder_safe = folder_safe,
-                        folder_label_html = html_escape(folder),
-                    )
-                };
-                let rows: String = items
-                    .iter()
-                    .map(|f| {
-                        let basename = f
-                            .path
-                            .rsplit('/')
-                            .next()
-                            .unwrap_or(&f.path)
-                            .to_string();
-                        let is_active = files.active_id.as_deref() == Some(f.id.as_str());
-                        let active = if is_active { " cz-tree-active" } else { "" };
-                        let mut next_open: Vec<&str> = files
-                            .open
-                            .iter()
-                            .map(|f| f.id.as_str())
-                            .collect();
-                        if !next_open.contains(&f.id.as_str()) {
-                            next_open.push(&f.id);
-                        }
-                        let next_open_csv = next_open.join(",");
-                        // Per-file 3-dot actions menu. Native <details>
-                        // toggles the popup with zero JS; the popup is
-                        // absolute-positioned right-aligned to the
-                        // ellipsis trigger. Items expand to per-file
-                        // operations via :target-anchored modals
-                        // (rename / delete) or inline forms (duplicate)
-                        // or direct GETs (download).
-                        format!(
-                            r##"<div class="cz-studio-file-row-wrap">
-<a class="cz-studio-file-row{active}" href="/studio?open={open}&active={id}"><span class="cz-tree-label" title="{path}">{label}</span></a>
+
+    // Helper closures used for both file rows + folder rows.
+    let dir_q = if in_root { String::new() } else { format!("&dir={}", url_encode(&current_dir)) };
+
+    // Build a per-file row HTML (renamed/deleted modals included so
+    // the action menu's :target anchors resolve).
+    let render_file_row = |f: &computeza_state::StudioFile| -> String {
+        let basename = f.path.rsplit('/').next().unwrap_or(&f.path).to_string();
+        let is_active = files.active_id.as_deref() == Some(f.id.as_str());
+        let active = if is_active { " cz-tree-active" } else { "" };
+        let mut next_open: Vec<&str> = files.open.iter().map(|f| f.id.as_str()).collect();
+        if !next_open.contains(&f.id.as_str()) {
+            next_open.push(&f.id);
+        }
+        let next_open_csv = next_open.join(",");
+        format!(
+            r##"<div class="cz-studio-file-row-wrap">
+<a class="cz-studio-file-row{active}" href="/studio?open={open}&active={id}{dir_q}"><span class="cz-tree-label" title="{path}">{label}</span></a>
 <details class="cz-row-menu cz-file-menu">
 <summary title="File actions" aria-label="File actions"><i class="fa-solid fa-ellipsis-vertical"></i></summary>
 <div class="cz-row-menu-popup">
@@ -6549,21 +6488,121 @@ fn render_studio_files_pane(files: &StudioFilesView) -> String {
 </form>
 </div>
 </div>"##,
-                            csrf = csrf,
-                            open = url_encode(&next_open_csv),
-                            id = url_encode(&f.id),
-                            path = html_escape(&f.path),
-                            label = html_escape(&basename),
-                        )
-                    })
-                    .collect();
-                format!(
-                    r#"<div class="cz-studio-file-folder-wrap"><div class="cz-studio-file-folder"><i class="fa-solid fa-folder fa-fw"></i> {folder_label}</div>{folder_actions}</div>{rows}"#,
-                    folder_label = html_escape(&folder_label),
-                    folder_actions = folder_actions,
-                )
-            })
-            .collect()
+            csrf = csrf,
+            open = url_encode(&next_open_csv),
+            id = url_encode(&f.id),
+            path = html_escape(&f.path),
+            label = html_escape(&basename),
+            active = active,
+            dir_q = dir_q,
+        )
+    };
+
+    // Per-folder row (only used in root view). Clicking the row label
+    // navigates into the folder via ?dir=<name>; the 3-dot menu carries
+    // the folder-level actions.
+    let render_folder_row = |folder: &str| -> String {
+        let folder_enc = url_encode(folder);
+        let folder_safe = folder
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect::<String>();
+        format!(
+            r##"<div class="cz-studio-folder-row-wrap">
+<a class="cz-studio-folder-row" href="/studio?open={open}&dir={folder_enc}"><i class="fa-solid fa-folder fa-fw cz-studio-folder-icon"></i><span class="cz-tree-label" title="/{folder_label_html}/">{folder_label_html}/</span></a>
+<details class="cz-row-menu cz-folder-menu">
+<summary title="Folder actions" aria-label="Folder actions"><i class="fa-solid fa-ellipsis-vertical"></i></summary>
+<div class="cz-row-menu-popup">
+<a href="/studio?open={open}&dir={folder_enc}" class="cz-row-menu-item"><i class="fa-solid fa-folder-open fa-fw"></i> Open</a>
+<a href="#cz-folder-rename-{folder_safe}" class="cz-row-menu-item"><i class="fa-solid fa-pen fa-fw"></i> Rename folder</a>
+<a href="/studio/folders/export?name={folder_enc}" class="cz-row-menu-item"><i class="fa-solid fa-file-zipper fa-fw"></i> Export as .cptz</a>
+<a href="#cz-folder-delete-{folder_safe}" class="cz-row-menu-item cz-row-menu-item-danger"><i class="fa-solid fa-trash fa-fw"></i> Delete folder</a>
+</div>
+</details>
+</div>
+<div id="cz-folder-rename-{folder_safe}" class="cz-modal-overlay" role="dialog" aria-modal="true">
+<a href="#" class="cz-modal-overlay-backdrop" aria-label="Close"></a>
+<div class="cz-modal">
+<a href="#" class="cz-modal-close" aria-label="Close">×</a>
+<h2 class="cz-modal-title">Rename folder /{folder_label_html}/</h2>
+<p class="cz-modal-subtitle">Rewrites the folder prefix on every file underneath.</p>
+<form method="post" action="/studio/folders/rename">
+{csrf}
+<input type="hidden" name="open" value="{open_csv_enc}" />
+<input type="hidden" name="old" value="{folder_label_html}" />
+<div class="cz-modal-field">
+<label for="cz-folder-rename-input-{folder_safe}">New folder name</label>
+<input id="cz-folder-rename-input-{folder_safe}" type="text" name="new" value="{folder_label_html}" class="cz-input" required autofocus />
+<p class="cz-modal-field-hint">Use slashes for nested folders, e.g. <code>analytics/v2/staging</code>.</p>
+</div>
+<div class="cz-modal-actions">
+<a href="#" class="cz-btn-ghost">Cancel</a>
+<button type="submit" class="cz-btn-primary">Rename folder</button>
+</div>
+</form>
+</div>
+</div>
+<div id="cz-folder-delete-{folder_safe}" class="cz-modal-overlay" role="dialog" aria-modal="true">
+<a href="#" class="cz-modal-overlay-backdrop" aria-label="Close"></a>
+<div class="cz-modal">
+<a href="#" class="cz-modal-close" aria-label="Close">×</a>
+<h2 class="cz-modal-title">Delete folder /{folder_label_html}/?</h2>
+<p class="cz-modal-subtitle">This permanently deletes every file under <code>/{folder_label_html}/</code>. The files cannot be recovered.</p>
+<form method="post" action="/studio/folders/delete">
+{csrf}
+<input type="hidden" name="open" value="{open_csv_enc}" />
+<input type="hidden" name="name" value="{folder_label_html}" />
+<div class="cz-modal-actions">
+<a href="#" class="cz-btn-ghost">Cancel</a>
+<button type="submit" class="cz-btn-danger">Delete folder</button>
+</div>
+</form>
+</div>
+</div>"##,
+            csrf = csrf,
+            open = html_escape(&open_csv),
+            open_csv_enc = html_escape(&open_csv),
+            folder_enc = folder_enc,
+            folder_safe = folder_safe,
+            folder_label_html = html_escape(folder),
+        )
+    };
+
+    let tree_html: String = if files.all.is_empty() {
+        r#"<div class="cz-studio-file-empty">No saved files yet. Click <strong>+</strong> to save your current editor body as a file, or import a .cptz archive.</div>"#.to_string()
+    } else if in_root {
+        // Root view: list folders (sorted), then root-level files.
+        let mut folders: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut root_files: Vec<&computeza_state::StudioFile> = Vec::new();
+        for f in &files.all {
+            let trimmed = f.path.trim_start_matches('/');
+            match trimmed.split_once('/') {
+                Some((dir, _)) if !dir.is_empty() => {
+                    folders.insert(dir.to_string());
+                }
+                _ => root_files.push(f),
+            }
+        }
+        let folder_rows: String = folders.iter().map(|f| render_folder_row(f)).collect();
+        let root_rows: String = root_files.iter().map(|f| render_file_row(f)).collect();
+        format!("{folder_rows}{root_rows}")
+    } else {
+        // Folder view: just the files whose first segment matches
+        // current_dir. Render basename only; .gitkeep placeholders are
+        // hidden so the folder doesn't show its scaffolding file.
+        let prefix = format!("/{current_dir}/");
+        let rows: String = files
+            .all
+            .iter()
+            .filter(|f| f.path.starts_with(&prefix))
+            .filter(|f| !f.path.ends_with("/.gitkeep"))
+            .map(|f| render_file_row(f))
+            .collect();
+        if rows.is_empty() {
+            r#"<div class="cz-studio-file-empty">Empty folder. Use the <strong>+</strong> button to add a file.</div>"#.to_string()
+        } else {
+            rows
+        }
     };
     format!(
         r##"{eyebrow}
@@ -6625,6 +6664,7 @@ fn render_studio_page(
     result: Option<RoutedOutcome>,
     sidebar_html: &str,
     files: &StudioFilesView,
+    current_dir: Option<&str>,
 ) -> String {
     let title = localizer.t("ui-studio-title");
     let sql_placeholder = localizer.t("ui-studio-sql-placeholder");
@@ -7192,7 +7232,7 @@ fn render_studio_page(
     );
 
     // ---- Files pane (middle column) ---------------------------------
-    let files_pane_html = render_studio_files_pane(files);
+    let files_pane_html = render_studio_files_pane(files, current_dir);
 
     let body = format!(
         r##"<div class="cz-studio-shell" id="cz-studio-shell">
@@ -7943,6 +7983,7 @@ fn render_studio_notebook_page(
     notebook: &Notebook,
     sidebar_html: &str,
     files: &StudioFilesView,
+    current_dir: Option<&str>,
 ) -> String {
     let _ = (has_lakekeeper, has_trino, lk_state, history);
     let title = "Studio · Notebook";
@@ -7958,7 +7999,7 @@ fn render_studio_notebook_page(
         .unwrap_or_default();
 
     // Inline the file-tree pane (same as the regular editor).
-    let files_pane_html = render_studio_files_pane(files);
+    let files_pane_html = render_studio_files_pane(files, current_dir);
 
     // Tabs strip across the top so the operator can flip between
     // open files (notebook or otherwise). Reuses the same shape
