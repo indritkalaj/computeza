@@ -4276,10 +4276,10 @@ fn build_cptz_archive(files: &[computeza_state::StudioFile]) -> std::result::Res
     Ok(buf)
 }
 
-#[allow(dead_code)] // Wired in once the axum 0.8 body extractor settles -- see TODO above.
 async fn import_cptz_archive(
     store: &computeza_state::SqliteStore,
     bytes: &[u8],
+    dest_folder: Option<&str>,
 ) -> std::result::Result<usize, String> {
     use std::io::Read;
     let cursor = std::io::Cursor::new(bytes);
@@ -4290,16 +4290,24 @@ async fn import_cptz_archive(
     // whole async fn's future !Send and axum would refuse it as a
     // handler.
     let mut staged: Vec<(String, String)> = Vec::new();
+    // When dest_folder is set, re-root every entry under
+    // /<dest_folder>/<basename-or-relative-path>. When None, the
+    // archive's paths are preserved verbatim (root-level import).
+    let dest = dest_folder.map(|d| d.trim().trim_matches('/').to_string()).filter(|s| !s.is_empty());
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i).map_err(|e| e.to_string())?;
         let name = entry.name().to_string();
-        let path = match name.strip_prefix("files/") {
-            Some(rest) => format!("/{}", rest),
+        let raw_rel = match name.strip_prefix("files/") {
+            Some(rest) => rest.to_string(),
             None => continue,
         };
-        if path.ends_with('/') {
+        if raw_rel.ends_with('/') {
             continue;
         }
+        let path = match &dest {
+            Some(d) => format!("/{d}/{raw_rel}"),
+            None => format!("/{raw_rel}"),
+        };
         let mut content = String::new();
         entry.read_to_string(&mut content).map_err(|e| e.to_string())?;
         staged.push((path, content));
@@ -4336,6 +4344,12 @@ async fn import_cptz_archive(
 #[derive(Debug, serde::Deserialize)]
 struct ArchiveImportForm {
     archive_b64: String,
+    /// Optional destination folder. When set, every entry in the
+    /// archive lands under /<dest>/<name>; when empty, paths are
+    /// preserved verbatim (root-level import). Used by the folder
+    /// 3-dot "Import archive" action.
+    #[serde(default)]
+    dest: String,
 }
 
 async fn studio_files_import_archive_handler(
@@ -4358,8 +4372,18 @@ async fn studio_files_import_archive_handler(
     if archive_bytes.is_empty() {
         return redirect_studio_flash(None, None, "upload: empty file");
     }
-    match import_cptz_archive(store, &archive_bytes).await {
-        Ok(n) => redirect_studio_flash(None, None, &format!("imported {n} file(s) from .cptz")),
+    let dest = if form.dest.trim().is_empty() {
+        None
+    } else {
+        Some(form.dest.trim())
+    };
+    match import_cptz_archive(store, &archive_bytes, dest).await {
+        Ok(n) => {
+            let where_ = dest
+                .map(|d| format!(" into /{}/", d.trim_matches('/')))
+                .unwrap_or_default();
+            redirect_studio_flash(None, None, &format!("imported {n} file(s) from .cptz{where_}"))
+        }
         Err(e) => redirect_studio_flash(None, None, &format!("import: {e}")),
     }
 }
@@ -6360,9 +6384,11 @@ fn render_studio_files_pane(files: &StudioFilesView, current_dir: Option<&str>) 
 <form method="post" action="/studio/files/import-archive" id="cz-archive-form">
 {csrf}
 <input type="hidden" name="archive_b64" id="cz-archive-b64" />
+<input type="hidden" name="dest" id="cz-archive-dest" value="{archive_dest}" />
 <div class="cz-modal-field">
 <label for="cz-archive-input">Archive file</label>
 <input id="cz-archive-input" type="file" accept=".cptz,.zip" required />
+<p class="cz-modal-field-hint" id="cz-archive-dest-hint">{archive_dest_hint}</p>
 </div>
 <div class="cz-modal-actions">
 <a href="#" class="cz-btn-ghost">Cancel</a>
@@ -6427,6 +6453,12 @@ fn render_studio_files_pane(files: &StudioFilesView, current_dir: Option<&str>) 
 </div>"##,
         csrf = csrf,
         open_csv = html_escape(&open_csv),
+        archive_dest = html_escape(&current_dir),
+        archive_dest_hint = if in_root {
+            "Paths in the archive are preserved as-is (root-level import).".to_string()
+        } else {
+            format!("Every entry will be placed under <code>/{0}/</code>.", html_escape(&current_dir))
+        },
     );
     // File-explorer header: eyebrow plus a breadcrumb / back-button
     // strip that mirrors a typical file manager. In root the strip is
@@ -8210,12 +8242,46 @@ window.czNotebook = (function () {{
     var dlAttr = downloadName ? ' data-download="' + escapeAttr(downloadName) + '"' : "";
     return truncNote + '<div class="cz-studio-results-table-wrap"><table class="cz-studio-results-table cz-cell-table"' + dlAttr + '><thead><tr>' + header + '</tr></thead><tbody>' + body + '</tbody></table></div>';
   }}
-  function renderOutput(out) {{
+  function renderOutput(out, cellSqlForPlan) {{
     if (!out) return "";
     if (out.kind === "sql_ok") {{
-      var meta = thousands(out.rows.length) + " row" + (out.rows.length === 1 ? "" : "s") + " · " + fmtDuration(out.duration_ms);
-      var tbl = renderTableOutput(out.columns, out.rows, out.rows.length, "Trino", "cell-result.csv");
-      return '<div class="cz-studio-results-header"><span class="cz-studio-engine-pill">Trino (SQL)</span><span class="cz-studio-results-eyebrow">Results</span><span class="cz-studio-results-count">' + meta + '</span><span class="cz-studio-actions-spacer"></span><a href="#" class="cz-studio-results-action" data-cell-action="download-csv" title="Download as CSV"><i class="fa-solid fa-download"></i></a><a href="#" class="cz-studio-results-action" data-cell-action="copy-tsv" title="Copy as TSV"><i class="fa-solid fa-copy"></i></a></div>' + tbl;
+      // Mirror the SQL editor's Results / Schema / Plan tab strip so
+      // the notebook surface looks identical. Tab switching is local
+      // (delegated handler below); Plan lazy-loads via the same
+      // /studio/api/sql/explain endpoint the editor uses, with the
+      // current cell's SQL as the payload.
+      var rowCount = out.rows.length;
+      var metaCount = thousands(rowCount) + " · " + fmtDuration(out.duration_ms);
+      var header = out.columns.map(function (c) {{ return '<th>' + escapeHtml(c.name) + '</th>'; }}).join("");
+      var body = out.rows.map(function (row) {{
+        return '<tr>' + row.map(function (cell) {{ return '<td>' + escapeHtml(String(cell)) + '</td>'; }}).join("") + '</tr>';
+      }}).join("");
+      var schemaRows = out.columns.map(function (c, i) {{
+        var ty = c.type_ || c.type || "-";
+        return '<tr><td class="cz-cell-mono cz-cell-dim">' + (i + 1) + '</td><td class="cz-strong">' + escapeHtml(c.name) + '</td><td class="cz-cell-mono">' + escapeHtml(ty) + '</td></tr>';
+      }}).join("");
+      var planSqlAttr = escapeAttr(cellSqlForPlan || "");
+      return ''
+        + '<div class="cz-studio-results-header">'
+        + '<span class="cz-studio-engine-pill">Trino (SQL)</span>'
+        + '<div class="cz-studio-results-tabs" role="tablist">'
+        + '  <button type="button" class="cz-studio-results-tab cz-studio-results-tab-active" data-result-tab="results" role="tab">Results <span class="cz-studio-results-count">' + metaCount + '</span></button>'
+        + '  <button type="button" class="cz-studio-results-tab" data-result-tab="schema" role="tab">Schema <span class="cz-studio-results-count">' + out.columns.length + '</span></button>'
+        + '  <button type="button" class="cz-studio-results-tab" data-result-tab="plan" role="tab" data-original-sql="' + planSqlAttr + '">Plan</button>'
+        + '</div>'
+        + '<span class="cz-studio-actions-spacer"></span>'
+        + '<a href="#" class="cz-studio-results-action" data-cell-action="download-csv" title="Download as CSV"><i class="fa-solid fa-download"></i></a>'
+        + '<a href="#" class="cz-studio-results-action" data-cell-action="copy-tsv" title="Copy as TSV"><i class="fa-solid fa-copy"></i></a>'
+        + '</div>'
+        + '<div class="cz-studio-results-pane" data-result-pane="results">'
+        + '<div class="cz-studio-results-table-wrap"><table class="cz-studio-results-table cz-cell-table" data-download="cell-result.csv"><thead><tr>' + header + '</tr></thead><tbody>' + body + '</tbody></table></div>'
+        + '</div>'
+        + '<div class="cz-studio-results-pane" data-result-pane="schema" hidden>'
+        + '<div class="cz-studio-results-table-wrap"><table class="cz-studio-results-table"><thead><tr><th>#</th><th>Column</th><th>Type</th></tr></thead><tbody>' + schemaRows + '</tbody></table></div>'
+        + '</div>'
+        + '<div class="cz-studio-results-pane cz-studio-plan-pane" data-result-pane="plan" data-loaded="false" hidden>'
+        + '<div class="cz-studio-plan-placeholder cz-muted">Click <strong>Plan</strong> to fetch the EXPLAIN tree from Trino.</div>'
+        + '</div>';
     }}
     if (out.kind === "sql_err") {{
       return '<div class="cz-studio-results-header"><span class="cz-studio-engine-pill">Trino (SQL)</span></div><pre class="cz-studio-error">' + escapeHtml(out.message || "") + '</pre>';
@@ -8233,8 +8299,27 @@ window.czNotebook = (function () {{
         bits.push('<div class="cz-studio-results-header" style="margin-top:0.6rem;"><span class="cz-studio-results-eyebrow">DataFrame</span><span class="cz-studio-results-count">' + meta + '</span><span class="cz-studio-actions-spacer"></span><a href="#" class="cz-studio-results-action" data-cell-action="download-csv" title="Download as CSV"><i class="fa-solid fa-download"></i></a><a href="#" class="cz-studio-results-action" data-cell-action="copy-tsv" title="Copy as TSV"><i class="fa-solid fa-copy"></i></a></div>');
         bits.push(renderTableOutput(df.columns, df.rows, df.total_rows, df.origin || "DataFrame", "cell-dataframe.csv"));
       }}
-      if (out.stdout && out.stdout.length) bits.push('<pre class="cz-studio-raw">' + escapeHtml(out.stdout) + '</pre>');
-      if (out.stderr && out.stderr.length) bits.push('<pre class="cz-studio-error">' + escapeHtml(out.stderr) + '</pre>');
+      // stdout (success path): show as a raw pre. On error, dropping
+      // into a <details> so the traceback dominates and stdout sits
+      // collapsed underneath -- matches the Python single-buffer
+      // editor's failure view.
+      if (out.stdout && out.stdout.length) {{
+        if (isErr) {{
+          bits.push('<details style="margin-top:0.75rem;"><summary class="cz-studio-raw-summary">stdout (partial output before failure)</summary><pre class="cz-studio-raw">' + escapeHtml(out.stdout) + '</pre></details>');
+        }} else {{
+          bits.push('<pre class="cz-studio-raw">' + escapeHtml(out.stdout) + '</pre>');
+        }}
+      }}
+      // stderr (success path): collapsed by default since it's
+      // usually Spark warnings / pip noise. On error, the stderr
+      // IS the traceback -- show it expanded.
+      if (out.stderr && out.stderr.length) {{
+        if (isErr) {{
+          bits.push('<pre class="cz-studio-error">' + escapeHtml(out.stderr) + '</pre>');
+        }} else {{
+          bits.push('<details style="margin-top:0.75rem;"><summary class="cz-studio-raw-summary">stderr (warnings / Spark logs)</summary><pre class="cz-studio-raw">' + escapeHtml(out.stderr) + '</pre></details>');
+        }}
+      }}
       var _ = engineLabel;
       return bits.join("");
     }}
@@ -8265,7 +8350,9 @@ window.czNotebook = (function () {{
     if (pillEl) pillEl.textContent = kindLabel(c.kind);
     var outEl = cellEl.querySelector(".cz-cell-output");
     if (outEl) {{
-      outEl.innerHTML = c.output ? renderOutput(c.output) : '<div class="cz-cell-output-empty cz-muted">No output yet. Hit Run.</div>';
+      // Pass current cell content as the SQL the Plan tab will
+      // EXPLAIN against. c.content holds the value at last run.
+      outEl.innerHTML = c.output ? renderOutput(c.output, c.content) : '<div class="cz-cell-output-empty cz-muted">No output yet. Hit Run.</div>';
     }}
   }}
 
@@ -8362,6 +8449,54 @@ window.czNotebook = (function () {{
         if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {{ e.preventDefault(); runCell(id); }}
       }});
     }}
+    // Result-pane tab switching (Results / Schema / Plan) + Plan
+    // lazy-load. Mirrors the SQL editor's tab strip exactly so cells
+    // and the single-buffer editor share visual behavior.
+    cellEl.addEventListener("click", function (e) {{
+      var tab = e.target.closest && e.target.closest(".cz-studio-results-tab");
+      if (!tab) return;
+      e.preventDefault();
+      var which = tab.getAttribute("data-result-tab");
+      var header = tab.closest(".cz-studio-results-header");
+      if (!header) return;
+      var container = header.parentElement;
+      header.querySelectorAll(".cz-studio-results-tab").forEach(function (t) {{
+        t.classList.toggle("cz-studio-results-tab-active", t === tab);
+      }});
+      container.querySelectorAll(".cz-studio-results-pane").forEach(function (p) {{
+        if (p.getAttribute("data-result-pane") === which) p.removeAttribute("hidden");
+        else p.setAttribute("hidden", "");
+      }});
+      if (which === "plan") {{
+        var pane = container.querySelector('.cz-studio-results-pane[data-result-pane="plan"]');
+        if (pane && pane.getAttribute("data-loaded") !== "true") {{
+          pane.setAttribute("data-loaded", "true");
+          var sql = tab.getAttribute("data-original-sql") || "";
+          pane.innerHTML = '<div class="cz-studio-plan-placeholder cz-muted">Fetching EXPLAIN …</div>';
+          var pb = new URLSearchParams();
+          pb.append("sql", sql);
+          var csrf2 = csrfToken();
+          if (csrf2) pb.append("csrf_token", csrf2);
+          fetch("/studio/api/sql/explain", {{
+            method: "POST",
+            credentials: "same-origin",
+            headers: {{ "Content-Type": "application/x-www-form-urlencoded" }},
+            body: pb.toString(),
+          }})
+            .then(function (r) {{ return r.json(); }})
+            .then(function (j) {{
+              if (j && j.ok && j.plan) {{
+                pane.innerHTML = '<pre class="cz-studio-raw">' + escapeHtml(j.plan) + '</pre>';
+              }} else {{
+                pane.innerHTML = '<pre class="cz-studio-error">' + escapeHtml((j && j.error) || "Could not fetch plan.") + '</pre>';
+              }}
+            }})
+            .catch(function (err) {{
+              pane.innerHTML = '<pre class="cz-studio-error">' + escapeHtml("EXPLAIN request failed: " + err) + '</pre>';
+            }});
+        }}
+      }}
+    }});
     // Output action delegate (copy / download).
     cellEl.addEventListener("click", function (e) {{
       var action = e.target.closest && e.target.closest("[data-cell-action]");
