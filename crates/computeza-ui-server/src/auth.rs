@@ -376,6 +376,20 @@ impl OperatorFile {
         Ok(())
     }
 
+    /// Replace the password hash for an existing operator. The hash
+    /// must already be Argon2id (use [`hash_password`] to mint one).
+    /// Returns `BadCredentials` when the username doesn't exist.
+    pub async fn set_password_hash(&self, username: &str, new_hash: &str) -> Result<(), AuthError> {
+        let mut records = self.cache.write().await;
+        let Some(rec) = records.iter_mut().find(|r| r.username == username) else {
+            return Err(AuthError::BadCredentials);
+        };
+        rec.password_hash = new_hash.to_string();
+        self.write_atomic(&records).await?;
+        tracing::info!(username = %username, "operator password hash rotated");
+        Ok(())
+    }
+
     /// Delete an operator account. Returns `BadCredentials` when no
     /// matching record exists. The caller is responsible for
     /// preventing the last admin from being removed -- that policy

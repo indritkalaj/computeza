@@ -579,6 +579,9 @@ component-sail-role       = Spark-API distributed compute (Python / DataFrame / 
 component-pyiceberg-name  = PyIceberg
 component-pyiceberg-role  = Python Iceberg client (Studio's Python -> PyIceberg execution path; installs into Sail's venv)
 
+component-minio-name      = MinIO
+component-minio-role      = Alternative S3-compatible storage backend (single binary, AGPL-licensed)
+
 component-trino-name      = Trino
 component-trino-role      = Distributed SQL engine with first-class Iceberg-REST support (Studio's default SQL surface)
 

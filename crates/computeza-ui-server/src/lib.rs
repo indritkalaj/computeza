@@ -731,7 +731,9 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/api/health/all", get(api_health_all_handler))
         .route("/api/test/echo", post(api_test_echo_handler))
         .route("/help/sitemap", get(help_sitemap_handler))
+        .route("/about", get(about_page_handler))
         .route("/storage/connect/aws", get(storage_connect_aws_form_handler).post(storage_connect_aws_submit_handler))
+        .route("/account/password", get(account_password_form_handler).post(account_password_submit_handler))
         .route(
             "/studio/api/completions",
             get(studio_completions_handler),
@@ -5395,6 +5397,161 @@ fn render_admin_smtp_page(flash: Option<&str>) -> Html<String> {
 </section>"##,
     );
     Html(render_shell(&l, "SMTP config", NavLink::Studio, &body))
+}
+
+// ============================================================
+// /about -- version + build info + license summary.
+// ============================================================
+
+async fn about_page_handler(State(state): State<AppState>) -> Html<String> {
+    let l = Localizer::english();
+    let version = env!("CARGO_PKG_VERSION");
+    let lic = state.license.read().await;
+    let license_label = match &*lic {
+        Some(_) => "Activated license envelope present".to_string(),
+        None => "Community mode (no license envelope)".to_string(),
+    };
+    drop(lic);
+    let installed = compute_installed_slugs(state.store.as_deref()).await;
+    let body = format!(
+        r##"<section class="cz-hero">
+<h1>About Computeza</h1>
+<p class="cz-muted">All-Rust open lakehouse control plane. One binary, embedded SQLite metadata, encrypted secrets vault, signed audit log.</p>
+</section>
+<section class="cz-section" style="max-width:42rem;">
+<div class="cz-card">
+<dl style="display:grid;grid-template-columns:auto 1fr;gap:0.5rem 1rem;">
+<dt class="cz-muted">Version</dt><dd class="cz-cell-mono">{version}</dd>
+<dt class="cz-muted">License</dt><dd>{license}</dd>
+<dt class="cz-muted">Installed</dt><dd>{count} of {total} managed components</dd>
+<dt class="cz-muted">Project</dt><dd><a href="https://github.com/indritkalaj/computeza" style="color:var(--lavender);">github.com/indritkalaj/computeza</a></dd>
+</dl>
+<p style="margin-top:1rem;"><a href="/sbom" class="cz-btn-ghost">SBOM</a> &middot; <a href="/admin/license" class="cz-btn-ghost">Manage license</a> &middot; <a href="/help/sitemap" class="cz-btn-ghost">Site map</a></p>
+</div>
+</section>"##,
+        version = html_escape(version),
+        license = html_escape(&license_label),
+        count = installed.len(),
+        total = COMPONENTS.len(),
+    );
+    Html(render_shell(&l, "About", NavLink::Studio, &body))
+}
+
+// ============================================================
+// /account/password -- self-service password change for the
+// currently signed-in operator.
+// ============================================================
+
+#[derive(serde::Deserialize, Default)]
+struct AccountPasswordForm {
+    #[serde(default)]
+    current_password: String,
+    #[serde(default)]
+    new_password: String,
+    #[serde(default)]
+    new_password_confirm: String,
+}
+
+async fn account_password_form_handler(
+    session: Option<axum::Extension<auth::Session>>,
+) -> Html<String> {
+    let user = session
+        .as_ref()
+        .map(|s| s.username.clone())
+        .unwrap_or_default();
+    render_account_password_page(&user, None, false)
+}
+
+async fn account_password_submit_handler(
+    State(state): State<AppState>,
+    session: Option<axum::Extension<auth::Session>>,
+    axum::extract::Form(form): axum::extract::Form<AccountPasswordForm>,
+) -> Html<String> {
+    let user = session
+        .as_ref()
+        .map(|s| s.username.clone())
+        .unwrap_or_default();
+    if user.is_empty() {
+        return render_account_password_page(&user, Some("Not signed in."), false);
+    }
+    if form.new_password.is_empty() {
+        return render_account_password_page(&user, Some("New password cannot be empty."), false);
+    }
+    if form.new_password != form.new_password_confirm {
+        return render_account_password_page(
+            &user,
+            Some("New password and confirmation must match."),
+            false,
+        );
+    }
+    let Some(operators) = state.operators.as_ref() else {
+        return render_account_password_page(
+            &user,
+            Some("Operator file not configured on this server."),
+            false,
+        );
+    };
+    // Verify the current password before allowing change.
+    let Some(op) = operators.get(&user).await else {
+        return render_account_password_page(&user, Some("Operator not found."), false);
+    };
+    match auth::verify_password(&form.current_password, &op.password_hash) {
+        Ok(true) => {}
+        _ => return render_account_password_page(&user, Some("Current password is wrong."), false),
+    }
+    let new_hash = match auth::hash_password(&form.new_password) {
+        Ok(h) => h,
+        Err(e) => {
+            return render_account_password_page(
+                &user,
+                Some(&format!("Could not hash new password: {e}")),
+                false,
+            );
+        }
+    };
+    if let Err(e) = operators.set_password_hash(&user, &new_hash).await {
+        return render_account_password_page(&user, Some(&format!("Save failed: {e}")), false);
+    }
+    render_account_password_page(&user, Some("Password changed."), true)
+}
+
+fn render_account_password_page(user: &str, flash: Option<&str>, ok: bool) -> Html<String> {
+    let l = Localizer::english();
+    let csrf = auth::csrf_input();
+    let flash_html = flash
+        .map(|m| {
+            let cls = if ok {
+                "cz-flash"
+            } else {
+                "cz-flash cz-flash-warn"
+            };
+            format!(
+                r#"<div class="{cls}" style="margin-bottom:1rem;">{}</div>"#,
+                html_escape(m)
+            )
+        })
+        .unwrap_or_default();
+    let body = format!(
+        r##"<section class="cz-hero">
+<h1>Change password</h1>
+<p class="cz-muted">Signed in as <strong>{user}</strong>. Argon2id hash gets rewritten in the operators file on success.</p>
+</section>
+<section class="cz-section" style="max-width:32rem;">
+{flash_html}
+<form method="post" action="/account/password" class="cz-form">
+{csrf}
+<label for="cur">Current password</label>
+<input id="cur" name="current_password" class="cz-input" type="password" autocomplete="current-password" required />
+<label for="new1">New password</label>
+<input id="new1" name="new_password" class="cz-input" type="password" autocomplete="new-password" required minlength="12" />
+<label for="new2">Confirm new password</label>
+<input id="new2" name="new_password_confirm" class="cz-input" type="password" autocomplete="new-password" required minlength="12" />
+<button type="submit" class="cz-btn-primary" style="align-self:flex-start;">Change password</button>
+</form>
+</section>"##,
+        user = html_escape(user),
+    );
+    Html(render_shell(&l, "Change password", NavLink::Studio, &body))
 }
 
 // ============================================================
@@ -10542,6 +10699,23 @@ window.czNotebook = (function () {{
     cellEl.querySelectorAll('[data-cell-action="format"]').forEach(function (b) {{
       b.addEventListener("click", function () {{ formatCell(id); }});
     }});
+    cellEl.querySelectorAll('[data-cell-action="duplicate"]').forEach(function (b) {{
+      b.addEventListener("click", function () {{
+        var entry = findCellById(id);
+        if (!entry) return;
+        // Insert a duplicate right after the source; drop the output
+        // so the cloned cell starts fresh until the operator hits Run.
+        var clone = {{
+          id: uuid(),
+          kind: entry.cell.kind,
+          content: entry.cell.content,
+        }};
+        nb.cells.splice(entry.index + 1, 0, clone);
+        rebuildCellsDom();
+        if (savePending !== null) clearTimeout(savePending);
+        persistNow({{ force: true }});
+      }});
+    }});
     // Kind dropdown
     var sel = cellEl.querySelector(".cz-cell-kind-select");
     if (sel) sel.addEventListener("change", function () {{
@@ -10693,6 +10867,7 @@ window.czNotebook = (function () {{
         </label>\
         <span class="cz-studio-actions-spacer"></span>\
         <button type="button" data-cell-action="format" title="Format (Ctrl+Shift+F)"><i class="fa-solid fa-wand-magic-sparkles"></i></button>\
+        <button type="button" data-cell-action="duplicate" title="Duplicate cell"><i class="fa-solid fa-clone"></i></button>\
         <button type="button" data-cell-action="move-up" title="Move up"><i class="fa-solid fa-arrow-up"></i></button>\
         <button type="button" data-cell-action="move-down" title="Move down"><i class="fa-solid fa-arrow-down"></i></button>\
         <button type="button" data-cell-action="delete" title="Delete cell"><i class="fa-solid fa-trash"></i></button>\
@@ -10931,6 +11106,7 @@ fn render_notebook_cell_skeleton(idx: usize, c: &NotebookCell) -> String {
 </label>
 <span class="cz-studio-actions-spacer"></span>
 <button type="button" data-cell-action="format" title="Format (Ctrl+Shift+F)"><i class="fa-solid fa-wand-magic-sparkles"></i></button>
+<button type="button" data-cell-action="duplicate" title="Duplicate cell"><i class="fa-solid fa-clone"></i></button>
 <button type="button" data-cell-action="move-up" title="Move up"><i class="fa-solid fa-arrow-up"></i></button>
 <button type="button" data-cell-action="move-down" title="Move down"><i class="fa-solid fa-arrow-down"></i></button>
 <button type="button" data-cell-action="delete" title="Delete cell"><i class="fa-solid fa-trash"></i></button>
@@ -18657,6 +18833,17 @@ const COMPONENTS: &[ComponentEntry] = &[
         // (HTTP) + port+1 (gRPC). Reconciler observes via HTTP.
         // No Windows / macOS driver -- Linux only for v0.0.x.
         available: true,
+    },
+    ComponentEntry {
+        slug: "minio",
+        name_key: "component-minio-name",
+        role_key: "component-minio-role",
+        // Planned: alternative S3-compatible storage backend to
+        // Garage. Single static binary from dl.min.io; same wire
+        // protocol so Lakekeeper / Trino / pyiceberg pick it up
+        // without changes. Driver lands when the install path
+        // gets its own module.
+        available: false,
     },
 ];
 
