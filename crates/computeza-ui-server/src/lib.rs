@@ -5602,15 +5602,17 @@ catalog_cfg = json.loads(sys.stdin.readline())
 user_code = sys.stdin.read()
 
 # Self-heal: install pyiceberg into the venv on the fly if it isn't
-# already there. Older Sail installs pre-dated the pip line change
-# that bundles PyIceberg. Force --only-binary so pip refuses source
-# builds (PyIceberg has a C extension that needs python3-dev to
-# compile from source -- not present on most distros' default
-# Python 3.14 install).
+# already there. Two-attempt strategy:
+#   1. Try with --only-binary so pip refuses source builds. Fast
+#      path on Python versions where wheels exist (3.10-3.13).
+#   2. If no compatible wheel exists, retry WITHOUT --only-binary
+#      so pip compiles the C extension from source. Requires
+#      python3-dev on the host (PyIceberg's decoder_fast).
 try:
     import pyiceberg.catalog  # noqa: F401
 except ModuleNotFoundError:
-    print("[pyiceberg] first-use install (~20s, wheel-only) ...", file=sys.stderr)
+    print("[pyiceberg] first-use install (~30s) ...", file=sys.stderr)
+    # Pass 1: wheel-only. Fast when a wheel exists.
     res = subprocess.run(
         [
             sys.executable, "-m", "pip", "install", "--quiet",
@@ -5620,23 +5622,33 @@ except ModuleNotFoundError:
         capture_output=True, text=True,
     )
     if res.returncode != 0:
-        print(
-            "\n[pyiceberg] No compatible wheel available for this Python "
-            f"({sys.version_info.major}.{sys.version_info.minor}).\n\n"
-            "PyIceberg ships pre-built wheels for Python 3.10-3.13. Your venv\n"
-            f"is on Python {sys.version_info.major}.{sys.version_info.minor}, which the upstream\n"
-            "maintainers haven't published wheels for yet. Two options:\n\n"
-            "  A. Build from source: `sudo apt install python3-dev` then re-run\n"
-            "     this query (pip will compile the C extension).\n"
-            "  B. Recreate the Sail venv against Python 3.13:\n"
-            "     `python3.13 -m venv /var/lib/computeza/sail/venv && \\\n"
-            "      /var/lib/computeza/sail/venv/bin/pip install pysail pyspark-client \\\n"
-            "      'pyiceberg[pyarrow,s3fs]>=0.10'`\n\n"
-            "Use Trino (SQL -> Trino in the editor) until either lands.\n\n"
-            f"pip stderr:\n{res.stderr}",
-            file=sys.stderr,
+        # Pass 2: allow source build. Needs python3-dev.
+        print("[pyiceberg] no wheel for this Python; trying source build (needs python3-dev) ...", file=sys.stderr)
+        res2 = subprocess.run(
+            [
+                sys.executable, "-m", "pip", "install", "--quiet",
+                "pyiceberg[pyarrow,s3fs]>=0.10",
+            ],
+            capture_output=True, text=True,
         )
-        sys.exit(1)
+        if res2.returncode != 0:
+            print(
+                f"\n[pyiceberg] Install failed on Python "
+                f"{sys.version_info.major}.{sys.version_info.minor}. Two options:\n\n"
+                "  A. Install Python dev headers (lets pip compile the C extension):\n"
+                "       sudo apt install python3-dev\n"
+                "     Then re-run this cell.\n\n"
+                "  B. Recreate the Sail venv against Python 3.13 (which has\n"
+                "     pre-built wheels published upstream):\n"
+                "       python3.13 -m venv /var/lib/computeza/sail/venv && \\\n"
+                "       /var/lib/computeza/sail/venv/bin/pip install pysail \\\n"
+                "         pyspark-client 'pyiceberg[pyarrow,s3fs]>=0.10'\n\n"
+                "Use Trino (SQL -> Trino in the editor) until either lands.\n\n"
+                f"pip (wheel attempt) stderr:\n{res.stderr}\n"
+                f"pip (source attempt) stderr:\n{res2.stderr}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
     import pyiceberg.catalog  # noqa: F401
 
 from pyiceberg.catalog import load_catalog
