@@ -43,6 +43,11 @@ tokio = { workspace = true }
 # Workspace file-browser .cptz archive bundle (just a ZIP with a
 # manifest.json + files/ tree).
 zip = { workspace = true }
+# Base64 decoder for the .cptz upload path -- the client sends the
+# archive bytes as form-urlencoded base64 so the body shape stays
+# compatible with the CSRF middleware (no multipart parsing needed
+# server-side).
+base64ct = { version = "1", features = ["alloc"] }
 # Tower middleware glue for the session-cookie auth layer.
 tower = { workspace = true }
 tower-http = { workspace = true }

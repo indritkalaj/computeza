@@ -484,6 +484,7 @@ async fn csrf_middleware(
 /// body. Returns the first match; ignores any other fields.
 fn parse_csrf_token_from_form(bytes: &[u8]) -> Option<String> {
     let s = std::str::from_utf8(bytes).ok()?;
+    // Try urlencoded first (the common case -- normal <form> POSTs).
     for pair in s.split('&') {
         let mut kv = pair.splitn(2, '=');
         let k = kv.next()?;
@@ -494,6 +495,31 @@ fn parse_csrf_token_from_form(bytes: &[u8]) -> Option<String> {
             // to be safe.
             let decoded = url_decode_minimal(v);
             return Some(decoded);
+        }
+    }
+    // Multipart fallback. File-upload forms (.cptz archive upload)
+    // send `multipart/form-data; boundary=...`. The body has the
+    // shape:
+    //   --<boundary>\r\n
+    //   Content-Disposition: form-data; name="csrf_token"\r\n
+    //   \r\n
+    //   <token>\r\n
+    //   --<boundary>...
+    // Match the field header and extract the value between the
+    // double-CRLF and the next boundary line. Robust enough for
+    // the single-file uploads we ship; not a full multipart
+    // parser, but the only thing the CSRF middleware needs to
+    // extract is the token, not the file.
+    if let Some(start) = s.find("name=\"csrf_token\"") {
+        let after_name = &s[start..];
+        if let Some(body_start) = after_name.find("\r\n\r\n") {
+            let body = &after_name[body_start + 4..];
+            if let Some(end) = body.find("\r\n") {
+                let token = body[..end].trim().to_string();
+                if !token.is_empty() {
+                    return Some(token);
+                }
+            }
         }
     }
     None
@@ -666,6 +692,8 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/studio/files/{id}/export", get(studio_file_export_handler))
         .route("/studio/files/import", post(studio_file_import_handler))
         .route("/studio/files/export-archive", get(studio_files_export_archive_handler))
+        .route("/studio/files/import-archive", post(studio_files_import_archive_handler))
+        .route("/studio/folders/new", post(studio_folder_new_handler))
         .route(
             "/studio/api/completions",
             get(studio_completions_handler),
@@ -1114,6 +1142,11 @@ struct DataFrameOutput {
 /// to the client. Large DataFrames (millions of rows) shouldn't
 /// land in the browser; the cell shows a "showing N of total"
 /// notice and the operator can downsample / paginate in code.
+/// The const is inlined into the Python wrappers as a literal at
+/// build time, so it's referenced from the Python source string
+/// rather than directly from Rust -- but keep it here so future
+/// callers (e.g. JS pagination) can read it without hunting.
+#[allow(dead_code)]
 const NOTEBOOK_DF_ROW_CAP: usize = 1000;
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -4195,30 +4228,197 @@ async fn import_cptz_archive(
     use std::io::Read;
     let cursor = std::io::Cursor::new(bytes);
     let mut zip = zip::ZipArchive::new(cursor).map_err(|e| format!("not a valid zip: {e}"))?;
-    let mut imported = 0usize;
+    // Walk the zip up-front and stash (path, content) pairs in a
+    // Vec, then await the store writes. ZipFile<'_> isn't Send so
+    // it can't live across an .await -- holding it would make the
+    // whole async fn's future !Send and axum would refuse it as a
+    // handler.
+    let mut staged: Vec<(String, String)> = Vec::new();
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i).map_err(|e| e.to_string())?;
         let name = entry.name().to_string();
-        // Skip the manifest + any non-files/ entry.
         let path = match name.strip_prefix("files/") {
             Some(rest) => format!("/{}", rest),
             None => continue,
         };
         if path.ends_with('/') {
-            // Directory entry inside files/; ignore.
             continue;
         }
         let mut content = String::new();
         entry.read_to_string(&mut content).map_err(|e| e.to_string())?;
+        staged.push((path, content));
+        // entry drops at the end of this iteration (before any
+        // store .await happens below).
+    }
+    let mut imported = 0usize;
+    for (path, content) in staged {
         // Overwrite-if-exists: same policy as single-file import.
         if let Ok(Some(existing)) = store.studio_files_get_by_path(&path).await {
-            let _ = store.studio_files_update(&existing.id, None, Some(&content)).await;
+            let _ = store
+                .studio_files_update(&existing.id, None, Some(&content))
+                .await;
         } else {
             let _ = store.studio_files_create(&path, &content).await;
         }
         imported += 1;
     }
     Ok(imported)
+}
+
+/// POST /studio/files/import-archive -- upload a .cptz archive
+/// and unpack every entry under /files/ into the workspace.
+/// Multipart form field name: `archive`. We accept the raw body
+/// bytes (axum::body::Bytes) and parse the multipart envelope
+/// ourselves so the handler signature stays compatible with the
+/// CSRF middleware's body-buffer + re-feed flow.
+/// Form body for the .cptz import. The archive bytes come over
+/// the wire base64-encoded so the body stays
+/// application/x-www-form-urlencoded -- the CSRF middleware and
+/// every other piece of the form-handling pipeline assumes that
+/// shape, and the JS client base64-encodes the uploaded file via
+/// FileReader/btoa.
+#[derive(Debug, serde::Deserialize)]
+struct ArchiveImportForm {
+    archive_b64: String,
+}
+
+async fn studio_files_import_archive_handler(
+    State(state): State<AppState>,
+    Form(form): Form<ArchiveImportForm>,
+) -> axum::response::Redirect {
+    let Some(store) = state.store.as_deref() else {
+        return redirect_studio_flash(None, None, "metadata store unavailable");
+    };
+    let archive_bytes = match decode_b64(form.archive_b64.trim()) {
+        Ok(b) => b,
+        Err(e) => {
+            return redirect_studio_flash(
+                None,
+                None,
+                &format!("upload: archive_b64 not valid base64: {e}"),
+            );
+        }
+    };
+    if archive_bytes.is_empty() {
+        return redirect_studio_flash(None, None, "upload: empty file");
+    }
+    match import_cptz_archive(store, &archive_bytes).await {
+        Ok(n) => redirect_studio_flash(None, None, &format!("imported {n} file(s) from .cptz")),
+        Err(e) => redirect_studio_flash(None, None, &format!("import: {e}")),
+    }
+}
+
+/// Wrapper so the handler body doesn't import base64ct's Encoding
+/// trait inline (the inline use was triggering a strange Handler-
+/// trait inference failure where axum couldn't resolve the
+/// handler shape).
+fn decode_b64(s: &str) -> Result<Vec<u8>, String> {
+    use base64ct::Encoding;
+    base64ct::Base64::decode_vec(s).map_err(|e| e.to_string())
+}
+
+/// Tiny multipart-body parser tailored to single-file uploads --
+/// scan for a part whose Content-Disposition has `name="<field>"`,
+/// then return the byte slice between the part's header / body
+/// boundary (\r\n\r\n) and the next `--<boundary>` separator.
+///
+/// Not a full RFC-7578 implementation -- doesn't handle nested
+/// multipart, doesn't unescape filename, doesn't process
+/// Content-Transfer-Encoding. Currently unused (the .cptz upload
+/// path went with base64-in-urlencoded instead, which avoids
+/// multipart parsing entirely), but kept as a building block for
+/// any future file-upload endpoint that wants to skip the b64
+/// detour.
+#[allow(dead_code)]
+fn extract_multipart_file_field(body: &[u8], field_name: &str) -> Option<Vec<u8>> {
+    // The body starts with `--<boundary>\r\n`. Read the first
+    // line to learn the boundary.
+    let first_newline = body.iter().position(|&b| b == b'\n')?;
+    if first_newline < 4 || !body.starts_with(b"--") {
+        return None;
+    }
+    let boundary_line = &body[..first_newline];
+    // Strip the leading `--` and the trailing `\r` (if any).
+    let boundary = if boundary_line.ends_with(b"\r") {
+        &boundary_line[2..boundary_line.len() - 1]
+    } else {
+        &boundary_line[2..]
+    };
+    if boundary.is_empty() {
+        return None;
+    }
+    let needle = format!("name=\"{field_name}\"");
+    // Iterate through the body looking for the field's
+    // Content-Disposition header.
+    let s = std::str::from_utf8(body).ok()?;
+    let header_pos = s.find(&needle)?;
+    // From header_pos, scan forward to the \r\n\r\n that
+    // separates this part's headers from its body.
+    let after_header = &body[header_pos..];
+    let body_off = after_header
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")?;
+    let body_start = header_pos + body_off + 4;
+    // Find the next `\r\n--<boundary>` to mark the end of this
+    // part's body.
+    let sep = {
+        let mut v = Vec::with_capacity(boundary.len() + 4);
+        v.extend_from_slice(b"\r\n--");
+        v.extend_from_slice(boundary);
+        v
+    };
+    let body_after = &body[body_start..];
+    let end_off = body_after
+        .windows(sep.len())
+        .position(|w| w == sep.as_slice())?;
+    Some(body_after[..end_off].to_vec())
+}
+
+/// Form body for the new-folder modal.
+#[derive(serde::Deserialize)]
+struct FolderNewForm {
+    #[serde(default)]
+    name: String,
+    /// Currently-open tab csv so the redirect preserves the editor
+    /// state.
+    #[serde(default)]
+    open: String,
+}
+
+/// POST /studio/folders/new -- create a folder placeholder so the
+/// file tree shows the new folder even when it's empty. Folders
+/// in studio_files are implicit (path prefixes), so the simplest
+/// way to materialize one is to drop a `.gitkeep`-style empty
+/// file under the new path.
+async fn studio_folder_new_handler(
+    State(state): State<AppState>,
+    axum::extract::Form(form): axum::extract::Form<FolderNewForm>,
+) -> axum::response::Redirect {
+    let Some(store) = state.store.as_deref() else {
+        return redirect_studio_flash(Some(form.open), None, "metadata store unavailable");
+    };
+    let trimmed = form.name.trim().trim_matches('/');
+    if trimmed.is_empty() {
+        return redirect_studio_flash(Some(form.open), None, "folder name required");
+    }
+    let placeholder_path = format!("/{}/.gitkeep", trimmed);
+    if store
+        .studio_files_get_by_path(&placeholder_path)
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return redirect_studio_flash(Some(form.open), None, "folder already exists");
+    }
+    match store.studio_files_create(&placeholder_path, "").await {
+        Ok(_) => redirect_studio_flash(
+            Some(form.open),
+            None,
+            &format!("folder /{trimmed}/ created"),
+        ),
+        Err(e) => redirect_studio_flash(Some(form.open), None, &format!("create folder: {e}")),
+    }
 }
 
 /// Build the /studio redirect URL with the standard tab-state +
@@ -5465,7 +5665,30 @@ for name, cfg in catalog_cfg.items():
 # without picking a name. catalogs[<name>] always works.
 cat = next(iter(catalogs.values()), None)
 
-scope = {"catalogs": catalogs, "cat": cat, "__name__": "__main__"}
+# Surface what the wrapper bound so a NameError on `cat` from
+# user code immediately tells the operator whether the vault
+# wiring is wrong (no catalogs found) vs a real bug.
+if cat is None:
+    print(
+        "[pyiceberg] no Iceberg catalogs registered in vault yet.\n"
+        "Open the warehouse page and click 'Connect to SQL' to wire one,\n"
+        "then re-run this cell. `cat` will be the first registered catalog.\n"
+        f"sail/catalog-names contents: {list(catalog_cfg.keys()) or 'EMPTY'}",
+        file=sys.stderr,
+    )
+
+scope = {
+    "catalogs": catalogs,
+    "cat": cat,
+    "__name__": "__main__",
+    # Include __builtins__ explicitly. When exec() is called with a
+    # globals dict that doesn't have __builtins__, Python auto-adds
+    # it -- but only AFTER the first execution. Some Python builds
+    # were observed treating the auto-added entry as a "ghost"
+    # global that's invisible to direct name lookups. Adding it
+    # explicitly removes that variability.
+    "__builtins__": __builtins__,
+}
 
 # DataFrame-capture helpers -- mirror the Sail wrapper so notebook
 # cells render PyIceberg results as interactive tables instead of
@@ -5757,8 +5980,77 @@ fn render_studio_files_pane(files: &StudioFilesView) -> String {
     let actions = format!(
         r##"<div class="cz-studio-files-actions">
 <a href="#cz-modal-new-file" data-tooltip="New file"><i class="fa-solid fa-plus"></i></a>
+<a href="#cz-modal-new-folder" data-tooltip="New folder"><i class="fa-solid fa-folder-plus"></i></a>
 <form method="post" action="/studio/notebooks/new" style="margin:0;display:inline;">{csrf}<button type="submit" data-tooltip="New notebook" class="cz-studio-files-action-btn"><i class="fa-solid fa-book"></i></button></form>
+<a href="#cz-modal-import-archive" data-tooltip="Upload .cptz archive"><i class="fa-solid fa-file-arrow-up"></i></a>
 <a href="/studio/files/export-archive" data-tooltip="Export workspace as .cptz"><i class="fa-solid fa-file-zipper"></i></a>
+</div>
+<div id="cz-modal-new-folder" class="cz-modal-overlay" role="dialog" aria-labelledby="cz-modal-new-folder-title" aria-modal="true">
+<a href="#" class="cz-modal-overlay-backdrop" aria-label="Close"></a>
+<div class="cz-modal">
+<a href="#" class="cz-modal-close" aria-label="Close">×</a>
+<h2 id="cz-modal-new-folder-title" class="cz-modal-title">New folder</h2>
+<p class="cz-modal-subtitle">Creates a folder placeholder so the tree shows the new path even when it's empty. Drops a tiny <code>.gitkeep</code> file inside.</p>
+<form method="post" action="/studio/folders/new">
+{csrf}
+<input type="hidden" name="open" value="{open_csv}" />
+<div class="cz-modal-field">
+<label for="cz-folder-new-name">Folder path</label>
+<input id="cz-folder-new-name" type="text" name="name" class="cz-input" placeholder="finance/raw" autofocus />
+<p class="cz-modal-field-hint">Leading + trailing slashes are stripped. Nested OK: <code>analytics/v2/staging</code>.</p>
+</div>
+<div class="cz-modal-actions">
+<a href="#" class="cz-btn-ghost">Cancel</a>
+<button type="submit" class="cz-btn-primary">Create folder</button>
+</div>
+</form>
+</div>
+</div>
+<div id="cz-modal-import-archive" class="cz-modal-overlay" role="dialog" aria-labelledby="cz-modal-import-archive-title" aria-modal="true">
+<a href="#" class="cz-modal-overlay-backdrop" aria-label="Close"></a>
+<div class="cz-modal">
+<a href="#" class="cz-modal-close" aria-label="Close">×</a>
+<h2 id="cz-modal-import-archive-title" class="cz-modal-title">Upload .cptz archive</h2>
+<p class="cz-modal-subtitle">A .cptz is a ZIP with a <code>manifest.json</code> plus a <code>files/</code> tree. Existing files at the same path get overwritten with the archive's contents.</p>
+<form method="post" action="/studio/files/import-archive" id="cz-archive-form">
+{csrf}
+<input type="hidden" name="archive_b64" id="cz-archive-b64" />
+<div class="cz-modal-field">
+<label for="cz-archive-input">Archive file</label>
+<input id="cz-archive-input" type="file" accept=".cptz,.zip" required />
+</div>
+<div class="cz-modal-actions">
+<a href="#" class="cz-btn-ghost">Cancel</a>
+<button type="submit" class="cz-btn-primary">Upload + unpack</button>
+</div>
+</form>
+<script>
+(function () {{
+  var form = document.getElementById("cz-archive-form");
+  var fileInput = document.getElementById("cz-archive-input");
+  var hidden = document.getElementById("cz-archive-b64");
+  if (!form || !fileInput || !hidden) return;
+  form.addEventListener("submit", function (e) {{
+    if (!fileInput.files || !fileInput.files[0]) return;
+    e.preventDefault();
+    var reader = new FileReader();
+    reader.onload = function () {{
+      // FileReader.result is "data:<type>;base64,<DATA>"; strip
+      // the prefix and stuff the rest into the hidden input so the
+      // standard form POST carries it as archive_b64=...
+      var s = reader.result;
+      var idx = s.indexOf(",");
+      hidden.value = (idx >= 0) ? s.substring(idx + 1) : s;
+      form.submit();
+    }};
+    reader.onerror = function () {{
+      alert("Could not read the archive file.");
+    }};
+    reader.readAsDataURL(fileInput.files[0]);
+  }});
+}})();
+</script>
+</div>
 </div>
 <div id="cz-modal-new-file" class="cz-modal-overlay" role="dialog" aria-labelledby="cz-modal-new-file-title" aria-modal="true">
 <a href="#" class="cz-modal-overlay-backdrop" aria-label="Close"></a>
