@@ -1424,6 +1424,46 @@ a.cz-card:hover {
 }
 .cz-studio-tab-close:hover { background: var(--navy-3); color: var(--ink); }
 .cz-studio-tabs-flex { flex: 1; }
+
+/* Live autosave status pill in the editor toolbar. Three states:
+   - idle: showing 'Saved' (default after a successful save).
+   - dirty: 'Saving in 1s...' while the debounce timer counts down.
+   - saving: 'Saving...' during the in-flight request.
+   - error: red 'Save failed' when the POST returned non-2xx. */
+.cz-studio-autosave-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-family: 'Geist Mono', ui-monospace, monospace;
+  font-size: 0.7rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  padding: 0.25rem 0.55rem;
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--muted);
+  border: 1px solid transparent;
+  transition: color 0.12s ease, border-color 0.12s ease, background 0.12s ease;
+}
+.cz-studio-autosave-status[data-state="idle"] {
+  color: var(--ok);
+}
+.cz-studio-autosave-status[data-state="dirty"],
+.cz-studio-autosave-status[data-state="saving"] {
+  color: var(--peach);
+}
+.cz-studio-autosave-status[data-state="saving"] i {
+  animation: cz-autosave-pulse 1s ease-in-out infinite;
+}
+.cz-studio-autosave-status[data-state="error"] {
+  color: var(--fail);
+  border-color: rgba(255, 157, 166, 0.4);
+  background: var(--fail-faint);
+}
+@keyframes cz-autosave-pulse {
+  0%, 100% { opacity: 0.5; }
+  50%      { opacity: 1; }
+}
 /* "scratch" tab when no file is active -- runs queries without
    saving them. Always present so the editor never goes blank. */
 .cz-studio-tab-scratch { font-style: italic; }

@@ -654,6 +654,12 @@ pub fn router_with_state(state: AppState) -> Router {
         // computeza-state's studio_files table.
         .route("/studio/files/new", post(studio_file_create_handler))
         .route("/studio/files/{id}/save", post(studio_file_save_handler))
+        .route("/studio/api/files/{id}/autosave", post(studio_file_autosave_api_handler))
+        .route("/studio/files/{id}/revisions", get(studio_file_revisions_handler))
+        .route(
+            "/studio/files/{file_id}/revisions/{revision_id}/restore",
+            post(studio_file_revision_restore_handler),
+        )
         .route("/studio/files/{id}/delete", post(studio_file_delete_handler))
         .route("/studio/files/{id}/duplicate", post(studio_file_duplicate_handler))
         .route("/studio/files/{id}/rename", post(studio_file_rename_handler))
@@ -3392,6 +3398,145 @@ async fn studio_file_save_handler(
     }
 }
 
+/// Form body for the autosave XHR endpoint. Just the content;
+/// path stays unchanged.
+#[derive(serde::Deserialize)]
+struct FileAutosaveForm {
+    #[serde(default)]
+    content: String,
+}
+
+/// POST /studio/api/files/{id}/autosave -- XHR variant of save.
+/// Returns 204 No Content on success, 404 if the file was deleted
+/// elsewhere, 503 if the store isn't configured. The editor JS
+/// fires this every ~1s after typing pauses; the previous Save
+/// button is gone now that autosave covers the happy path.
+async fn studio_file_autosave_api_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Form(form): axum::extract::Form<FileAutosaveForm>,
+) -> axum::http::StatusCode {
+    let Some(store) = state.store.as_deref() else {
+        return axum::http::StatusCode::SERVICE_UNAVAILABLE;
+    };
+    match store
+        .studio_files_update(&id, None, Some(&form.content))
+        .await
+    {
+        Ok(Some(_)) => axum::http::StatusCode::NO_CONTENT,
+        Ok(None) => axum::http::StatusCode::NOT_FOUND,
+        Err(e) => {
+            tracing::warn!(error = %e, file_id = %id, "autosave failed");
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+/// GET /studio/files/{id}/revisions -- list revisions for a file.
+/// Each row shows when it was captured + a preview, with a Restore
+/// button that POSTs to the restore endpoint.
+async fn studio_file_revisions_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Html<String> {
+    let l = Localizer::english();
+    let Some(store) = state.store.as_deref() else {
+        return Html(render_shell(
+            &l,
+            "Revisions",
+            NavLink::Studio,
+            "<section class=\"cz-section\"><p>Metadata store is not configured.</p></section>",
+        ));
+    };
+    let Ok(Some(file)) = store.studio_files_get(&id).await else {
+        return Html(render_shell(
+            &l,
+            "Revisions",
+            NavLink::Studio,
+            "<section class=\"cz-section\"><p>File not found.</p></section>",
+        ));
+    };
+    let revisions = store.studio_files_list_revisions(&id).await.unwrap_or_default();
+    let csrf = auth::csrf_input();
+    let rows: String = if revisions.is_empty() {
+        r#"<tr><td colspan="3" class="cz-cell-dim" style="text-align:center; padding:1.5rem;">No revisions yet. Edits will start showing up here as you type.</td></tr>"#.to_string()
+    } else {
+        revisions
+            .iter()
+            .map(|r| {
+                let preview: String = r
+                    .content
+                    .lines()
+                    .take(2)
+                    .map(|l| l.chars().take(120).collect::<String>())
+                    .collect::<Vec<_>>()
+                    .join(" ↵ ");
+                format!(
+                    r##"<tr>
+<td class="cz-cell-mono cz-cell-dim"><span data-ts-utc="{ts}">{ts}</span></td>
+<td class="cz-cell-mono" style="max-width: 32rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{preview}</td>
+<td>
+<form method="post" action="/studio/files/{file_id}/revisions/{rev_id}/restore" style="margin:0;display:inline;">{csrf}<button type="submit" class="cz-btn-ghost">Restore</button></form>
+</td>
+</tr>"##,
+                    ts = html_escape(&r.created_at),
+                    preview = html_escape(&preview),
+                    file_id = url_encode(&id),
+                    rev_id = url_encode(&r.id),
+                    csrf = csrf,
+                )
+            })
+            .collect()
+    };
+    let body = format!(
+        r##"<section class="cz-hero">
+<h1>Revision history</h1>
+<p class="cz-muted">Past versions of <code>{path}</code>. Every autosave that changes the file's content snapshots the prior content here. Restore makes a chosen revision the current content (the previous current is itself snapshotted, so Restore is reversible).</p>
+</section>
+<section class="cz-section">
+<div class="cz-table-wrap">
+<table class="cz-table">
+<thead><tr><th>Captured at</th><th>Preview</th><th></th></tr></thead>
+<tbody>{rows}</tbody>
+</table>
+</div>
+<p style="margin-top:1rem;"><a href="/studio?open={id_q}&amp;active={id_q}" class="cz-btn-ghost">← Back to editor</a></p>
+</section>"##,
+        path = html_escape(&file.path),
+        rows = rows,
+        id_q = url_encode(&id),
+    );
+    Html(render_shell(&l, "Revisions", NavLink::Studio, &body))
+}
+
+/// POST /studio/files/{file_id}/revisions/{rev_id}/restore --
+/// replace the current content with the revision's content. The
+/// existing current content gets snapshotted via studio_files_update's
+/// auto-revision step, so this is reversible.
+async fn studio_file_revision_restore_handler(
+    State(state): State<AppState>,
+    axum::extract::Path((file_id, revision_id)): axum::extract::Path<(String, String)>,
+) -> axum::response::Redirect {
+    let Some(store) = state.store.as_deref() else {
+        return redirect_studio_flash(None, Some(file_id), "metadata store unavailable");
+    };
+    let Ok(Some(rev)) = store.studio_files_get_revision(&revision_id).await else {
+        return redirect_studio_flash(None, Some(file_id), "revision not found");
+    };
+    match store
+        .studio_files_update(&file_id, None, Some(&rev.content))
+        .await
+    {
+        Ok(Some(_)) => redirect_studio_flash(
+            None,
+            Some(file_id),
+            &format!("restored revision from {}", rev.created_at),
+        ),
+        Ok(None) => redirect_studio_flash(None, Some(file_id), "file not found"),
+        Err(e) => redirect_studio_flash(None, Some(file_id), &format!("restore: {e}")),
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct FileTabContextForm {
     #[serde(default)]
@@ -5283,14 +5428,16 @@ fn render_studio_page(
         })
         .unwrap_or_default();
     // Save / rename / delete / duplicate buttons -- only meaningful
-    // when a file is active. Each is a tiny form that POSTs to the
-    // matching handler. The Save button is the highlight: its
-    // formaction overrides the parent form's /studio/sql/execute
-    // so the same textarea content can be saved instead of run.
+    // when a file is active. Edits now autosave every ~1s after the
+    // operator stops typing (see autosave JS below), so the manual
+    // Save button is gone -- we surface a live save-status indicator
+    // instead, and a link to the file's revision history.
     let save_button_html = match files.active_file() {
         Some(f) => format!(
-            r##"<button type="submit" class="cz-btn-ghost" formaction="/studio/files/{id}/save" formmethod="post" title="Save current editor body to {path}">Save</button>"##,
+            r##"<span class="cz-studio-autosave-status" id="cz-autosave-status" data-file-id="{id_raw}" data-state="idle" title="Autosaves every second after you stop typing"><i class="fa-solid fa-cloud-arrow-up" aria-hidden="true"></i><span class="cz-studio-autosave-text">Saved</span></span>
+<a href="/studio/files/{id}/revisions" class="cz-btn-ghost" title="Revision history for {path}">History</a>"##,
             id = url_encode(&f.id),
+            id_raw = html_escape(&f.id),
             path = html_escape(&f.path),
         ),
         None => String::new(),
@@ -5749,34 +5896,113 @@ document.addEventListener("click", function (e) {{
   }});
 }})();
 
-// ---------- Editor autosave to localStorage ----------
-// Every keystroke writes the textarea body to localStorage under
-// cz-studio-scratch. On page load, if the textarea is empty AND no
-// file is active AND no ?sql= query param was passed, restore it.
+// ---------- Editor autosave ----------
+// Two paths:
+//   - Active file open  -> POST /studio/api/files/<id>/autosave
+//     every ~1s after typing stops. Server snapshots prior content
+//     into studio_file_revisions on every change so the operator
+//     can restore older versions from the /studio/files/<id>/revisions
+//     page. Live status pip in the editor toolbar reflects
+//     'saving' / 'saved' / 'error' so operators see the autosave
+//     happening.
+//   - Scratch tab (no file) -> localStorage only (cz-studio-scratch
+//     key), restored on next page load.
+// In both cases we also sync Monaco -> textarea on every change so
+// the value sent to the server is the live editor body.
 (function () {{
   var SCRATCH_KEY = "cz-studio-scratch";
   var ta = document.getElementById("cz-sql-textarea");
   if (!ta) return;
-  // Restore only when the editor would otherwise be empty -- never
-  // clobber an explicit prefill from ?sql= or a loaded file.
+  var statusEl = document.getElementById("cz-autosave-status");
+  var fileId = statusEl ? statusEl.getAttribute("data-file-id") : null;
+  var textEl = statusEl ? statusEl.querySelector(".cz-studio-autosave-text") : null;
+
+  // Restore scratch contents if the editor would otherwise be empty.
   try {{
-    if (!ta.value || ta.value.trim() === "") {{
+    if (!fileId && (!ta.value || ta.value.trim() === "")) {{
       var saved = localStorage.getItem(SCRATCH_KEY);
       if (saved) ta.value = saved;
     }}
   }} catch (_) {{}}
-  // Throttled write -- one localStorage call every 250ms while
-  // typing, plus one on blur.
-  var pending = null;
-  function save() {{
-    try {{ localStorage.setItem(SCRATCH_KEY, ta.value); }} catch (_) {{}}
-    pending = null;
+
+  function setStatus(state, text) {{
+    if (!statusEl) return;
+    statusEl.setAttribute("data-state", state);
+    if (textEl && text) textEl.textContent = text;
   }}
-  ta.addEventListener("input", function () {{
+
+  // Pull the current editor content. Monaco's value wins when
+  // mounted; fall back to the textarea otherwise.
+  function currentContent() {{
+    try {{
+      if (typeof monaco !== "undefined" && monaco.editor && monaco.editor.getEditors) {{
+        var eds = monaco.editor.getEditors();
+        if (eds && eds.length > 0) return eds[0].getValue();
+      }}
+    }} catch (_) {{}}
+    return ta.value;
+  }}
+
+  var pending = null;
+  var lastSaved = null;
+  function save() {{
+    pending = null;
+    var content = currentContent();
+    // Mirror to textarea so a fallback form submit serializes the
+    // current body.
+    if (ta.value !== content) ta.value = content;
+    if (fileId) {{
+      // Skip the network if content matches what we last successfully
+      // saved -- common case when the operator's cursor moves but
+      // body is unchanged.
+      if (content === lastSaved) return;
+      setStatus("saving", "Saving…");
+      var body = new URLSearchParams();
+      body.append("content", content);
+      fetch("/studio/api/files/" + encodeURIComponent(fileId) + "/autosave", {{
+        method: "POST",
+        credentials: "same-origin",
+        headers: {{ "Content-Type": "application/x-www-form-urlencoded" }},
+        body: body.toString(),
+      }})
+        .then(function (r) {{
+          if (r.ok) {{
+            lastSaved = content;
+            setStatus("idle", "Saved");
+          }} else {{
+            setStatus("error", "Save failed (" + r.status + ")");
+          }}
+        }})
+        .catch(function () {{
+          setStatus("error", "Save failed");
+        }});
+    }} else {{
+      try {{ localStorage.setItem(SCRATCH_KEY, content); }} catch (_) {{}}
+    }}
+  }}
+
+  function schedule() {{
     if (pending !== null) clearTimeout(pending);
-    pending = setTimeout(save, 250);
+    setStatus("dirty", "Saving in 1s…");
+    pending = setTimeout(save, 1000);
+  }}
+
+  // Re-trigger on every keystroke (textarea-side) AND on Monaco's
+  // content-change event (Monaco hides the textarea so no native
+  // input event fires). Monaco's editor variable lives in the
+  // Monaco IIFE scope; we tap into onDidChangeModelContent there.
+  ta.addEventListener("input", schedule);
+  // Also save once on blur, in case the operator alt-tabs away
+  // before the 1s timer fires.
+  ta.addEventListener("blur", function () {{
+    if (pending !== null) {{ clearTimeout(pending); save(); }}
   }});
-  ta.addEventListener("blur", save);
+
+  // Surface as a global so the Monaco IIFE can call it on every
+  // content change (Monaco's input doesn't propagate to the
+  // hidden textarea -- it syncs via the submit listener, not the
+  // input event).
+  window.czAutosaveSchedule = schedule;
 }})();
 
 // ---------- Keyboard shortcuts ----------
@@ -5989,7 +6215,15 @@ window.czDownloadCsv = function (e) {{
           monaco.editor.setModelLanguage(model, lang);
         }}
       }}
-      editor.onDidChangeModelContent(applyLang);
+      editor.onDidChangeModelContent(function () {{
+        applyLang();
+        // Trigger the same autosave schedule that the textarea
+        // input listener does -- Monaco's edits don't fire a native
+        // input event on the underlying textarea, so without this
+        // hook autosave would only run on blur for Monaco-mounted
+        // editors.
+        try {{ if (window.czAutosaveSchedule) window.czAutosaveSchedule(); }} catch (_) {{}}
+      }});
       // Tap into clicks on each lang-option button.
       document.querySelectorAll(".cz-studio-lang-option").forEach(function (opt) {{
         opt.addEventListener("click", function () {{ setTimeout(applyLang, 0); }});

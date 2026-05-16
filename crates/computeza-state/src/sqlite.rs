@@ -49,6 +49,19 @@ const SCHEMA_STATEMENTS: &[&str] = &[
         updated_at TEXT NOT NULL
     )"#,
     r#"CREATE INDEX IF NOT EXISTS studio_files_by_path ON studio_files(path)"#,
+    // Per-file revision history. Every studio_files_update that
+    // changes the content snapshots the prior content here so
+    // operators can browse / restore older versions Databricks-
+    // style. Append-only; never pruned automatically (operators
+    // can drop rows by hand or via a future retention setting).
+    r#"CREATE TABLE IF NOT EXISTS studio_file_revisions (
+        id TEXT PRIMARY KEY NOT NULL,
+        file_id TEXT NOT NULL,
+        content TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (file_id) REFERENCES studio_files(id) ON DELETE CASCADE
+    )"#,
+    r#"CREATE INDEX IF NOT EXISTS studio_file_revisions_by_file ON studio_file_revisions(file_id, created_at DESC)"#,
 ];
 
 /// SQLite-backed state store.
@@ -168,7 +181,10 @@ impl SqliteStore {
     }
 
     /// Update content and/or path. Either field is optional. Returns
-    /// Ok(None) when the id doesn't exist.
+    /// Ok(None) when the id doesn't exist. When `content` changes
+    /// and differs from the current value, the prior content is
+    /// snapshotted into `studio_file_revisions` so operators can
+    /// browse / restore older versions later.
     pub async fn studio_files_update(
         &self,
         id: &str,
@@ -182,6 +198,27 @@ impl SqliteStore {
         let now = Utc::now().to_rfc3339();
         let new_path = path.unwrap_or(&existing.path);
         let new_content = content.unwrap_or(&existing.content);
+
+        // Snapshot the prior content only when:
+        //   1. The content is actually changing.
+        //   2. The prior content is non-empty (skip the no-op initial
+        //      revision for blank files).
+        if let Some(c) = content {
+            if c != existing.content && !existing.content.is_empty() {
+                let rev_id = Uuid::new_v4().to_string();
+                sqlx::query(
+                    "INSERT INTO studio_file_revisions (id, file_id, content, created_at) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                )
+                .bind(&rev_id)
+                .bind(id)
+                .bind(&existing.content)
+                .bind(&existing.updated_at)
+                .execute(&self.pool)
+                .await?;
+            }
+        }
+
         sqlx::query(
             "UPDATE studio_files SET path = ?1, content = ?2, updated_at = ?3 \
              WHERE id = ?4",
@@ -198,6 +235,53 @@ impl SqliteStore {
             content: new_content.to_string(),
             created_at: existing.created_at,
             updated_at: now,
+        }))
+    }
+
+    /// List revisions for a file, newest first. Each row carries
+    /// the content as it was BEFORE the update that produced the
+    /// next-newer revision (or the current file, for the first row).
+    pub async fn studio_files_list_revisions(
+        &self,
+        file_id: &str,
+    ) -> Result<Vec<StudioFileRevision>> {
+        let rows = sqlx::query(
+            "SELECT id, content, created_at \
+             FROM studio_file_revisions \
+             WHERE file_id = ?1 \
+             ORDER BY created_at DESC",
+        )
+        .bind(file_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| StudioFileRevision {
+                id: r.get::<String, _>("id"),
+                file_id: file_id.to_string(),
+                content: r.get::<String, _>("content"),
+                created_at: r.get::<String, _>("created_at"),
+            })
+            .collect())
+    }
+
+    /// Fetch a single revision by id (for restore / preview).
+    pub async fn studio_files_get_revision(
+        &self,
+        revision_id: &str,
+    ) -> Result<Option<StudioFileRevision>> {
+        let row = sqlx::query(
+            "SELECT id, file_id, content, created_at \
+             FROM studio_file_revisions WHERE id = ?1",
+        )
+        .bind(revision_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| StudioFileRevision {
+            id: r.get::<String, _>("id"),
+            file_id: r.get::<String, _>("file_id"),
+            content: r.get::<String, _>("content"),
+            created_at: r.get::<String, _>("created_at"),
         }))
     }
 
@@ -229,6 +313,17 @@ pub struct StudioFile {
     pub created_at: String,
     /// RFC3339 string.
     pub updated_at: String,
+}
+
+/// One row of the studio_file_revisions table -- a snapshot of a
+/// file's prior content. Each row was the file's content right
+/// before the update that created the next-newer revision.
+#[derive(Clone, Debug)]
+pub struct StudioFileRevision {
+    pub id: String,
+    pub file_id: String,
+    pub content: String,
+    pub created_at: String,
 }
 
 fn studio_file_from_row(row: sqlx::sqlite::SqliteRow) -> Result<StudioFile> {
