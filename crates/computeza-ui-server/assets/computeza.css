@@ -1305,6 +1305,16 @@ a.cz-card:hover {
 .cz-studio-files-crumb-sep { color: var(--muted); opacity: 0.5; }
 .cz-studio-files-crumb-current { color: var(--ink); font-weight: 500; }
 .cz-studio-files-crumb-root { color: var(--muted); display: inline-flex; align-items: center; gap: 0.4rem; }
+.cz-studio-files-crumb-user {
+  font-family: 'Geist', system-ui, sans-serif;
+  font-size: 0.72rem;
+  color: var(--lavender);
+  background: var(--navy-3);
+  border: 1px solid var(--line);
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  margin-left: 0.25rem;
+}
 
 /* Folder rows in root view: clickable, drill into the folder.
    Visually similar to file rows but with a folder icon + slightly

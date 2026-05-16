@@ -3710,7 +3710,9 @@ async fn build_studio_files_view(
 async fn studio_handler(
     State(state): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<StudioQuery>,
+    session: Option<axum::Extension<auth::Session>>,
 ) -> Html<String> {
+    let username = session.as_ref().map(|s| s.username.clone());
     let l = Localizer::english();
     let lakekeeper = discover_lakekeeper_endpoint(state.store.as_deref()).await;
     let trino = discover_trino_endpoint(state.store.as_deref()).await;
@@ -3740,6 +3742,7 @@ async fn studio_handler(
                 &sidebar,
                 &files,
                 q.dir.as_deref(),
+                username.as_deref(),
             ));
         }
     }
@@ -3764,6 +3767,7 @@ async fn studio_handler(
         &sidebar,
         &files,
         q.dir.as_deref(),
+        username.as_deref(),
     ))
 }
 
@@ -4885,9 +4889,11 @@ async fn studio_completions_handler(
 
 async fn studio_sql_execute_handler(
     State(state): State<AppState>,
+    session: Option<axum::Extension<auth::Session>>,
     axum::extract::Form(form): axum::extract::Form<StudioSqlForm>,
 ) -> Html<String> {
     let l = Localizer::english();
+    let username = session.as_ref().map(|s| s.username.clone());
     let lakekeeper = discover_lakekeeper_endpoint(state.store.as_deref()).await;
     let trino = discover_trino_endpoint(state.store.as_deref()).await;
     let sail = discover_sail_endpoint(state.store.as_deref()).await;
@@ -5030,6 +5036,7 @@ async fn studio_sql_execute_handler(
         &sidebar,
         &files,
         None,
+        username.as_deref(),
     ))
 }
 
@@ -6635,7 +6642,11 @@ async fn execute_one_trino_statement(base_url: &str, sql: &str) -> SqlOutcome {
 /// from the path prefixes -- folders are implicit. Each row links
 /// to /studio?open=...&active=<id> which the next render uses to
 /// drop the file's content into the editor and highlight its tab.
-fn render_studio_files_pane(files: &StudioFilesView, current_dir: Option<&str>) -> String {
+fn render_studio_files_pane(
+    files: &StudioFilesView,
+    current_dir: Option<&str>,
+    username: Option<&str>,
+) -> String {
     let csrf = auth::csrf_input();
     let open_csv = files.open_csv();
     // Normalize the current dir: strip surrounding slashes so "/foo/"
@@ -6773,10 +6784,19 @@ fn render_studio_files_pane(files: &StudioFilesView, current_dir: Option<&str>) 
         // Root crumb gets its own 3-dot menu carrying the same set of
         // actions as a folder row (plus the create-new shortcuts that
         // also live in the eyebrow). Operators expecting consistency
-        // ("every row has a ⋮") get it.
+        // ("every row has a ⋮") get it. Username appears next to the
+        // home icon so the workspace ownership is visible at a glance.
+        let user_html = match username {
+            Some(u) if !u.is_empty() => format!(
+                r#"<span class="cz-studio-files-crumb-user" title="Signed in as {u}">{u}</span>"#,
+                u = html_escape(u),
+            ),
+            _ => String::new(),
+        };
         format!(
             r##"<div class="cz-studio-files-crumb">
 <span class="cz-studio-files-crumb-root"><i class="fa-solid fa-house fa-fw"></i> /</span>
+{user_html}
 <span class="cz-studio-actions-spacer"></span>
 <details class="cz-row-menu cz-folder-menu">
 <summary title="Workspace actions" aria-label="Workspace actions"><i class="fa-solid fa-ellipsis-vertical"></i></summary>
@@ -6790,6 +6810,7 @@ fn render_studio_files_pane(files: &StudioFilesView, current_dir: Option<&str>) 
 </details>
 </div>"##,
             csrf = csrf,
+            user_html = user_html,
         )
     } else {
         format!(
@@ -7071,6 +7092,7 @@ fn render_studio_page(
     sidebar_html: &str,
     files: &StudioFilesView,
     current_dir: Option<&str>,
+    username: Option<&str>,
 ) -> String {
     let title = localizer.t("ui-studio-title");
     let sql_placeholder = localizer.t("ui-studio-sql-placeholder");
@@ -7638,7 +7660,7 @@ fn render_studio_page(
     );
 
     // ---- Files pane (middle column) ---------------------------------
-    let files_pane_html = render_studio_files_pane(files, current_dir);
+    let files_pane_html = render_studio_files_pane(files, current_dir, username);
 
     let body = format!(
         r##"<div class="cz-studio-shell" id="cz-studio-shell">
@@ -8390,6 +8412,7 @@ fn render_studio_notebook_page(
     sidebar_html: &str,
     files: &StudioFilesView,
     current_dir: Option<&str>,
+    username: Option<&str>,
 ) -> String {
     let _ = (has_lakekeeper, has_trino, lk_state, history);
     let title = "Studio · Notebook";
@@ -8405,7 +8428,7 @@ fn render_studio_notebook_page(
         .unwrap_or_default();
 
     // Inline the file-tree pane (same as the regular editor).
-    let files_pane_html = render_studio_files_pane(files, current_dir);
+    let files_pane_html = render_studio_files_pane(files, current_dir, username);
 
     // Tabs strip across the top so the operator can flip between
     // open files (notebook or otherwise). Reuses the same shape
