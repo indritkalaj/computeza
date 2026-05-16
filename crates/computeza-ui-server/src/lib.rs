@@ -2946,12 +2946,14 @@ async fn build_studio_sidebar_tree(
         _ => Vec::new(),
     };
     let mut warehouses: Vec<SidebarWarehouseNode> = Vec::with_capacity(names.len());
+    // Eager fetch: pre-load namespaces (and tables) for EVERY warehouse.
+    // The tree used to lazily fetch only the focused branch because
+    // clicking a row navigated to /studio/catalog/<warehouse>; now that
+    // clicks just expand the row in-place we need the full tree
+    // server-side. N+1 against Lakekeeper, but cached implicitly by the
+    // refresh button and capped by realistic warehouse counts (<10).
     for name in names {
-        let namespaces = if focus.warehouse == Some(name.as_str()) {
-            Some(load_namespaces_for_sidebar(state, &base_url, &name, focus).await)
-        } else {
-            None
-        };
+        let namespaces = Some(load_namespaces_for_sidebar(state, &base_url, &name, focus).await);
         warehouses.push(SidebarWarehouseNode { name, namespaces });
     }
     StudioSidebarTree { warehouses }
@@ -2991,35 +2993,32 @@ async fn load_namespaces_for_sidebar(
         })
         .unwrap_or_default();
     let mut nodes: Vec<SidebarNamespaceNode> = Vec::with_capacity(qualified_names.len());
+    let _ = focus; // tables are now eager-loaded for every namespace
     for qualified in qualified_names {
-        let tables = if focus.namespace == Some(qualified.as_str()) {
-            let ns_encoded = qualified.split('.').collect::<Vec<_>>().join("%1F");
-            let tpath = format!(
-                "/catalog/v1/{}/namespaces/{}/tables",
-                url_encode(&wh_id),
-                ns_encoded
-            );
-            Some(
-                get_lakekeeper_catalog_json(base_url, &tpath)
-                    .await
-                    .map(|tv| {
-                        tv.get("identifiers")
-                            .and_then(|n| n.as_array())
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|t| {
-                                        t.get("name")
-                                            .and_then(|n| n.as_str())
-                                            .map(str::to_string)
-                                    })
-                                    .collect::<Vec<String>>()
-                            })
-                            .unwrap_or_default()
-                    }),
-            )
-        } else {
-            None
-        };
+        let ns_encoded = qualified.split('.').collect::<Vec<_>>().join("%1F");
+        let tpath = format!(
+            "/catalog/v1/{}/namespaces/{}/tables",
+            url_encode(&wh_id),
+            ns_encoded
+        );
+        let tables = Some(
+            get_lakekeeper_catalog_json(base_url, &tpath)
+                .await
+                .map(|tv| {
+                    tv.get("identifiers")
+                        .and_then(|n| n.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|t| {
+                                    t.get("name")
+                                        .and_then(|n| n.as_str())
+                                        .map(str::to_string)
+                                })
+                                .collect::<Vec<String>>()
+                        })
+                        .unwrap_or_default()
+                }),
+        );
         nodes.push(SidebarNamespaceNode { qualified, tables });
     }
     Ok(nodes)
@@ -3108,12 +3107,6 @@ fn render_sidebar_tree_js() -> &'static str {
 
 fn render_sidebar_warehouse(node: &SidebarWarehouseNode, focus: SidebarFocus<'_>) -> String {
     let is_current = focus.warehouse == Some(node.name.as_str());
-    let href = format!("/studio/catalog/{}", url_encode(&node.name));
-    let active = if is_current && focus.namespace.is_none() {
-        " cz-tree-active"
-    } else {
-        ""
-    };
     let open_attr = if is_current { " open" } else { "" };
     let children_html = match &node.namespaces {
         Some(Ok(nss)) if nss.is_empty() => format!(
@@ -3129,19 +3122,19 @@ fn render_sidebar_warehouse(node: &SidebarWarehouseNode, focus: SidebarFocus<'_>
         ),
         None => String::new(),
     };
-    let children_block = if is_current {
-        format!(r#"<ul class="cz-tree-children">{children_html}</ul>"#)
-    } else {
-        String::new()
-    };
+    let children_block = format!(r#"<ul class="cz-tree-children">{children_html}</ul>"#);
+    // Per-row + button to create a namespace under this catalog.
+    // Hits the existing namespace-creation flow which lives on the
+    // warehouse page; the deep link pre-fills the warehouse param.
+    let create_url = format!("/studio/catalog/{}", url_encode(&node.name));
     format!(
         r#"<li class="cz-tree-item"><details class="cz-tree-details"{open_attr}>
-<summary class="cz-tree-row{active}"><span class="cz-tree-toggle"></span><span class="cz-tree-icon">⬢</span><a class="cz-tree-link" href="{href}">{label}</a><button type="button" class="cz-tree-copy" data-copy="{copy}" title="Copy name" aria-label="Copy {copy}"><i class="fa-solid fa-copy"></i></button></summary>
+<summary class="cz-tree-row"><span class="cz-tree-toggle"></span><span class="cz-tree-icon">⬢</span><span class="cz-tree-label">{label}</span><a href="{create_url}" class="cz-tree-action" title="Add namespace inside {label}" aria-label="Add namespace"><i class="fa-solid fa-plus"></i></a><button type="button" class="cz-tree-copy" data-copy="{copy}" title="Copy {copy}" aria-label="Copy {copy}"><i class="fa-solid fa-copy"></i></button></summary>
 {children_block}
 </details></li>"#,
-        href = html_escape(&href),
         label = html_escape(&node.name),
         copy = html_escape(&node.name),
+        create_url = html_escape(&create_url),
     )
 }
 
@@ -3151,16 +3144,6 @@ fn render_sidebar_namespace(
     focus: SidebarFocus<'_>,
 ) -> String {
     let is_current = focus.namespace == Some(node.qualified.as_str());
-    let href = format!(
-        "/studio/catalog/{}/{}",
-        url_encode(warehouse),
-        url_encode(&node.qualified)
-    );
-    let active = if is_current && focus.table.is_none() {
-        " cz-tree-active"
-    } else {
-        ""
-    };
     let open_attr = if is_current { " open" } else { "" };
     let children_html = match &node.tables {
         Some(Ok(tbls)) if tbls.is_empty() => {
@@ -3176,20 +3159,25 @@ fn render_sidebar_namespace(
         ),
         None => String::new(),
     };
-    let children_block = if is_current {
-        format!(r#"<ul class="cz-tree-children">{children_html}</ul>"#)
-    } else {
-        String::new()
-    };
+    let children_block = format!(r#"<ul class="cz-tree-children">{children_html}</ul>"#);
     let copy_full = format!("{warehouse}.{}", &node.qualified);
+    // The "create table" deep link lands on the namespace's page on
+    // the catalog browser; that page already carries the table-creation
+    // form. As a follow-up we can lift the form into a modal here so
+    // the operator doesn't navigate away.
+    let create_url = format!(
+        "/studio/catalog/{}/{}",
+        url_encode(warehouse),
+        url_encode(&node.qualified)
+    );
     format!(
         r#"<li class="cz-tree-item"><details class="cz-tree-details"{open_attr}>
-<summary class="cz-tree-row{active}"><span class="cz-tree-toggle"></span><span class="cz-tree-icon">◇</span><a class="cz-tree-link" href="{href}">{label}</a><button type="button" class="cz-tree-copy" data-copy="{copy}" title="Copy {copy}" aria-label="Copy {copy}"><i class="fa-solid fa-copy"></i></button></summary>
+<summary class="cz-tree-row"><span class="cz-tree-toggle"></span><span class="cz-tree-icon">◇</span><span class="cz-tree-label">{label}</span><a href="{create_url}" class="cz-tree-action" title="Add table inside {copy}" aria-label="Add table"><i class="fa-solid fa-plus"></i></a><button type="button" class="cz-tree-copy" data-copy="{copy}" title="Copy {copy}" aria-label="Copy {copy}"><i class="fa-solid fa-copy"></i></button></summary>
 {children_block}
 </details></li>"#,
-        href = html_escape(&href),
         label = html_escape(&node.qualified),
         copy = html_escape(&copy_full),
+        create_url = html_escape(&create_url),
     )
 }
 
@@ -3208,8 +3196,12 @@ fn render_sidebar_table(
     );
     let active = if is_current { " cz-tree-active" } else { "" };
     let copy_full = format!("{warehouse}.{namespace}.{table}");
+    // Table rows are still navigable (open the table-detail page) but
+    // the click target is the explicit "open" icon now -- the row
+    // label is just a label, consistent with catalogs and namespaces
+    // that no longer navigate on click.
     format!(
-        r#"<li class="cz-tree-item"><div class="cz-tree-row cz-tree-leaf{active}"><a href="{href}" style="display:flex;align-items:center;gap:0.35rem;flex:1;min-width:0;text-decoration:none;color:inherit;"><span class="cz-tree-toggle"></span><span class="cz-tree-icon">▤</span><span class="cz-tree-label">{label}</span></a><button type="button" class="cz-tree-copy" data-copy="{copy}" title="Copy {copy}" aria-label="Copy {copy}"><i class="fa-solid fa-copy"></i></button></div></li>"#,
+        r#"<li class="cz-tree-item"><div class="cz-tree-row cz-tree-leaf{active}"><span class="cz-tree-toggle"></span><span class="cz-tree-icon">▤</span><span class="cz-tree-label">{label}</span><a href="{href}" class="cz-tree-action" title="Open {copy}" aria-label="Open table"><i class="fa-solid fa-up-right-from-square"></i></a><button type="button" class="cz-tree-copy" data-copy="{copy}" title="Copy {copy}" aria-label="Copy {copy}"><i class="fa-solid fa-copy"></i></button></div></li>"#,
         href = html_escape(&href),
         label = html_escape(table),
         copy = html_escape(&copy_full),

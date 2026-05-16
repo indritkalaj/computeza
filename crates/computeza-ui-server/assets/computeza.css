@@ -1751,6 +1751,28 @@ a.cz-card:hover {
 .cz-tree-row:hover .cz-tree-copy,
 .cz-tree-copy:focus { opacity: 1; }
 .cz-tree-copy:hover { color: var(--ink); background: var(--navy); }
+/* Per-row action button (e.g. + to add namespace/table, ↗ to open
+   a detail page). Same hover-reveal as copy, slightly distinct color
+   so the two icons read as different affordances. */
+.cz-tree-action {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 0.7rem;
+  line-height: 1;
+  opacity: 0;
+  text-decoration: none;
+  transition: opacity 0.12s ease, color 0.12s ease, background 0.12s ease;
+  margin-left: auto;
+}
+.cz-tree-row:hover .cz-tree-action,
+.cz-tree-action:focus { opacity: 1; }
+.cz-tree-action:hover { color: var(--lavender); background: var(--navy); }
+.cz-tree-row:hover .cz-tree-action + .cz-tree-copy,
+.cz-tree-action + .cz-tree-copy { margin-left: 0; }
 /* Storage source row: small badge to the right of the label that
    shows the endpoint at a glance (or "live" with hover tooltip). */
 .cz-storage-icon { color: var(--lavender); }
