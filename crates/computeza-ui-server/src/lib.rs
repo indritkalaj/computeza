@@ -6894,8 +6894,7 @@ fn render_studio_files_pane(
         )
     };
     let eyebrow = format!(
-        r#"<div class="cz-studio-files-eyebrow"><span>Files ({n})</span>{actions}</div>{crumb}"#,
-        n = files.all.len(),
+        r#"<div class="cz-studio-files-eyebrow"><span>Files</span>{actions}</div>{crumb}"#,
         actions = actions,
         crumb = crumb_html,
     );
