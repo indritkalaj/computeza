@@ -1863,6 +1863,30 @@ details > summary::-webkit-details-marker { display: none; }
 .cz-studio-results-pane[hidden] {
   display: none;
 }
+/* Plan tab: monospaced pre that scrolls horizontally for wide
+   operator trees. Same color palette as the table to feel like
+   part of the result block, not a separate panel. */
+.cz-studio-plan-pane {
+  max-height: 32rem;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--navy-2);
+}
+.cz-studio-plan-text {
+  margin: 0;
+  padding: 1rem 1.1rem;
+  font-family: 'Geist Mono', ui-monospace, monospace;
+  font-size: 0.78rem;
+  line-height: 1.55;
+  color: var(--ink);
+  white-space: pre;
+}
+.cz-studio-plan-placeholder {
+  padding: 2rem 1.25rem;
+  text-align: center;
+  font-size: 0.85rem;
+}
 .cz-studio-results-eyebrow {
   font-family: 'Geist Mono', ui-monospace, monospace;
   font-size: 0.7rem;

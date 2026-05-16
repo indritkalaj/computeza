@@ -670,6 +670,7 @@ pub fn router_with_state(state: AppState) -> Router {
             "/studio/api/completions",
             get(studio_completions_handler),
         )
+        .route("/studio/api/sql/explain", post(studio_sql_explain_handler))
         .route(
             "/studio/bootstrap",
             get(studio_bootstrap_form_handler).post(studio_bootstrap_submit_handler),
@@ -4127,6 +4128,73 @@ async fn studio_sql_execute_handler(
     ))
 }
 
+#[derive(serde::Deserialize)]
+struct StudioExplainForm {
+    sql: String,
+}
+
+#[derive(serde::Serialize)]
+struct StudioExplainResponse {
+    ok: bool,
+    plan: Option<String>,
+    error: Option<String>,
+}
+
+/// POST /studio/api/sql/explain -- runs `EXPLAIN <sql>` against
+/// Trino and returns the plan as a single text blob in JSON.
+/// Studio's result-pane Plan tab calls this lazily on first
+/// click, so non-SQL queries never pay for it.
+async fn studio_sql_explain_handler(
+    State(state): State<AppState>,
+    axum::extract::Form(form): axum::extract::Form<StudioExplainForm>,
+) -> axum::Json<StudioExplainResponse> {
+    let body = form.sql.trim().to_string();
+    if body.is_empty() {
+        return axum::Json(StudioExplainResponse {
+            ok: false,
+            plan: None,
+            error: Some("No SQL to explain.".into()),
+        });
+    }
+    // EXPLAIN expects a single statement; reject anything with a
+    // semicolon to keep the wire shape tight (Trino's /v1/statement
+    // is single-statement-per-call too).
+    let cleaned = body.trim_end_matches(';').trim();
+    let Some(trino_url) = discover_trino_endpoint(state.store.as_deref()).await else {
+        return axum::Json(StudioExplainResponse {
+            ok: false,
+            plan: None,
+            error: Some(
+                "Trino isn't installed or discoverable. Install it from /install."
+                    .into(),
+            ),
+        });
+    };
+    let explain_sql = format!("EXPLAIN {cleaned}");
+    match execute_sql_against_trino(&trino_url, &explain_sql).await {
+        SqlOutcome::Ok { rows, .. } => {
+            // EXPLAIN returns N rows of plan text (one per line of
+            // the rendered plan tree). Join them so the UI gets a
+            // single readable blob.
+            let plan = rows
+                .iter()
+                .filter_map(|row| row.first().cloned())
+                .collect::<Vec<_>>()
+                .join("\n");
+            axum::Json(StudioExplainResponse {
+                ok: true,
+                plan: Some(plan),
+                error: None,
+            })
+        }
+        SqlOutcome::Err(e) => axum::Json(StudioExplainResponse {
+            ok: false,
+            plan: None,
+            error: Some(e),
+        }),
+    }
+}
+
 /// Which language did the operator actually type? Routing key:
 /// SQL goes to Trino; PyIceberg (the default Python path) talks
 /// to Lakekeeper REST directly; Sail is the experimental Spark
@@ -5278,12 +5346,21 @@ fn render_studio_page(
                     )
                 })
                 .collect();
+            // Plan-tab availability: only for SQL queries. (Python
+            // result blocks never reach this match arm anyway, so
+            // there's no need to gate by engine here -- every
+            // SqlOutcome::Ok corresponds to a Trino query.) The
+            // pane stays empty until the operator clicks the Plan
+            // tab, at which point the JS posts the original SQL to
+            // /studio/api/sql/explain and fills the pane.
+            let original_sql_attr = html_escape(sql_prefill);
             format!(
                 r##"<div class="cz-studio-results-header">
 {pill}
 <div class="cz-studio-results-tabs" role="tablist">
   <button type="button" class="cz-studio-results-tab cz-studio-results-tab-active" data-result-tab="results" role="tab">Results <span class="cz-studio-results-count">{row_count_fmt} · {duration_label}</span></button>
   <button type="button" class="cz-studio-results-tab" data-result-tab="schema" role="tab">Schema <span class="cz-studio-results-count">{col_count}</span></button>
+  <button type="button" class="cz-studio-results-tab" data-result-tab="plan" role="tab" data-original-sql="{original_sql_attr}">Plan</button>
 </div>
 <span class="cz-studio-actions-spacer"></span>
 <a href="#" class="cz-studio-results-action" onclick="czDownloadCsv(event);" title="Download as CSV"><i class="fa-solid fa-download"></i></a>
@@ -5304,6 +5381,9 @@ fn render_studio_page(
 <tbody>{schema_rows}</tbody>
 </table>
 </div>
+</div>
+<div class="cz-studio-results-pane cz-studio-plan-pane" data-result-pane="plan" data-loaded="false" hidden>
+<div class="cz-studio-plan-placeholder cz-muted">Click <strong>Plan</strong> to fetch the EXPLAIN tree from Trino.</div>
 </div>"##,
                 pill = engine_pill(engine),
                 col_count = columns.len(),
@@ -5803,10 +5883,11 @@ fn render_studio_page(
   }});
 }})();
 
-// ---------- Result-pane tab switcher (Results / Schema) ----------
-// Click a result tab to flip the visible pane. Multiple result
-// blocks could exist on the page; resolve the container by walking
-// up from the clicked tab so tabs only affect their own block.
+// ---------- Result-pane tab switcher (Results / Schema / Plan) ----------
+// Click a result tab to flip the visible pane. Plan pane lazy-
+// loads its content on first activation: posts the original SQL
+// to /studio/api/sql/explain and fills the pane with the Trino
+// EXPLAIN output.
 document.addEventListener("click", function (e) {{
   var tab = e.target.closest(".cz-studio-results-tab");
   if (!tab) return;
@@ -5819,6 +5900,54 @@ document.addEventListener("click", function (e) {{
   container.querySelectorAll(".cz-studio-results-pane").forEach(function (p) {{
     p.hidden = p.getAttribute("data-result-pane") !== which;
   }});
+  // Lazy-load the Plan pane on first activation.
+  if (which === "plan") {{
+    var pane = container.querySelector('.cz-studio-results-pane[data-result-pane="plan"]');
+    if (pane && pane.getAttribute("data-loaded") === "false") {{
+      var originalSql = tab.getAttribute("data-original-sql") || "";
+      pane.setAttribute("data-loaded", "pending");
+      pane.innerHTML = '<div class="cz-studio-plan-placeholder cz-muted">Fetching EXPLAIN plan…</div>';
+      // CSRF token, same approach as autosave.
+      var csrf = "";
+      try {{
+        var parts = document.cookie.split(";");
+        for (var i = 0; i < parts.length; i++) {{
+          var t = parts[i].trim();
+          if (t.indexOf("computeza_csrf=") === 0) {{ csrf = t.substring(15); break; }}
+        }}
+      }} catch (_) {{}}
+      var body = new URLSearchParams();
+      body.append("sql", originalSql);
+      if (csrf) body.append("csrf_token", csrf);
+      fetch("/studio/api/sql/explain", {{
+        method: "POST",
+        credentials: "same-origin",
+        headers: {{ "Content-Type": "application/x-www-form-urlencoded" }},
+        body: body.toString(),
+      }})
+        .then(function (r) {{ return r.json(); }})
+        .then(function (j) {{
+          pane.setAttribute("data-loaded", "true");
+          if (j.ok && j.plan) {{
+            var pre = document.createElement("pre");
+            pre.className = "cz-studio-plan-text";
+            pre.textContent = j.plan;
+            pane.innerHTML = "";
+            pane.appendChild(pre);
+          }} else {{
+            var err = document.createElement("pre");
+            err.className = "cz-studio-error";
+            err.textContent = j.error || "EXPLAIN returned no plan.";
+            pane.innerHTML = "";
+            pane.appendChild(err);
+          }}
+        }})
+        .catch(function (e) {{
+          pane.setAttribute("data-loaded", "false");
+          pane.innerHTML = '<pre class="cz-studio-error">Plan fetch failed: ' + (e && e.message ? e.message : String(e)) + '</pre>';
+        }});
+    }}
+  }}
 }});
 
 // ---------- Tab drag-to-reorder ----------
