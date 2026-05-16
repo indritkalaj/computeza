@@ -1751,6 +1751,20 @@ a.cz-card:hover {
 .cz-tree-row:hover .cz-tree-copy,
 .cz-tree-copy:focus { opacity: 1; }
 .cz-tree-copy:hover { color: var(--ink); background: var(--navy); }
+/* Storage source row: small badge to the right of the label that
+   shows the endpoint at a glance (or "live" with hover tooltip). */
+.cz-storage-icon { color: var(--lavender); }
+.cz-tree-storage-endpoint {
+  font-size: 0.62rem;
+  color: var(--ok, #9fe8c4);
+  background: rgba(159, 232, 196, 0.12);
+  border: 1px solid rgba(159, 232, 196, 0.25);
+  padding: 0 0.35rem;
+  border-radius: 999px;
+  margin-left: 0.35rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
 
 /* Tree component */
 .cz-tree {

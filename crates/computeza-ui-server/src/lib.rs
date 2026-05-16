@@ -2859,8 +2859,39 @@ async fn build_studio_full_sidebar(state: &AppState, focus: SidebarFocus<'_>) ->
     // request. Per-file query history is reachable via the file 3-dot
     // menu's "History" entry (revisions list) and the global view at
     // /studio/history aggregates across all files.
+    let storage_html = render_studio_storage_section(state).await;
     let tree = build_studio_sidebar_tree(state, focus).await;
-    render_studio_tree_sidebar(&tree, focus)
+    let tree_html = render_studio_tree_sidebar(&tree, focus);
+    format!("{storage_html}{tree_html}")
+}
+
+/// Render the "Storage source" section -- shows the operator which
+/// object store actually holds the data behind the catalog. Today the
+/// only managed backend is Garage; the section also exposes an
+/// "Add connector" link that links to the install hub filtered to
+/// storage-class components (MinIO, etc. as they're added).
+async fn render_studio_storage_section(state: &AppState) -> String {
+    let garage = discover_garage_endpoint(state.store.as_deref()).await;
+    let row = match garage {
+        Some(url) => format!(
+            r##"<li class="cz-tree-item"><div class="cz-tree-row"><span class="cz-tree-toggle"></span><span class="cz-tree-icon cz-storage-icon" title="Garage (managed)">◈</span><span class="cz-tree-label">garage</span><span class="cz-tree-storage-endpoint" title="{ep}">live</span><button type="button" class="cz-tree-copy" data-copy="{ep}" title="Copy endpoint {ep}" aria-label="Copy endpoint"><i class="fa-solid fa-copy"></i></button></div></li>"##,
+            ep = html_escape(&url),
+        ),
+        None => r#"<li class="cz-tree-empty">No storage configured yet.</li>"#.to_string(),
+    };
+    // Future connectors land alongside garage here. For now the
+    // "+ Add connector" link routes to /install#storage; storage-class
+    // components (minio / s3-byo / azure / gcs) get added there as
+    // they're built. The popup menu spec'd in the storage portability
+    // plan can replace this link once the backends exist.
+    format!(
+        r##"<section class="cz-studio-sidebar-section">
+<div class="cz-studio-sidebar-eyebrow"><span>Storage source</span><span class="cz-studio-sidebar-eyebrow-actions">
+<a href="/install#storage" class="cz-studio-sidebar-action" title="Add a storage connector" data-tooltip="Add a storage connector" aria-label="Add a storage connector"><i class="fa-solid fa-plus"></i></a>
+</span></div>
+<ul class="cz-tree">{row}</ul>
+</section>"##,
+    )
 }
 
 /// In-memory shape of the full sidebar tree at render time. Built by
