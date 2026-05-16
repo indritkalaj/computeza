@@ -2855,14 +2855,14 @@ fn render_drilldown_breadcrumbs(crumbs: &[(&str, &str)]) -> String {
 /// page passes the operator's current focus so the right branch
 /// renders expanded and the right row gets `cz-tree-active`.
 async fn build_studio_full_sidebar(state: &AppState, focus: SidebarFocus<'_>) -> String {
-    // Recent-queries section used to live here; removed at operator
-    // request. Per-file query history is reachable via the file 3-dot
-    // menu's "History" entry (revisions list) and the global view at
-    // /studio/history aggregates across all files.
+    // Wrap the sidebar contents in a stable id container so the
+    // catalog Refresh button can pull just this fragment over fetch()
+    // and replace it in place -- avoiding a full page reload that
+    // would wipe the open notebook's editor state.
     let storage_html = render_studio_storage_section(state).await;
     let tree = build_studio_sidebar_tree(state, focus).await;
     let tree_html = render_studio_tree_sidebar(&tree, focus);
-    format!("{storage_html}{tree_html}")
+    format!(r#"<div id="cz-studio-sidebar-body">{storage_html}{tree_html}</div>"#)
 }
 
 /// Render the "Storage source" section -- shows the operator which
@@ -3111,19 +3111,61 @@ fn render_sidebar_tree_js() -> &'static str {
     writeOpenSet(s);
   }, true);
 
-  // Refresh button -- full reload so the server re-queries Lakekeeper.
-  // Flushes any open notebook's typed-but-not-saved content first so
-  // the reload doesn't drop pending edits. sendBeacon is synchronous-
-  // enough for the browser to deliver the POST even as we navigate.
+  // Refresh button -- re-fetch the current URL, parse the response,
+  // and splice ONLY the sidebar fragment into the live DOM. No full
+  // page reload, so the notebook editor / open files / scroll
+  // position all stay intact. The server re-queries Lakekeeper on
+  // each /studio render so a fragment fetch gets fresh data the
+  // same way a reload would.
+  function refreshCatalogTree(btn) {
+    var body = document.getElementById("cz-studio-sidebar-body");
+    if (!body) { window.location.reload(); return; }
+    var origIcon = btn.innerHTML;
+    btn.innerHTML = '<i class="fa-solid fa-rotate fa-spin"></i>';
+    btn.style.pointerEvents = "none";
+    fetch(window.location.href, {
+      method: "GET",
+      credentials: "same-origin",
+      headers: { "X-Requested-With": "fetch" },
+    })
+      .then(function (r) { return r.text(); })
+      .then(function (html) {
+        var doc = new DOMParser().parseFromString(html, "text/html");
+        var fresh = doc.getElementById("cz-studio-sidebar-body");
+        if (!fresh) throw new Error("sidebar fragment not found in response");
+        body.replaceWith(fresh);
+        // Re-execute any inline <script> the new fragment carries
+        // (the localStorage-restore + copy / refresh handlers live
+        // inside it, attached via querySelectorAll on the section).
+        fresh.querySelectorAll("script").forEach(function (s) {
+          var ns = document.createElement("script");
+          for (var i = 0; i < s.attributes.length; i++) {
+            ns.setAttribute(s.attributes[i].name, s.attributes[i].value);
+          }
+          ns.textContent = s.textContent;
+          s.parentNode.replaceChild(ns, s);
+        });
+      })
+      .catch(function (e) {
+        console.error("[catalog-refresh] fragment refresh failed:", e);
+        // Fall back to a full reload, after flushing the notebook so
+        // typed content survives the navigation.
+        try {
+          if (window.czNotebook && typeof window.czNotebook.flushBeacon === "function") {
+            window.czNotebook.flushBeacon();
+          }
+        } catch (_e) {}
+        window.location.reload();
+      })
+      .finally(function () {
+        btn.innerHTML = origIcon;
+        btn.style.pointerEvents = "";
+      });
+  }
   document.querySelectorAll(".cz-catalog-refresh").forEach(function (a) {
     a.addEventListener("click", function (e) {
       e.preventDefault();
-      try {
-        if (window.czNotebook && typeof window.czNotebook.flushBeacon === "function") {
-          window.czNotebook.flushBeacon();
-        }
-      } catch (_e) {}
-      window.location.reload();
+      refreshCatalogTree(a);
     });
   });
   // Copy-name buttons: each .cz-tree-copy[data-copy] writes its
