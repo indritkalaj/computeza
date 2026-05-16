@@ -2306,6 +2306,120 @@ details > summary::-webkit-details-marker { display: none; }
   display: none;
 }
 
+/* ============================================================
+   Studio notebook cells
+   ============================================================ */
+.cz-studio-cells {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+  margin-bottom: 1rem;
+}
+.cz-studio-cell {
+  background: var(--navy-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.cz-studio-cell-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.85rem;
+  background: rgba(255, 255, 255, 0.03);
+  border-bottom: 1px solid var(--line);
+  font-size: 0.78rem;
+}
+.cz-studio-cell-index {
+  font-family: 'Geist Mono', ui-monospace, monospace;
+  color: var(--muted);
+  font-size: 0.7rem;
+  letter-spacing: 0.08em;
+}
+.cz-studio-cell-kind {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+.cz-studio-cell-kind .cz-cell-kind-current {
+  font-family: 'Geist Mono', ui-monospace, monospace;
+  font-size: 0.7rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 0.2rem 0.55rem;
+  border-radius: 999px;
+  background: var(--navy-3);
+  color: var(--lavender);
+  border: 1px solid rgba(196, 184, 232, 0.25);
+  pointer-events: none;
+}
+.cz-studio-cell-kind .cz-cell-kind-select {
+  /* Sit invisibly on top so a click on the pill opens the native
+     dropdown. The pill text is what's actually visible. */
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  cursor: pointer;
+  color-scheme: dark;
+}
+.cz-studio-cell-header button {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 0.3rem 0.55rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.78rem;
+}
+.cz-studio-cell-header button:hover {
+  color: var(--ink);
+  background: rgba(255, 255, 255, 0.06);
+}
+.cz-studio-cell-header button.cz-btn-primary {
+  color: var(--lavender);
+  background: rgba(196, 184, 232, 0.12);
+  border-color: rgba(196, 184, 232, 0.3);
+  padding: 0.3rem 0.85rem;
+}
+.cz-studio-cell-header button.cz-btn-primary:hover {
+  background: rgba(196, 184, 232, 0.2);
+}
+.cz-studio-cell-editor {
+  padding: 0;
+}
+.cz-studio-cell-editor textarea {
+  width: 100%;
+  min-height: 7rem;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  font-family: 'Geist Mono', ui-monospace, monospace;
+  font-size: 0.82rem;
+  padding: 0.75rem 0.9rem;
+  color: var(--ink);
+  resize: vertical;
+  outline: none;
+}
+.cz-cell-output {
+  border-top: 1px solid var(--line);
+  padding: 0.75rem 0.85rem;
+  background: var(--navy);
+  min-height: 2rem;
+}
+.cz-cell-output-empty {
+  font-family: 'Geist Mono', ui-monospace, monospace;
+  font-size: 0.74rem;
+  text-align: center;
+  padding: 1rem 0;
+}
+.cz-studio-cells-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin: 0.75rem 0 2rem;
+}
+
 /* ---------- Keyboard-shortcut overlay ---------- */
 #cz-studio-shortcuts {
   display: none;

@@ -671,6 +671,8 @@ pub fn router_with_state(state: AppState) -> Router {
             get(studio_completions_handler),
         )
         .route("/studio/api/sql/explain", post(studio_sql_explain_handler))
+        .route("/studio/api/cells/run", post(studio_cell_run_handler))
+        .route("/studio/notebooks/new", post(studio_notebook_new_handler))
         .route("/studio/history", get(studio_history_page_handler))
         .route(
             "/studio/bootstrap",
@@ -966,6 +968,351 @@ async fn discover_lakekeeper_endpoint(
 /// 1MB SQLite-blob soft ceiling" -- 20 entries * ~2KB SQL each
 /// leaves plenty of headroom.
 const STUDIO_HISTORY_CAP: usize = 20;
+
+// ============================================================
+// Studio notebook (Jupyter-style multi-cell editor)
+// ============================================================
+//
+// A notebook is a sequence of `Cell`s, each pinned to one
+// language (SQL -> Trino, Python -> PyIceberg, Python -> Sail).
+// The whole notebook is stored as JSON inside a regular
+// `studio_files` row -- so file browser / autosave / revisions
+// all "just work" for notebook files. Detection is path-based:
+// .notebook (Computeza native JSON) or .ipynb (Jupyter format,
+// imported / exported in the same wire shape).
+//
+// Cell execution is stateless per call -- each Run posts a single
+// cell's body to /studio/api/cells/run, the server routes it the
+// same way the single-buffer editor does (Trino / PyIceberg /
+// Sail), and the response carries the rendered output. The client
+// stores the output back into the cell's `output` field and
+// the autosave path persists the notebook (including outputs) into
+// the file. Reloading shows the last output per cell exactly as
+// Databricks / Jupyter do.
+
+/// Programmable cells -- pinned per-cell, no magics. Operators
+/// who want to mix engines do it by adding new cells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum CellKind {
+    Sql,
+    PyIceberg,
+    Sail,
+}
+
+impl CellKind {
+    fn from_form_value(s: &str) -> Self {
+        match s {
+            "sql" => CellKind::Sql,
+            "sail" => CellKind::Sail,
+            // "pyiceberg" + anything else = the default Python path.
+            _ => CellKind::PyIceberg,
+        }
+    }
+    fn label(&self) -> &'static str {
+        match self {
+            CellKind::Sql => "SQL → Trino",
+            CellKind::PyIceberg => "Python → PyIceberg",
+            CellKind::Sail => "Python → Sail",
+        }
+    }
+}
+
+/// One cell in the notebook. `output` is the result of the last
+/// Run and survives autosave so reopening the notebook restores
+/// the prior view (same as Databricks).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct NotebookCell {
+    /// Stable per-cell UUID. Used as the DOM id (cz-cell-<id>) +
+    /// in cell-reorder messages.
+    id: String,
+    kind: CellKind,
+    #[serde(default)]
+    content: String,
+    /// Last-execution output. `None` for cells that haven't been
+    /// run yet (just-added cells, or notebooks loaded from a fresh
+    /// .ipynb that didn't carry outputs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    output: Option<CellOutput>,
+}
+
+impl NotebookCell {
+    fn empty(kind: CellKind) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            kind,
+            content: String::new(),
+            output: None,
+        }
+    }
+}
+
+/// What one cell's last Run produced. Tagged enum so the client
+/// can render the right shape (SQL table / Python stdout /
+/// interactive DataFrame / error pane) without server-side
+/// HTML rendering -- keeps the wire JSON minimal.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum CellOutput {
+    /// Trino result set. Same shape Studio's main editor uses.
+    SqlOk {
+        columns: Vec<CellColumn>,
+        rows: Vec<Vec<String>>,
+        duration_ms: u128,
+        executed_at: chrono::DateTime<chrono::Utc>,
+    },
+    /// Trino rejected the query (parser error, missing catalog, etc.).
+    SqlErr {
+        message: String,
+        duration_ms: u128,
+        executed_at: chrono::DateTime<chrono::Utc>,
+    },
+    /// Python ran successfully. `stdout` carries print() output;
+    /// `dataframe` is filled when the cell's last expression
+    /// evaluated to a PyArrow Table or pandas DataFrame, so the
+    /// client can render it as an interactive table (Phase 3).
+    PyOk {
+        stdout: String,
+        stderr: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dataframe: Option<DataFrameOutput>,
+        duration_ms: u128,
+        executed_at: chrono::DateTime<chrono::Utc>,
+    },
+    /// Python raised. `stderr` carries the traceback.
+    PyErr {
+        stdout: String,
+        stderr: String,
+        duration_ms: u128,
+        executed_at: chrono::DateTime<chrono::Utc>,
+    },
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CellColumn {
+    name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "type")]
+    type_: Option<String>,
+}
+
+/// Last-expression DataFrame captured by the Python executor.
+/// Serialized as columns + string-stringified rows so the client
+/// renders it through the same code path as a Trino result.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct DataFrameOutput {
+    columns: Vec<CellColumn>,
+    rows: Vec<Vec<String>>,
+    /// Total number of rows in the source DataFrame before any
+    /// truncation. The `rows` array is capped at NOTEBOOK_DF_ROW_CAP.
+    total_rows: u64,
+    /// Origin so the UI can label "Arrow Table" / "pandas DataFrame".
+    origin: String,
+}
+
+/// Cap on how many rows of a Python-cell DataFrame we transport
+/// to the client. Large DataFrames (millions of rows) shouldn't
+/// land in the browser; the cell shows a "showing N of total"
+/// notice and the operator can downsample / paginate in code.
+const NOTEBOOK_DF_ROW_CAP: usize = 1000;
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct NotebookMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+}
+
+/// The on-disk shape (computeza-native `.notebook`). For `.ipynb`
+/// import/export we translate between this and Jupyter's cell
+/// format on demand.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct Notebook {
+    #[serde(default)]
+    metadata: NotebookMetadata,
+    cells: Vec<NotebookCell>,
+}
+
+impl Notebook {
+    /// Empty notebook with one starter SQL cell -- friendlier than
+    /// opening a totally blank editor.
+    fn fresh() -> Self {
+        Self {
+            metadata: NotebookMetadata::default(),
+            cells: vec![NotebookCell::empty(CellKind::Sql)],
+        }
+    }
+
+    /// Parse from JSON. Falls back to fresh() on empty/malformed
+    /// input so existing-file paths never panic.
+    fn parse_or_fresh(raw: &str) -> Self {
+        if raw.trim().is_empty() {
+            return Self::fresh();
+        }
+        serde_json::from_str(raw).unwrap_or_else(|_| Self::fresh())
+    }
+
+    fn to_json_pretty(&self) -> String {
+        serde_json::to_string_pretty(self).unwrap_or_default()
+    }
+}
+
+/// Detect whether a file path should be opened in the notebook
+/// renderer (vs the single-buffer editor). Two extensions:
+///   - `.notebook` : Computeza-native JSON, full fidelity
+///   - `.ipynb`    : Jupyter format, lossy on metadata + execution counts
+fn is_notebook_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".notebook") || lower.ends_with(".ipynb")
+}
+
+fn is_ipynb_path(path: &str) -> bool {
+    path.to_ascii_lowercase().ends_with(".ipynb")
+}
+
+/// Load a notebook from a studio_files row's content. Branches on
+/// the path extension: .ipynb gets translated through the Jupyter
+/// shape, .notebook is parsed directly.
+fn notebook_from_file_content(path: &str, content: &str) -> Notebook {
+    if is_ipynb_path(path) {
+        ipynb_to_notebook(content)
+    } else {
+        Notebook::parse_or_fresh(content)
+    }
+}
+
+/// Serialize a notebook back to the wire format that matches its
+/// path. .ipynb files round-trip through the Jupyter translator;
+/// .notebook files emit our native JSON.
+fn notebook_to_file_content(path: &str, nb: &Notebook) -> String {
+    if is_ipynb_path(path) {
+        notebook_to_ipynb(nb)
+    } else {
+        nb.to_json_pretty()
+    }
+}
+
+/// Translate a `.ipynb` body (Jupyter's `{cells: [{cell_type, source, outputs, ...}]}`)
+/// into our internal Notebook. Lossy: Jupyter execution counts +
+/// kernel metadata are dropped; cell language defaults to SQL
+/// because Jupyter's "code" cell doesn't distinguish SQL/Python by
+/// itself. Operators can change the per-cell language pill after
+/// import.
+fn ipynb_to_notebook(raw: &str) -> Notebook {
+    let v: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => return Notebook::fresh(),
+    };
+    let cells = v
+        .get("cells")
+        .and_then(|c| c.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|c| {
+                    let cell_type = c.get("cell_type").and_then(|t| t.as_str()).unwrap_or("");
+                    if cell_type != "code" && cell_type != "markdown" && cell_type != "raw" {
+                        return None;
+                    }
+                    // `source` is either a string or an array of
+                    // strings that we join.
+                    let content = match c.get("source") {
+                        Some(serde_json::Value::String(s)) => s.clone(),
+                        Some(serde_json::Value::Array(parts)) => parts
+                            .iter()
+                            .filter_map(|p| p.as_str())
+                            .collect::<Vec<_>>()
+                            .join(""),
+                        _ => String::new(),
+                    };
+                    // Inspect any computeza-specific cell metadata
+                    // we wrote on a previous export -- carry kind +
+                    // last output across the round-trip when present.
+                    let cz_meta = c
+                        .get("metadata")
+                        .and_then(|m| m.get("computeza"));
+                    let kind = cz_meta
+                        .and_then(|m| m.get("kind"))
+                        .and_then(|k| k.as_str())
+                        .map(CellKind::from_form_value)
+                        .unwrap_or(CellKind::Sql);
+                    let output = cz_meta
+                        .and_then(|m| m.get("output"))
+                        .and_then(|o| serde_json::from_value::<CellOutput>(o.clone()).ok());
+                    Some(NotebookCell {
+                        id: c
+                            .get("id")
+                            .and_then(|i| i.as_str())
+                            .map(str::to_string)
+                            .unwrap_or_else(|| Uuid::new_v4().to_string()),
+                        kind,
+                        content,
+                        output,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Notebook {
+        metadata: NotebookMetadata::default(),
+        cells: if cells.is_empty() {
+            vec![NotebookCell::empty(CellKind::Sql)]
+        } else {
+            cells
+        },
+    }
+}
+
+/// Emit a `.ipynb`-compatible body for the given notebook. Cell
+/// kind + last output get tucked into `metadata.computeza` so a
+/// re-import preserves the Studio-only fields without breaking
+/// Jupyter (which ignores unknown metadata).
+fn notebook_to_ipynb(nb: &Notebook) -> String {
+    let cells: Vec<serde_json::Value> = nb
+        .cells
+        .iter()
+        .map(|c| {
+            let mut meta = serde_json::Map::new();
+            let mut cz = serde_json::Map::new();
+            cz.insert(
+                "kind".into(),
+                serde_json::Value::String(
+                    match c.kind {
+                        CellKind::Sql => "sql",
+                        CellKind::PyIceberg => "pyiceberg",
+                        CellKind::Sail => "sail",
+                    }
+                    .into(),
+                ),
+            );
+            if let Some(out) = &c.output {
+                if let Ok(v) = serde_json::to_value(out) {
+                    cz.insert("output".into(), v);
+                }
+            }
+            meta.insert("computeza".into(), serde_json::Value::Object(cz));
+            serde_json::json!({
+                "id": c.id,
+                "cell_type": "code",
+                "source": c.content,
+                "metadata": meta,
+                "outputs": [],
+                "execution_count": serde_json::Value::Null,
+            })
+        })
+        .collect();
+    let doc = serde_json::json!({
+        "cells": cells,
+        "metadata": {
+            "kernelspec": {
+                "name": "computeza",
+                "display_name": "Computeza Studio"
+            },
+            "language_info": { "name": "sql" }
+        },
+        "nbformat": 4,
+        "nbformat_minor": 5
+    });
+    serde_json::to_string_pretty(&doc).unwrap_or_default()
+}
 
 /// One row in the studio SQL history. Persisted as JSON inside
 /// a single resource row (`studio-history/default`) so we don't
@@ -3241,6 +3588,28 @@ async fn studio_handler(
     };
     let history = load_studio_history(state.store.as_deref()).await;
     let files = build_studio_files_view(&state, &q).await;
+    let sidebar = build_studio_full_sidebar(&state, SidebarFocus::default()).await;
+
+    // Notebook detection: if the active file's path ends in
+    // .notebook or .ipynb, render the cells UI instead of the
+    // single-buffer editor. The single-buffer editor handles
+    // every other file type (sql, py, txt, md) unchanged.
+    if let Some(active) = files.active_file() {
+        if is_notebook_path(&active.path) {
+            let notebook = notebook_from_file_content(&active.path, &active.content);
+            return Html(render_studio_notebook_page(
+                &l,
+                lakekeeper.is_some(),
+                trino.is_some(),
+                &lk_state,
+                &history,
+                &notebook,
+                &sidebar,
+                &files,
+            ));
+        }
+    }
+
     // sql_prefill priority: explicit ?sql= override beats the active
     // file's content. Lets the catalog "Pre-fill SELECT *" deep link
     // overwrite the editor body even when a file tab is open.
@@ -3250,7 +3619,6 @@ async fn studio_handler(
             .map(|f| f.content.clone())
             .unwrap_or_default()
     });
-    let sidebar = build_studio_full_sidebar(&state, SidebarFocus::default()).await;
     Html(render_studio_page(
         &l,
         lakekeeper.is_some(),
@@ -4129,6 +4497,204 @@ async fn studio_sql_execute_handler(
     ))
 }
 
+#[derive(serde::Deserialize)]
+struct CellRunForm {
+    /// Cell language / engine ("sql" / "pyiceberg" / "sail").
+    #[serde(default)]
+    kind: String,
+    /// Cell body.
+    #[serde(default)]
+    content: String,
+}
+
+/// POST /studio/api/cells/run -- execute one notebook cell.
+///
+/// Stateless: each call runs in a fresh process. Variable carry-
+/// over across Python cells is a Phase 5 / future concern; the
+/// current contract is "each cell is its own world" which keeps
+/// the execution model predictable.
+///
+/// Response is a CellOutput tagged JSON (sql_ok / sql_err /
+/// py_ok / py_err). py_ok carries an optional `dataframe` when
+/// the cell's last expression evaluated to a PyArrow Table or
+/// pandas DataFrame -- the client renders that the same way it
+/// renders a Trino result table.
+async fn studio_cell_run_handler(
+    State(state): State<AppState>,
+    axum::extract::Form(form): axum::extract::Form<CellRunForm>,
+) -> axum::Json<CellOutput> {
+    let kind = CellKind::from_form_value(&form.kind);
+    let started = chrono::Utc::now();
+    let t0 = std::time::Instant::now();
+    match kind {
+        CellKind::Sql => {
+            let Some(url) = discover_trino_endpoint(state.store.as_deref()).await else {
+                return axum::Json(CellOutput::SqlErr {
+                    message: "Trino isn't installed or discoverable. Install it from /install.".into(),
+                    duration_ms: t0.elapsed().as_millis(),
+                    executed_at: started,
+                });
+            };
+            match execute_sql_against_trino(&url, &form.content).await {
+                SqlOutcome::Ok { columns, rows, duration_ms } => axum::Json(CellOutput::SqlOk {
+                    columns: columns
+                        .into_iter()
+                        .map(|c| CellColumn {
+                            name: c.name,
+                            type_: c.type_,
+                        })
+                        .collect(),
+                    rows,
+                    duration_ms,
+                    executed_at: started,
+                }),
+                SqlOutcome::Err(message) => axum::Json(CellOutput::SqlErr {
+                    message,
+                    duration_ms: t0.elapsed().as_millis(),
+                    executed_at: started,
+                }),
+            }
+        }
+        CellKind::PyIceberg | CellKind::Sail => {
+            let outcome = match kind {
+                CellKind::PyIceberg => {
+                    execute_python_via_pyiceberg(&form.content, state.secrets.as_deref()).await
+                }
+                _ => {
+                    let url = match discover_sail_endpoint(state.store.as_deref()).await {
+                        Some(u) => u,
+                        None => {
+                            return axum::Json(CellOutput::PyErr {
+                                stdout: String::new(),
+                                stderr: "Sail isn't installed.".into(),
+                                duration_ms: t0.elapsed().as_millis(),
+                                executed_at: started,
+                            });
+                        }
+                    };
+                    execute_python_via_sail(&url, &form.content, state.secrets.as_deref())
+                        .await
+                }
+            };
+            // Both executors emit a magic-line into stdout that
+            // carries the captured DataFrame (when present). We
+            // strip it out here so the operator's stdout view
+            // stays clean and the structured DF lands as a
+            // dedicated field on CellOutput::PyOk.
+            let (stdout, stderr, dataframe) = split_dataframe_marker(outcome);
+            let duration_ms = t0.elapsed().as_millis();
+            match dataframe {
+                Some(Err(err_stderr)) => axum::Json(CellOutput::PyErr {
+                    stdout,
+                    stderr: if stderr.is_empty() {
+                        err_stderr
+                    } else {
+                        format!("{stderr}\n{err_stderr}")
+                    },
+                    duration_ms,
+                    executed_at: started,
+                }),
+                df_opt => {
+                    // If we have stderr but stdout is also non-empty,
+                    // surface them both. If the executor itself
+                    // returned PythonOutcome::Err the split function
+                    // already routed stderr into a PyErr below.
+                    if !stderr.is_empty() && stdout.is_empty() && df_opt.is_none() {
+                        // Pure error case (no captured stdout) --
+                        // surface as PyErr so the cell goes red.
+                        return axum::Json(CellOutput::PyErr {
+                            stdout,
+                            stderr,
+                            duration_ms,
+                            executed_at: started,
+                        });
+                    }
+                    axum::Json(CellOutput::PyOk {
+                        stdout,
+                        stderr,
+                        dataframe: df_opt.and_then(|r| r.ok()),
+                        duration_ms,
+                        executed_at: started,
+                    })
+                }
+            }
+        }
+    }
+}
+
+/// Parse a PythonOutcome into (stdout, stderr, optional DataFrame
+/// result). The executors emit a single marker line
+/// `__COMPUTEZA_DATAFRAME__<json>__END__` on stdout when the
+/// cell's last expression captured to a DataFrame. We extract
+/// that line out of stdout, parse the JSON, and return the
+/// remaining stdout for the operator to read.
+fn split_dataframe_marker(
+    outcome: PythonOutcome,
+) -> (String, String, Option<Result<DataFrameOutput, String>>) {
+    let (raw_stdout, stderr, is_err) = match outcome {
+        PythonOutcome::Ok { stdout, stderr } => (stdout, stderr, false),
+        PythonOutcome::Err { stdout, stderr } => (stdout, stderr, true),
+    };
+    const MARKER_START: &str = "__COMPUTEZA_DATAFRAME__";
+    const MARKER_END: &str = "__END__";
+    let mut cleaned_stdout = String::new();
+    let mut captured: Option<Result<DataFrameOutput, String>> = None;
+    for line in raw_stdout.lines() {
+        if let Some(rest) = line.strip_prefix(MARKER_START) {
+            if let Some(json_str) = rest.strip_suffix(MARKER_END) {
+                captured = Some(
+                    serde_json::from_str::<DataFrameOutput>(json_str)
+                        .map_err(|e| format!("parse df marker: {e}")),
+                );
+                continue;
+            }
+        }
+        cleaned_stdout.push_str(line);
+        cleaned_stdout.push('\n');
+    }
+    // Trim the trailing \n we always append.
+    if cleaned_stdout.ends_with('\n') {
+        cleaned_stdout.pop();
+    }
+    if is_err && captured.is_none() {
+        // Caller expects to detect errors via the stderr-only path
+        // when there's no DataFrame.
+        return (cleaned_stdout, stderr, None);
+    }
+    (cleaned_stdout, stderr, captured)
+}
+
+/// POST /studio/notebooks/new -- create a fresh .notebook file
+/// (with one starter SQL cell) and redirect into the editor
+/// with it open. Hooked to the "New notebook" button in the
+/// file-tree.
+async fn studio_notebook_new_handler(
+    State(state): State<AppState>,
+) -> axum::response::Redirect {
+    let Some(store) = state.store.as_deref() else {
+        return redirect_studio_flash(None, None, "metadata store unavailable");
+    };
+    // Pick a unique path. /notebooks/ folder so it groups in the
+    // file tree.
+    let mut candidate = "/notebooks/untitled.notebook".to_string();
+    let mut n = 1;
+    while store
+        .studio_files_get_by_path(&candidate)
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        n += 1;
+        candidate = format!("/notebooks/untitled-{n}.notebook");
+    }
+    let body = Notebook::fresh().to_json_pretty();
+    match store.studio_files_create(&candidate, &body).await {
+        Ok(f) => redirect_studio_flash(Some(f.id.clone()), Some(f.id), "notebook created"),
+        Err(e) => redirect_studio_flash(None, None, &format!("create: {e}")),
+    }
+}
+
 async fn studio_history_page_handler(
     State(state): State<AppState>,
 ) -> Html<String> {
@@ -4557,14 +5123,104 @@ if _first_catalog is not None:
     builder = builder.config("spark.sql.defaultCatalog", _first_catalog)
 spark = builder.getOrCreate()
 
+scope = {{"spark": spark, "__name__": "__main__"}}
+import ast as _cz_ast
+import json as _cz_json
+def _cz_emit_df(result):
+    """Marker-line emit so Studio can render the last expression as
+    an interactive table when it's a DataFrame / Arrow Table /
+    list-of-dicts. Cap rows at NOTEBOOK_DF_ROW_CAP to keep payload
+    small. Best-effort: never raises -- a bad serialization just
+    drops the marker, the operator still sees the textual stdout."""
+    if result is None:
+        return
+    try:
+        cap = {row_cap}
+        cols = None
+        rows = None
+        origin = type(result).__module__ + "." + type(result).__name__
+        # PyArrow Table
+        try:
+            import pyarrow as pa
+            if isinstance(result, pa.Table):
+                total = result.num_rows
+                t = result.slice(0, cap)
+                cols = [{{"name": f, "type": str(result.schema.field(f).type)}} for f in result.schema.names]
+                rows = [
+                    [str(t.column(c)[r].as_py()) for c in result.schema.names]
+                    for r in range(t.num_rows)
+                ]
+                payload = {{"columns": cols, "rows": rows, "total_rows": int(total), "origin": "pyarrow.Table"}}
+                print("__COMPUTEZA_DATAFRAME__" + _cz_json.dumps(payload) + "__END__")
+                return
+        except Exception:
+            pass
+        # pandas DataFrame
+        try:
+            import pandas as pd
+            if isinstance(result, pd.DataFrame):
+                total = len(result)
+                head = result.head(cap)
+                cols = [{{"name": str(c), "type": str(result[c].dtype)}} for c in result.columns]
+                rows = [[("" if pd.isna(v) else str(v)) for v in row] for row in head.itertuples(index=False, name=None)]
+                payload = {{"columns": cols, "rows": rows, "total_rows": int(total), "origin": "pandas.DataFrame"}}
+                print("__COMPUTEZA_DATAFRAME__" + _cz_json.dumps(payload) + "__END__")
+                return
+        except Exception:
+            pass
+        # Spark Connect DataFrame -- collect into rows (cap first).
+        try:
+            from pyspark.sql.connect.dataframe import DataFrame as SparkConnectDF
+            if isinstance(result, SparkConnectDF):
+                total = result.count()
+                head = result.limit(cap).collect()
+                col_names = result.columns
+                cols = [{{"name": n}} for n in col_names]
+                rows = [[("" if v is None else str(v)) for v in row] for row in head]
+                payload = {{"columns": cols, "rows": rows, "total_rows": int(total), "origin": "pyspark.DataFrame"}}
+                print("__COMPUTEZA_DATAFRAME__" + _cz_json.dumps(payload) + "__END__")
+                return
+        except Exception:
+            pass
+        # list of dicts: assume column-uniform.
+        if isinstance(result, list) and result and isinstance(result[0], dict):
+            keys = list(result[0].keys())
+            cols = [{{"name": k}} for k in keys]
+            rows = [[str(r.get(k, "")) for k in keys] for r in result[:cap]]
+            payload = {{"columns": cols, "rows": rows, "total_rows": len(result), "origin": "list[dict]"}}
+            print("__COMPUTEZA_DATAFRAME__" + _cz_json.dumps(payload) + "__END__")
+            return
+    except Exception:
+        pass
+
+def _cz_run(code, scope):
+    """Eval user code; if the last statement is an expression,
+    capture its value so we can stream it back as a DataFrame
+    marker. Otherwise just exec straight through."""
+    tree = _cz_ast.parse(code, "<studio>", mode="exec")
+    captured = None
+    if tree.body and isinstance(tree.body[-1], _cz_ast.Expr):
+        last = tree.body[-1]
+        tree.body[-1] = _cz_ast.Assign(
+            targets=[_cz_ast.Name(id="__cz_last", ctx=_cz_ast.Store())],
+            value=last.value,
+            lineno=last.lineno,
+            col_offset=last.col_offset,
+        )
+        _cz_ast.fix_missing_locations(tree)
+    exec(compile(tree, "<studio>", "exec"), scope)
+    captured = scope.get("__cz_last")
+    _cz_emit_df(captured)
+
 try:
-    exec(compile(user_code, "<studio>", "exec"), {{"spark": spark, "__name__": "__main__"}})
+    _cz_run(user_code, scope)
 except Exception:
     traceback.print_exc()
     sys.exit(1)
 "#,
         host = sail_host,
         port = sail_port,
+        row_cap = NOTEBOOK_DF_ROW_CAP,
     );
 
     // Spawn python3 wrapper, write stdin = JSON-config-line + user-code, capture stdout/stderr.
@@ -4797,8 +5453,72 @@ for name, cfg in catalog_cfg.items():
 cat = next(iter(catalogs.values()), None)
 
 scope = {"catalogs": catalogs, "cat": cat, "__name__": "__main__"}
+
+# DataFrame-capture helpers -- mirror the Sail wrapper so notebook
+# cells render PyIceberg results as interactive tables instead of
+# stdout dumps. Marker line prefix is parsed by the Rust executor;
+# best-effort throughout so a serialization hiccup never breaks
+# the cell run.
+import ast as _cz_ast
+import json as _cz_json
+def _cz_emit_df(result):
+    if result is None:
+        return
+    try:
+        cap = 1000
+        try:
+            import pyarrow as pa
+            if isinstance(result, pa.Table):
+                total = result.num_rows
+                t = result.slice(0, cap)
+                cols = [{"name": f, "type": str(result.schema.field(f).type)} for f in result.schema.names]
+                rows = [
+                    [str(t.column(c)[r].as_py()) for c in result.schema.names]
+                    for r in range(t.num_rows)
+                ]
+                payload = {"columns": cols, "rows": rows, "total_rows": int(total), "origin": "pyarrow.Table"}
+                print("__COMPUTEZA_DATAFRAME__" + _cz_json.dumps(payload) + "__END__")
+                return
+        except Exception:
+            pass
+        try:
+            import pandas as pd
+            if isinstance(result, pd.DataFrame):
+                total = len(result)
+                head = result.head(cap)
+                cols = [{"name": str(c), "type": str(result[c].dtype)} for c in result.columns]
+                rows = [[("" if pd.isna(v) else str(v)) for v in row] for row in head.itertuples(index=False, name=None)]
+                payload = {"columns": cols, "rows": rows, "total_rows": int(total), "origin": "pandas.DataFrame"}
+                print("__COMPUTEZA_DATAFRAME__" + _cz_json.dumps(payload) + "__END__")
+                return
+        except Exception:
+            pass
+        if isinstance(result, list) and result and isinstance(result[0], dict):
+            keys = list(result[0].keys())
+            cols = [{"name": k} for k in keys]
+            rows = [[str(r.get(k, "")) for k in keys] for r in result[:cap]]
+            payload = {"columns": cols, "rows": rows, "total_rows": len(result), "origin": "list[dict]"}
+            print("__COMPUTEZA_DATAFRAME__" + _cz_json.dumps(payload) + "__END__")
+            return
+    except Exception:
+        pass
+
+def _cz_run(code, scope):
+    tree = _cz_ast.parse(code, "<studio>", mode="exec")
+    if tree.body and isinstance(tree.body[-1], _cz_ast.Expr):
+        last = tree.body[-1]
+        tree.body[-1] = _cz_ast.Assign(
+            targets=[_cz_ast.Name(id="__cz_last", ctx=_cz_ast.Store())],
+            value=last.value,
+            lineno=last.lineno,
+            col_offset=last.col_offset,
+        )
+        _cz_ast.fix_missing_locations(tree)
+    exec(compile(tree, "<studio>", "exec"), scope)
+    _cz_emit_df(scope.get("__cz_last"))
+
 try:
-    exec(compile(user_code, "<studio>", "exec"), scope)
+    _cz_run(user_code, scope)
 except Exception:
     traceback.print_exc()
     sys.exit(1)
@@ -5024,6 +5744,7 @@ fn render_studio_files_pane(files: &StudioFilesView) -> String {
     let actions = format!(
         r##"<div class="cz-studio-files-actions">
 <a href="#cz-modal-new-file" data-tooltip="New file"><i class="fa-solid fa-plus"></i></a>
+<form method="post" action="/studio/notebooks/new" style="margin:0;display:inline;">{csrf}<button type="submit" data-tooltip="New notebook" class="cz-studio-files-action-btn"><i class="fa-solid fa-book"></i></button></form>
 <a href="/studio/files/export-archive" data-tooltip="Export workspace as .cptz"><i class="fa-solid fa-file-zipper"></i></a>
 </div>
 <div id="cz-modal-new-file" class="cz-modal-overlay" role="dialog" aria-labelledby="cz-modal-new-file-title" aria-modal="true">
@@ -6562,6 +7283,551 @@ window.czDownloadCsv = function (e) {{
     );
 
     render_shell(localizer, &title, NavLink::Studio, &body)
+}
+
+/// Render the notebook view: stacked cells, each with its own
+/// language pill + Run button + output panel. Cells autosave to
+/// the underlying studio_files content as a JSON blob through the
+/// regular /studio/api/files/<id>/autosave path -- so revisions,
+/// export, drag-reorder all reuse the file infrastructure.
+#[allow(clippy::too_many_arguments)]
+fn render_studio_notebook_page(
+    localizer: &Localizer,
+    has_lakekeeper: bool,
+    has_trino: bool,
+    lk_state: &LakekeeperState,
+    history: &StudioHistory,
+    notebook: &Notebook,
+    sidebar_html: &str,
+    files: &StudioFilesView,
+) -> String {
+    let _ = (has_lakekeeper, has_trino, lk_state, history);
+    let title = "Studio · Notebook";
+    let csrf = auth::csrf_input();
+    let open_csv = files.open_csv();
+    let active_id = files
+        .active_id
+        .clone()
+        .unwrap_or_default();
+    let active_path = files
+        .active_file()
+        .map(|f| f.path.clone())
+        .unwrap_or_default();
+
+    // Inline the file-tree pane (same as the regular editor).
+    let files_pane_html = render_studio_files_pane(files);
+
+    // Tabs strip across the top so the operator can flip between
+    // open files (notebook or otherwise). Reuses the same shape
+    // the editor page emits.
+    let tabs_html = render_studio_tabs_strip(files);
+
+    // The cells JSON is embedded as a script tag so the JS can
+    // bootstrap the editor without an extra fetch. JSON encoded
+    // inside a <script type="application/json"> element to avoid
+    // HTML-escaping the body.
+    let notebook_json = serde_json::to_string(notebook).unwrap_or_else(|_| "{\"cells\":[]}".into());
+    let notebook_json_safe = notebook_json.replace("</", "<\\/");
+
+    // Server-rendered cell skeletons so the page works without
+    // Monaco (cell content shows in a textarea, Run button posts).
+    let cells_html: String = notebook
+        .cells
+        .iter()
+        .enumerate()
+        .map(|(i, c)| render_notebook_cell_skeleton(i, c))
+        .collect();
+
+    let main_html = format!(
+        r##"<div class="cz-studio-crumbs">
+<a href="/studio">Studio</a><span class="cz-studio-crumbs-sep">/</span><span class="cz-studio-crumbs-current">Notebook · {path}</span>
+</div>
+<div class="cz-studio-actions" style="margin-bottom: 0.75rem;">
+<div>
+<h1 class="cz-studio-pane-title" style="margin: 0;">Notebook</h1>
+<p class="cz-studio-pane-subtitle" style="margin: 0.25rem 0 0;">Stacked cells. Each cell runs against its own engine; per-cell output below. Edits autosave every 1s.</p>
+</div>
+<span class="cz-studio-actions-spacer"></span>
+<span class="cz-studio-autosave-status" id="cz-autosave-status" data-file-id="{file_id}" data-state="idle" title="Autosaves every second after you stop typing"><i class="fa-solid fa-cloud-arrow-up" aria-hidden="true"></i><span class="cz-studio-autosave-text">Saved</span></span>
+<a href="/studio/files/{file_id_enc}/revisions" class="cz-btn-ghost" title="Revision history">History</a>
+</div>
+{tabs_html}
+<div id="cz-notebook-cells" class="cz-studio-cells">
+{cells_html}
+</div>
+<div class="cz-studio-cells-actions">
+<button type="button" class="cz-btn-ghost" id="cz-notebook-add-sql"><i class="fa-solid fa-plus"></i> Add SQL cell</button>
+<button type="button" class="cz-btn-ghost" id="cz-notebook-add-py"><i class="fa-solid fa-plus"></i> Add Python cell</button>
+</div>
+<script type="application/json" id="cz-notebook-state">{nb_json}</script>
+{csrf_template}
+<script>
+// =====================================================
+// Studio notebook runtime
+// =====================================================
+// The page renders server-side cell skeletons; this script
+// re-hydrates them as interactive cells (Monaco editor per cell,
+// Run button, output rendering, drag-reorder, add/delete). Cell
+// state lives in window.czNotebook; every mutation autosaves the
+// whole notebook to the underlying studio_files row.
+window.czNotebook = (function () {{
+  var FILE_ID = "{file_id_js}";
+  var stateEl = document.getElementById("cz-notebook-state");
+  var nb = JSON.parse(stateEl.textContent || '{{"cells":[]}}');
+  if (!nb.cells) nb.cells = [];
+
+  var cellsRoot = document.getElementById("cz-notebook-cells");
+  var statusEl = document.getElementById("cz-autosave-status");
+  var statusText = statusEl && statusEl.querySelector(".cz-studio-autosave-text");
+
+  function setStatus(state, text) {{
+    if (!statusEl) return;
+    statusEl.setAttribute("data-state", state);
+    if (statusText && text) statusText.textContent = text;
+  }}
+
+  function csrfToken() {{
+    try {{
+      var parts = document.cookie.split(";");
+      for (var i = 0; i < parts.length; i++) {{
+        var t = parts[i].trim();
+        if (t.indexOf("computeza_csrf=") === 0) return t.substring(15);
+      }}
+    }} catch (_) {{}}
+    return "";
+  }}
+
+  var savePending = null;
+  var lastSaved = null;
+  function persistNow() {{
+    savePending = null;
+    var body = JSON.stringify(nb, null, 2);
+    if (body === lastSaved) return;
+    setStatus("saving", "Saving…");
+    var b = new URLSearchParams();
+    b.append("content", body);
+    var csrf = csrfToken();
+    if (csrf) b.append("csrf_token", csrf);
+    fetch("/studio/api/files/" + encodeURIComponent(FILE_ID) + "/autosave", {{
+      method: "POST",
+      credentials: "same-origin",
+      headers: {{ "Content-Type": "application/x-www-form-urlencoded" }},
+      body: b.toString(),
+    }})
+      .then(function (r) {{
+        if (r.ok) {{
+          lastSaved = body;
+          setStatus("idle", "Saved");
+        }} else {{
+          setStatus("error", "Save failed (" + r.status + ")");
+        }}
+      }})
+      .catch(function () {{ setStatus("error", "Save failed"); }});
+  }}
+  function scheduleSave() {{
+    if (savePending !== null) clearTimeout(savePending);
+    setStatus("dirty", "Saving in 1s…");
+    savePending = setTimeout(persistNow, 1000);
+  }}
+
+  function uuid() {{
+    // RFC4122 v4-ish. Crypto-good when available; falls back to
+    // Math.random for older browsers (still unique enough for a
+    // local-only cell id).
+    if (window.crypto && window.crypto.randomUUID) return window.crypto.randomUUID();
+    return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, function (c) {{
+      var r = (Math.random() * 16) | 0, v = c === "x" ? r : (r & 0x3) | 0x8;
+      return v.toString(16);
+    }});
+  }}
+
+  // -------------- Output rendering --------------
+  function pad(n) {{ return n < 10 ? "0" + n : "" + n; }}
+  function fmtDuration(ms) {{
+    if (ms < 1000) return ms + " ms";
+    if (ms < 60000) return (ms / 1000).toFixed(1) + " s";
+    var s = Math.floor(ms / 1000);
+    return Math.floor(s / 60) + ":" + pad(s % 60);
+  }}
+  function thousands(n) {{
+    var s = String(n);
+    return s.replace(/\B(?=(\d{{3}})+(?!\d))/g, ",");
+  }}
+  function renderTableOutput(columns, rows, totalRows, originLabel, downloadName) {{
+    var header = columns.map(function (c) {{
+      return '<th>' + escapeHtml(c.name) + '</th>';
+    }}).join("");
+    var body = rows.map(function (row) {{
+      return '<tr>' + row.map(function (cell) {{ return '<td>' + escapeHtml(String(cell)) + '</td>'; }}).join("") + '</tr>';
+    }}).join("");
+    var truncNote = (totalRows != null && totalRows > rows.length)
+      ? ('<div class="cz-muted" style="font-size:0.72rem;margin:0.4rem 0;">Showing ' + thousands(rows.length) + ' of ' + thousands(totalRows) + ' rows from ' + escapeHtml(originLabel || "result") + '. Filter / aggregate in code to see more.</div>')
+      : "";
+    var dlAttr = downloadName ? ' data-download="' + escapeAttr(downloadName) + '"' : "";
+    return truncNote + '<div class="cz-studio-results-table-wrap"><table class="cz-studio-results-table cz-cell-table"' + dlAttr + '><thead><tr>' + header + '</tr></thead><tbody>' + body + '</tbody></table></div>';
+  }}
+  function renderOutput(out) {{
+    if (!out) return "";
+    if (out.kind === "sql_ok") {{
+      var meta = thousands(out.rows.length) + " row" + (out.rows.length === 1 ? "" : "s") + " · " + fmtDuration(out.duration_ms);
+      var tbl = renderTableOutput(out.columns, out.rows, out.rows.length, "Trino", "cell-result.csv");
+      return '<div class="cz-studio-results-header"><span class="cz-studio-engine-pill">Trino (SQL)</span><span class="cz-studio-results-eyebrow">Results</span><span class="cz-studio-results-count">' + meta + '</span><span class="cz-studio-actions-spacer"></span><a href="#" class="cz-studio-results-action" data-cell-action="download-csv" title="Download as CSV"><i class="fa-solid fa-download"></i></a><a href="#" class="cz-studio-results-action" data-cell-action="copy-tsv" title="Copy as TSV"><i class="fa-solid fa-copy"></i></a></div>' + tbl;
+    }}
+    if (out.kind === "sql_err") {{
+      return '<div class="cz-studio-results-header"><span class="cz-studio-engine-pill">Trino (SQL)</span></div><pre class="cz-studio-error">' + escapeHtml(out.message || "") + '</pre>';
+    }}
+    if (out.kind === "py_ok" || out.kind === "py_err") {{
+      var isErr = out.kind === "py_err";
+      var engineLabel = (out.engine_label || "Python");
+      var bits = [];
+      bits.push('<div class="cz-studio-results-header"><span class="cz-studio-engine-pill">Python</span>' +
+        (isErr ? '' : '<span class="cz-studio-results-eyebrow">stdout · ' + fmtDuration(out.duration_ms) + '</span>') +
+        '<span class="cz-studio-actions-spacer"></span></div>');
+      if (out.dataframe) {{
+        var df = out.dataframe;
+        var meta = thousands(df.rows.length) + " of " + thousands(df.total_rows) + " rows · " + (df.origin || "");
+        bits.push('<div class="cz-studio-results-header" style="margin-top:0.6rem;"><span class="cz-studio-results-eyebrow">DataFrame</span><span class="cz-studio-results-count">' + meta + '</span><span class="cz-studio-actions-spacer"></span><a href="#" class="cz-studio-results-action" data-cell-action="download-csv" title="Download as CSV"><i class="fa-solid fa-download"></i></a><a href="#" class="cz-studio-results-action" data-cell-action="copy-tsv" title="Copy as TSV"><i class="fa-solid fa-copy"></i></a></div>');
+        bits.push(renderTableOutput(df.columns, df.rows, df.total_rows, df.origin || "DataFrame", "cell-dataframe.csv"));
+      }}
+      if (out.stdout && out.stdout.length) bits.push('<pre class="cz-studio-raw">' + escapeHtml(out.stdout) + '</pre>');
+      if (out.stderr && out.stderr.length) bits.push('<pre class="cz-studio-error">' + escapeHtml(out.stderr) + '</pre>');
+      var _ = engineLabel;
+      return bits.join("");
+    }}
+    return "";
+  }}
+
+  function escapeHtml(s) {{
+    return String(s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  }}
+  function escapeAttr(s) {{ return escapeHtml(s); }}
+
+  // -------------- Cell wiring --------------
+  function findCellById(id) {{
+    for (var i = 0; i < nb.cells.length; i++) {{
+      if (nb.cells[i].id === id) return {{ cell: nb.cells[i], index: i }};
+    }}
+    return null;
+  }}
+
+  function repaintCell(cellEl) {{
+    var id = cellEl.getAttribute("data-cell-id");
+    var entry = findCellById(id);
+    if (!entry) return;
+    var c = entry.cell;
+    var pillEl = cellEl.querySelector(".cz-cell-kind-current");
+    if (pillEl) pillEl.textContent = kindLabel(c.kind);
+    var outEl = cellEl.querySelector(".cz-cell-output");
+    if (outEl) {{
+      outEl.innerHTML = c.output ? renderOutput(c.output) : '<div class="cz-cell-output-empty cz-muted">No output yet. Hit Run.</div>';
+    }}
+  }}
+
+  function kindLabel(k) {{
+    if (k === "sql") return "SQL → Trino";
+    if (k === "sail") return "Python → Sail";
+    return "Python → PyIceberg";
+  }}
+
+  function runCell(cellId) {{
+    var entry = findCellById(cellId);
+    if (!entry) return;
+    var c = entry.cell;
+    var cellEl = document.querySelector('[data-cell-id="' + cellId + '"]');
+    if (!cellEl) return;
+    var outEl = cellEl.querySelector(".cz-cell-output");
+    if (outEl) outEl.innerHTML = '<div class="cz-cell-output-empty cz-muted">Running…</div>';
+    var content = currentContentFor(cellEl);
+    c.content = content; // capture before submit; autosave on next tick
+    scheduleSave();
+    var b = new URLSearchParams();
+    b.append("kind", c.kind);
+    b.append("content", content);
+    var csrf = csrfToken();
+    if (csrf) b.append("csrf_token", csrf);
+    fetch("/studio/api/cells/run", {{
+      method: "POST",
+      credentials: "same-origin",
+      headers: {{ "Content-Type": "application/x-www-form-urlencoded" }},
+      body: b.toString(),
+    }})
+      .then(function (r) {{ return r.json(); }})
+      .then(function (out) {{
+        c.output = out;
+        repaintCell(cellEl);
+        scheduleSave();
+      }})
+      .catch(function (e) {{
+        c.output = {{
+          kind: "py_err",
+          stdout: "",
+          stderr: "Cell run request failed: " + (e && e.message ? e.message : String(e)),
+          duration_ms: 0,
+          executed_at: new Date().toISOString(),
+        }};
+        repaintCell(cellEl);
+      }});
+  }}
+
+  function currentContentFor(cellEl) {{
+    var ta = cellEl.querySelector("textarea");
+    return ta ? ta.value : "";
+  }}
+
+  function wireCell(cellEl) {{
+    var id = cellEl.getAttribute("data-cell-id");
+    // Run button
+    var runBtn = cellEl.querySelector('[data-cell-action="run"]');
+    if (runBtn) runBtn.addEventListener("click", function () {{ runCell(id); }});
+    // Delete
+    var delBtn = cellEl.querySelector('[data-cell-action="delete"]');
+    if (delBtn) delBtn.addEventListener("click", function () {{
+      var entry = findCellById(id);
+      if (!entry) return;
+      if (nb.cells.length === 1) {{
+        // Don't allow deleting the last cell -- keep at least one.
+        return;
+      }}
+      nb.cells.splice(entry.index, 1);
+      cellEl.parentNode.removeChild(cellEl);
+      scheduleSave();
+    }});
+    // Move up / down
+    cellEl.querySelectorAll('[data-cell-action="move-up"]').forEach(function (b) {{
+      b.addEventListener("click", function () {{ moveCell(id, -1); }});
+    }});
+    cellEl.querySelectorAll('[data-cell-action="move-down"]').forEach(function (b) {{
+      b.addEventListener("click", function () {{ moveCell(id, 1); }});
+    }});
+    // Kind dropdown
+    var sel = cellEl.querySelector(".cz-cell-kind-select");
+    if (sel) sel.addEventListener("change", function () {{
+      var entry = findCellById(id);
+      if (entry) {{ entry.cell.kind = sel.value; repaintCell(cellEl); scheduleSave(); }}
+    }});
+    // Textarea autosave + keyboard run
+    var ta = cellEl.querySelector("textarea");
+    if (ta) {{
+      ta.addEventListener("input", function () {{
+        var entry = findCellById(id);
+        if (entry) {{ entry.cell.content = ta.value; scheduleSave(); }}
+      }});
+      ta.addEventListener("keydown", function (e) {{
+        if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {{ e.preventDefault(); runCell(id); }}
+      }});
+    }}
+    // Output action delegate (copy / download).
+    cellEl.addEventListener("click", function (e) {{
+      var action = e.target.closest && e.target.closest("[data-cell-action]");
+      if (!action) return;
+      var a = action.getAttribute("data-cell-action");
+      if (a === "download-csv" || a === "copy-tsv") {{
+        var table = action.closest(".cz-studio-results-header").nextElementSibling.querySelector(".cz-cell-table");
+        if (!table) return;
+        var rows = [];
+        table.querySelectorAll("tr").forEach(function (tr) {{
+          var cells = [];
+          tr.querySelectorAll("th,td").forEach(function (c) {{ cells.push(c.textContent); }});
+          rows.push(cells);
+        }});
+        if (a === "copy-tsv") {{
+          if (navigator.clipboard) navigator.clipboard.writeText(rows.map(function (r) {{ return r.join("\t"); }}).join("\n"));
+        }} else {{
+          var csv = "﻿" + rows.map(function (r) {{ return r.map(function (v) {{ return '"' + String(v).replace(/"/g, '""') + '"'; }}).join(","); }}).join("\r\n");
+          var blob = new Blob([csv], {{ type: "text/csv;charset=utf-8" }});
+          var url = URL.createObjectURL(blob);
+          var dlName = table.getAttribute("data-download") || "cell-output.csv";
+          var aDl = document.createElement("a");
+          aDl.href = url; aDl.download = dlName;
+          document.body.appendChild(aDl); aDl.click(); document.body.removeChild(aDl);
+          setTimeout(function () {{ URL.revokeObjectURL(url); }}, 1000);
+        }}
+      }}
+    }});
+  }}
+
+  function moveCell(id, delta) {{
+    var entry = findCellById(id);
+    if (!entry) return;
+    var newIdx = entry.index + delta;
+    if (newIdx < 0 || newIdx >= nb.cells.length) return;
+    var moved = nb.cells.splice(entry.index, 1)[0];
+    nb.cells.splice(newIdx, 0, moved);
+    rebuildCellsDom();
+    scheduleSave();
+  }}
+
+  function addCell(kind) {{
+    var newCell = {{ id: uuid(), kind: kind, content: "" }};
+    nb.cells.push(newCell);
+    rebuildCellsDom();
+    scheduleSave();
+  }}
+
+  function cellSkeleton(c, idx) {{
+    var div = document.createElement("div");
+    div.className = "cz-studio-cell";
+    div.setAttribute("data-cell-id", c.id);
+    div.innerHTML = '\
+      <div class="cz-studio-cell-header">\
+        <span class="cz-studio-cell-index">[' + (idx + 1) + ']</span>\
+        <label class="cz-studio-cell-kind">\
+          <span class="cz-cell-kind-current">' + escapeHtml(kindLabel(c.kind)) + '</span>\
+          <select class="cz-cell-kind-select">\
+            <option value="sql"' + (c.kind === "sql" ? " selected" : "") + '>SQL → Trino</option>\
+            <option value="pyiceberg"' + (c.kind === "pyiceberg" ? " selected" : "") + '>Python → PyIceberg</option>\
+            <option value="sail"' + (c.kind === "sail" ? " selected" : "") + '>Python → Sail (experimental)</option>\
+          </select>\
+        </label>\
+        <span class="cz-studio-actions-spacer"></span>\
+        <button type="button" data-cell-action="move-up" title="Move up"><i class="fa-solid fa-arrow-up"></i></button>\
+        <button type="button" data-cell-action="move-down" title="Move down"><i class="fa-solid fa-arrow-down"></i></button>\
+        <button type="button" data-cell-action="delete" title="Delete cell"><i class="fa-solid fa-trash"></i></button>\
+        <button type="button" data-cell-action="run" class="cz-btn-primary"><i class="fa-solid fa-play"></i> Run</button>\
+      </div>\
+      <div class="cz-studio-cell-editor">\
+        <textarea class="cz-studio-editor-textarea" rows="6" placeholder="-- Run this cell with Ctrl/Cmd+Enter">' + escapeHtml(c.content || "") + '</textarea>\
+      </div>\
+      <div class="cz-cell-output">' + (c.output ? renderOutput(c.output) : '<div class="cz-cell-output-empty cz-muted">No output yet. Hit Run.</div>') + '</div>';
+    return div;
+  }}
+
+  function rebuildCellsDom() {{
+    cellsRoot.innerHTML = "";
+    nb.cells.forEach(function (c, i) {{
+      var el = cellSkeleton(c, i);
+      cellsRoot.appendChild(el);
+      wireCell(el);
+    }});
+  }}
+
+  // First pass: wire existing server-rendered skeletons.
+  Array.prototype.forEach.call(cellsRoot.querySelectorAll(".cz-studio-cell"), function (el) {{ wireCell(el); }});
+
+  document.getElementById("cz-notebook-add-sql").addEventListener("click", function () {{ addCell("sql"); }});
+  document.getElementById("cz-notebook-add-py").addEventListener("click", function () {{ addCell("pyiceberg"); }});
+
+  return {{ nb: nb, rebuild: rebuildCellsDom }};
+}})();
+</script>"##,
+        path = html_escape(&active_path),
+        file_id = html_escape(&active_id),
+        file_id_enc = url_encode(&active_id),
+        file_id_js = active_id.replace('"', "\\\""),
+        tabs_html = tabs_html,
+        cells_html = cells_html,
+        nb_json = notebook_json_safe,
+        csrf_template = csrf,
+    );
+    let _ = csrf;
+    let _ = open_csv;
+
+    let body = format!(
+        r##"<div class="cz-studio-shell" id="cz-studio-shell">
+<aside class="cz-studio-sidebar">{sidebar_html}</aside>
+<aside class="cz-studio-files">{files_pane_html}</aside>
+<main class="cz-studio-main">{main_html}</main>
+</div>"##,
+    );
+    render_shell(localizer, title, NavLink::Studio, &body)
+}
+
+/// Server-side cell skeleton -- the JS rebuilds this on add /
+/// delete / reorder, but the initial page-load uses what the
+/// server renders so the operator sees content even before JS
+/// boots.
+fn render_notebook_cell_skeleton(idx: usize, c: &NotebookCell) -> String {
+    let kind_attr = match c.kind {
+        CellKind::Sql => "sql",
+        CellKind::PyIceberg => "pyiceberg",
+        CellKind::Sail => "sail",
+    };
+    let kind_options = ["sql", "pyiceberg", "sail"]
+        .iter()
+        .map(|k| {
+            let label = match *k {
+                "sql" => "SQL → Trino",
+                "pyiceberg" => "Python → PyIceberg",
+                _ => "Python → Sail (experimental)",
+            };
+            let sel = if *k == kind_attr { " selected" } else { "" };
+            format!("<option value=\"{k}\"{sel}>{}</option>", html_escape(label))
+        })
+        .collect::<String>();
+    format!(
+        r##"<div class="cz-studio-cell" data-cell-id="{id}">
+<div class="cz-studio-cell-header">
+<span class="cz-studio-cell-index">[{n}]</span>
+<label class="cz-studio-cell-kind">
+<span class="cz-cell-kind-current">{label}</span>
+<select class="cz-cell-kind-select">{kind_options}</select>
+</label>
+<span class="cz-studio-actions-spacer"></span>
+<button type="button" data-cell-action="move-up" title="Move up"><i class="fa-solid fa-arrow-up"></i></button>
+<button type="button" data-cell-action="move-down" title="Move down"><i class="fa-solid fa-arrow-down"></i></button>
+<button type="button" data-cell-action="delete" title="Delete cell"><i class="fa-solid fa-trash"></i></button>
+<button type="button" data-cell-action="run" class="cz-btn-primary"><i class="fa-solid fa-play"></i> Run</button>
+</div>
+<div class="cz-studio-cell-editor">
+<textarea class="cz-studio-editor-textarea" rows="6" placeholder="-- Run this cell with Ctrl/Cmd+Enter">{content}</textarea>
+</div>
+<div class="cz-cell-output">{output_html}</div>
+</div>"##,
+        id = html_escape(&c.id),
+        n = idx + 1,
+        label = html_escape(c.kind.label()),
+        kind_options = kind_options,
+        content = html_escape(&c.content),
+        output_html = if c.output.is_some() {
+            // Render-time placeholder; the JS hydrates immediately
+            // with the proper interactive table.
+            r#"<div class="cz-cell-output-empty cz-muted">Loading output…</div>"#.to_string()
+        } else {
+            r#"<div class="cz-cell-output-empty cz-muted">No output yet. Hit Run.</div>"#.to_string()
+        },
+    )
+}
+
+/// Standalone tab-strip renderer so the notebook view can show
+/// the same tabs as the editor view. Extracted from the editor's
+/// inline tab-strip block.
+fn render_studio_tabs_strip(files: &StudioFilesView) -> String {
+    let open_csv = files.open_csv();
+    let scratch_active = files.active_id.is_none();
+    let scratch_class = if scratch_active {
+        " cz-studio-tab-active"
+    } else {
+        ""
+    };
+    let mut html = format!(
+        r#"<div class="cz-studio-tabs" id="cz-studio-tabs"><div class="cz-studio-tab-wrap{scratch_class}" data-tab-id=""><a class="cz-studio-tab cz-studio-tab-scratch" href="/studio?open={open}"><span class="cz-studio-tab-label">scratch</span></a></div>"#,
+        open = url_encode(&open_csv),
+    );
+    for f in &files.open {
+        let is_active = files.active_id.as_deref() == Some(f.id.as_str());
+        let active = if is_active { " cz-studio-tab-active" } else { "" };
+        let basename = f.path.rsplit('/').next().unwrap_or(&f.path);
+        let next_open: String = files
+            .open
+            .iter()
+            .filter(|x| x.id != f.id)
+            .map(|x| x.id.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        html.push_str(&format!(
+            r##"<div class="cz-studio-tab-wrap{active}" draggable="true" data-tab-id="{id_raw}"><a class="cz-studio-tab" href="/studio?open={open}&active={id}"><span class="cz-studio-tab-label" title="{path}">{label}</span></a><a class="cz-studio-tab-close" href="/studio?open={next_open}" title="Close tab (doesn't delete file)">×</a></div>"##,
+            open = url_encode(&open_csv),
+            next_open = url_encode(&next_open),
+            id = url_encode(&f.id),
+            id_raw = html_escape(&f.id),
+            path = html_escape(&f.path),
+            label = html_escape(basename),
+        ));
+    }
+    html.push_str(r#"<div class="cz-studio-tabs-flex"></div></div>"#);
+    html
 }
 
 /// Minimal percent-encoder used to pass the prefill-SQL through the
