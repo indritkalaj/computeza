@@ -8484,7 +8484,7 @@ fn render_studio_notebook_page(
 <p class="cz-studio-pane-subtitle" style="margin: 0.25rem 0 0;">Stacked cells. Each cell runs against its own engine; per-cell output below. Edits autosave every 1s.</p>
 </div>
 <span class="cz-studio-actions-spacer"></span>
-<span class="cz-studio-autosave-status" id="cz-autosave-status" data-file-id="{file_id}" data-state="idle" title="Autosaves every second after you stop typing"><i class="fa-solid fa-cloud-arrow-up" aria-hidden="true"></i><span class="cz-studio-autosave-text">Saved</span></span>
+<button type="button" class="cz-studio-autosave-status" id="cz-autosave-status" data-file-id="{file_id}" data-state="idle" title="Autosaves every second after you stop typing. Click to save now." style="border:none;cursor:pointer;"><i class="fa-solid fa-cloud-arrow-up" aria-hidden="true"></i><span class="cz-studio-autosave-text">Saved</span></button>
 <a href="/studio/files/{file_id_enc}/revisions" class="cz-btn-ghost" title="Revision history">History</a>
 </div>
 {tabs_html}
@@ -8594,6 +8594,16 @@ window.czNotebook = (function () {{
       persistNow({{ keepalive: true, force: true }});
     }}
   }});
+  // Clicking the autosave badge force-saves immediately. Helpful when
+  // the operator wants to reload right after typing and doesn't want
+  // to wait for the 1s debounce. Also useful for confirming the path
+  // works ("Saved HH:MM:SS" stamp updates).
+  if (statusEl) {{
+    statusEl.addEventListener("click", function () {{
+      if (savePending !== null) clearTimeout(savePending);
+      persistNow({{ force: true }});
+    }});
+  }}
 
   function uuid() {{
     // RFC4122 v4-ish. Crypto-good when available; falls back to
@@ -8777,7 +8787,12 @@ window.czNotebook = (function () {{
       .then(function (out) {{
         c.output = out;
         repaintCell(cellEl);
-        scheduleSave();
+        // Cell-run completion is a discrete event the operator just
+        // witnessed; debouncing the save 1s after means a quick reload
+        // loses the output. Fire immediately so the round-trip is
+        // visible in the badge ("Saved HH:MM:SS") right after Run.
+        if (savePending !== null) clearTimeout(savePending);
+        persistNow({{ force: true }});
       }})
       .catch(function (e) {{
         c.output = {{
@@ -8788,6 +8803,8 @@ window.czNotebook = (function () {{
           executed_at: new Date().toISOString(),
         }};
         repaintCell(cellEl);
+        if (savePending !== null) clearTimeout(savePending);
+        persistNow({{ force: true }});
       }});
   }}
 
