@@ -1154,19 +1154,56 @@ a.cz-card:hover {
 
 .cz-studio-shell {
   display: grid;
-  /* Three panes: catalog tree | workspace files | editor.
-     Drilldown pages collapse to two by omitting the .cz-studio-files
-     div from their body, which the auto-fit grid handles cleanly. */
-  grid-template-columns: 220px 220px 1fr;
+  /* CSS variables drive the resizable pane widths -- JS updates
+     them on splitter drag, localStorage persists across reloads.
+     The .cz-studio-shell-resizable class is added by JS once it's
+     wired up the splitters; without it, the shell falls back to
+     a 3-column layout that ignores splitter elements. */
+  --cz-sidebar-w: 220px;
+  --cz-files-w: 220px;
+  grid-template-columns: var(--cz-sidebar-w) var(--cz-files-w) 1fr;
   gap: 1px;
   min-height: calc(100vh - 48px);
   background: var(--line);
   margin: 0;
   border-top: 1px solid var(--line);
 }
+/* Splitter handles are display:none by default so the layout
+   collapses to 3 panes when the splitters aren't rendered. JS
+   flips to grid + 5 columns once the wire-up finishes. */
+.cz-studio-splitter {
+  display: none;
+}
+.cz-studio-shell.cz-studio-shell-resizable {
+  grid-template-columns:
+    var(--cz-sidebar-w)
+    4px
+    var(--cz-files-w)
+    4px
+    1fr;
+}
+.cz-studio-shell.cz-studio-shell-resizable .cz-studio-splitter {
+  display: block;
+  background: var(--line);
+  cursor: col-resize;
+  position: relative;
+  z-index: 5;
+  transition: background-color 0.12s ease;
+}
+.cz-studio-shell.cz-studio-shell-resizable .cz-studio-splitter:hover,
+.cz-studio-shell.cz-studio-shell-resizable .cz-studio-splitter.cz-studio-splitter-active {
+  background: var(--lavender);
+}
+/* Wider hit area than the 4-px visual handle so the operator
+   doesn't have to be pixel-precise. */
+.cz-studio-shell.cz-studio-shell-resizable .cz-studio-splitter::before {
+  content: "";
+  position: absolute;
+  top: 0; bottom: 0;
+  left: -3px; right: -3px;
+}
 /* Drilldown pages only emit two panes (sidebar + main), so the
-   grid falls back to a 2-col layout. The :has() rule keeps the
-   shell working without inline overrides. */
+   grid falls back to a 2-col layout. */
 .cz-studio-shell:not(:has(> .cz-studio-files)) {
   grid-template-columns: 240px 1fr;
 }

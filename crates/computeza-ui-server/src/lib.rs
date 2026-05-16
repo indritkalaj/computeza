@@ -5462,9 +5462,11 @@ fn render_studio_page(
     let files_pane_html = render_studio_files_pane(files);
 
     let body = format!(
-        r##"<div class="cz-studio-shell">
+        r##"<div class="cz-studio-shell" id="cz-studio-shell">
 <aside class="cz-studio-sidebar">{sidebar_html}</aside>
+<div class="cz-studio-splitter" data-splitter="sidebar" aria-hidden="true" role="separator" aria-orientation="vertical"></div>
 <aside class="cz-studio-files">{files_pane_html}</aside>
+<div class="cz-studio-splitter" data-splitter="files" aria-hidden="true" role="separator" aria-orientation="vertical"></div>
 <main class="cz-studio-main">{main_html}</main>
 </div>
 
@@ -5528,6 +5530,74 @@ fn render_studio_page(
   }}
   refresh();
   setInterval(refresh, 8000);
+}})();
+
+// ---------- Resizable splitters between studio panels ----------
+// Drag the 4-px strip between Catalog | Files | Editor. Updates
+// CSS variables on .cz-studio-shell so the grid re-layouts; the
+// chosen widths persist to localStorage and restore on next load.
+(function () {{
+  var shell = document.getElementById("cz-studio-shell");
+  if (!shell) return;
+  // Only activate when the shell renders all three panes -- if
+  // there's no .cz-studio-files (drill-down pages), skip wiring.
+  if (!shell.querySelector(".cz-studio-files")) return;
+  // Pull saved widths.
+  try {{
+    var sw = parseInt(localStorage.getItem("cz-sidebar-w") || "", 10);
+    var fw = parseInt(localStorage.getItem("cz-files-w") || "", 10);
+    if (sw >= 120 && sw <= 600) shell.style.setProperty("--cz-sidebar-w", sw + "px");
+    if (fw >= 120 && fw <= 600) shell.style.setProperty("--cz-files-w", fw + "px");
+  }} catch (_) {{}}
+  // Flip on the resizable layout (adds splitter tracks via CSS).
+  shell.classList.add("cz-studio-shell-resizable");
+
+  var splitters = shell.querySelectorAll(".cz-studio-splitter");
+  splitters.forEach(function (handle) {{
+    var which = handle.getAttribute("data-splitter"); // "sidebar" | "files"
+    var cssVar = which === "sidebar" ? "--cz-sidebar-w" : "--cz-files-w";
+    var storeKey = which === "sidebar" ? "cz-sidebar-w" : "cz-files-w";
+    handle.addEventListener("mousedown", function (e) {{
+      e.preventDefault();
+      handle.classList.add("cz-studio-splitter-active");
+      // Snapshot starting state so the drag delta is from a stable
+      // anchor (mousemove deltas vs the original click x).
+      var startX = e.clientX;
+      var startW = parseInt(
+        getComputedStyle(shell).getPropertyValue(cssVar),
+        10
+      ) || 220;
+      document.body.style.cursor = "col-resize";
+      document.body.style.userSelect = "none";
+      function onMove(ev) {{
+        var dx = ev.clientX - startX;
+        var w = Math.max(120, Math.min(600, startW + dx));
+        shell.style.setProperty(cssVar, w + "px");
+      }}
+      function onUp() {{
+        document.removeEventListener("mousemove", onMove);
+        document.removeEventListener("mouseup", onUp);
+        handle.classList.remove("cz-studio-splitter-active");
+        document.body.style.cursor = "";
+        document.body.style.userSelect = "";
+        // Persist final width.
+        try {{
+          var finalW = parseInt(
+            getComputedStyle(shell).getPropertyValue(cssVar),
+            10
+          );
+          if (finalW) localStorage.setItem(storeKey, String(finalW));
+        }} catch (_) {{}}
+      }}
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+    }});
+    // Double-click resets to the default for that pane.
+    handle.addEventListener("dblclick", function () {{
+      shell.style.setProperty(cssVar, "220px");
+      try {{ localStorage.removeItem(storeKey); }} catch (_) {{}}
+    }});
+  }});
 }})();
 
 // ---------- Editor autosave to localStorage ----------
