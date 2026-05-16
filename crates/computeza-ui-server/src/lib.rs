@@ -4188,14 +4188,11 @@ async fn studio_files_export_archive_handler(
 ///   manifest.json       -- {version: 1, exported_at, files: [{path}]}
 ///   files/<path-as-is>  -- file content; the leading slash on
 ///                          `path` becomes the root of the zip tree
-// TODO(file-browser-v2): wire the .cptz archive import handler. The
-// export side works fine via a GET that returns the zip bytes; the
-// import side needs a request-body extractor that axum 0.8's
-// Handler trait isn't accepting in this build configuration. The
-// helper import_cptz_archive() is fully implemented and tested in
-// isolation; flipping the handler back on is a one-route patch once
-// the extractor signature is sorted.
-
+///
+/// Both the workspace-wide export (/studio/files/export-archive) and
+/// the per-folder export (/studio/folders/export?name=<folder>) use
+/// this builder. The matching import path is
+/// /studio/files/import-archive (POST archive_b64=<base64>).
 fn build_cptz_archive(files: &[computeza_state::StudioFile]) -> std::result::Result<Vec<u8>, String> {
     use std::io::Write;
     let mut buf: Vec<u8> = Vec::new();
@@ -6407,10 +6404,10 @@ fn render_studio_files_pane(files: &StudioFilesView) -> String {
 <details class="cz-row-menu cz-file-menu">
 <summary title="File actions" aria-label="File actions"><i class="fa-solid fa-ellipsis-vertical"></i></summary>
 <div class="cz-row-menu-popup">
-<a href="#cz-rename-{id}" class="cz-row-menu-item"><i class="fa-solid fa-pen fa-fw"></i> Rename</a>
-<a href="#cz-rename-{id}" class="cz-row-menu-item"><i class="fa-solid fa-arrows-up-down-left-right fa-fw"></i> Move...</a>
+<a href="#cz-rename-{id}" class="cz-row-menu-item"><i class="fa-solid fa-pen fa-fw"></i> Rename / move</a>
 <form method="post" action="/studio/files/{id}/duplicate" class="cz-row-menu-form">{csrf}<input type="hidden" name="open" value="{open}" /><button type="submit" class="cz-row-menu-item"><i class="fa-solid fa-copy fa-fw"></i> Duplicate</button></form>
 <a href="/studio/files/{id}/export" class="cz-row-menu-item"><i class="fa-solid fa-download fa-fw"></i> Download</a>
+<a href="/studio/files/{id}/revisions" class="cz-row-menu-item"><i class="fa-solid fa-clock-rotate-left fa-fw"></i> History</a>
 <a href="#cz-delete-{id}" class="cz-row-menu-item cz-row-menu-item-danger"><i class="fa-solid fa-trash fa-fw"></i> Delete</a>
 </div>
 </details>
