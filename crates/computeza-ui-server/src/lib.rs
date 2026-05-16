@@ -4552,9 +4552,18 @@ except Exception:
 /// result set (columns + rows of stringified values) or an error
 /// message we can render verbatim.
 #[derive(Debug)]
+struct ResultColumn {
+    name: String,
+    /// Trino fills the type for every column; if a row source lacks
+    /// type metadata (e.g. some edge-case `SHOW` results) we leave
+    /// this None and the Schema tab renders `-`.
+    type_: Option<String>,
+}
+
+#[derive(Debug)]
 enum SqlOutcome {
     Ok {
-        columns: Vec<String>,
+        columns: Vec<ResultColumn>,
         rows: Vec<Vec<String>>,
         /// Wall-clock execution time on the server side, in
         /// milliseconds. Surfaced in the results header so the
@@ -4617,7 +4626,7 @@ async fn execute_sql_against_trino(base_url: &str, sql: &str) -> SqlOutcome {
         }
     };
 
-    let mut columns: Vec<String> = Vec::new();
+    let mut columns: Vec<ResultColumn> = Vec::new();
     let mut rows: Vec<Vec<String>> = Vec::new();
     // 60-iteration cap (~60s with the per-poll ~1s pacing Trino
     // typically applies). A genuinely long query should produce
@@ -4639,7 +4648,12 @@ async fn execute_sql_against_trino(base_url: &str, sql: &str) -> SqlOutcome {
                 columns = cols
                     .iter()
                     .filter_map(|c| {
-                        c.get("name").and_then(|n| n.as_str()).map(str::to_string)
+                        let name = c.get("name").and_then(|n| n.as_str())?.to_string();
+                        let type_ = c
+                            .get("type")
+                            .and_then(|t| t.as_str())
+                            .map(str::to_string);
+                        Some(ResultColumn { name, type_ })
                     })
                     .collect();
             }
@@ -5078,7 +5092,7 @@ fn render_studio_page(
         }) => {
             let header: String = columns
                 .iter()
-                .map(|c| format!("<th>{}</th>", html_escape(c)))
+                .map(|c| format!("<th>{}</th>", html_escape(&c.name)))
                 .collect();
             let body_rows: String = rows
                 .iter()
@@ -5105,23 +5119,49 @@ fn render_studio_page(
             // large result sets (the Databricks SQL editor does
             // this too).
             let row_count_fmt = thousands(row_count);
+            // Schema-tab pane: column name + type per row.
+            let schema_rows: String = columns
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let type_str = c.type_.as_deref().unwrap_or("-");
+                    format!(
+                        "<tr><td class=\"cz-cell-mono cz-cell-dim\">{idx}</td><td class=\"cz-strong\">{name}</td><td class=\"cz-cell-mono\">{ty}</td></tr>",
+                        idx = i + 1,
+                        name = html_escape(&c.name),
+                        ty = html_escape(type_str),
+                    )
+                })
+                .collect();
             format!(
                 r##"<div class="cz-studio-results-header">
 {pill}
-<span class="cz-studio-results-eyebrow">Results</span>
-<span class="cz-studio-results-count">{row_count_fmt} row{plural} · {duration_label}</span>
+<div class="cz-studio-results-tabs" role="tablist">
+  <button type="button" class="cz-studio-results-tab cz-studio-results-tab-active" data-result-tab="results" role="tab">Results <span class="cz-studio-results-count">{row_count_fmt} · {duration_label}</span></button>
+  <button type="button" class="cz-studio-results-tab" data-result-tab="schema" role="tab">Schema <span class="cz-studio-results-count">{col_count}</span></button>
+</div>
 <span class="cz-studio-actions-spacer"></span>
 <a href="#" class="cz-studio-results-action" onclick="czDownloadCsv(event);" title="Download as CSV"><i class="fa-solid fa-download"></i></a>
 <a href="#" class="cz-studio-results-action" onclick="czCopyResults(event);" title="Copy as TSV"><i class="fa-solid fa-copy"></i></a>
 </div>
+<div class="cz-studio-results-pane" data-result-pane="results">
 <div class="cz-studio-results-table-wrap">
 <table class="cz-studio-results-table" id="cz-results-table">
 <thead><tr>{header}</tr></thead>
 <tbody>{body_rows}</tbody>
 </table>
+</div>
+</div>
+<div class="cz-studio-results-pane" data-result-pane="schema" hidden>
+<div class="cz-studio-results-table-wrap">
+<table class="cz-studio-results-table">
+<thead><tr><th>#</th><th>Column</th><th>Type</th></tr></thead>
+<tbody>{schema_rows}</tbody>
+</table>
+</div>
 </div>"##,
-                plural = if row_count == 1 { "" } else { "s" },
                 pill = engine_pill(engine),
+                col_count = columns.len(),
             )
         }
         Some(RoutedOutcome::Python {
@@ -5603,6 +5643,24 @@ fn render_studio_page(
     }});
   }});
 }})();
+
+// ---------- Result-pane tab switcher (Results / Schema) ----------
+// Click a result tab to flip the visible pane. Multiple result
+// blocks could exist on the page; resolve the container by walking
+// up from the clicked tab so tabs only affect their own block.
+document.addEventListener("click", function (e) {{
+  var tab = e.target.closest(".cz-studio-results-tab");
+  if (!tab) return;
+  var which = tab.getAttribute("data-result-tab");
+  var container = tab.closest(".cz-studio-results");
+  if (!container) return;
+  container.querySelectorAll(".cz-studio-results-tab").forEach(function (t) {{
+    t.classList.toggle("cz-studio-results-tab-active", t === tab);
+  }});
+  container.querySelectorAll(".cz-studio-results-pane").forEach(function (p) {{
+    p.hidden = p.getAttribute("data-result-pane") !== which;
+  }});
+}});
 
 // ---------- Tab drag-to-reorder ----------
 // Reorder the open-files tab strip by dragging a tab onto another.
