@@ -5881,24 +5881,64 @@ def _cz_emit_df(result):
     except Exception:
         pass
 
+_cz_captured_df = [None]
+def _cz_track(val):
+    """Stash any DataFrame-like value so a trailing print()
+    statement doesn't bury an earlier DataFrame -- the cell renderer
+    only emits the marker for ONE captured value."""
+    try:
+        import pyarrow as pa
+        if isinstance(val, pa.Table):
+            _cz_captured_df[0] = val
+            return val
+    except Exception:
+        pass
+    try:
+        import pandas as pd
+        if isinstance(val, pd.DataFrame):
+            _cz_captured_df[0] = val
+            return val
+    except Exception:
+        pass
+    try:
+        from pyspark.sql.connect.dataframe import DataFrame as SparkConnectDF
+        if isinstance(val, SparkConnectDF):
+            _cz_captured_df[0] = val
+            return val
+    except Exception:
+        pass
+    if isinstance(val, list) and val and isinstance(val[0], dict):
+        _cz_captured_df[0] = val
+        return val
+    return val
+scope["_cz_track"] = _cz_track
+scope["_cz_captured_df"] = _cz_captured_df
+
 def _cz_run(code, scope):
-    """Eval user code; if the last statement is an expression,
-    capture its value so we can stream it back as a DataFrame
-    marker. Otherwise just exec straight through."""
+    """Eval user code; wrap every top-level expression's value in a
+    call to _cz_track(...). The LAST DataFrame-like value across the
+    cell wins, so writing `df` followed by `print(...)` still renders
+    the DataFrame -- print's None return doesn't clobber it."""
     tree = _cz_ast.parse(code, "<studio>", mode="exec")
-    captured = None
-    if tree.body and isinstance(tree.body[-1], _cz_ast.Expr):
-        last = tree.body[-1]
-        tree.body[-1] = _cz_ast.Assign(
-            targets=[_cz_ast.Name(id="__cz_last", ctx=_cz_ast.Store())],
-            value=last.value,
-            lineno=last.lineno,
-            col_offset=last.col_offset,
+    for stmt in tree.body:
+        if not isinstance(stmt, _cz_ast.Expr):
+            continue
+        v = stmt.value
+        ln, col = v.lineno, v.col_offset
+        el = getattr(v, "end_lineno", ln)
+        ec = getattr(v, "end_col_offset", col)
+        stmt.value = _cz_ast.Call(
+            func=_cz_ast.Name(
+                id="_cz_track", ctx=_cz_ast.Load(),
+                lineno=ln, col_offset=col, end_lineno=el, end_col_offset=ec,
+            ),
+            args=[v],
+            keywords=[],
+            lineno=ln, col_offset=col, end_lineno=el, end_col_offset=ec,
         )
-        _cz_ast.fix_missing_locations(tree)
+    _cz_ast.fix_missing_locations(tree)
     exec(compile(tree, "<studio>", "exec"), scope)
-    captured = scope.get("__cz_last")
-    _cz_emit_df(captured)
+    _cz_emit_df(_cz_captured_df[0])
 
 try:
     _cz_run(user_code, scope)
@@ -6415,34 +6455,65 @@ def _cz_emit_df(result):
     except Exception:
         pass
 
+_cz_captured_df = [None]
+def _cz_track(val):
+    """Stash any DataFrame-like value so a later print() doesn't bury
+    it -- the cell renderer only emits the marker for ONE captured
+    value, and without this helper a trailing print() (which returns
+    None) clobbered any earlier DataFrame."""
+    try:
+        import pyarrow as pa
+        if isinstance(val, pa.Table):
+            _cz_captured_df[0] = val
+            return val
+    except Exception:
+        pass
+    try:
+        import pandas as pd
+        if isinstance(val, pd.DataFrame):
+            _cz_captured_df[0] = val
+            return val
+    except Exception:
+        pass
+    try:
+        from pyspark.sql.connect.dataframe import DataFrame as SparkConnectDF
+        if isinstance(val, SparkConnectDF):
+            _cz_captured_df[0] = val
+            return val
+    except Exception:
+        pass
+    if isinstance(val, list) and val and isinstance(val[0], dict):
+        _cz_captured_df[0] = val
+        return val
+    return val
+scope["_cz_track"] = _cz_track
+scope["_cz_captured_df"] = _cz_captured_df
+
 def _cz_run(code, scope):
     tree = _cz_ast.parse(code, "<studio>", mode="exec")
-    if tree.body and isinstance(tree.body[-1], _cz_ast.Expr):
-        last = tree.body[-1]
-        # CPython >=3.8 validates end_lineno >= lineno and end_col_offset
-        # >= col_offset. fix_missing_locations only fills in zeros, so
-        # we copy the originals from the Expr node we replaced -- if we
-        # leave end_lineno unset, the parent Module's end_lineno=1 wins
-        # and compile() raises "AST node line range (20, 1) is not valid".
-        new_node = _cz_ast.Assign(
-            targets=[_cz_ast.Name(
-                id="__cz_last",
-                ctx=_cz_ast.Store(),
-                lineno=last.lineno,
-                col_offset=last.col_offset,
-                end_lineno=getattr(last, "end_lineno", last.lineno),
-                end_col_offset=getattr(last, "end_col_offset", last.col_offset),
-            )],
-            value=last.value,
-            lineno=last.lineno,
-            col_offset=last.col_offset,
-            end_lineno=getattr(last, "end_lineno", last.lineno),
-            end_col_offset=getattr(last, "end_col_offset", last.col_offset),
+    # Wrap EVERY top-level expression statement's value in a call to
+    # _cz_track(...). The last DataFrame-like value across the whole
+    # cell wins, so writing `df` then `print(...)` still renders the
+    # DataFrame -- the print's None return doesn't overwrite df.
+    for stmt in tree.body:
+        if not isinstance(stmt, _cz_ast.Expr):
+            continue
+        v = stmt.value
+        ln, col = v.lineno, v.col_offset
+        el = getattr(v, "end_lineno", ln)
+        ec = getattr(v, "end_col_offset", col)
+        stmt.value = _cz_ast.Call(
+            func=_cz_ast.Name(
+                id="_cz_track", ctx=_cz_ast.Load(),
+                lineno=ln, col_offset=col, end_lineno=el, end_col_offset=ec,
+            ),
+            args=[v],
+            keywords=[],
+            lineno=ln, col_offset=col, end_lineno=el, end_col_offset=ec,
         )
-        tree.body[-1] = new_node
-        _cz_ast.fix_missing_locations(tree)
+    _cz_ast.fix_missing_locations(tree)
     exec(compile(tree, "<studio>", "exec"), scope)
-    _cz_emit_df(scope.get("__cz_last"))
+    _cz_emit_df(_cz_captured_df[0])
 
 try:
     _cz_run(user_code, scope)
