@@ -5193,8 +5193,11 @@ fn render_studio_page(
     let tabs_html = {
         let scratch_active = files.active_id.is_none();
         let scratch_class = if scratch_active { " cz-studio-tab-active" } else { "" };
+        // data-tab-id="" marks the scratch tab as non-draggable (it
+        // has no id to reorder against). Other tabs carry their id
+        // in data-tab-id and become draggable.
         let mut html = format!(
-            r#"<div class="cz-studio-tabs"><a class="cz-studio-tab cz-studio-tab-scratch{scratch_class}" href="/studio?open={open}"><span class="cz-studio-tab-label">scratch</span></a>"#,
+            r#"<div class="cz-studio-tabs" id="cz-studio-tabs"><a class="cz-studio-tab cz-studio-tab-scratch{scratch_class}" href="/studio?open={open}" data-tab-id=""><span class="cz-studio-tab-label">scratch</span></a>"#,
             open = url_encode(&open_csv),
         );
         for f in &files.open {
@@ -5212,10 +5215,11 @@ fn render_studio_page(
                 .collect::<Vec<_>>()
                 .join(",");
             html.push_str(&format!(
-                r##"<a class="cz-studio-tab{active}" href="/studio?open={open}&active={id}"><span class="cz-studio-tab-label" title="{path}">{label}</span><a class="cz-studio-tab-close" href="/studio?open={next_open}" title="Close tab (doesn't delete file)">×</a></a>"##,
+                r##"<a class="cz-studio-tab{active}" href="/studio?open={open}&active={id}" draggable="true" data-tab-id="{id_raw}"><span class="cz-studio-tab-label" title="{path}">{label}</span><a class="cz-studio-tab-close" href="/studio?open={next_open}" title="Close tab (doesn't delete file)">×</a></a>"##,
                 open = url_encode(&open_csv),
                 next_open = url_encode(&next_open),
                 id = url_encode(&f.id),
+                id_raw = html_escape(&f.id),
                 path = html_escape(&f.path),
                 label = html_escape(basename),
             ));
@@ -5597,6 +5601,74 @@ fn render_studio_page(
       shell.style.setProperty(cssVar, "220px");
       try {{ localStorage.removeItem(storeKey); }} catch (_) {{}}
     }});
+  }});
+}})();
+
+// ---------- Tab drag-to-reorder ----------
+// Reorder the open-files tab strip by dragging a tab onto another.
+// New order is written to the hidden 'open' input AND mirrored to
+// the URL query string via history.replaceState so a page reload
+// keeps the new layout. Scratch tab is non-draggable (data-tab-id
+// is empty for it) and always stays at the leftmost slot.
+(function () {{
+  var strip = document.getElementById("cz-studio-tabs");
+  if (!strip) return;
+  var dragging = null;
+  function tabs() {{
+    return Array.prototype.filter.call(
+      strip.querySelectorAll(".cz-studio-tab"),
+      function (el) {{ return el.getAttribute("data-tab-id"); }}
+    );
+  }}
+  function persistOrder() {{
+    var ids = tabs().map(function (t) {{ return t.getAttribute("data-tab-id"); }});
+    var csv = ids.join(",");
+    // Mirror to the hidden open field so the next Run/Save submit
+    // forwards the new order.
+    var hidden = document.querySelector('input[name="open"]');
+    if (hidden) hidden.value = csv;
+    // Update the URL so a manual reload keeps the order.
+    try {{
+      var url = new URL(window.location.href);
+      url.searchParams.set("open", csv);
+      window.history.replaceState({{}}, "", url);
+    }} catch (_) {{}}
+    // Patch the href of each tab to carry the fresh open csv.
+    tabs().forEach(function (t) {{
+      try {{
+        var u = new URL(t.href, window.location.origin);
+        u.searchParams.set("open", csv);
+        t.href = u.toString();
+      }} catch (_) {{}}
+    }});
+  }}
+  strip.addEventListener("dragstart", function (e) {{
+    var t = e.target.closest(".cz-studio-tab[data-tab-id]");
+    if (!t || !t.getAttribute("data-tab-id")) return;
+    dragging = t;
+    t.classList.add("cz-studio-tab-dragging");
+    try {{ e.dataTransfer.effectAllowed = "move"; }} catch (_) {{}}
+  }});
+  strip.addEventListener("dragend", function () {{
+    if (dragging) dragging.classList.remove("cz-studio-tab-dragging");
+    dragging = null;
+  }});
+  strip.addEventListener("dragover", function (e) {{
+    var over = e.target.closest(".cz-studio-tab[data-tab-id]");
+    if (!dragging || !over || over === dragging) return;
+    e.preventDefault();
+    var rect = over.getBoundingClientRect();
+    var midX = rect.left + rect.width / 2;
+    if (e.clientX < midX) {{
+      strip.insertBefore(dragging, over);
+    }} else {{
+      strip.insertBefore(dragging, over.nextSibling);
+    }}
+  }});
+  strip.addEventListener("drop", function (e) {{
+    if (!dragging) return;
+    e.preventDefault();
+    persistOrder();
   }});
 }})();
 

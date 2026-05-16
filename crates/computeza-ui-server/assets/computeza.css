@@ -1427,6 +1427,15 @@ a.cz-card:hover {
 /* "scratch" tab when no file is active -- runs queries without
    saving them. Always present so the editor never goes blank. */
 .cz-studio-tab-scratch { font-style: italic; }
+/* Drag-to-reorder visual: dim the source tab during drag so the
+   operator sees where it'll land after drop. */
+.cz-studio-tab[draggable="true"] {
+  cursor: grab;
+}
+.cz-studio-tab.cz-studio-tab-dragging {
+  opacity: 0.4;
+  cursor: grabbing;
+}
 
 .cz-studio-sidebar {
   background: var(--navy);
