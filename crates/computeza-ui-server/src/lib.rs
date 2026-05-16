@@ -7228,7 +7228,8 @@ def print_storage(c=None):
     print(" format 'S3' regardless of whether the bytes live in AWS,")
     print(" Garage, MinIO, Ceph, R2, etc. The data here is on this")
     print(" host, not on AWS.)")
-scope["print_storage"] = print_storage
+# Registered into the exec scope below (the dict `scope` is built
+# AFTER all the helpers + the `cat` binding).
 
 # Lakekeeper's /v1/config response injects `s3.remote-signing-enabled
 # = true` plus `s3.signer.uri = http://.../v1/signer/...`, which tells
@@ -7325,6 +7326,7 @@ if cat is None:
 scope = {
     "catalogs": catalogs,
     "cat": cat,
+    "print_storage": print_storage,
     "__name__": "__main__",
     # Include __builtins__ explicitly. When exec() is called with a
     # globals dict that doesn't have __builtins__, Python auto-adds
