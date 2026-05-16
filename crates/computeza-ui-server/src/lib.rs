@@ -5713,7 +5713,18 @@ def _cz_emit_df(result):
                 total = len(result)
                 head = result.head(cap)
                 cols = [{{"name": str(c), "type": str(result[c].dtype)}} for c in result.columns]
-                rows = [[("" if pd.isna(v) else str(v)) for v in row] for row in head.itertuples(index=False, name=None)]
+                def _cz_is_na(v):
+                    # pd.isna on a list/dict returns an *array*, not a
+                    # scalar -- `bool(...)` then raises ValueError and
+                    # the marker silently drops. Scalar-safe check.
+                    if v is None:
+                        return True
+                    try:
+                        r = pd.isna(v)
+                        return bool(r) if isinstance(r, bool) else False
+                    except (ValueError, TypeError):
+                        return False
+                rows = [[("" if _cz_is_na(v) else str(v)) for v in row] for row in head.itertuples(index=False, name=None)]
                 payload = {{"columns": cols, "rows": rows, "total_rows": int(total), "origin": "pandas.DataFrame"}}
                 print("__COMPUTEZA_DATAFRAME__" + _cz_json.dumps(payload) + "__END__")
                 return
@@ -6171,7 +6182,18 @@ def _cz_emit_df(result):
                 total = len(result)
                 head = result.head(cap)
                 cols = [{"name": str(c), "type": str(result[c].dtype)} for c in result.columns]
-                rows = [[("" if pd.isna(v) else str(v)) for v in row] for row in head.itertuples(index=False, name=None)]
+                def _cz_is_na(v):
+                    # pd.isna on a list/dict returns an *array*, not a
+                    # scalar -- `bool(...)` then raises ValueError and
+                    # the marker silently drops. Scalar-safe check.
+                    if v is None:
+                        return True
+                    try:
+                        r = pd.isna(v)
+                        return bool(r) if isinstance(r, bool) else False
+                    except (ValueError, TypeError):
+                        return False
+                rows = [[("" if _cz_is_na(v) else str(v)) for v in row] for row in head.itertuples(index=False, name=None)]
                 payload = {"columns": cols, "rows": rows, "total_rows": int(total), "origin": "pandas.DataFrame"}
                 print("__COMPUTEZA_DATAFRAME__" + _cz_json.dumps(payload) + "__END__")
                 return
