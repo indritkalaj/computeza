@@ -6216,7 +6216,190 @@ enum SqlOutcome {
 /// fully-qualified `<catalog>.<schema>.<table>` references so the
 /// operator can query any registered catalog from one editor
 /// without changing the session context.
+/// Split a SQL buffer on TOP-LEVEL semicolons, respecting:
+///   - `--` line comments
+///   - `/* ... */` block comments (nestable per Trino spec)
+///   - `'...'` single-quoted strings (with `''` escape)
+///   - `"..."` double-quoted identifiers (with `""` escape)
+///
+/// Trailing empty / whitespace-only / comment-only statements are
+/// dropped so trailing `;` and stray newlines don't surface as
+/// extra round-trips. Returns at least one element when the input
+/// has any non-whitespace content.
+fn split_sql_statements(sql: &str) -> Vec<String> {
+    let bytes = sql.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    // Per ANSI SQL block comments do NOT nest -- the first `*/`
+    // closes the block. Some dialects (Postgres) DO nest; Trino
+    // follows the ANSI rule.
+    let mut in_block = false;
+    let mut in_line_comment = false;
+    let mut in_single = false;
+    let mut in_double = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_line_comment {
+            if b == b'\n' {
+                in_line_comment = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_block {
+            if i + 1 < bytes.len() && b == b'*' && bytes[i + 1] == b'/' {
+                in_block = false;
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if in_single {
+            if b == b'\'' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    i += 2;
+                    continue;
+                }
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_double {
+            if b == b'"' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                    i += 2;
+                    continue;
+                }
+                in_double = false;
+            }
+            i += 1;
+            continue;
+        }
+        // Outside any quote / comment.
+        if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            in_line_comment = true;
+            i += 2;
+            continue;
+        }
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            in_block = true;
+            i += 2;
+            continue;
+        }
+        if b == b'\'' {
+            in_single = true;
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_double = true;
+            i += 1;
+            continue;
+        }
+        if b == b';' {
+            let stmt = sql[start..i].trim().to_string();
+            if !is_comment_or_whitespace_only(&stmt) {
+                out.push(stmt);
+            }
+            i += 1;
+            start = i;
+            continue;
+        }
+        i += 1;
+    }
+    let tail = sql[start..].trim().to_string();
+    if !is_comment_or_whitespace_only(&tail) {
+        out.push(tail);
+    }
+    out
+}
+
+/// True when the input contains no executable SQL token -- only
+/// whitespace, line comments, and block comments. Used to drop
+/// segments like `--just a note` so they don't generate empty
+/// round-trips against Trino's /v1/statement.
+fn is_comment_or_whitespace_only(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    let mut in_block = false;
+    let mut in_line = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_line {
+            if b == b'\n' {
+                in_line = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_block {
+            if i + 1 < bytes.len() && b == b'*' && bytes[i + 1] == b'/' {
+                in_block = false;
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if b.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            in_line = true;
+            i += 2;
+            continue;
+        }
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            in_block = true;
+            i += 2;
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
 async fn execute_sql_against_trino(base_url: &str, sql: &str) -> SqlOutcome {
+    // Trino's /v1/statement accepts ONE statement per request and
+    // refuses trailing semicolons. Split the buffer here so a
+    // multi-statement editor body (`SHOW CATALOGS; SELECT 1;`) and
+    // a single-statement-with-trailing-semicolon (`SHOW CATALOGS;`)
+    // both work. Returns the LAST statement's result; earlier
+    // statements run for side effects and short-circuit on error
+    // (same semantics as `psql` running a script).
+    let statements = split_sql_statements(sql);
+    if statements.is_empty() {
+        return SqlOutcome::Err("Empty SQL.".into());
+    }
+    let last_idx = statements.len() - 1;
+    let mut last_ok: Option<SqlOutcome> = None;
+    for (idx, stmt) in statements.iter().enumerate() {
+        let out = execute_one_trino_statement(base_url, stmt).await;
+        match out {
+            SqlOutcome::Err(msg) => {
+                let preview: String = stmt.lines().next().unwrap_or("").chars().take(80).collect();
+                return SqlOutcome::Err(format!(
+                    "Statement {} of {} failed (`{}`): {msg}",
+                    idx + 1,
+                    statements.len(),
+                    preview
+                ));
+            }
+            ok => {
+                if idx == last_idx {
+                    last_ok = Some(ok);
+                }
+            }
+        }
+    }
+    last_ok.unwrap_or(SqlOutcome::Err("Empty SQL.".into()))
+}
+
+async fn execute_one_trino_statement(base_url: &str, sql: &str) -> SqlOutcome {
     let start = std::time::Instant::now();
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
@@ -21117,6 +21300,37 @@ pub fn render_resource_deleted(localizer: &Localizer, kind: &str, name: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sql_splitter_strips_trailing_semicolon() {
+        assert_eq!(split_sql_statements("SHOW CATALOGS;"), vec!["SHOW CATALOGS"]);
+        assert_eq!(split_sql_statements("SHOW CATALOGS"), vec!["SHOW CATALOGS"]);
+        assert_eq!(split_sql_statements("SHOW CATALOGS;  \n"), vec!["SHOW CATALOGS"]);
+    }
+
+    #[test]
+    fn sql_splitter_handles_multi_statement() {
+        let v = split_sql_statements("SHOW CATALOGS; SELECT 1;");
+        assert_eq!(v, vec!["SHOW CATALOGS", "SELECT 1"]);
+    }
+
+    #[test]
+    fn sql_splitter_respects_quotes_and_comments() {
+        // Semicolons inside string literals + comments aren't separators.
+        // Block comments do NOT nest (ANSI SQL / Trino rule).
+        let v = split_sql_statements(
+            "SELECT 'a;b', \"c;d\" -- ignored ; trailing\nFROM t; /* block ; comment */ SELECT 2",
+        );
+        assert_eq!(v.len(), 2, "got: {:?}", v);
+        assert!(v[0].starts_with("SELECT 'a;b'"));
+        assert!(v[1].ends_with("SELECT 2"));
+    }
+
+    #[test]
+    fn sql_splitter_drops_empty_and_comment_only_segments() {
+        let v = split_sql_statements(";;  ; -- just a comment\n;");
+        assert!(v.is_empty());
+    }
 
     #[test]
     fn render_install_guide_covers_all_sections() {
