@@ -5957,12 +5957,31 @@ document.addEventListener("click", function (e) {{
       // body is unchanged.
       if (content === lastSaved) return;
       setStatus("saving", "Saving…");
+      // Pull the CSRF token from the cookie that auth sets on every
+      // authenticated request. Same source + same parsing the
+      // global submit-listener uses (no URL-decode -- tokens are
+      // hex-only so no escapes to undo).
+      var csrf = "";
+      try {{
+        var parts = document.cookie.split(";");
+        for (var i = 0; i < parts.length; i++) {{
+          var t = parts[i].trim();
+          if (t.indexOf("computeza_csrf=") === 0) {{
+            csrf = t.substring(15);
+            break;
+          }}
+        }}
+      }} catch (_) {{}}
       var body = new URLSearchParams();
       body.append("content", content);
+      if (csrf) body.append("csrf_token", csrf);
       fetch("/studio/api/files/" + encodeURIComponent(fileId) + "/autosave", {{
         method: "POST",
         credentials: "same-origin",
-        headers: {{ "Content-Type": "application/x-www-form-urlencoded" }},
+        headers: {{
+          "Content-Type": "application/x-www-form-urlencoded",
+          "X-CSRF-Token": csrf,
+        }},
         body: body.toString(),
       }})
         .then(function (r) {{
